@@ -3,7 +3,6 @@
 
 Environment:
     SLACK_USER_TOKEN  — Required. Slack user token (xoxp-...) with appropriate scopes.
-                        Get one at https://api.slack.com/apps → OAuth & Permissions.
 
 Commands:
     slackcli channels         List channels (public, private, DMs)
@@ -22,13 +21,10 @@ Usage:
     slackcli channels
     slackcli history C02DLS4PFH7 -n 30
     slackcli send C02DLS4PFH7 "Hello from the CLI!"
-    slackcli reply C02DLS4PFH7 1710430020.123456 "Thread reply"
-    slackcli search "deployment failed" -n 5
     slackcli unread
     slackcli react C02DLS4PFH7 1710430020.123456 thumbsup
 """
 
-import argparse
 import json
 import os
 import sys
@@ -36,49 +32,61 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
+import click
+
 API = "https://slack.com/api"
 
 
-def get_token():
-    token = os.environ.get("SLACK_USER_TOKEN", "")
+def _get_token(ctx):
+    token = ctx.obj.get("token", "")
     if not token:
-        print("Error: SLACK_USER_TOKEN not set", file=sys.stderr)
-        sys.exit(1)
+        raise click.ClickException("SLACK_USER_TOKEN not set. Pass --token or set the env var.")
     return token
 
 
-TOKEN = None  # Set in main()
-
-
-def api_get(method, params=None):
+def _api_get(token, method, params=None):
     url = f"{API}/{method}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read())
 
 
-def api_post(method, data):
+def _api_post(token, method, data):
     req = urllib.request.Request(
         f"{API}/{method}",
         data=json.dumps(data).encode(),
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read())
 
 
-def check(data):
+def _check(data):
     if not data.get("ok"):
-        print(f"Error: {data.get('error', 'unknown')}", file=sys.stderr)
-        sys.exit(1)
+        raise click.ClickException(f"Slack API error: {data.get('error', 'unknown')}")
     return data
 
 
-def cmd_channels(args):
-    types = args.type or "public_channel,private_channel,im,mpim"
-    data = check(api_get("conversations.list", {"types": types, "limit": args.limit, "exclude_archived": "true"}))
+@click.group()
+@click.option("--token", envvar="SLACK_USER_TOKEN", required=True, help="Slack user token [env: SLACK_USER_TOKEN].")
+@click.pass_context
+def main(ctx, token):
+    """Lightweight Slack CLI."""
+    ctx.ensure_object(dict)
+    ctx.obj["token"] = token
+
+
+@main.command()
+@click.option("-t", "--type", "channel_type", default=None, help="Channel types (e.g. public_channel,im).")
+@click.option("-n", "--limit", default=20, show_default=True, help="Max channels to list.")
+@click.pass_context
+def channels(ctx, channel_type, limit):
+    """List channels (public, private, DMs)."""
+    token = _get_token(ctx)
+    types = channel_type or "public_channel,private_channel,im,mpim"
+    data = _check(_api_get(token, "conversations.list", {"types": types, "limit": limit, "exclude_archived": "true"}))
     for ch in data["channels"]:
         cid = ch["id"]
         if ch.get("is_im"):
@@ -88,12 +96,17 @@ def cmd_channels(args):
         else:
             name = f"#{ch.get('name', '?')}"
         members = ch.get("num_members", "-")
-        print(f"{cid}  {name}  (members: {members})")
+        click.echo(f"{cid}  {name}  (members: {members})")
 
 
-def cmd_history(args):
-    params = {"channel": args.channel, "limit": args.limit}
-    data = check(api_get("conversations.history", params))
+@main.command()
+@click.argument("channel")
+@click.option("-n", "--limit", default=20, show_default=True, help="Max messages to show.")
+@click.pass_context
+def history(ctx, channel, limit):
+    """Read channel message history."""
+    token = _get_token(ctx)
+    data = _check(_api_get(token, "conversations.history", {"channel": channel, "limit": limit}))
     msgs = data.get("messages", [])
     msgs.reverse()
     for m in msgs:
@@ -102,72 +115,110 @@ def cmd_history(args):
         user = m.get("user", m.get("username", "bot"))
         text = m.get("text", "")
         thread = f" [{m.get('reply_count', 0)} replies]" if m.get("reply_count") else ""
-        print(f"[{dt}] <{user}>{thread} {text}")
+        click.echo(f"[{dt}] <{user}>{thread} {text}")
 
 
-def cmd_send(args):
-    message = " ".join(args.message)
-    data = check(api_post("chat.postMessage", {"channel": args.channel, "text": message}))
-    print(f"Sent (ts: {data.get('ts')})")
+@main.command()
+@click.argument("channel")
+@click.argument("message", nargs=-1, required=True)
+@click.pass_context
+def send(ctx, channel, message):
+    """Send a message to a channel."""
+    token = _get_token(ctx)
+    text = " ".join(message)
+    data = _check(_api_post(token, "chat.postMessage", {"channel": channel, "text": text}))
+    click.echo(f"Sent (ts: {data.get('ts')})")
 
 
-def cmd_reply(args):
-    message = " ".join(args.message)
-    data = check(api_post("chat.postMessage", {
-        "channel": args.channel, "thread_ts": args.thread_ts, "text": message,
+@main.command()
+@click.argument("channel")
+@click.argument("thread_ts")
+@click.argument("message", nargs=-1, required=True)
+@click.pass_context
+def reply(ctx, channel, thread_ts, message):
+    """Reply in a thread."""
+    token = _get_token(ctx)
+    text = " ".join(message)
+    data = _check(_api_post(token, "chat.postMessage", {
+        "channel": channel, "thread_ts": thread_ts, "text": text,
     }))
-    print(f"Replied (ts: {data.get('ts')})")
+    click.echo(f"Replied (ts: {data.get('ts')})")
 
 
-def cmd_search(args):
-    query = " ".join(args.query)
-    data = check(api_get("search.messages", {"query": query, "count": args.limit}))
+@main.command()
+@click.argument("query", nargs=-1, required=True)
+@click.option("-n", "--limit", default=10, show_default=True, help="Max results.")
+@click.pass_context
+def search(ctx, query, limit):
+    """Search messages across workspace."""
+    token = _get_token(ctx)
+    q = " ".join(query)
+    data = _check(_api_get(token, "search.messages", {"query": q, "count": limit}))
     for m in data.get("messages", {}).get("matches", []):
         ts = float(m.get("ts", 0))
         dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
         user = m.get("username", m.get("user", "?"))
         ch = m.get("channel", {}).get("name", "?")
         text = m.get("text", "")[:150]
-        print(f"[{dt}] #{ch} <{user}> {text}")
+        click.echo(f"[{dt}] #{ch} <{user}> {text}")
 
 
-def cmd_users(args):
-    data = check(api_get("users.list", {"limit": args.limit}))
+@main.command()
+@click.option("-n", "--limit", default=200, show_default=True, help="Max users to list.")
+@click.pass_context
+def users(ctx, limit):
+    """List workspace members."""
+    token = _get_token(ctx)
+    data = _check(_api_get(token, "users.list", {"limit": limit}))
     for u in data.get("members", []):
         if u.get("deleted") or u.get("is_bot"):
             continue
         uid = u["id"]
         name = u.get("real_name", u.get("name", "?"))
         display = u.get("profile", {}).get("display_name", "")
-        print(f"{uid}  {name}  @{display}")
+        click.echo(f"{uid}  {name}  @{display}")
 
 
-def cmd_userinfo(args):
-    data = check(api_get("users.info", {"user": args.user}))
+@main.command()
+@click.argument("user")
+@click.pass_context
+def userinfo(ctx, user):
+    """Show user details."""
+    token = _get_token(ctx)
+    data = _check(_api_get(token, "users.info", {"user": user}))
     u = data["user"]
     p = u.get("profile", {})
-    print(f"ID:      {u['id']}")
-    print(f"Name:    {u.get('real_name', '?')}")
-    print(f"Display: {p.get('display_name', '')}")
-    print(f"Email:   {p.get('email', '')}")
-    print(f"Title:   {p.get('title', '')}")
-    print(f"TZ:      {u.get('tz', '')}")
+    click.echo(f"ID:      {u['id']}")
+    click.echo(f"Name:    {u.get('real_name', '?')}")
+    click.echo(f"Display: {p.get('display_name', '')}")
+    click.echo(f"Email:   {p.get('email', '')}")
+    click.echo(f"Title:   {p.get('title', '')}")
+    click.echo(f"TZ:      {u.get('tz', '')}")
 
 
-def cmd_dm(args):
-    data = check(api_post("conversations.open", {"users": args.user}))
-    print(data["channel"]["id"])
+@main.command()
+@click.argument("user")
+@click.pass_context
+def dm(ctx, user):
+    """Get or create a DM channel ID."""
+    token = _get_token(ctx)
+    data = _check(_api_post(token, "conversations.open", {"users": user}))
+    click.echo(data["channel"]["id"])
 
 
-def cmd_unread(args):
-    data = check(api_get("conversations.list", {
+@main.command()
+@click.pass_context
+def unread(ctx):
+    """Show channels with unread messages."""
+    token = _get_token(ctx)
+    data = _check(_api_get(token, "conversations.list", {
         "types": "public_channel,private_channel,im,mpim",
         "limit": 200, "exclude_archived": "true",
     }))
     found = False
     for ch in data.get("channels", []):
-        unread = ch.get("unread_count_display", 0)
-        if unread > 0:
+        count = ch.get("unread_count_display", 0)
+        if count > 0:
             found = True
             cid = ch["id"]
             if ch.get("is_im"):
@@ -176,90 +227,33 @@ def cmd_unread(args):
                 name = ch.get("name", "group-dm")
             else:
                 name = f"#{ch.get('name', '?')}"
-            print(f"{cid}  {name}  ({unread} unread)")
+            click.echo(f"{cid}  {name}  ({count} unread)")
     if not found:
-        print("No unread messages")
+        click.echo("No unread messages")
 
 
-def cmd_react(args):
-    data = api_post("reactions.add", {
-        "channel": args.channel, "timestamp": args.ts, "name": args.emoji,
-    })
-    print("Reacted ✅" if data.get("ok") else f"Error: {data.get('error')}")
+@main.command()
+@click.argument("channel")
+@click.argument("ts")
+@click.argument("emoji")
+@click.pass_context
+def react(ctx, channel, ts, emoji):
+    """Add an emoji reaction to a message."""
+    token = _get_token(ctx)
+    data = _api_post(token, "reactions.add", {"channel": channel, "timestamp": ts, "name": emoji})
+    click.echo("Reacted ✅" if data.get("ok") else f"Error: {data.get('error')}")
 
 
-def cmd_unreact(args):
-    data = api_post("reactions.remove", {
-        "channel": args.channel, "timestamp": args.ts, "name": args.emoji,
-    })
-    print("Removed ✅" if data.get("ok") else f"Error: {data.get('error')}")
-
-
-def main():
-    global TOKEN
-    TOKEN = get_token()
-
-    parser = argparse.ArgumentParser(prog="slackcli", description="Lightweight Slack CLI")
-    sub = parser.add_subparsers(dest="command")
-
-    p = sub.add_parser("channels", aliases=["ch"], help="List channels")
-    p.add_argument("--type", "-t", default=None)
-    p.add_argument("--limit", "-n", type=int, default=20)
-    p.set_defaults(func=cmd_channels)
-
-    p = sub.add_parser("history", aliases=["h"], help="Read channel messages")
-    p.add_argument("channel")
-    p.add_argument("--limit", "-n", type=int, default=20)
-    p.set_defaults(func=cmd_history)
-
-    p = sub.add_parser("send", aliases=["s"], help="Send a message")
-    p.add_argument("channel")
-    p.add_argument("message", nargs="+")
-    p.set_defaults(func=cmd_send)
-
-    p = sub.add_parser("reply", aliases=["r"], help="Reply in thread")
-    p.add_argument("channel")
-    p.add_argument("thread_ts")
-    p.add_argument("message", nargs="+")
-    p.set_defaults(func=cmd_reply)
-
-    p = sub.add_parser("search", help="Search messages")
-    p.add_argument("query", nargs="+")
-    p.add_argument("--limit", "-n", type=int, default=10)
-    p.set_defaults(func=cmd_search)
-
-    p = sub.add_parser("users", aliases=["u"], help="List workspace members")
-    p.add_argument("--limit", "-n", type=int, default=200)
-    p.set_defaults(func=cmd_users)
-
-    p = sub.add_parser("userinfo", aliases=["ui"], help="User details")
-    p.add_argument("user")
-    p.set_defaults(func=cmd_userinfo)
-
-    p = sub.add_parser("dm", help="Get/create DM channel")
-    p.add_argument("user")
-    p.set_defaults(func=cmd_dm)
-
-    p = sub.add_parser("unread", help="Channels with unread messages")
-    p.set_defaults(func=cmd_unread)
-
-    p = sub.add_parser("react", help="Add reaction")
-    p.add_argument("channel")
-    p.add_argument("ts")
-    p.add_argument("emoji")
-    p.set_defaults(func=cmd_react)
-
-    p = sub.add_parser("unreact", help="Remove reaction")
-    p.add_argument("channel")
-    p.add_argument("ts")
-    p.add_argument("emoji")
-    p.set_defaults(func=cmd_unreact)
-
-    args = parser.parse_args()
-    if not args.command:
-        parser.print_help()
-        sys.exit(0)
-    args.func(args)
+@main.command()
+@click.argument("channel")
+@click.argument("ts")
+@click.argument("emoji")
+@click.pass_context
+def unreact(ctx, channel, ts, emoji):
+    """Remove an emoji reaction from a message."""
+    token = _get_token(ctx)
+    data = _api_post(token, "reactions.remove", {"channel": channel, "timestamp": ts, "name": emoji})
+    click.echo("Removed ✅" if data.get("ok") else f"Error: {data.get('error')}")
 
 
 if __name__ == "__main__":

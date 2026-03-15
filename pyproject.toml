@@ -12,6 +12,7 @@ requires-python = ">=3.10"
 authors = [
     { name = "Márcio Martins", email = "marcioapm@gmail.com" }
 ]
+dependencies = ["click>=8.0"]
 keywords = ["cli", "gemini", "ai", "tts", "image-generation", "video-generation", "slack"]
 classifiers = [
     "Development Status :: 4 - Beta",

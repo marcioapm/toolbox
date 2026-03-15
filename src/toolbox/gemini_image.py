@@ -18,12 +18,13 @@ Usage:
     gemini-image "watercolor landscape" -m gemini-3-pro-image-preview --aspect 16:9
 """
 
-import argparse
 import base64
 import json
 import os
 import sys
 import urllib.request
+
+import click
 
 MODELS = [
     "imagen-4.0-generate-001",
@@ -43,105 +44,70 @@ GEMINI_NATIVE_MODELS = {
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
-def get_api_key():
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        print("Error: GEMINI_API_KEY not set. Get one at https://aistudio.google.com/apikey", file=sys.stderr)
-        sys.exit(1)
-    return key
-
-
-def generate_imagen(api_key, model, prompt, count, aspect):
-    """Generate via Imagen predict endpoint."""
-    url = f"{BASE_URL}/{model}:predict?key={api_key}"
-    payload = {
-        "instances": [{"prompt": prompt}],
-        "parameters": {"sampleCount": min(count, 4), "aspectRatio": aspect},
-    }
-    return _api_call(url, payload)
-
-
-def generate_gemini_native(api_key, model, prompt):
-    """Generate via Gemini generateContent endpoint (native image models)."""
-    url = f"{BASE_URL}/{model}:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
-        "generationConfig": {"responseModalities": ["image", "text"]},
-    }
-    return _api_call(url, payload)
-
-
 def _api_call(url, payload):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
     try:
         resp = urllib.request.urlopen(req, timeout=120)
         return json.load(resp)
     except urllib.error.HTTPError as e:
-        print(f"API error: {e.read().decode()}", file=sys.stderr)
-        sys.exit(1)
+        raise click.ClickException(f"API error: {e.read().decode()}")
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise click.ClickException(str(e))
 
 
-def save_images(data, output, is_gemini_native):
-    """Extract and save images from API response."""
-    count = 0
+@click.command()
+@click.argument("prompt")
+@click.option("-o", "--output", default="output.png", show_default=True, help="Output file path.")
+@click.option("-m", "--model", default="imagen-4.0-generate-001", show_default=True,
+              type=click.Choice(MODELS, case_sensitive=False), help="Generation model.")
+@click.option("-n", "--count", default=1, show_default=True, type=click.IntRange(1, 4), help="Number of images.")
+@click.option("--aspect", default="1:1", show_default=True, help="Aspect ratio (e.g. 16:9, 9:16, 1:1).")
+@click.option("--api-key", envvar="GEMINI_API_KEY", required=True, help="Gemini API key [env: GEMINI_API_KEY].")
+def main(prompt, output, model, count, aspect, api_key):
+    """Generate images via Google Gemini API."""
+    is_native = model in GEMINI_NATIVE_MODELS
+
+    if is_native:
+        url = f"{BASE_URL}/{model}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
+            "generationConfig": {"responseModalities": ["image", "text"]},
+        }
+    else:
+        url = f"{BASE_URL}/{model}:predict?key={api_key}"
+        payload = {
+            "instances": [{"prompt": prompt}],
+            "parameters": {"sampleCount": count, "aspectRatio": aspect},
+        }
+
+    data = _api_call(url, payload)
+
+    saved = 0
     base, ext = os.path.splitext(output)
 
-    if is_gemini_native:
+    if is_native:
         for candidate in data.get("candidates", []):
             for part in candidate.get("content", {}).get("parts", []):
                 if "inlineData" in part:
                     img_bytes = base64.b64decode(part["inlineData"]["data"])
                     mime = part["inlineData"].get("mimeType", "image/png")
                     file_ext = ".jpg" if "jpeg" in mime else ".png"
-                    count += 1
-                    out = output if count == 1 else f"{base}-{count}{file_ext}"
+                    saved += 1
+                    out = output if saved == 1 else f"{base}-{saved}{file_ext}"
                     with open(out, "wb") as f:
                         f.write(img_bytes)
-                    print(f"Saved {out} ({len(img_bytes)} bytes)")
+                    click.echo(f"Saved {out} ({len(img_bytes)} bytes)")
     else:
         for pred in data.get("predictions", []):
             img_bytes = base64.b64decode(pred["bytesBase64Encoded"])
-            count += 1
-            out = output if count == 1 else f"{base}-{count}{ext or '.png'}"
+            saved += 1
+            out = output if saved == 1 else f"{base}-{saved}{ext or '.png'}"
             with open(out, "wb") as f:
                 f.write(img_bytes)
-            print(f"Saved {out} ({len(img_bytes)} bytes)")
+            click.echo(f"Saved {out} ({len(img_bytes)} bytes)")
 
-    if count == 0:
-        print("No images generated", file=sys.stderr)
-        print(json.dumps(data, indent=2)[:500], file=sys.stderr)
-        sys.exit(1)
-
-    return count
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        prog="gemini-image",
-        description="Generate images via Google Gemini API",
-    )
-    parser.add_argument("prompt", help="Image generation prompt")
-    parser.add_argument("-o", "--output", default="output.png", help="Output file (default: output.png)")
-    parser.add_argument(
-        "-m", "--model", default="imagen-4.0-generate-001", choices=MODELS,
-        help="Model (default: imagen-4.0-generate-001)",
-    )
-    parser.add_argument("-n", "--count", type=int, default=1, help="Number of images, 1-4 (default: 1)")
-    parser.add_argument("--aspect", default="1:1", help="Aspect ratio (default: 1:1)")
-    args = parser.parse_args()
-
-    api_key = get_api_key()
-    is_native = args.model in GEMINI_NATIVE_MODELS
-
-    if is_native:
-        data = generate_gemini_native(api_key, args.model, args.prompt)
-    else:
-        data = generate_imagen(api_key, args.model, args.prompt, args.count, args.aspect)
-
-    save_images(data, args.output, is_native)
+    if saved == 0:
+        raise click.ClickException(f"No images generated.\n{json.dumps(data, indent=2)[:500]}")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,6 @@ Usage:
     gemini-tts "Breaking news" -v Charon -o news.wav
 """
 
-import argparse
 import base64
 import json
 import os
@@ -25,30 +24,30 @@ import sys
 import urllib.request
 import wave
 
+import click
+
 MODELS = ["gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"]
 VOICES = ["Aoede", "Charon", "Fenrir", "Kore", "Puck", "Orbit", "Vale"]
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
-def get_api_key():
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        print("Error: GEMINI_API_KEY not set. Get one at https://aistudio.google.com/apikey", file=sys.stderr)
-        sys.exit(1)
-    return key
-
-
-def generate_speech(api_key, model, text, voice):
-    """Call Gemini TTS API and return audio bytes."""
+@click.command()
+@click.argument("text")
+@click.option("-o", "--output", default="output.wav", show_default=True, help="Output WAV file path.")
+@click.option("-m", "--model", default="gemini-2.5-flash-preview-tts", show_default=True,
+              type=click.Choice(MODELS, case_sensitive=False), help="TTS model.")
+@click.option("-v", "--voice", default="Kore", show_default=True,
+              type=click.Choice(VOICES, case_sensitive=False), help="Voice name.")
+@click.option("--api-key", envvar="GEMINI_API_KEY", required=True, help="Gemini API key [env: GEMINI_API_KEY].")
+def main(text, output, model, voice, api_key):
+    """Text-to-speech via Gemini native audio."""
     url = f"{BASE_URL}/{model}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": text}]}],
         "generationConfig": {
             "responseModalities": ["audio"],
             "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {"voiceName": voice}
-                }
+                "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
             },
         },
     }
@@ -58,58 +57,29 @@ def generate_speech(api_key, model, text, voice):
         resp = urllib.request.urlopen(req, timeout=60)
         data = json.load(resp)
     except urllib.error.HTTPError as e:
-        print(f"API error: {e.read().decode()}", file=sys.stderr)
-        sys.exit(1)
+        raise click.ClickException(f"API error: {e.read().decode()}")
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise click.ClickException(str(e))
 
     for candidate in data.get("candidates", []):
         for part in candidate.get("content", {}).get("parts", []):
             if "inlineData" in part:
-                return base64.b64decode(part["inlineData"]["data"])
+                audio_bytes = base64.b64decode(part["inlineData"]["data"])
 
-    print("No audio in response", file=sys.stderr)
-    sys.exit(1)
+                if audio_bytes[:4] == b"RIFF":
+                    with open(output, "wb") as f:
+                        f.write(audio_bytes)
+                else:
+                    with wave.open(output, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(24000)
+                        wf.writeframes(audio_bytes)
 
+                click.echo(f"Saved {output} ({os.path.getsize(output)} bytes)")
+                return
 
-def save_audio(audio_bytes, output):
-    """Save audio bytes as WAV, wrapping raw PCM if needed."""
-    if audio_bytes[:4] == b"RIFF":
-        # Already a valid WAV
-        with open(output, "wb") as f:
-            f.write(audio_bytes)
-    else:
-        # Raw PCM — wrap in WAV container (16-bit LE, 24kHz mono)
-        with wave.open(output, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(24000)
-            wf.writeframes(audio_bytes)
-
-    print(f"Saved {output} ({os.path.getsize(output)} bytes)")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        prog="gemini-tts",
-        description="Text-to-speech via Gemini native audio",
-    )
-    parser.add_argument("text", help="Text to speak")
-    parser.add_argument("-o", "--output", default="output.wav", help="Output file (default: output.wav)")
-    parser.add_argument(
-        "-m", "--model", default="gemini-2.5-flash-preview-tts", choices=MODELS,
-        help="TTS model (default: gemini-2.5-flash-preview-tts)",
-    )
-    parser.add_argument(
-        "-v", "--voice", default="Kore", choices=VOICES,
-        help="Voice name (default: Kore)",
-    )
-    args = parser.parse_args()
-
-    api_key = get_api_key()
-    audio_bytes = generate_speech(api_key, args.model, args.text, args.voice)
-    save_audio(audio_bytes, args.output)
+    raise click.ClickException("No audio in response")
 
 
 if __name__ == "__main__":
