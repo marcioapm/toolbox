@@ -10,6 +10,7 @@ A collection of lightweight CLI tools for AI content generation and chat operati
 | `gemini-tts` | Text-to-speech via Gemini native audio | `GEMINI_API_KEY` |
 | `gemini-video` | Generate video via Google Veo 2/3/3.1 | `GEMINI_API_KEY` |
 | `slackcli` | Lightweight Slack client (channels, messages, search, reactions) | `SLACK_USER_TOKEN` |
+| `llm-usage` | Monitor LLM token usage, costs, and quotas across providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` |
 
 ## Install
 
@@ -261,6 +262,83 @@ Your `SLACK_USER_TOKEN` needs these scopes:
 
 ---
 
+---
+
+## llm-usage
+
+Monitor LLM token usage and quotas across Anthropic, OpenAI, and Google Gemini.
+
+### What it checks
+
+| Provider | Rate limits | Token usage | Cost |
+|----------|------------|-------------|------|
+| Anthropic | ✅ via response headers | ✅ via OpenClaw logs | ✅ |
+| OpenAI | ✅ via response headers | ✅ org API (needs admin key) + OpenClaw logs | ✅ |
+| Gemini | — (no API) | ✅ via OpenClaw logs | ✅ |
+
+### Usage
+
+```bash
+# Check all providers
+llm-usage
+
+# Check specific provider
+llm-usage -p anthropic
+llm-usage -p openai
+
+# JSON output (for scripts/agents)
+llm-usage --json
+
+# Skip OpenClaw local stats
+llm-usage --no-openclaw
+```
+
+### Example output
+
+```
+🔍 LLM Usage Monitor
+   2026-03-15 17:39
+
+✅ ANTHROPIC
+  Status: ok
+  Rate limits:
+    requests-limit: 4000
+    requests-remaining: 3999
+    tokens-limit: 400000
+    tokens-remaining: 399990
+
+✅ OPENAI
+  Status: ok
+
+✅ GEMINI
+  Status: ok
+  Available models: 45
+
+📊 OPENCLAW LOCAL USAGE
+  Today:
+    anthropic: 121.2M tokens (925 in / 192.9K out) · cache: 112.9M read / 8.2M write · $112.39 · 728 reqs
+    openai-codex: 7.8M tokens (3.4M in / 5.7K out) · cache: 4.3M read / 0 write · $6.80 · 42 reqs
+  Week:
+    anthropic: 1298.7M tokens (12.7K in / 2.4M out) · cache: 1190.8M read / 105.5M write · $1314.18 · 11751 reqs
+    google: 33.6M tokens (33.5M in / 63.0K out) · $73.59 · 451 reqs
+    openai-codex: 83.2M tokens (17.2M in / 146.4K out) · $43.62 · 794 reqs
+```
+
+### Options
+
+```
+options:
+  -p, --provider [anthropic|openai|gemini|all]  Provider(s) to check  [default: all]
+  --openclaw / --no-openclaw    Include OpenClaw local session usage  [default: openclaw]
+  --json                        Output as JSON
+  --anthropic-api-key TEXT      Anthropic API key [env: ANTHROPIC_API_KEY]
+  --openai-api-key TEXT         OpenAI API key [env: OPENAI_API_KEY]
+  --openai-admin-key TEXT       OpenAI admin key for usage API [env: OPENAI_ADMIN_KEY]
+  --gemini-api-key TEXT         Gemini API key [env: GEMINI_API_KEY]
+```
+
+---
+
 ## For LLMs / AI Agents
 
 All tools follow the same patterns:
@@ -289,6 +367,11 @@ slackcli unread
 slackcli history CHANNEL_ID -n 10
 slackcli send CHANNEL_ID "message"
 slackcli react CHANNEL_ID TIMESTAMP emoji_name
+
+# Usage: check token spending across providers
+llm-usage
+llm-usage --json
+llm-usage -p anthropic
 ```
 
 ## License
