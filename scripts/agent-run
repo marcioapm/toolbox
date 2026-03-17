@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# agent-run — Wrapper for coding agents (Claude Code, Codex, etc.)
+# Creates a run directory with PID, log, status, and exit marker files.
+# Designed to be polled safely without blind-loop issues.
+#
+# Usage:
+#   agent-run <name> <command...>
+#   agent-run llm-proxy-build claude --permission-mode bypassPermissions --print "Build the thing"
+#   agent-run boxctl-review codex exec "Review the codebase"
+#
+# Creates:
+#   /tmp/agent-runs/<name>/
+#     pid        — PID of the agent process
+#     log        — stdout+stderr (tee'd in real-time)
+#     status     — "running", "done", or "failed"
+#     exit_code  — exit code (written on completion)
+#     started_at — ISO timestamp
+#     ended_at   — ISO timestamp (written on completion)
+#     command    — the full command that was run
+#
+# Poll pattern (for LLM orchestrators):
+#   cat /tmp/agent-runs/<name>/status   → "running" | "done" | "failed"
+#   tail -20 /tmp/agent-runs/<name>/log → latest output
+#   cat /tmp/agent-runs/<name>/exit_code → 0 if success
+#   wc -l /tmp/agent-runs/<name>/log    → progress indicator (line count growing = alive)
+#
+# List active runs:
+#   agent-run (no args)
+
+set -uo pipefail
+
+if [ $# -lt 2 ]; then
+    echo "agent-run — Coding agent wrapper with structured run tracking"
+    echo ""
+    echo "Usage: agent-run <name> <command...>"
+    echo ""
+    echo "Examples:"
+    echo "  agent-run my-build claude --permission-mode bypassPermissions --print 'Build X'"
+    echo "  agent-run pr-review codex exec 'Review PR #42'"
+    echo ""
+    echo "Poll:"
+    echo "  cat /tmp/agent-runs/<name>/status     # running | done | failed"
+    echo "  tail -20 /tmp/agent-runs/<name>/log   # latest output"
+    echo "  cat /tmp/agent-runs/<name>/exit_code   # 0 = success"
+    echo ""
+    echo "Active runs:"
+    found=0
+    for d in /tmp/agent-runs/*/; do
+        [ -d "$d" ] || continue
+        found=1
+        name=$(basename "$d")
+        status=$(cat "$d/status" 2>/dev/null || echo "unknown")
+        pid=$(cat "$d/pid" 2>/dev/null || echo "?")
+        started=$(cat "$d/started_at" 2>/dev/null || echo "?")
+        lines=$(wc -l < "$d/log" 2>/dev/null || echo "0")
+        echo "  $name: status=$status pid=$pid started=$started lines=$lines"
+    done
+    [ "$found" -eq 0 ] && echo "  (none)"
+    exit 0
+fi
+
+NAME="$1"
+shift
+COMMAND="$*"
+
+RUN_DIR="/tmp/agent-runs/$NAME"
+
+# Clean up previous run with same name
+if [ -d "$RUN_DIR" ]; then
+    old_pid=$(cat "$RUN_DIR/pid" 2>/dev/null || echo "")
+    old_status=$(cat "$RUN_DIR/status" 2>/dev/null || echo "")
+    if [ "$old_status" = "running" ] && [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        echo "Error: Run '$NAME' is still active (pid $old_pid). Kill it first or use a different name."
+        exit 1
+    fi
+    rm -rf "$RUN_DIR"
+fi
+
+mkdir -p "$RUN_DIR"
+
+# Write metadata
+echo "$COMMAND" > "$RUN_DIR/command"
+date -u +"%Y-%m-%dT%H:%M:%SZ" > "$RUN_DIR/started_at"
+echo "running" > "$RUN_DIR/status"
+touch "$RUN_DIR/log"
+
+# Launch the command, tee output to log
+(
+    eval "$COMMAND" 2>&1 | tee "$RUN_DIR/log"
+    EXIT_CODE=${PIPESTATUS[0]}
+
+    echo "$EXIT_CODE" > "$RUN_DIR/exit_code"
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$RUN_DIR/ended_at"
+
+    if [ "$EXIT_CODE" -eq 0 ]; then
+        echo "done" > "$RUN_DIR/status"
+    else
+        echo "failed" > "$RUN_DIR/status"
+    fi
+) &
+
+AGENT_PID=$!
+echo "$AGENT_PID" > "$RUN_DIR/pid"
+
+echo "agent-run: started '$NAME' (pid $AGENT_PID)"
+echo "agent-run: run_dir=$RUN_DIR"
+echo "agent-run: poll with: cat $RUN_DIR/status"
+echo "agent-run: logs with: tail -20 $RUN_DIR/log"
