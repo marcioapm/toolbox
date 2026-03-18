@@ -30,6 +30,7 @@ Repository = "https://github.com/marcioapm/toolbox"
 gemini-image = "toolbox.gemini_image:main"
 gemini-tts = "toolbox.gemini_tts:main"
 gemini-video = "toolbox.gemini_video:main"
+gemini-vision = "toolbox.gemini_vision:main"
 slackcli = "toolbox.slackcli:main"
 llm-usage = "toolbox.llm_usage:main"
 

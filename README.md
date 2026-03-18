@@ -9,6 +9,7 @@ A collection of lightweight CLI tools for AI content generation and chat operati
 | `gemini-image` | Generate images via Imagen 4.0 / Gemini native models | `GEMINI_API_KEY` |
 | `gemini-tts` | Text-to-speech via Gemini native audio | `GEMINI_API_KEY` |
 | `gemini-video` | Generate video via Google Veo 2/3/3.1 | `GEMINI_API_KEY` |
+| `gemini-vision` | Analyze images/videos via Gemini (supports YouTube, Instagram, TikTok) | `GEMINI_API_KEY` |
 | `slackcli` | Lightweight Slack client (channels, messages, search, reactions) | `SLACK_USER_TOKEN` |
 | `llm-usage` | Monitor LLM token usage, costs, and quotas across providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` |
 
@@ -264,6 +265,62 @@ Your `SLACK_USER_TOKEN` needs these scopes:
 
 ---
 
+## gemini-vision
+
+Analyze images and videos using Gemini's multimodal capabilities. Auto-downloads videos from YouTube, Instagram, TikTok, X/Twitter, Vimeo, and more via yt-dlp.
+
+### Usage
+
+```bash
+# Analyze a local image
+gemini-vision photo.jpg
+
+# Describe with custom prompt
+gemini-vision screenshot.png -p "What's the error in this screenshot?"
+
+# Transcribe speech from a video
+gemini-vision video.mp4 -p "Transcribe all speech in this video"
+
+# Analyze YouTube video
+gemini-vision "https://youtube.com/watch?v=dQw4w9WgXcQ" -p "Summarize this video"
+
+# Instagram reel
+gemini-vision "https://instagram.com/reel/ABC123/" -p "Describe what happens"
+
+# TikTok / X post
+gemini-vision "https://tiktok.com/@user/video/123" -p "What's in this video?"
+gemini-vision "https://x.com/user/status/123" -p "Describe the video"
+
+# Use a different model
+gemini-vision photo.jpg -m gemini-2.5-pro -p "Detailed art analysis"
+
+# Keep the downloaded video file
+gemini-vision "https://youtube.com/watch?v=..." --keep
+```
+
+### Supported platforms
+
+YouTube, Instagram, TikTok, X/Twitter, Vimeo, Facebook, Reddit — anything yt-dlp supports.
+
+### Options
+
+```
+positional:
+  file                  Image/video path, URL, or social media link
+
+options:
+  -p, --prompt TEXT     Analysis prompt  [default: Describe what you see in detail.]
+  -m, --model [...]     Gemini model  [default: gemini-2.5-flash]
+  --keep                Keep downloaded video (don't delete temp file)
+  --api-key TEXT        Gemini API key [env: GEMINI_API_KEY]
+```
+
+### Requirements
+
+- `yt-dlp` for social media downloads: `brew install yt-dlp`
+
+---
+
 ## llm-usage
 
 Monitor LLM token usage and quotas across Anthropic, OpenAI, and Google Gemini.
@@ -361,6 +418,11 @@ gemini-tts "text to speak" -o /tmp/speech.wav -v Aoede
 
 # Video: prompt → MP4 (takes minutes, async polling)
 gemini-video "prompt" -o /tmp/video.mp4
+
+# Vision: analyze images/videos (YouTube, Instagram, etc.)
+gemini-vision photo.jpg -p "What's in this image?"
+gemini-vision "https://youtube.com/watch?v=..." -p "Summarize this video"
+gemini-vision video.mp4 -p "Transcribe the speech"
 
 # Slack: read unread → send reply
 slackcli unread
