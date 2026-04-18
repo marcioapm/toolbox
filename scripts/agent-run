@@ -244,8 +244,12 @@ cmd_launch() {
         fi
     done
     printf '%s\n' "${pretty# }" > "$run_dir/command"
-    # NUL-delimited argv for faithful replay.
+    # NUL-delimited argv for faithful replay on bash 4+; for bash 3.2 fallback
+    # we also keep a single-line eval-quoted form. The launcher reads whichever
+    # exists via a bash-version check in the inner subshell.
     printf '%s\0' "$@" > "$run_dir/argv"
+    # eval-quoted form: `printf '%q ' "$@"` is restored via `eval set -- $(<file)`.
+    printf '%q ' "$@" > "$run_dir/argv.quoted"
     date -u +"%Y-%m-%dT%H:%M:%SZ" > "$run_dir/started_at"
     echo "running" > "$run_dir/status"
     echo "$interactive" > "$run_dir/interactive"
@@ -258,12 +262,16 @@ cmd_launch() {
     fi
 
     # Launch the command in its own process group so `kill -- -PGID` reaches
-    # the whole tree (agent + tee + any children). We use setsid so the
-    # background job becomes its own session+group leader (it also detaches
-    # from our controlling terminal, which is what we want for a daemon).
-    local launcher=(bash -c)
+    # the whole tree (agent + tee + any children).
+    #   * Linux: use `setsid -f` so the background job becomes its own
+    #     session+group leader (pid == pgid).
+    #   * macOS and other BSDs (no setsid -f): fall back to a detached
+    #     subshell; the subshell records its real pgid via `ps`.
+    local have_setsid_f=0
     if command -v setsid >/dev/null 2>&1; then
-        launcher=(setsid -f bash -c)
+        if setsid -f true >/dev/null 2>&1; then
+            have_setsid_f=1
+        fi
     fi
 
     # We pass the whole launcher subshell as a single bash -c string so setsid
@@ -275,8 +283,14 @@ run_dir="$1"
 interactive="$2"
 fifo="$run_dir/stdin"
 
-# Record pgid (which == our pid under setsid -f's grandchild).
-echo "$$" > "$run_dir/pgid"
+# Record our pid (== pgid under setsid -f; under the no-setsid fallback we use
+# our own pgid which may differ from pid but can be resolved via `ps`).
+echo "$$" > "$run_dir/pid_self"
+if command -v ps >/dev/null 2>&1; then
+    ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' > "$run_dir/pgid" || echo "$$" > "$run_dir/pgid"
+else
+    echo "$$" > "$run_dir/pgid"
+fi
 
 finalize() {
     local code=${1:-143}
@@ -290,11 +304,18 @@ trap 'finalize 143' TERM
 trap 'finalize 130' INT
 trap 'finalize 137' HUP
 
-# Rebuild argv from NUL-delimited file.
-mapfile -d '' AGENT_ARGV < "$run_dir/argv"
-# mapfile appends an empty trailing element when the file ends with NUL.
-if [ "${#AGENT_ARGV[@]}" -gt 0 ] && [ -z "${AGENT_ARGV[-1]}" ]; then
-    unset 'AGENT_ARGV[-1]'
+# Rebuild argv. Prefer mapfile -d '' (bash 4+) with NUL-delimited file, fall
+# back to eval-quoted form (bash 3.2 on macOS etc.).
+if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && [ -f "$run_dir/argv" ]; then
+    mapfile -d '' AGENT_ARGV < "$run_dir/argv"
+    # mapfile appends an empty trailing element when the file ends with NUL.
+    if [ "${#AGENT_ARGV[@]}" -gt 0 ] && [ -z "${AGENT_ARGV[${#AGENT_ARGV[@]}-1]}" ]; then
+        unset 'AGENT_ARGV[${#AGENT_ARGV[@]}-1]'
+    fi
+else
+    # shellcheck disable=SC2046,SC2086
+    eval "set -- $(cat "$run_dir/argv.quoted")"
+    AGENT_ARGV=("$@")
 fi
 
 if [ "$interactive" = "1" ]; then
@@ -319,9 +340,11 @@ fi
 SUB
 )
 
-    # Launch detached; if setsid is available it forks and returns immediately.
-    if [ "${launcher[0]}" = "setsid" ]; then
-        "${launcher[@]}" "$sub_script" _ "$run_dir" "$interactive" </dev/null >/dev/null 2>&1
+    # Launch detached. With setsid -f the grandchild runs in its own session;
+    # without it we just background and disown, and the subshell records its
+    # real pgid via ps.
+    if [ "$have_setsid_f" = "1" ]; then
+        setsid -f bash -c "$sub_script" _ "$run_dir" "$interactive" </dev/null >/dev/null 2>&1
     else
         bash -c "$sub_script" _ "$run_dir" "$interactive" </dev/null >/dev/null 2>&1 &
         disown 2>/dev/null || true
@@ -333,13 +356,14 @@ SUB
         sleep 0.05
         tries=$((tries + 1))
     done
-    local bg_pid
-    bg_pid=$(cat "$run_dir/pgid" 2>/dev/null || echo "")
-    if [ -z "$bg_pid" ]; then
+    local bg_pgid bg_pid
+    bg_pgid=$(cat "$run_dir/pgid" 2>/dev/null || echo "")
+    bg_pid=$(cat "$run_dir/pid_self" 2>/dev/null || echo "$bg_pgid")
+    if [ -z "$bg_pgid" ]; then
         echo "agent-run: failed to start agent (no pid recorded)" >&2
         exit 1
     fi
-    # Under setsid -f, pid == pgid. Store both for convenience.
+    # Store both; `kill` prefers pgid for group-wide SIGTERM.
     echo "$bg_pid" > "$run_dir/pid"
 
     echo "agent-run: started '$name' (pid $bg_pid)${interactive:+}"
