@@ -12,6 +12,7 @@ A collection of lightweight CLI tools for AI content generation and chat operati
 | `gemini-vision` | Analyze images/videos via Gemini (supports YouTube, Instagram, TikTok) | `GEMINI_API_KEY` |
 | `slackcli` | Lightweight Slack client (channels, messages, search, reactions) | `SLACK_USER_TOKEN` |
 | `llm-usage` | Monitor LLM token usage, costs, and quotas across providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` |
+| `agent-run` | Background wrapper for coding agents (Claude Code, Codex…) with steering + live log streaming | — |
 
 ## Install
 
@@ -434,7 +435,72 @@ slackcli react CHANNEL_ID TIMESTAMP emoji_name
 llm-usage
 llm-usage --json
 llm-usage -p anthropic
+
+# Agent-run: background coding agents with steering + live logs
+agent-run build claude --permission-mode bypassPermissions --print 'Refactor X'
+agent-run tail build                      # follow logs in real time
+agent-run status build                    # running | done | failed
+agent-run -i chat claude --permission-mode bypassPermissions
+agent-run steer chat 'Also add tests for edge cases.'
+agent-run kill chat                       # clean kill of the whole group
 ```
+
+---
+
+## agent-run
+
+Background wrapper for long-running coding agents (Claude Code, Codex, Pi, OpenCode).
+Creates a run directory under `/tmp/agent-runs/<name>/` with structured state
+files you can poll safely — no brittle process-poll loops — and adds a stdin
+FIFO when you need to steer an interactive agent mid-flight.
+
+### Launch
+
+```bash
+# Non-interactive (one-shot, e.g. claude --print, codex exec):
+agent-run build claude --permission-mode bypassPermissions --print 'Build the thing'
+
+# Interactive (steerable via stdin FIFO):
+agent-run -i chat claude --permission-mode bypassPermissions
+```
+
+### Inspect / control
+
+```bash
+agent-run list                            # show all runs
+agent-run status <name>                   # one-line status
+agent-run logs <name> [N]                 # last N lines (default 50)
+agent-run tail <name>                     # follow log (exits when agent dies)
+agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
+agent-run kill <name> [SIGNAL]            # default TERM; use 9 if stuck
+```
+
+### Files under `/tmp/agent-runs/<name>/`
+
+| File | Contents |
+|------|----------|
+| `status` | `running` / `done` / `failed` |
+| `exit_code` | numeric exit code (after completion) |
+| `pid`, `pgid` | agent session/group leader pid (== pgid under setsid) |
+| `log` | combined stdout+stderr, tee'd live |
+| `command` | pretty-printed launch command |
+| `argv` | NUL-delimited argv (used for faithful replay) |
+| `started_at`, `ended_at` | ISO-8601 UTC timestamps |
+| `stdin` | FIFO for `steer` (only when launched with `-i`) |
+| `interactive` | `1` if launched with `-i`, else `0` |
+
+### Why `setsid` + FIFO?
+
+- `setsid -f` makes each run its own session/process-group leader so
+  `kill <name>` reliably reaps the agent plus `tee` plus any children.
+- On interactive runs, the launcher holds **both** a reader and a writer fd
+  on the FIFO. Without the writer-fd, the first `steer` closes the only
+  writer and the agent sees EOF on stdin and exits after a single message.
+- Argv is persisted NUL-delimited and replayed via `exec` instead of `eval`,
+  so commands with quoted arguments or shell syntax (e.g.
+  `bash -c 'for i in ...; do ...; done'`) work correctly.
+- SIGTERM/INT/HUP traps always finalize `status` + `exit_code` + `ended_at`,
+  even when the launcher is killed mid-pipeline.
 
 ## License
 

@@ -36,3 +36,7 @@ llm-usage = "toolbox.llm_usage:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Ship non-Python helpers (bash wrappers in scripts/) as part of the wheel.
+[tool.setuptools]
+script-files = ["scripts/agent-run"]
