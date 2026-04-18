@@ -1,108 +1,378 @@
 #!/usr/bin/env bash
 # agent-run — Wrapper for coding agents (Claude Code, Codex, etc.)
-# Creates a run directory with PID, log, status, and exit marker files.
-# Designed to be polled safely without blind-loop issues.
+# Creates a run directory with PID, log, status, exit marker, and optional stdin FIFO.
+# Designed to be polled safely without blind-loop issues, and now supports
+# live log streaming and steering (sending input to a running agent).
 #
 # Usage:
-#   agent-run <name> <command...>
-#   agent-run llm-proxy-build claude --permission-mode bypassPermissions --print "Build the thing"
-#   agent-run boxctl-review codex exec "Review the codebase"
+#   agent-run <name> <command...>                  # launch (non-interactive)
+#   agent-run -i <name> <command...>               # launch with stdin FIFO for steering
+#   agent-run --interactive <name> <command...>    # same as -i
+#   agent-run tail <name>                          # follow log in real-time (like tail -f)
+#   agent-run logs <name> [N]                      # print last N lines (default 50)
+#   agent-run steer <name> <message...>            # send text to agent's stdin (requires -i)
+#   agent-run status <name>                        # print one-line status
+#   agent-run kill <name> [SIGNAL]                 # kill agent (default TERM; use 9/KILL if stuck)
+#   agent-run list                                 # list all runs (also shown when no args)
+#   agent-run                                      # same as list
 #
-# Creates:
-#   /tmp/agent-runs/<name>/
-#     pid        — PID of the agent process
-#     log        — stdout+stderr (tee'd in real-time)
-#     status     — "running", "done", or "failed"
-#     exit_code  — exit code (written on completion)
-#     started_at — ISO timestamp
-#     ended_at   — ISO timestamp (written on completion)
-#     command    — the full command that was run
+# Examples:
+#   # Non-interactive (Claude print mode, Codex one-shot):
+#   agent-run build claude --permission-mode bypassPermissions --print "Build X"
 #
-# Poll pattern (for LLM orchestrators):
-#   cat /tmp/agent-runs/<name>/status   → "running" | "done" | "failed"
-#   tail -20 /tmp/agent-runs/<name>/log → latest output
-#   cat /tmp/agent-runs/<name>/exit_code → 0 if success
-#   wc -l /tmp/agent-runs/<name>/log    → progress indicator (line count growing = alive)
+#   # Interactive (steerable):
+#   agent-run chat -i claude --permission-mode bypassPermissions
+#   agent-run steer chat "Actually, also add tests for the edge cases."
+#   agent-run tail chat
 #
-# List active runs:
-#   agent-run (no args)
+# Creates under /tmp/agent-runs/<name>/:
+#   pid        — PID of the agent process
+#   log        — stdout+stderr (tee'd in real-time)
+#   status     — "running", "done", or "failed"
+#   exit_code  — exit code (written on completion)
+#   started_at — ISO timestamp
+#   ended_at   — ISO timestamp (written on completion)
+#   command    — the full command that was run
+#   interactive — "1" if launched with -i
+#   stdin      — FIFO for steering (only when interactive)
 
 set -uo pipefail
 
-if [ $# -lt 2 ]; then
-    echo "agent-run — Coding agent wrapper with structured run tracking"
-    echo ""
-    echo "Usage: agent-run <name> <command...>"
-    echo ""
-    echo "Examples:"
-    echo "  agent-run my-build claude --permission-mode bypassPermissions --print 'Build X'"
-    echo "  agent-run pr-review codex exec 'Review PR #42'"
-    echo ""
-    echo "Poll:"
-    echo "  cat /tmp/agent-runs/<name>/status     # running | done | failed"
-    echo "  tail -20 /tmp/agent-runs/<name>/log   # latest output"
-    echo "  cat /tmp/agent-runs/<name>/exit_code   # 0 = success"
-    echo ""
-    echo "Active runs:"
-    found=0
-    for d in /tmp/agent-runs/*/; do
-        [ -d "$d" ] || continue
+RUNS_ROOT="${AGENT_RUN_DIR:-/tmp/agent-runs}"
+
+# ----- helpers ---------------------------------------------------------------
+
+print_help() {
+    cat <<'EOF'
+agent-run — Coding agent wrapper with structured run tracking
+
+Launch:
+  agent-run <name> <command...>                 # non-interactive
+  agent-run -i <name> <command...>              # interactive (steerable via stdin FIFO)
+
+Inspect / control:
+  agent-run tail <name>                         # follow log (tail -f)
+  agent-run logs <name> [N]                     # last N lines (default 50)
+  agent-run status <name>                       # one-line status
+  agent-run steer <name> <message...>           # send text to agent stdin (needs -i)
+  agent-run kill <name> [SIGNAL]                # default TERM
+  agent-run list                                # list all runs
+
+Examples:
+  agent-run build claude --permission-mode bypassPermissions --print 'Build X'
+  agent-run chat -i claude --permission-mode bypassPermissions
+  agent-run steer chat 'Also add tests.'
+  agent-run tail chat
+EOF
+}
+
+list_runs() {
+    local found=0
+    echo "Active runs ($RUNS_ROOT):"
+    shopt -s nullglob
+    for d in "$RUNS_ROOT"/*/; do
         found=1
+        local name status pid started lines interactive
         name=$(basename "$d")
         status=$(cat "$d/status" 2>/dev/null || echo "unknown")
         pid=$(cat "$d/pid" 2>/dev/null || echo "?")
         started=$(cat "$d/started_at" 2>/dev/null || echo "?")
         lines=$(wc -l < "$d/log" 2>/dev/null || echo "0")
-        echo "  $name: status=$status pid=$pid started=$started lines=$lines"
+        interactive=$(cat "$d/interactive" 2>/dev/null || echo "0")
+        local flag=""
+        [ "$interactive" = "1" ] && flag=" [interactive]"
+        echo "  $name: status=$status pid=$pid started=$started lines=$lines$flag"
     done
+    shopt -u nullglob
     [ "$found" -eq 0 ] && echo "  (none)"
+    return 0
+}
+
+require_run_dir() {
+    local name="$1"
+    local dir="$RUNS_ROOT/$name"
+    if [ ! -d "$dir" ]; then
+        echo "agent-run: no run named '$name' in $RUNS_ROOT" >&2
+        exit 1
+    fi
+    echo "$dir"
+}
+
+# ----- subcommands -----------------------------------------------------------
+
+cmd_list() {
+    list_runs
+}
+
+cmd_status() {
+    [ $# -ge 1 ] || { echo "usage: agent-run status <name>" >&2; exit 2; }
+    local dir; dir=$(require_run_dir "$1")
+    local name status pid started ended lines exit_code interactive
+    name=$(basename "$dir")
+    status=$(cat "$dir/status" 2>/dev/null || echo "unknown")
+    pid=$(cat "$dir/pid" 2>/dev/null || echo "?")
+    started=$(cat "$dir/started_at" 2>/dev/null || echo "?")
+    ended=$(cat "$dir/ended_at" 2>/dev/null || echo "-")
+    lines=$(wc -l < "$dir/log" 2>/dev/null || echo "0")
+    exit_code=$(cat "$dir/exit_code" 2>/dev/null || echo "-")
+    interactive=$(cat "$dir/interactive" 2>/dev/null || echo "0")
+    echo "name=$name status=$status pid=$pid exit=$exit_code started=$started ended=$ended lines=$lines interactive=$interactive"
+}
+
+cmd_logs() {
+    [ $# -ge 1 ] || { echo "usage: agent-run logs <name> [N]" >&2; exit 2; }
+    local dir; dir=$(require_run_dir "$1")
+    local n="${2:-50}"
+    tail -n "$n" "$dir/log"
+}
+
+cmd_tail() {
+    [ $# -ge 1 ] || { echo "usage: agent-run tail <name>" >&2; exit 2; }
+    local dir; dir=$(require_run_dir "$1")
+    # Follow the log. --pid makes tail exit when the agent dies (if PID is known).
+    local pid
+    pid=$(cat "$dir/pid" 2>/dev/null || echo "")
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        exec tail -n +1 --pid="$pid" -f "$dir/log"
+    else
+        exec tail -n +1 -f "$dir/log"
+    fi
+}
+
+cmd_steer() {
+    [ $# -ge 2 ] || { echo "usage: agent-run steer <name> <message...>" >&2; exit 2; }
+    local name="$1"; shift
+    local dir; dir=$(require_run_dir "$name")
+    local interactive
+    interactive=$(cat "$dir/interactive" 2>/dev/null || echo "0")
+    if [ "$interactive" != "1" ]; then
+        echo "agent-run: '$name' is not interactive. Relaunch with: agent-run -i <name> <command...>" >&2
+        exit 1
+    fi
+    if [ ! -p "$dir/stdin" ]; then
+        echo "agent-run: no stdin FIFO at $dir/stdin" >&2
+        exit 1
+    fi
+    local pid
+    pid=$(cat "$dir/pid" 2>/dev/null || echo "")
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        echo "agent-run: '$name' is not running" >&2
+        exit 1
+    fi
+    # Send message + newline. The launcher holds the FIFO open for reading
+    # (fd 9) so our write returns as soon as the bytes are buffered — no
+    # blocking, no timeout needed in the normal path. We still guard with
+    # `timeout` in case something weird has happened to the reader.
+    local msg="$*"
+    if command -v timeout >/dev/null 2>&1; then
+        if ! timeout 10 bash -c "printf '%s\n' \"\$1\" > \"\$2\"" _ "$msg" "$dir/stdin"; then
+            echo "agent-run: steer timed out writing to FIFO — is the agent still alive?" >&2
+            exit 1
+        fi
+    else
+        printf '%s\n' "$msg" > "$dir/stdin"
+    fi
+    echo "agent-run: steered '$name' ($(printf '%s' "$msg" | wc -c) bytes)"
+}
+
+cmd_kill() {
+    [ $# -ge 1 ] || { echo "usage: agent-run kill <name> [SIGNAL]" >&2; exit 2; }
+    local dir; dir=$(require_run_dir "$1")
+    local sig="${2:-TERM}"
+    local pid
+    pid=$(cat "$dir/pid" 2>/dev/null || echo "")
+    if [ -z "$pid" ]; then
+        echo "agent-run: no pid recorded for $1" >&2
+        exit 1
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "agent-run: $1 is not running (pid $pid)"
+        exit 0
+    fi
+    # Kill the whole process group if we can (set when launched).
+    local pgid
+    pgid=$(cat "$dir/pgid" 2>/dev/null || echo "")
+    if [ -n "$pgid" ]; then
+        kill -"$sig" -"$pgid" 2>/dev/null || kill -"$sig" "$pid" 2>/dev/null || true
+    else
+        kill -"$sig" "$pid" 2>/dev/null || true
+    fi
+    echo "agent-run: sent SIG$sig to $1 (pid=$pid pgid=${pgid:-?})"
+}
+
+# ----- launch ----------------------------------------------------------------
+
+cmd_launch() {
+    local interactive=0
+    if [ "${1:-}" = "-i" ] || [ "${1:-}" = "--interactive" ]; then
+        interactive=1
+        shift
+    fi
+
+    if [ $# -lt 2 ]; then
+        print_help
+        exit 2
+    fi
+
+    local name="$1"; shift
+    # Preserve argv so we can invoke the command without eval/quote mangling.
+    # We save each arg to argv.jsonl (one per line, NUL-delimited for safety)
+    # and reconstruct via readarray in the launched subshell.
+    local run_dir="$RUNS_ROOT/$name"
+
+    # Clean up previous run with same name (refuse if still active).
+    if [ -d "$run_dir" ]; then
+        local old_pid old_status
+        old_pid=$(cat "$run_dir/pid" 2>/dev/null || echo "")
+        old_status=$(cat "$run_dir/status" 2>/dev/null || echo "")
+        if [ "$old_status" = "running" ] && [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            echo "Error: Run '$name' is still active (pid $old_pid). Kill it first or use a different name." >&2
+            exit 1
+        fi
+        rm -rf "$run_dir"
+    fi
+
+    mkdir -p "$run_dir"
+    # Human-readable rendering of the command for `status`/`list`.
+    local pretty=""
+    local a
+    for a in "$@"; do
+        if [[ "$a" =~ [[:space:]\'\"\\\$\|\&\;\(\)\<\>\*\?\[\]\{\}\#] ]] || [ -z "$a" ]; then
+            pretty+=" $(printf '%q' "$a")"
+        else
+            pretty+=" $a"
+        fi
+    done
+    printf '%s\n' "${pretty# }" > "$run_dir/command"
+    # NUL-delimited argv for faithful replay.
+    printf '%s\0' "$@" > "$run_dir/argv"
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$run_dir/started_at"
+    echo "running" > "$run_dir/status"
+    echo "$interactive" > "$run_dir/interactive"
+    touch "$run_dir/log"
+
+    local fifo=""
+    if [ "$interactive" = "1" ]; then
+        fifo="$run_dir/stdin"
+        mkfifo "$fifo"
+    fi
+
+    # Launch the command in its own process group so `kill -- -PGID` reaches
+    # the whole tree (agent + tee + any children). We use setsid so the
+    # background job becomes its own session+group leader (it also detaches
+    # from our controlling terminal, which is what we want for a daemon).
+    local launcher=(bash -c)
+    if command -v setsid >/dev/null 2>&1; then
+        launcher=(setsid -f bash -c)
+    fi
+
+    # We pass the whole launcher subshell as a single bash -c string so setsid
+    # can wrap it cleanly. The subshell reads argv from $run_dir/argv to avoid
+    # eval/quote mangling.
+    local sub_script
+    sub_script=$(cat <<'SUB'
+run_dir="$1"
+interactive="$2"
+fifo="$run_dir/stdin"
+
+# Record pgid (which == our pid under setsid -f's grandchild).
+echo "$$" > "$run_dir/pgid"
+
+finalize() {
+    local code=${1:-143}
+    if [ ! -s "$run_dir/exit_code" ]; then
+        echo "$code" > "$run_dir/exit_code"
+        date -u +"%Y-%m-%dT%H:%M:%SZ" > "$run_dir/ended_at"
+        echo "failed" > "$run_dir/status"
+    fi
+}
+trap 'finalize 143' TERM
+trap 'finalize 130' INT
+trap 'finalize 137' HUP
+
+# Rebuild argv from NUL-delimited file.
+mapfile -d '' AGENT_ARGV < "$run_dir/argv"
+# mapfile appends an empty trailing element when the file ends with NUL.
+if [ "${#AGENT_ARGV[@]}" -gt 0 ] && [ -z "${AGENT_ARGV[-1]}" ]; then
+    unset 'AGENT_ARGV[-1]'
+fi
+
+if [ "$interactive" = "1" ]; then
+    # Open FIFO for both read and write so the agent never sees EOF on stdin
+    # just because a steer writer closed its fd.
+    exec 9<"$fifo" 8>"$fifo"
+    "${AGENT_ARGV[@]}" <&9 2>&1 | tee "$run_dir/log"
+    exit_code=${PIPESTATUS[0]}
+    exec 9<&- 8>&-
+else
+    "${AGENT_ARGV[@]}" </dev/null 2>&1 | tee "$run_dir/log"
+    exit_code=${PIPESTATUS[0]}
+fi
+
+echo "$exit_code" > "$run_dir/exit_code"
+date -u +"%Y-%m-%dT%H:%M:%SZ" > "$run_dir/ended_at"
+if [ "$exit_code" -eq 0 ]; then
+    echo "done" > "$run_dir/status"
+else
+    echo "failed" > "$run_dir/status"
+fi
+SUB
+)
+
+    # Launch detached; if setsid is available it forks and returns immediately.
+    if [ "${launcher[0]}" = "setsid" ]; then
+        "${launcher[@]}" "$sub_script" _ "$run_dir" "$interactive" </dev/null >/dev/null 2>&1
+    else
+        bash -c "$sub_script" _ "$run_dir" "$interactive" </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+
+    # Wait briefly for the child to record its pid/pgid.
+    local tries=0
+    while [ ! -s "$run_dir/pgid" ] && [ $tries -lt 25 ]; do
+        sleep 0.05
+        tries=$((tries + 1))
+    done
+    local bg_pid
+    bg_pid=$(cat "$run_dir/pgid" 2>/dev/null || echo "")
+    if [ -z "$bg_pid" ]; then
+        echo "agent-run: failed to start agent (no pid recorded)" >&2
+        exit 1
+    fi
+    # Under setsid -f, pid == pgid. Store both for convenience.
+    echo "$bg_pid" > "$run_dir/pid"
+
+    echo "agent-run: started '$name' (pid $bg_pid)${interactive:+}"
+    [ "$interactive" = "1" ] && echo "agent-run: interactive — steer with: agent-run steer $name '<message>'"
+    echo "agent-run: run_dir=$run_dir"
+    echo "agent-run: poll:   cat $run_dir/status"
+    echo "agent-run: logs:   agent-run tail $name"
+}
+
+# ----- dispatch --------------------------------------------------------------
+
+if [ $# -eq 0 ]; then
+    list_runs
     exit 0
 fi
 
-NAME="$1"
-shift
-COMMAND="$*"
-
-RUN_DIR="/tmp/agent-runs/$NAME"
-
-# Clean up previous run with same name
-if [ -d "$RUN_DIR" ]; then
-    old_pid=$(cat "$RUN_DIR/pid" 2>/dev/null || echo "")
-    old_status=$(cat "$RUN_DIR/status" 2>/dev/null || echo "")
-    if [ "$old_status" = "running" ] && [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-        echo "Error: Run '$NAME' is still active (pid $old_pid). Kill it first or use a different name."
-        exit 1
-    fi
-    rm -rf "$RUN_DIR"
-fi
-
-mkdir -p "$RUN_DIR"
-
-# Write metadata
-echo "$COMMAND" > "$RUN_DIR/command"
-date -u +"%Y-%m-%dT%H:%M:%SZ" > "$RUN_DIR/started_at"
-echo "running" > "$RUN_DIR/status"
-touch "$RUN_DIR/log"
-
-# Launch the command, tee output to log
-(
-    eval "$COMMAND" 2>&1 | tee "$RUN_DIR/log"
-    EXIT_CODE=${PIPESTATUS[0]}
-
-    echo "$EXIT_CODE" > "$RUN_DIR/exit_code"
-    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$RUN_DIR/ended_at"
-
-    if [ "$EXIT_CODE" -eq 0 ]; then
-        echo "done" > "$RUN_DIR/status"
-    else
-        echo "failed" > "$RUN_DIR/status"
-    fi
-) &
-
-AGENT_PID=$!
-echo "$AGENT_PID" > "$RUN_DIR/pid"
-
-echo "agent-run: started '$NAME' (pid $AGENT_PID)"
-echo "agent-run: run_dir=$RUN_DIR"
-echo "agent-run: poll with: cat $RUN_DIR/status"
-echo "agent-run: logs with: tail -20 $RUN_DIR/log"
+case "$1" in
+    -h|--help|help)
+        print_help; exit 0 ;;
+    list)
+        shift; cmd_list "$@" ;;
+    status)
+        shift; cmd_status "$@" ;;
+    logs)
+        shift; cmd_logs "$@" ;;
+    tail)
+        shift; cmd_tail "$@" ;;
+    steer)
+        shift; cmd_steer "$@" ;;
+    kill)
+        shift; cmd_kill "$@" ;;
+    -i|--interactive)
+        cmd_launch "$@" ;;
+    *)
+        cmd_launch "$@" ;;
+esac
