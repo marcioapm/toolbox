@@ -389,49 +389,133 @@ fi
 
 if [ "$interactive" = "1" ]; then
     # ---- Interactive PTY mode ----
-    # Wrap the agent in a PTY via `script(1)` so TUI/line-buffered agents
-    # (Claude Code, Codex, etc.) behave as if attached to a real terminal.
-    # The FIFO feeds keystrokes; a long-lived "keeper" writer holds the
-    # FIFO open so the agent never sees EOF between steers.
-
-    # Detect script flavor once.
-    #   util-linux (Linux):  script -qefc 'CMD' /dev/null
-    #   BSD (macOS):         script -q /dev/null CMD ARGS...
-    #   (none available):    fall back to the old pipe-mode (no PTY)
+    # Wrap the agent in a PTY so TUI/line-buffered agents (Claude Code, Codex,
+    # etc.) behave as if attached to a real terminal. The FIFO feeds
+    # keystrokes; a long-lived "keeper" writer holds the FIFO open so the
+    # agent never sees EOF between steers.
+    #
+    # PTY backend detection (first available wins):
+    #   linux   util-linux `script` (accepts FIFO stdin fine)
+    #   python  `python3 -c 'pty.spawn(...)'` (portable fallback; works on macOS)
+    #   bsd     BSD `script` — LAST RESORT (often fails with FIFO stdin
+    #           because it tcgetattr's stdin; kept for completeness)
+    #   none    raw pipe, no PTY (works for line-buffered REPLs only)
     script_flavor="none"
-    if command -v script >/dev/null 2>&1; then
-        if script --version 2>&1 | grep -qi util-linux; then
-            script_flavor="linux"
-        else
-            script_flavor="bsd"
-        fi
+    if command -v script >/dev/null 2>&1 && script --version 2>&1 | grep -qi util-linux; then
+        script_flavor="linux"
+    elif command -v python3 >/dev/null 2>&1; then
+        script_flavor="python"
+    elif command -v python >/dev/null 2>&1; then
+        script_flavor="python2"
+    elif command -v script >/dev/null 2>&1; then
+        script_flavor="bsd"
     fi
     echo "$script_flavor" > "$run_dir/pty_flavor"
 
     # Persistent writer that holds the FIFO open for the lifetime of the run.
-    # Using a long `sleep` is portable; `tail -f /dev/null` also works.
     sleep 2147483647 > "$fifo" &
     KEEPER_PID=$!
     echo "$KEEPER_PID" > "$run_dir/keeper_pid"
 
     if [ "$script_flavor" = "linux" ]; then
-        # -q quiet, -e return child exit, -f flush after each write, -c cmd.
-        # Render argv into a shell string for -c using printf %q.
         cmd_str=$(printf '%q ' "${AGENT_ARGV[@]}")
         script -qefc "$cmd_str" /dev/null < "$fifo" > "$run_dir/log" 2>&1 &
         SCRIPT_PID=$!
         echo "$SCRIPT_PID" > "$run_dir/script_pid"
         wait "$SCRIPT_PID"
         exit_code=$?
+    elif [ "$script_flavor" = "python" ] || [ "$script_flavor" = "python2" ]; then
+        # Portable PTY via Python. We use pty.fork + manual event loop so the
+        # child runs under a real TTY. Command argv is read from argv.quoted
+        # to stay bash-3.2 safe.
+        PY=python3; [ "$script_flavor" = "python2" ] && PY=python
+        "$PY" -u -c '
+import os, sys, pty, select, errno, shlex, signal
+argv_file = sys.argv[1]
+fifo     = sys.argv[2]
+log      = sys.argv[3]
+with open(argv_file) as f:
+    quoted = f.read()
+argv = shlex.split(quoted)
+if not argv:
+    sys.stderr.write("agent-run: empty argv\n"); sys.exit(2)
+
+log_fd = os.open(log, os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o644)
+fifo_fd = os.open(fifo, os.O_RDONLY|os.O_NONBLOCK)
+# Re-enable blocking reads via select; keep O_NONBLOCK off because pty master
+# expects blocking writes from us. select handles readiness.
+import fcntl
+fl = fcntl.fcntl(fifo_fd, fcntl.F_GETFL)
+fcntl.fcntl(fifo_fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+
+pid, master_fd = pty.fork()
+if pid == 0:
+    # Child: exec the agent. Stdin/stdout/stderr are the slave PTY.
+    try:
+        os.execvp(argv[0], argv)
+    except Exception as e:
+        sys.stderr.write("agent-run: exec failed: %s\n" % e)
+        os._exit(127)
+
+# Parent: shuttle bytes FIFO -> master, master -> log.
+def _ignore(*a): pass
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+while True:
+    try:
+        r, _, _ = select.select([master_fd, fifo_fd], [], [], 0.5)
+    except OSError as e:
+        if e.errno == errno.EINTR: continue
+        break
+    if master_fd in r:
+        try:
+            data = os.read(master_fd, 4096)
+        except OSError:
+            data = b""
+        if not data:
+            break
+        os.write(log_fd, data)
+    if fifo_fd in r:
+        try:
+            data = os.read(fifo_fd, 4096)
+        except OSError:
+            data = b""
+        if data:
+            try:
+                os.write(master_fd, data)
+            except OSError:
+                pass
+    # Reap child if it died.
+    try:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            # Drain remaining master output.
+            try:
+                while True:
+                    data = os.read(master_fd, 4096)
+                    if not data: break
+                    os.write(log_fd, data)
+            except OSError:
+                pass
+            sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
+    except ChildProcessError:
+        break
+sys.exit(0)
+' "$run_dir/argv.quoted" "$fifo" "$run_dir/log" &
+        SCRIPT_PID=$!
+        echo "$SCRIPT_PID" > "$run_dir/script_pid"
+        wait "$SCRIPT_PID"
+        exit_code=$?
     elif [ "$script_flavor" = "bsd" ]; then
-        # BSD script: -q quiet, typescript-file first, then command + args.
+        # BSD script needs a TTY on its own stdin. This path almost never
+        # works with a FIFO; kept as last-ditch, but we try anyway.
         script -q /dev/null "${AGENT_ARGV[@]}" < "$fifo" > "$run_dir/log" 2>&1 &
         SCRIPT_PID=$!
         echo "$SCRIPT_PID" > "$run_dir/script_pid"
         wait "$SCRIPT_PID"
         exit_code=$?
     else
-        # No `script` available — fall back to raw pipe (works for line-by-line
+        # No PTY backend — fall back to raw pipe (works for line-by-line
         # stdin consumers; will likely hang for TUI agents, documented).
         exec 9<"$fifo" 8>"$fifo"
         "${AGENT_ARGV[@]}" <&9 2>&1 | tee "$run_dir/log"
