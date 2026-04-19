@@ -6,8 +6,23 @@
 #
 # Usage:
 #   agent-run <name> <command...>                  # launch (non-interactive)
-#   agent-run -i <name> <command...>               # launch with stdin FIFO for steering
+#   agent-run -i <name> <command...>               # launch with PTY + FIFO for steering
 #   agent-run --interactive <name> <command...>    # same as -i
+#   agent-run tail <name>                          # follow log in real-time (like tail -f)
+#   agent-run logs <name> [N]                      # print last N lines (default 50)
+#   agent-run steer <name> <message...>            # send text to agent's stdin (requires -i)
+#   agent-run status <name>                        # print one-line status
+#   agent-run kill <name> [SIGNAL]                 # kill agent (default TERM; use 9/KILL if stuck)
+#   agent-run list                                 # list all runs (also shown when no args)
+#   agent-run                                      # same as list
+#
+# Interactive mode (-i):
+#   Wraps the agent in a PTY via `script(1)` so TUI agents like Claude Code,
+#   Codex, pi, opencode behave as if attached to a real terminal. Steers are
+#   injected via a FIFO that script forwards to the PTY master. If `script`
+#   is unavailable, falls back to a raw pipe (works for line-buffered stdin
+#   consumers like simple REPLs, fails for full TUIs).
+#
 #   agent-run tail <name>                          # follow log in real-time (like tail -f)
 #   agent-run logs <name> [N]                      # print last N lines (default 50)
 #   agent-run steer <name> <message...>            # send text to agent's stdin (requires -i)
@@ -26,7 +41,22 @@
 #   agent-run tail chat
 #
 # Creates under /tmp/agent-runs/<name>/:
-#   pid        — PID of the agent process
+#   pid        — PID of the launcher subshell (== pgid under setsid)
+#   pid_self   — same as pid (historical)
+#   pgid       — process group id for `kill -- -PGID`
+#   script_pid — PID of the `script(1)` PTY wrapper (interactive only)
+#   keeper_pid — PID of the FIFO keeper process (interactive only)
+#   pty_flavor — linux | bsd | none (which `script` was detected/used)
+#   log        — stdout+stderr (PTY-captured when interactive)
+#   status     — "running", "done", or "failed"
+#   exit_code  — exit code (written on completion)
+#   started_at — ISO timestamp
+#   ended_at   — ISO timestamp (written on completion)
+#   command    — the full command that was run
+#   argv       — NUL-delimited argv (used on bash 4+)
+#   argv.quoted — printf %q form (used on bash 3.2)
+#   interactive — "1" if launched with -i
+#   stdin      — FIFO for steering (only when interactive)
 #   log        — stdout+stderr (tee'd in real-time)
 #   status     — "running", "done", or "failed"
 #   exit_code  — exit code (written on completion)
@@ -48,20 +78,27 @@ agent-run — Coding agent wrapper with structured run tracking
 
 Launch:
   agent-run <name> <command...>                 # non-interactive
-  agent-run -i <name> <command...>              # interactive (steerable via stdin FIFO)
+  agent-run -i <name> <command...>              # interactive (PTY via script(1))
+                                                #   Works with TUI agents like
+                                                #   Claude Code, Codex, etc.
+                                                #   Falls back to pipe mode
+                                                #   if `script` is unavailable.
 
 Inspect / control:
   agent-run tail <name>                         # follow log (tail -f)
   agent-run logs <name> [N]                     # last N lines (default 50)
   agent-run status <name>                       # one-line status
   agent-run steer <name> <message...>           # send text to agent stdin (needs -i)
-  agent-run kill <name> [SIGNAL]                # default TERM
+  agent-run kill <name> [SIGNAL]                # default TERM; use 9/KILL if stuck
   agent-run list                                # list all runs
 
 Examples:
+  # One-shot with Claude --print:
   agent-run build claude --permission-mode bypassPermissions --print 'Build X'
-  agent-run chat -i claude --permission-mode bypassPermissions
-  agent-run steer chat 'Also add tests.'
+
+  # Interactive Claude Code (steerable via PTY):
+  agent-run -i chat claude --permission-mode bypassPermissions
+  agent-run steer chat 'Also add tests for the edge cases.'
   agent-run tail chat
 EOF
 }
@@ -197,6 +234,22 @@ cmd_kill() {
     else
         kill -"$sig" "$pid" 2>/dev/null || true
     fi
+    # Also explicitly reap the FIFO keeper (if any) and the `script` child.
+    # Under the PTY path those aren't always in the pgid we recorded because
+    # `setsid -f` puts only the launcher shell into a new session, not the
+    # keeper's group — which on some kernels becomes its own job-control group
+    # once backgrounded with `&`. Belt-and-braces: kill any PIDs tracked in
+    # auxiliary files.
+    local aux
+    for aux in keeper_pid script_pid; do
+        if [ -s "$dir/$aux" ]; then
+            local auxpid
+            auxpid=$(cat "$dir/$aux" 2>/dev/null || echo "")
+            if [ -n "$auxpid" ] && kill -0 "$auxpid" 2>/dev/null; then
+                kill -"$sig" "$auxpid" 2>/dev/null || true
+            fi
+        fi
+    done
     echo "agent-run: sent SIG$sig to $1 (pid=$pid pgid=${pgid:-?})"
 }
 
@@ -294,6 +347,22 @@ fi
 
 finalize() {
     local code=${1:-143}
+    # Best-effort: kill the PTY child (`script`) and the FIFO keeper so we
+    # don't leak processes when the launcher is SIGTERM'd.
+    if [ -s "$run_dir/script_pid" ]; then
+        local spid
+        spid=$(cat "$run_dir/script_pid" 2>/dev/null || echo "")
+        if [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null; then
+            kill -TERM "$spid" 2>/dev/null || true
+        fi
+    fi
+    if [ -s "$run_dir/keeper_pid" ]; then
+        local kpid
+        kpid=$(cat "$run_dir/keeper_pid" 2>/dev/null || echo "")
+        if [ -n "$kpid" ] && kill -0 "$kpid" 2>/dev/null; then
+            kill -TERM "$kpid" 2>/dev/null || true
+        fi
+    fi
     if [ ! -s "$run_dir/exit_code" ]; then
         echo "$code" > "$run_dir/exit_code"
         date -u +"%Y-%m-%dT%H:%M:%SZ" > "$run_dir/ended_at"
@@ -319,12 +388,59 @@ else
 fi
 
 if [ "$interactive" = "1" ]; then
-    # Open FIFO for both read and write so the agent never sees EOF on stdin
-    # just because a steer writer closed its fd.
-    exec 9<"$fifo" 8>"$fifo"
-    "${AGENT_ARGV[@]}" <&9 2>&1 | tee "$run_dir/log"
-    exit_code=${PIPESTATUS[0]}
-    exec 9<&- 8>&-
+    # ---- Interactive PTY mode ----
+    # Wrap the agent in a PTY via `script(1)` so TUI/line-buffered agents
+    # (Claude Code, Codex, etc.) behave as if attached to a real terminal.
+    # The FIFO feeds keystrokes; a long-lived "keeper" writer holds the
+    # FIFO open so the agent never sees EOF between steers.
+
+    # Detect script flavor once.
+    #   util-linux (Linux):  script -qefc 'CMD' /dev/null
+    #   BSD (macOS):         script -q /dev/null CMD ARGS...
+    #   (none available):    fall back to the old pipe-mode (no PTY)
+    script_flavor="none"
+    if command -v script >/dev/null 2>&1; then
+        if script --version 2>&1 | grep -qi util-linux; then
+            script_flavor="linux"
+        else
+            script_flavor="bsd"
+        fi
+    fi
+    echo "$script_flavor" > "$run_dir/pty_flavor"
+
+    # Persistent writer that holds the FIFO open for the lifetime of the run.
+    # Using a long `sleep` is portable; `tail -f /dev/null` also works.
+    sleep 2147483647 > "$fifo" &
+    KEEPER_PID=$!
+    echo "$KEEPER_PID" > "$run_dir/keeper_pid"
+
+    if [ "$script_flavor" = "linux" ]; then
+        # -q quiet, -e return child exit, -f flush after each write, -c cmd.
+        # Render argv into a shell string for -c using printf %q.
+        cmd_str=$(printf '%q ' "${AGENT_ARGV[@]}")
+        script -qefc "$cmd_str" /dev/null < "$fifo" > "$run_dir/log" 2>&1 &
+        SCRIPT_PID=$!
+        echo "$SCRIPT_PID" > "$run_dir/script_pid"
+        wait "$SCRIPT_PID"
+        exit_code=$?
+    elif [ "$script_flavor" = "bsd" ]; then
+        # BSD script: -q quiet, typescript-file first, then command + args.
+        script -q /dev/null "${AGENT_ARGV[@]}" < "$fifo" > "$run_dir/log" 2>&1 &
+        SCRIPT_PID=$!
+        echo "$SCRIPT_PID" > "$run_dir/script_pid"
+        wait "$SCRIPT_PID"
+        exit_code=$?
+    else
+        # No `script` available — fall back to raw pipe (works for line-by-line
+        # stdin consumers; will likely hang for TUI agents, documented).
+        exec 9<"$fifo" 8>"$fifo"
+        "${AGENT_ARGV[@]}" <&9 2>&1 | tee "$run_dir/log"
+        exit_code=${PIPESTATUS[0]}
+        exec 9<&- 8>&-
+    fi
+
+    # Stop the keeper so the FIFO drains and gets cleaned up.
+    kill "$KEEPER_PID" 2>/dev/null || true
 else
     "${AGENT_ARGV[@]}" </dev/null 2>&1 | tee "$run_dir/log"
     exit_code=${PIPESTATUS[0]}
