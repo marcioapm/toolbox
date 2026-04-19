@@ -33,10 +33,7 @@ gemini-video = "toolbox.gemini_video:main"
 gemini-vision = "toolbox.gemini_vision:main"
 slackcli = "toolbox.slackcli:main"
 llm-usage = "toolbox.llm_usage:main"
+agent-run = "toolbox.agent_run:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-# Ship non-Python helpers (bash wrappers in scripts/) as part of the wheel.
-[tool.setuptools]
-script-files = ["scripts/agent-run"]

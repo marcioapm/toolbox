@@ -12,7 +12,7 @@ A collection of lightweight CLI tools for AI content generation and chat operati
 | `gemini-vision` | Analyze images/videos via Gemini (supports YouTube, Instagram, TikTok) | `GEMINI_API_KEY` |
 | `slackcli` | Lightweight Slack client (channels, messages, search, reactions) | `SLACK_USER_TOKEN` |
 | `llm-usage` | Monitor LLM token usage, costs, and quotas across providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` |
-| `agent-run` | Background wrapper for coding agents (Claude Code, Codex…) with steering + live log streaming | — |
+| `agent-run` | Background wrapper for coding agents (Claude Code, Codex…) with PTY steering + live log streaming | — |
 
 ## Install
 
@@ -482,25 +482,30 @@ agent-run kill <name> [SIGNAL]            # default TERM; use 9 if stuck
 | `status` | `running` / `done` / `failed` |
 | `exit_code` | numeric exit code (after completion) |
 | `pid`, `pgid` | agent session/group leader pid (== pgid under setsid) |
-| `log` | combined stdout+stderr, tee'd live |
+| `log` | combined stdout+stderr (PTY-captured in interactive mode) |
 | `command` | pretty-printed launch command |
-| `argv` | NUL-delimited argv (used for faithful replay) |
+| `argv` | JSON-encoded argv (authoritative form for replay) |
 | `started_at`, `ended_at` | ISO-8601 UTC timestamps |
 | `stdin` | FIFO for `steer` (only when launched with `-i`) |
+| `pty_pid` | PID of the PTY child (interactive only) |
+| `keeper_pid` | PID of the FIFO keeper (interactive only) |
 | `interactive` | `1` if launched with `-i`, else `0` |
 
-### Why `setsid` + FIFO?
+### Design notes
 
-- `setsid -f` makes each run its own session/process-group leader so
-  `kill <name>` reliably reaps the agent plus `tee` plus any children.
-- On interactive runs, the launcher holds **both** a reader and a writer fd
-  on the FIFO. Without the writer-fd, the first `steer` closes the only
-  writer and the agent sees EOF on stdin and exits after a single message.
-- Argv is persisted NUL-delimited and replayed via `exec` instead of `eval`,
-  so commands with quoted arguments or shell syntax (e.g.
-  `bash -c 'for i in ...; do ...; done'`) work correctly.
-- SIGTERM/INT/HUP traps always finalize `status` + `exit_code` + `ended_at`,
-  even when the launcher is killed mid-pipeline.
+- Written in Python (`src/toolbox/agent_run.py`), installed as a
+  `[project.scripts]` entry point alongside the rest of the toolbox.
+- Double-forks and `os.setsid()` on launch so the run becomes its own
+  session + process-group leader. `agent-run kill` uses `os.killpg`, so it
+  reliably reaps the agent plus the PTY wrapper plus the FIFO keeper.
+- On interactive runs, a dedicated "keeper" child process holds the FIFO
+  open for writing (`O_RDWR`) so readers never see EOF between steers.
+- The PTY is allocated via `pty.fork()`; the parent runs a `select()` loop
+  that shuttles FIFO → PTY master (keystrokes) and PTY master → log file
+  (agent output). Works identically on Linux and macOS without depending
+  on the (different) `script(1)` flavors.
+- SIGTERM/INT/HUP handlers always finalize `status` + `exit_code` +
+  `ended_at`, even when the launcher is killed mid-run.
 
 ## License
 
