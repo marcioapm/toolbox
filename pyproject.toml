@@ -28,6 +28,7 @@ Repository = "https://github.com/marcioapm/toolbox"
 
 [project.scripts]
 gemini-image = "toolbox.gemini_image:main"
+gemini-transcribe = "toolbox.gemini_transcribe:main"
 gemini-tts = "toolbox.gemini_tts:main"
 gemini-video = "toolbox.gemini_video:main"
 gemini-vision = "toolbox.gemini_vision:main"
