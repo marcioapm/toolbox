@@ -8,6 +8,7 @@ A collection of lightweight CLI tools for AI content generation and chat operati
 |-----|-------------|------|
 | `gemini-image` | Generate images via Imagen 4.0 / Gemini native models | `GEMINI_API_KEY` |
 | `gemini-tts` | Text-to-speech via Gemini native audio | `GEMINI_API_KEY` |
+| `gemini-transcribe` | Transcribe audio files via Gemini | `GEMINI_API_KEY` |
 | `gemini-video` | Generate video via Google Veo 2/3/3.1 | `GEMINI_API_KEY` |
 | `gemini-vision` | Analyze images/videos via Gemini (supports YouTube, Instagram, TikTok) | `GEMINI_API_KEY` |
 | `slackcli` | Lightweight Slack client (channels, messages, search, reactions) | `SLACK_USER_TOKEN` |
@@ -145,6 +146,57 @@ options:
   -m, --model MODEL   TTS model (default: gemini-2.5-flash-preview-tts)
   -v, --voice VOICE   Voice name (default: Kore)
 ```
+
+---
+
+## gemini-transcribe
+
+Transcribe audio files via the Gemini API.
+
+### Models
+
+| Model | Speed | Notes |
+|-------|-------|-------|
+| `gemini-2.5-flash` | Fast | Default, cheap |
+| `gemini-2.5-pro` | Slower | More accurate, pricier |
+
+Model names are accepted as free-form strings, so any new Gemini model can be passed via `-m`.
+
+### Usage
+
+```bash
+# Basic transcription (prints transcript to stdout)
+gemini-transcribe meeting.mp3
+
+# Save transcript to a file
+gemini-transcribe call.ogg -o transcript.txt
+
+# Use the more accurate model with a language hint
+gemini-transcribe lecture.wav -m gemini-2.5-pro --language Portuguese
+
+# Custom prompt (e.g. add speaker labels)
+gemini-transcribe interview.m4a --prompt "Transcribe with speaker labels (Speaker A, Speaker B)."
+
+# Get full JSON response instead of just text
+gemini-transcribe note.opus --json
+```
+
+### Options
+
+```
+positional:
+  audio_path           Path to audio file (.ogg/.opus, .mp3, .wav, .m4a, .flac, .aac, .webm)
+
+options:
+  -o, --output FILE    Write transcript to file (default: stdout)
+  -m, --model MODEL    Gemini model (default: gemini-2.5-flash)
+  --prompt TEXT        Custom transcription prompt
+  --language TEXT      Optional language hint, e.g. "Portuguese"
+  --json               Output the full JSON response
+  --api-key TEXT       Gemini API key [env: GEMINI_API_KEY]
+```
+
+**Note:** Files larger than ~19 MB are rejected (Gemini's `inline_data` limit is 20 MB). Use the Files API for larger audio.
 
 ---
 
@@ -416,6 +468,9 @@ gemini-image "prompt" -o /tmp/out.png -m imagen-4.0-fast-generate-001
 
 # TTS: text → WAV file
 gemini-tts "text to speak" -o /tmp/speech.wav -v Aoede
+
+# Transcribe: audio file → text
+gemini-transcribe meeting.mp3 -o /tmp/transcript.txt
 
 # Video: prompt → MP4 (takes minutes, async polling)
 gemini-video "prompt" -o /tmp/video.mp4
