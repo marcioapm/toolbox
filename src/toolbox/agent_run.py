@@ -230,8 +230,21 @@ def cmd_steer(args: argparse.Namespace) -> int:
     if not pid_raw or not _pid_alive(int(pid_raw)):
         sys.exit(f"agent-run: '{args.name}' is not running")
     msg = " ".join(args.message)
-    # Append newline unless the caller included one explicitly.
-    payload = msg if msg.endswith("\n") else msg + "\n"
+    if args.raw:
+        # Caller knows what they want — send bytes verbatim.
+        payload = msg
+        esc_payload: Optional[bytes] = None
+        send_separate_cr = False
+    else:
+        # PTY + raw-mode TUIs (Claude Code, Codex REPL) treat \r as Enter,
+        # not \n. Send CR so the line is actually submitted.
+        payload = msg + "\r"
+        # --esc: send ESC first as its own write so the TUI has time to
+        # exit generation mode before the new prompt+CR arrive. Sending ESC
+        # + text in one chunk races the TUI's mode switch and the CR can
+        # end up dropped while the input buffer is still being reset.
+        esc_payload = b"\x1b" if args.esc else None
+        send_separate_cr = args.esc
     data = payload.encode()
     # Write with a timeout guard: a healthy run has the keeper holding the
     # FIFO open for reading, so this returns immediately.
@@ -241,13 +254,28 @@ def cmd_steer(args: argparse.Namespace) -> int:
     signal.alarm(10)
     try:
         with fifo.open("wb") as f:
+            if esc_payload is not None:
+                f.write(esc_payload)
+                f.flush()
+                # Give the TUI ~600ms to register the interrupt, reset the
+                # input buffer, and switch back to input mode before the new
+                # prompt arrives.
+                time.sleep(0.6)
             f.write(data)
             f.flush()
+            if send_separate_cr:
+                # Belt-and-braces: send a final CR as its own write after a
+                # brief settle so the TUI is guaranteed to see Enter even if
+                # it briefly flushed input while exiting generation mode.
+                time.sleep(0.2)
+                f.write(b"\r")
+                f.flush()
     except TimeoutError:
         sys.exit("agent-run: steer timed out writing to FIFO — is the agent alive?")
     finally:
         signal.alarm(0)
-    print(f"agent-run: steered '{args.name}' ({len(data)} bytes)")
+    sent = len(data) + (len(esc_payload) if esc_payload else 0) + (1 if send_separate_cr else 0)
+    print(f"agent-run: steered '{args.name}' ({sent} bytes)")
     return 0
 
 
@@ -668,9 +696,22 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_tail.add_argument("name")
     sp_tail.set_defaults(func=cmd_tail)
 
-    sp_steer = sub.add_parser("steer", help="send text to agent stdin (needs -i)")
+    sp_steer = sub.add_parser(
+        "steer",
+        help="send text to agent stdin (needs -i); auto-appends CR to submit",
+    )
     sp_steer.add_argument("name")
     sp_steer.add_argument("message", nargs="+")
+    sp_steer.add_argument(
+        "--esc",
+        action="store_true",
+        help="prepend ESC to interrupt the running generation before sending",
+    )
+    sp_steer.add_argument(
+        "--raw",
+        action="store_true",
+        help="send bytes verbatim — do not append CR or prepend ESC",
+    )
     sp_steer.set_defaults(func=cmd_steer)
 
     sp_kill = sub.add_parser("kill", help="kill the agent (default SIGTERM)")
