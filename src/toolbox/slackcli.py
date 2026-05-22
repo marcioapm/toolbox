@@ -234,6 +234,55 @@ def unread(ctx):
 
 @main.command()
 @click.argument("channel")
+@click.argument("filepath", type=click.Path(exists=True))
+@click.option("-m", "--message", default="", help="Initial message/comment for the upload.")
+@click.option("--thread", "thread_ts", default=None, help="Thread timestamp to upload into.")
+@click.option("--filename", default=None, help="Override the filename shown in Slack.")
+@click.pass_context
+def upload(ctx, channel, filepath, message, thread_ts, filename):
+    """Upload a file to a channel.
+
+    Uses files.getUploadURLExternal + files.completeUploadExternal (v2 API).
+    Requires files:write scope on the user token.
+    """
+    import mimetypes
+    import os as _os
+
+    token = _get_token(ctx)
+    fname = filename or _os.path.basename(filepath)
+    fsize = _os.path.getsize(filepath)
+    mime = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
+
+    # Step 1: get upload URL
+    params = {"filename": fname, "length": str(fsize)}
+    data = _check(_api_get(token, "files.getUploadURLExternal", params))
+    upload_url = data["upload_url"]
+    file_id = data["file_id"]
+
+    # Step 2: PUT the file bytes to the upload URL
+    with open(filepath, "rb") as f:
+        file_bytes = f.read()
+    req = urllib.request.Request(upload_url, data=file_bytes, method="POST")
+    req.add_header("Content-Type", mime)
+    with urllib.request.urlopen(req) as resp:
+        resp.read()  # consume response
+
+    # Step 3: complete the upload
+    complete_data = {
+        "files": [{"id": file_id, "title": fname}],
+        "channel_id": channel,
+    }
+    if message:
+        complete_data["initial_comment"] = message
+    if thread_ts:
+        complete_data["thread_ts"] = thread_ts
+
+    _check(_api_post(token, "files.completeUploadExternal", complete_data))
+    click.echo(f"Uploaded {fname} ({fsize} bytes) to {channel}")
+
+
+@main.command()
+@click.argument("channel")
 @click.argument("ts")
 @click.argument("emoji")
 @click.pass_context
