@@ -347,6 +347,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
     argv: List[str] = list(args.command)
     if not argv:
         sys.exit("agent-run: missing command")
+    prompt_file: Optional[str] = getattr(args, "prompt_file", None)
+    if prompt_file and not Path(prompt_file).is_file():
+        sys.exit(f"agent-run: prompt file not found: {prompt_file}")
     d = _run_dir(name)
     # Reject if a previous run with the same name is still active.
     if d.is_dir():
@@ -372,6 +375,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
     _write(d / "status", "running\n")
     _write(d / "interactive", "1\n" if args.interactive else "0\n")
     (d / "log").touch()
+    if prompt_file:
+        # Snapshot the prompt-file path so introspection shows what was fed in.
+        _write(d / "prompt_file", prompt_file + "\n")
 
     if args.interactive:
         fifo = d / "stdin"
@@ -415,7 +421,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
         os._exit(0)
 
     # Grandchild: actually run the agent.
-    _runner(d, argv, args.interactive, w_ack)
+    _runner(d, argv, args.interactive, w_ack, prompt_file)
     return 0  # never reached
 
 
@@ -424,6 +430,7 @@ def _runner(
     argv: Sequence[str],
     interactive: bool,
     ready_fd: int,
+    prompt_file: Optional[str] = None,
 ) -> None:
     """Execute in the detached session-leader process.
 
@@ -476,9 +483,9 @@ def _runner(
 
     try:
         if interactive:
-            exit_code = _run_interactive(run_dir, argv, log_fd)
+            exit_code = _run_interactive(run_dir, argv, log_fd, prompt_file)
         else:
-            exit_code = _run_oneshot(run_dir, argv, log_fd)
+            exit_code = _run_oneshot(run_dir, argv, log_fd, prompt_file)
     except Exception as exc:  # noqa: BLE001
         try:
             os.write(log_fd, f"\nagent-run: runner crashed: {exc!r}\n".encode())
@@ -490,16 +497,29 @@ def _runner(
     os._exit(exit_code)
 
 
-def _run_oneshot(run_dir: Path, argv: Sequence[str], log_fd: int) -> int:
+def _run_oneshot(
+    run_dir: Path,
+    argv: Sequence[str],
+    log_fd: int,
+    prompt_file: Optional[str] = None,
+) -> int:
     pid = os.fork()
     if pid == 0:
-        # Child: stdin from /dev/null; stdout/stderr to log.
-        devnull = os.open(os.devnull, os.O_RDONLY)
-        os.dup2(devnull, 0)
+        # Child: stdin from prompt file (if provided) or /dev/null;
+        # stdout/stderr to log.
+        if prompt_file:
+            try:
+                stdin_fd = os.open(prompt_file, os.O_RDONLY)
+            except OSError as exc:
+                os.write(2, f"agent-run: cannot open prompt file: {exc}\n".encode())
+                os._exit(127)
+        else:
+            stdin_fd = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(stdin_fd, 0)
         os.dup2(log_fd, 1)
         os.dup2(log_fd, 2)
-        if devnull > 2:
-            os.close(devnull)
+        if stdin_fd > 2:
+            os.close(stdin_fd)
         try:
             os.execvp(argv[0], list(argv))
         except OSError as exc:
@@ -513,7 +533,12 @@ def _run_oneshot(run_dir: Path, argv: Sequence[str], log_fd: int) -> int:
     return 1
 
 
-def _run_interactive(run_dir: Path, argv: Sequence[str], log_fd: int) -> int:
+def _run_interactive(
+    run_dir: Path,
+    argv: Sequence[str],
+    log_fd: int,
+    prompt_file: Optional[str] = None,
+) -> int:
     fifo_path = run_dir / "stdin"
 
     # Persistent keeper process: holds the FIFO open for writing so the reader
@@ -562,6 +587,45 @@ def _run_interactive(run_dir: Path, argv: Sequence[str], log_fd: int) -> int:
             sys.stderr.write(f"agent-run: exec failed: {exc}\n")
             os._exit(127)
     _write(run_dir / "pty_pid", f"{pty_pid}\n")
+
+    # If a prompt file was provided, fork a helper that waits for the TUI to
+    # finish initializing (so the PTY is in raw mode and CR -> Enter), then
+    # writes the prompt + CR to the FIFO so the agent receives it as if a
+    # human had typed it. Same pattern as `agent-run steer`.
+    if prompt_file:
+        helper = os.fork()
+        if helper == 0:
+            # Detach from the parent's stdio. Errors are silent (no log to write to).
+            try:
+                # Wait a few seconds for the TUI to enable raw mode. Earlier
+                # tests showed sub-3s delivery races ICRNL CR->LF translation.
+                time.sleep(4)
+                try:
+                    data = Path(prompt_file).read_bytes()
+                except OSError:
+                    os._exit(0)
+                # Submit with CR; trailing CR is unconditional so the agent
+                # treats the file as a single Enter-terminated message. Send
+                # a second separate CR after a brief settle so the TUI is
+                # guaranteed to see Enter even if the first one races the
+                # input-buffer being reset right after typing finishes.
+                try:
+                    fd = os.open(str(fifo_path), os.O_WRONLY)
+                    try:
+                        os.write(fd, data + b"\r")
+                    finally:
+                        os.close(fd)
+                    time.sleep(0.5)
+                    fd = os.open(str(fifo_path), os.O_WRONLY)
+                    try:
+                        os.write(fd, b"\r")
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    pass
+            finally:
+                os._exit(0)
+        # Parent (the runner) just continues; helper is detached.
 
     # Open FIFO read end (blocks until the keeper has opened for writing,
     # which it has by the time we got the ack).
@@ -742,13 +806,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Interactive flag consumed explicitly (may be before name).
     interactive = False
-    if raw and raw[0] in ("-i", "--interactive"):
-        interactive = True
-        raw = raw[1:]
+    prompt_file: Optional[str] = None
+    # Consume top-level flags (`-i`, `-f <path>`) in any order before the name.
+    while raw:
+        if raw[0] in ("-i", "--interactive"):
+            interactive = True
+            raw = raw[1:]
+            continue
+        if raw[0] in ("-f", "--prompt-file"):
+            if len(raw) < 2:
+                sys.exit("agent-run: -f/--prompt-file requires a path")
+            prompt_file = raw[1]
+            raw = raw[2:]
+            continue
+        if raw[0].startswith("--prompt-file="):
+            prompt_file = raw[0].split("=", 1)[1]
+            raw = raw[1:]
+            continue
+        break
 
     # Try to dispatch a known subcommand; otherwise treat as launch.
     known_subcommands = {"status", "logs", "tail", "steer", "kill", "list", "help"}
-    if raw and raw[0] in known_subcommands and not interactive:
+    if raw and raw[0] in known_subcommands and not interactive and not prompt_file:
         # argparse handles these, including their own -h/--help.
         parser = _build_parser()
         args = parser.parse_args(raw)
@@ -761,7 +840,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Basic validation of the name.
     if "/" in name or name.startswith("-"):
         sys.exit(f"agent-run: invalid name '{name}'")
-    ns = argparse.Namespace(name=name, command=command, interactive=interactive)
+    ns = argparse.Namespace(
+        name=name,
+        command=command,
+        interactive=interactive,
+        prompt_file=prompt_file,
+    )
     return cmd_launch(ns)
 
 
