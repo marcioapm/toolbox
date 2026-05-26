@@ -213,6 +213,115 @@ def cmd_tail(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# clean (render PTY-captured logs into readable transcripts)
+# ---------------------------------------------------------------------------
+
+def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 100000) -> str:
+    """Render a raw PTY-captured log (with ANSI/Ink redraw artifacts) into a
+    plain-text transcript by replaying the byte stream through a VT100
+    emulator (pyte). Returns the deduplicated screen history + final visible
+    viewport, joined with newlines.
+
+    Pyte is loaded lazily so the rest of agent-run keeps working even if the
+    extra is not installed (and so we get a clear error message when it is
+    really needed).
+    """
+    try:
+        import pyte  # type: ignore
+    except ImportError:
+        sys.exit(
+            "agent-run: `pyte` is required for `clean` / --echo. "
+            "Install with: pipx inject mmartins-toolbox pyte  (or uv tool install --with pyte ...)"
+        )
+
+    screen = pyte.HistoryScreen(width, height, history=history, ratio=0.5)
+    stream = pyte.ByteStream(screen)
+    stream.feed(raw)
+
+    rows: List[str] = []
+    # Past history rows that have scrolled off the top.
+    for entry in screen.history.top:
+        text = "".join(entry[col].data for col in sorted(entry)) if entry else ""
+        rows.append(text.rstrip())
+    # Currently-visible viewport.
+    for row in screen.display:
+        rows.append(row.rstrip())
+
+    # Collapse adjacent duplicate lines (Ink redraws the same content many times).
+    deduped: List[str] = []
+    for line in rows:
+        if not deduped or deduped[-1] != line:
+            deduped.append(line)
+    # Trim trailing empties.
+    while deduped and not deduped[-1]:
+        deduped.pop()
+    return "\n".join(deduped) + "\n"
+
+
+def _echo_loop(run_dir: "Path", interval: float) -> None:
+    """Periodically render run_dir/log into run_dir/log.clean.
+
+    Runs in a detached child for the lifetime of the agent. The parent's
+    signal handler kills us on shutdown so we don't outlive the run. We
+    only re-render when the raw log's mtime has changed, so a quiet run
+    doesn't burn CPU.
+    """
+    log = run_dir / "log"
+    clean = run_dir / "log.clean"
+    last_mtime = -1.0
+    # Soft cap: if pyte isn't installed, write a friendly stub and exit.
+    try:
+        import pyte  # noqa: F401  (just probe; real import is in _render_log)
+    except ImportError:
+        clean.write_text(
+            "agent-run: --echo requested but `pyte` is not installed.\n"
+            "Install with: pipx inject mmartins-toolbox pyte\n"
+        )
+        return
+    while True:
+        try:
+            mtime = log.stat().st_mtime
+        except FileNotFoundError:
+            time.sleep(interval)
+            continue
+        if mtime != last_mtime:
+            last_mtime = mtime
+            try:
+                raw = log.read_bytes()
+                rendered = _render_log(raw)
+                tmp = clean.with_suffix(".clean.tmp")
+                tmp.write_text(rendered, encoding="utf-8")
+                tmp.replace(clean)
+            except Exception:
+                # Don't crash the helper on transient render errors;
+                # next tick may succeed.
+                pass
+        time.sleep(interval)
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    d = _require_run(args.name)
+    log = d / "log"
+    if not log.is_file():
+        sys.exit(f"agent-run: no log file for '{args.name}' at {log}")
+    raw = log.read_bytes()
+    rendered = _render_log(
+        raw,
+        width=args.width,
+        height=args.height,
+        history=args.history,
+    )
+    out_path = getattr(args, "out", None)
+    if out_path:
+        Path(out_path).write_text(rendered, encoding="utf-8")
+        size = len(rendered.encode("utf-8"))
+        sys.stderr.write(f"agent-run: wrote {size} bytes of cleaned transcript to {out_path}\n")
+        return 0
+    sys.stdout.write(rendered)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # steer / kill
 # ---------------------------------------------------------------------------
 
@@ -350,6 +459,8 @@ def cmd_launch(args: argparse.Namespace) -> int:
     prompt_file: Optional[str] = getattr(args, "prompt_file", None)
     if prompt_file and not Path(prompt_file).is_file():
         sys.exit(f"agent-run: prompt file not found: {prompt_file}")
+    echo: bool = bool(getattr(args, "echo", False))
+    echo_interval: float = float(getattr(args, "echo_interval", 2.0))
     d = _run_dir(name)
     # Reject if a previous run with the same name is still active.
     if d.is_dir():
@@ -378,6 +489,8 @@ def cmd_launch(args: argparse.Namespace) -> int:
     if prompt_file:
         # Snapshot the prompt-file path so introspection shows what was fed in.
         _write(d / "prompt_file", prompt_file + "\n")
+    if echo:
+        _write(d / "echo", f"{echo_interval}\n")
 
     if args.interactive:
         fifo = d / "stdin"
@@ -421,7 +534,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
         os._exit(0)
 
     # Grandchild: actually run the agent.
-    _runner(d, argv, args.interactive, w_ack, prompt_file)
+    _runner(d, argv, args.interactive, w_ack, prompt_file, echo, echo_interval)
     return 0  # never reached
 
 
@@ -431,6 +544,8 @@ def _runner(
     interactive: bool,
     ready_fd: int,
     prompt_file: Optional[str] = None,
+    echo: bool = False,
+    echo_interval: float = 2.0,
 ) -> None:
     """Execute in the detached session-leader process.
 
@@ -467,7 +582,7 @@ def _runner(
 
     def _on_signal(signum: int, _frame) -> None:
         # Propagate to children, then finalize and exit.
-        for aux in ("pty_pid", "keeper_pid"):
+        for aux in ("pty_pid", "keeper_pid", "echo_pid"):
             raw = _read(run_dir / aux)
             if raw:
                 try:
@@ -480,6 +595,18 @@ def _runner(
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGHUP, _on_signal)
+
+    # If --echo was requested, fork a background renderer that periodically
+    # writes a cleaned transcript next to the raw log. Stays alive for the
+    # whole run; the signal handler tears it down on shutdown.
+    if echo:
+        echo_pid = os.fork()
+        if echo_pid == 0:
+            try:
+                _echo_loop(run_dir, echo_interval)
+            finally:
+                os._exit(0)
+        _write(run_dir / "echo_pid", f"{echo_pid}\n")
 
     try:
         if interactive:
@@ -760,6 +887,37 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_tail.add_argument("name")
     sp_tail.set_defaults(func=cmd_tail)
 
+    sp_clean = sub.add_parser(
+        "clean",
+        help="render PTY-captured TUI log into a readable transcript via pyte",
+    )
+    sp_clean.add_argument("name")
+    sp_clean.add_argument(
+        "-o",
+        "--out",
+        default=None,
+        help="write the cleaned transcript to this file (default: stdout)",
+    )
+    sp_clean.add_argument(
+        "--width",
+        type=int,
+        default=120,
+        help="emulated terminal width in columns (default: 120)",
+    )
+    sp_clean.add_argument(
+        "--height",
+        type=int,
+        default=60,
+        help="emulated viewport height in rows (default: 60)",
+    )
+    sp_clean.add_argument(
+        "--history",
+        type=int,
+        default=100000,
+        help="scrollback line budget for the emulator (default: 100000)",
+    )
+    sp_clean.set_defaults(func=cmd_clean)
+
     sp_steer = sub.add_parser(
         "steer",
         help="send text to agent stdin (needs -i); auto-appends CR to submit",
@@ -807,7 +965,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Interactive flag consumed explicitly (may be before name).
     interactive = False
     prompt_file: Optional[str] = None
-    # Consume top-level flags (`-i`, `-f <path>`) in any order before the name.
+    echo: bool = False
+    echo_interval: float = 2.0
+    # Consume top-level flags (`-i`, `-f <path>`, `--echo[=interval]`) in
+    # any order before the name.
     while raw:
         if raw[0] in ("-i", "--interactive"):
             interactive = True
@@ -823,11 +984,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             prompt_file = raw[0].split("=", 1)[1]
             raw = raw[1:]
             continue
+        if raw[0] == "--echo":
+            echo = True
+            raw = raw[1:]
+            continue
+        if raw[0].startswith("--echo="):
+            echo = True
+            try:
+                echo_interval = float(raw[0].split("=", 1)[1])
+            except ValueError:
+                sys.exit("agent-run: --echo=<interval> needs a number (seconds)")
+            raw = raw[1:]
+            continue
         break
 
     # Try to dispatch a known subcommand; otherwise treat as launch.
-    known_subcommands = {"status", "logs", "tail", "steer", "kill", "list", "help"}
-    if raw and raw[0] in known_subcommands and not interactive and not prompt_file:
+    known_subcommands = {"status", "logs", "tail", "clean", "steer", "kill", "list", "help"}
+    if raw and raw[0] in known_subcommands and not interactive and not prompt_file and not echo:
         # argparse handles these, including their own -h/--help.
         parser = _build_parser()
         args = parser.parse_args(raw)
@@ -845,6 +1018,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         command=command,
         interactive=interactive,
         prompt_file=prompt_file,
+        echo=echo,
+        echo_interval=echo_interval,
     )
     return cmd_launch(ns)
 
