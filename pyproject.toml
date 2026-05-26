@@ -22,6 +22,9 @@ classifiers = [
     "Topic :: Utilities",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
 [project.urls]
 Homepage = "https://github.com/marcioapm/toolbox"
 Repository = "https://github.com/marcioapm/toolbox"
@@ -38,3 +41,6 @@ agent-run = "toolbox.agent_run:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
