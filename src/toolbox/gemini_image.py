@@ -10,7 +10,8 @@ Models:
     imagen-4.0-fast-generate-001  — Imagen 4.0 Fast (quickest)
     nano-banana-pro-preview       — Nano Banana Pro (Gemini native)
     gemini-3-pro-image-preview    — Gemini 3 Pro Image
-    gemini-3.1-flash-image-preview — Gemini 3.1 Flash Image (fastest native)
+    gemini-3.1-flash-image-preview — Gemini 3.1 Flash Image Preview
+    gemini-3.1-flash-image        — Gemini 3.1 Flash Image (GA, fastest native)
 
 Usage:
     gemini-image "a cat riding a skateboard" -o cat.png
@@ -33,12 +34,14 @@ MODELS = [
     "nano-banana-pro-preview",
     "gemini-3-pro-image-preview",
     "gemini-3.1-flash-image-preview",
+    "gemini-3.1-flash-image",
 ]
 
 GEMINI_NATIVE_MODELS = {
     "nano-banana-pro-preview",
     "gemini-3-pro-image-preview",
     "gemini-3.1-flash-image-preview",
+    "gemini-3.1-flash-image",
 }
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"

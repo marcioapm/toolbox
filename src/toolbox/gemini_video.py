@@ -7,9 +7,9 @@ Environment:
 Models:
     veo-2.0-generate-001         — Veo 2.0
     veo-3.0-generate-001         — Veo 3.0 (high quality)
-    veo-3.0-fast-generate-001    — Veo 3.0 Fast (default, good balance)
+    veo-3.0-fast-generate-001    — Veo 3.0 Fast (good balance)
     veo-3.1-generate-preview     — Veo 3.1 Preview
-    veo-3.1-fast-generate-preview — Veo 3.1 Fast Preview
+    veo-3.1-fast-generate-preview — Veo 3.1 Fast Preview (default)
 
 Usage:
     gemini-video "a drone flying over mountains at sunset" -o mountains.mp4
@@ -41,7 +41,7 @@ MAX_POLLS = 120  # 10 minutes
 @click.command()
 @click.argument("prompt")
 @click.option("-o", "--output", default="output.mp4", show_default=True, help="Output file path.")
-@click.option("-m", "--model", default="veo-3.0-fast-generate-001", show_default=True,
+@click.option("-m", "--model", default="veo-3.1-fast-generate-preview", show_default=True,
               type=click.Choice(MODELS, case_sensitive=False), help="Veo model.")
 @click.option("--aspect", default="16:9", show_default=True, help="Aspect ratio (e.g. 16:9, 9:16, 1:1).")
 @click.option("--api-key", envvar="GEMINI_API_KEY", required=True, help="Gemini API key [env: GEMINI_API_KEY].")

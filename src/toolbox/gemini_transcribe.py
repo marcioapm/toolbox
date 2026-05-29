@@ -5,7 +5,8 @@ Environment:
     GEMINI_API_KEY  — Required. Google AI API key from https://aistudio.google.com/apikey
 
 Models:
-    gemini-2.5-flash — Fast, cheap (default)
+    gemini-3.5-flash — Fast, cheap (default)
+    gemini-2.5-flash — Previous fast/cheap model
     gemini-2.5-pro   — More accurate, slower / pricier
     Any other model name is also accepted (free-form).
 
@@ -56,8 +57,8 @@ def _mime_for(path):
 @click.argument("audio_path", type=click.Path(exists=False, dir_okay=False))
 @click.option("-o", "--output", type=click.Path(dir_okay=False), default=None,
               help="Write transcript to file (default: stdout).")
-@click.option("-m", "--model", default="gemini-2.5-flash", show_default=True,
-              help="Gemini model (free-form; e.g. gemini-2.5-flash, gemini-2.5-pro).")
+@click.option("-m", "--model", default="gemini-3.5-flash", show_default=True,
+              help="Gemini model (free-form; e.g. gemini-3.5-flash, gemini-2.5-flash, gemini-2.5-pro).")
 @click.option("--prompt", default=DEFAULT_PROMPT, show_default=False,
               help="Custom transcription prompt.")
 @click.option("--language", default=None,

@@ -5,7 +5,8 @@ Environment:
     GEMINI_API_KEY  — Required. Google AI API key from https://aistudio.google.com/apikey
 
 Models:
-    gemini-2.5-flash-preview-tts — Flash TTS (default, fast)
+    gemini-3.1-flash-tts-preview — Flash TTS (default, fast)
+    gemini-2.5-flash-preview-tts — Previous Flash TTS (fallback)
     gemini-2.5-pro-preview-tts   — Pro TTS (more expressive, slower)
 
 Voices:
@@ -26,7 +27,7 @@ import wave
 
 import click
 
-MODELS = ["gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"]
+MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"]
 VOICES = ["Aoede", "Charon", "Fenrir", "Kore", "Puck", "Orbit", "Vale"]
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
@@ -34,7 +35,7 @@ BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 @click.command()
 @click.argument("text")
 @click.option("-o", "--output", default="output.wav", show_default=True, help="Output WAV file path.")
-@click.option("-m", "--model", default="gemini-2.5-flash-preview-tts", show_default=True,
+@click.option("-m", "--model", default="gemini-3.1-flash-tts-preview", show_default=True,
               type=click.Choice(MODELS, case_sensitive=False), help="TTS model.")
 @click.option("-v", "--voice", default="Kore", show_default=True,
               type=click.Choice(VOICES, case_sensitive=False), help="Voice name.")

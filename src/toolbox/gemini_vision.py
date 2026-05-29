@@ -12,7 +12,8 @@ Requirements:
     yt-dlp          — Required for social media video downloads (brew install yt-dlp)
 
 Models:
-    gemini-2.5-flash       — Fast, good quality (default)
+    gemini-3.5-flash       — Fast, good quality (default)
+    gemini-2.5-flash       — Previous fast model
     gemini-2.5-pro         — Best quality, slower
     gemini-3-pro-preview   — Gemini 3 Pro
     gemini-3-flash-preview — Gemini 3 Flash
@@ -42,6 +43,7 @@ import urllib.request
 import click
 
 MODELS = [
+    "gemini-3.5-flash",
     "gemini-2.5-flash",
     "gemini-2.5-pro",
     "gemini-3-pro-preview",
@@ -177,7 +179,7 @@ def _resolve_input(file_input, api_key, keep):
 @click.argument("file")
 @click.option("-p", "--prompt", default="Describe what you see in detail.", show_default=True,
               help="Analysis prompt.")
-@click.option("-m", "--model", default="gemini-2.5-flash", show_default=True,
+@click.option("-m", "--model", default="gemini-3.5-flash", show_default=True,
               type=click.Choice(MODELS, case_sensitive=False), help="Gemini model.")
 @click.option("--keep", is_flag=True, help="Keep downloaded video (don't delete temp file).")
 @click.option("--api-key", envvar="GEMINI_API_KEY", required=True,
