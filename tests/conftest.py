@@ -33,13 +33,25 @@ def print_log_bytes(fixtures_dir: Path) -> bytes:
 
 @pytest.fixture
 def isolated_runs_root(tmp_path, monkeypatch) -> Path:
-    """Point agent-run's runs-root at a fresh temp dir so tests don't
-    collide with real /tmp/agent-runs/. Reaches into both the env var
-    (which the CLI reads at import time) and the module-level constant."""
-    runs = tmp_path / "agent-runs"
-    runs.mkdir()
-    monkeypatch.setenv("AGENT_RUN_DIR", str(runs))
-    # The module captured RUNS_ROOT at import time; patch it too.
+    """Point agent-run's state/log roots at fresh temp dirs so tests don't
+    collide with real /tmp/agent-runs/ or /var/tmp/agent-runs/. Reaches into
+    both the env vars (which the CLI reads at import time) and the
+    module-level constants."""
+    state = tmp_path / "agent-runs-state"
+    logs = tmp_path / "agent-runs-log"
+    state.mkdir()
+    logs.mkdir()
+    monkeypatch.setenv("AGENT_RUN_STATE_DIR", str(state))
+    monkeypatch.setenv("AGENT_RUN_LOG_DIR", str(logs))
+    # The module captured these at import time; patch them too.
     from toolbox import agent_run
-    monkeypatch.setattr(agent_run, "RUNS_ROOT", runs)
-    return runs
+    monkeypatch.setattr(agent_run, "STATE_ROOT", state)
+    monkeypatch.setattr(agent_run, "LOG_ROOT", logs)
+    return state
+
+
+@pytest.fixture
+def isolated_log_root(isolated_runs_root) -> Path:
+    """The persistent log root paired with isolated_runs_root."""
+    from toolbox import agent_run
+    return agent_run.LOG_ROOT

@@ -13,15 +13,25 @@ import pytest
 from toolbox import agent_run
 
 
-def _make_run(runs_root, name: str, log_bytes: bytes, interactive: bool = True):
-    """Seed a minimal run directory the way agent-run would."""
+def _make_run(runs_root, name: str, log_bytes: bytes, interactive: bool = True, old_layout: bool = False):
+    """Seed a run the way agent-run would: ephemeral state under
+    runs_root/<name>/, persistent log under LOG_ROOT/<name>/log. Pass
+    old_layout=True to seed the pre-split single-directory layout instead
+    (log alongside state), to exercise the fallback path."""
+    from toolbox import agent_run
+
     d = runs_root / name
     d.mkdir()
-    (d / "log").write_bytes(log_bytes)
     (d / "status").write_text("done\n")
     (d / "pid").write_text("0\n")
     (d / "started_at").write_text("2026-05-26T18:00:00Z\n")
     (d / "interactive").write_text("1\n" if interactive else "0\n")
+    if old_layout:
+        (d / "log").write_bytes(log_bytes)
+    else:
+        log_d = agent_run.LOG_ROOT / name
+        log_d.mkdir(parents=True, exist_ok=True)
+        (log_d / "log").write_bytes(log_bytes)
     return d
 
 

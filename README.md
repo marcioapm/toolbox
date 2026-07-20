@@ -505,9 +505,20 @@ agent-run kill chat                       # clean kill of the whole group
 ## agent-run
 
 Background wrapper for long-running coding agents (Claude Code, Codex, Pi, OpenCode).
-Creates a run directory under `/tmp/agent-runs/<name>/` with structured state
-files you can poll safely — no brittle process-poll loops — and adds a stdin
-FIFO when you need to steer an interactive agent mid-flight.
+Creates a run directory with structured state files you can poll safely — no
+brittle process-poll loops — and adds a stdin FIFO when you need to steer an
+interactive agent mid-flight.
+
+Storage is split across two roots so a hard crash or reboot never loses a
+log even though the ephemeral process state is gone:
+
+- `/tmp/agent-runs/<name>/` — ephemeral process state (pid, status,
+  exit_code, FIFO). tmpfs on Linux, wiped on reboot — a missing entry here
+  unambiguously means "not running". Override with `AGENT_RUN_STATE_DIR`.
+- `/var/tmp/agent-runs/<name>/` — persistent log, cleaned transcript, and a
+  copy of the prompt file. Survives reboot/crash; the log fd is opened here
+  from the start, so there's no copy-on-exit step a crash could lose.
+  Override with `AGENT_RUN_LOG_DIR`. Pruned automatically after 21 days.
 
 ### Launch
 
@@ -530,14 +541,21 @@ agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
 agent-run kill <name> [SIGNAL]            # default TERM; use 9 if stuck
 ```
 
-### Files under `/tmp/agent-runs/<name>/`
+`status` reports `not running (log preserved)` when the process state is
+gone (e.g. after a reboot) but the log survived in `/var/tmp`. `list` shows
+live runs from `/tmp` and, separately, any preserved-log-only runs.
+`logs`/`tail`/`clean` always read the persistent log, falling back to the
+old single-directory layout for runs launched before this split.
+
+### Files
+
+Ephemeral, under `$AGENT_RUN_STATE_DIR/<name>/` (default `/tmp/agent-runs`):
 
 | File | Contents |
 |------|----------|
 | `status` | `running` / `done` / `failed` |
 | `exit_code` | numeric exit code (after completion) |
 | `pid`, `pgid` | agent session/group leader pid (== pgid under setsid) |
-| `log` | combined stdout+stderr (PTY-captured in interactive mode) |
 | `command` | pretty-printed launch command |
 | `argv` | JSON-encoded argv (authoritative form for replay) |
 | `started_at`, `ended_at` | ISO-8601 UTC timestamps |
@@ -545,6 +563,14 @@ agent-run kill <name> [SIGNAL]            # default TERM; use 9 if stuck
 | `pty_pid` | PID of the PTY child (interactive only) |
 | `keeper_pid` | PID of the FIFO keeper (interactive only) |
 | `interactive` | `1` if launched with `-i`, else `0` |
+
+Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
+
+| File | Contents |
+|------|----------|
+| `log` | combined stdout+stderr (PTY-captured in interactive mode) |
+| `log.clean` | rendered transcript (only when launched with `--echo`) |
+| `prompt` | copy of the `-f`/`--prompt-file` input, if one was given |
 
 ### Design notes
 

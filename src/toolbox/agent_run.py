@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
 """agent-run — Wrapper for coding agents (Claude Code, Codex, etc.).
 
-Creates a run directory under /tmp/agent-runs/<name>/ with structured state
-files so LLM orchestrators can poll safely without brittle process-poll loops,
-and optionally allocates a real PTY so TUI agents behave as if attached to a
-terminal (no more 0-CPU hangs from isatty() checks).
+Creates a run directory with structured state files so LLM orchestrators can
+poll safely without brittle process-poll loops, and optionally allocates a
+real PTY so TUI agents behave as if attached to a terminal (no more 0-CPU
+hangs from isatty() checks).
+
+Storage is split across two roots so a hard crash or reboot never loses a
+log even though the ephemeral process state is gone:
+
+    /tmp/agent-runs/<name>/       ephemeral process state (tmpfs on Linux —
+                                   wiped on reboot, so "missing" unambiguously
+                                   means "not running"). Override with
+                                   AGENT_RUN_STATE_DIR.
+    /var/tmp/agent-runs/<name>/   persistent log + prompt copy, survives
+                                   reboot/crash. Override with
+                                   AGENT_RUN_LOG_DIR. The log fd is opened
+                                   here from the start — no copy-on-exit step
+                                   that a crash could lose.
 
 Usage::
 
@@ -17,7 +30,7 @@ Usage::
     agent-run kill <name> [SIGNAL]       # TERM by default; 9/KILL if stuck
     agent-run list                       # list all runs
 
-Files under /tmp/agent-runs/<name>/::
+Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 
     status       running | done | failed
     exit_code    numeric exit code (after completion)
@@ -25,13 +38,24 @@ Files under /tmp/agent-runs/<name>/::
     pgid         process group id (kill target)
     pty_pid      PTY child pid (interactive only)
     keeper_pid   FIFO-keeper pid (interactive only)
-    log          captured stdout+stderr (PTY-captured when interactive)
     command      pretty-printed launch command
     argv         JSON-encoded argv (authoritative form for replay)
     started_at   ISO-8601 UTC
     ended_at     ISO-8601 UTC (after completion)
     interactive  "1" if launched with -i, else "0"
     stdin        FIFO for steering (interactive only)
+
+Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs)::
+
+    log          captured stdout+stderr (PTY-captured when interactive)
+    log.clean    rendered transcript (only when launched with --echo)
+    prompt       copy of the -f/--prompt-file input, if one was given
+
+`status` reports "not running (log preserved)" when the state dir is gone
+but the log dir survived. `logs`/`tail`/`clean` always read from the log
+dir, falling back to the old single-directory layout for runs started
+before this split. Log dirs older than 21 days are pruned opportunistically
+on `list`/launch.
 """
 
 from __future__ import annotations
@@ -44,6 +68,7 @@ import os
 import pty
 import select
 import shlex
+import shutil
 import signal
 import sys
 import time
@@ -52,7 +77,9 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 
-RUNS_ROOT = Path(os.environ.get("AGENT_RUN_DIR", "/tmp/agent-runs"))
+STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
+LOG_ROOT = Path(os.environ.get("AGENT_RUN_LOG_DIR", "/var/tmp/agent-runs"))
+PRUNE_AFTER_DAYS = 21
 
 
 # ---------------------------------------------------------------------------
@@ -74,15 +101,74 @@ def _read(path: Path, default: str = "") -> str:
         return default
 
 
-def _run_dir(name: str) -> Path:
-    return RUNS_ROOT / name
+def _state_dir(name: str) -> Path:
+    return STATE_ROOT / name
 
 
-def _require_run(name: str) -> Path:
-    d = _run_dir(name)
+def _log_dir(name: str) -> Path:
+    return LOG_ROOT / name
+
+
+def _log_file_for(name: str) -> Optional[Path]:
+    """Resolve the persistent log for a run, preferring the new split
+    layout ($AGENT_RUN_LOG_DIR/<name>/log) and falling back to the old
+    single-directory layout ($AGENT_RUN_STATE_DIR/<name>/log) so in-flight
+    runs started before this split remain readable."""
+    new_log = _log_dir(name) / "log"
+    if new_log.exists():
+        return new_log
+    old_log = _state_dir(name) / "log"
+    if old_log.exists():
+        return old_log
+    return None
+
+
+def _require_state(name: str) -> Path:
+    d = _state_dir(name)
     if not d.is_dir():
-        sys.exit(f"agent-run: no run named '{name}' in {RUNS_ROOT}")
+        sys.exit(
+            f"agent-run: no active run state for '{name}' in {STATE_ROOT} "
+            f"(try 'agent-run status {name}' for a preserved log)"
+        )
     return d
+
+
+def _require_log(name: str) -> Path:
+    log = _log_file_for(name)
+    if log is not None:
+        return log
+    if _state_dir(name).is_dir() or _log_dir(name).is_dir():
+        sys.exit(f"agent-run: no log file for '{name}' in {_log_dir(name)}")
+    sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
+
+
+def _known(name: str) -> bool:
+    return _state_dir(name).is_dir() or _log_dir(name).is_dir()
+
+
+def _prune_old_logs(max_age_days: int = PRUNE_AFTER_DAYS) -> None:
+    """Remove log dirs whose newest file is older than max_age_days.
+
+    Best-effort and silent: called opportunistically from `list` and launch
+    so stale crash-survivor logs don't accumulate forever in /var/tmp."""
+    if not LOG_ROOT.is_dir():
+        return
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        candidates = list(LOG_ROOT.iterdir())
+    except OSError:
+        return
+    for d in candidates:
+        if not d.is_dir():
+            continue
+        try:
+            mtime = max(
+                (f.stat().st_mtime for f in d.iterdir()), default=d.stat().st_mtime
+            )
+        except OSError:
+            continue
+        if mtime < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -104,45 +190,62 @@ def _pretty_command(argv: Sequence[str]) -> str:
 # list / status / logs / tail
 # ---------------------------------------------------------------------------
 
+def _log_line_count(log: Optional[Path]) -> int:
+    if log is None:
+        return 0
+    try:
+        with log.open("rb") as f:
+            return sum(1 for _ in f)
+    except FileNotFoundError:
+        return 0
+
+
 def cmd_list(_args: argparse.Namespace) -> int:
-    print(f"Active runs ({RUNS_ROOT}):")
-    if not RUNS_ROOT.is_dir():
+    _prune_old_logs()
+    state_names = set()
+    print(f"Live runs ({STATE_ROOT}):")
+    if STATE_ROOT.is_dir():
+        state_names = {p.name for p in STATE_ROOT.iterdir() if p.is_dir()}
+    if not state_names:
         print("  (none)")
-        return 0
-    runs = sorted(p for p in RUNS_ROOT.iterdir() if p.is_dir())
-    if not runs:
-        print("  (none)")
-        return 0
-    for d in runs:
-        status = _read(d / "status", "unknown")
-        pid = _read(d / "pid", "?")
-        started = _read(d / "started_at", "?")
-        lines = 0
-        try:
-            with (d / "log").open("rb") as f:
-                lines = sum(1 for _ in f)
-        except FileNotFoundError:
-            pass
-        interactive = _read(d / "interactive", "0")
-        flag = " [interactive]" if interactive == "1" else ""
-        print(f"  {d.name}: status={status} pid={pid} started={started} lines={lines}{flag}")
+    else:
+        for d in sorted(_state_dir(n) for n in state_names):
+            status = _read(d / "status", "unknown")
+            pid = _read(d / "pid", "?")
+            started = _read(d / "started_at", "?")
+            lines = _log_line_count(_log_file_for(d.name))
+            interactive = _read(d / "interactive", "0")
+            flag = " [interactive]" if interactive == "1" else ""
+            print(f"  {d.name}: status={status} pid={pid} started={started} lines={lines}{flag}")
+
+    log_only_names = set()
+    if LOG_ROOT.is_dir():
+        log_only_names = {p.name for p in LOG_ROOT.iterdir() if p.is_dir()} - state_names
+    if log_only_names:
+        print(f"Preserved logs, not running ({LOG_ROOT}):")
+        for name in sorted(log_only_names):
+            lines = _log_line_count(_log_file_for(name))
+            print(f"  {name}: lines={lines}")
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    d = _require_run(args.name)
-    name = d.name
+    name = args.name
+    state_dir = _state_dir(name)
+    log_dir = _log_dir(name)
+    if not state_dir.is_dir() and not log_dir.is_dir():
+        sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
+    lines = _log_line_count(_log_file_for(name))
+    if not state_dir.is_dir():
+        print(f"name={name} status=not running (log preserved) lines={lines}")
+        return 0
+    d = state_dir
     status = _read(d / "status", "unknown")
     pid = _read(d / "pid", "?")
     started = _read(d / "started_at", "?")
     ended = _read(d / "ended_at", "-")
     exit_code = _read(d / "exit_code", "-")
     interactive = _read(d / "interactive", "0")
-    try:
-        with (d / "log").open("rb") as f:
-            lines = sum(1 for _ in f)
-    except FileNotFoundError:
-        lines = 0
     print(
         f"name={name} status={status} pid={pid} exit={exit_code} "
         f"started={started} ended={ended} lines={lines} interactive={interactive}"
@@ -151,11 +254,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
-    d = _require_run(args.name)
+    log = _require_log(args.name)
     n = max(1, args.n)
-    log = d / "log"
-    if not log.exists():
-        return 0
     # Read tail-n efficiently for large logs.
     with log.open("rb") as f:
         f.seek(0, os.SEEK_END)
@@ -178,10 +278,8 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 
 def cmd_tail(args: argparse.Namespace) -> int:
-    d = _require_run(args.name)
-    log = d / "log"
-    log.touch(exist_ok=True)
-    pid_raw = _read(d / "pid")
+    log = _require_log(args.name)
+    pid_raw = _read(_state_dir(args.name) / "pid")
     try:
         pid = int(pid_raw) if pid_raw else None
     except ValueError:
@@ -258,16 +356,16 @@ def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 1
     return "\n".join(deduped) + "\n"
 
 
-def _echo_loop(run_dir: "Path", interval: float) -> None:
-    """Periodically render run_dir/log into run_dir/log.clean.
+def _echo_loop(log_dir: "Path", interval: float) -> None:
+    """Periodically render log_dir/log into log_dir/log.clean.
 
     Runs in a detached child for the lifetime of the agent. The parent's
     signal handler kills us on shutdown so we don't outlive the run. We
     only re-render when the raw log's mtime has changed, so a quiet run
     doesn't burn CPU.
     """
-    log = run_dir / "log"
-    clean = run_dir / "log.clean"
+    log = log_dir / "log"
+    clean = log_dir / "log.clean"
     last_mtime = -1.0
     # Soft cap: if pyte isn't installed, write a friendly stub and exit.
     try:
@@ -300,10 +398,7 @@ def _echo_loop(run_dir: "Path", interval: float) -> None:
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
-    d = _require_run(args.name)
-    log = d / "log"
-    if not log.is_file():
-        sys.exit(f"agent-run: no log file for '{args.name}' at {log}")
+    log = _require_log(args.name)
     raw = log.read_bytes()
     rendered = _render_log(
         raw,
@@ -326,7 +421,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_steer(args: argparse.Namespace) -> int:
-    d = _require_run(args.name)
+    d = _require_state(args.name)
     if _read(d / "interactive") != "1":
         sys.exit(
             f"agent-run: '{args.name}' is not interactive. "
@@ -398,7 +493,7 @@ def _signal_by_name(name: str) -> int:
 
 
 def cmd_kill(args: argparse.Namespace) -> int:
-    d = _require_run(args.name)
+    d = _require_state(args.name)
     try:
         sig = _signal_by_name(args.signal)
     except AttributeError:
@@ -461,7 +556,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
         sys.exit(f"agent-run: prompt file not found: {prompt_file}")
     echo: bool = bool(getattr(args, "echo", False))
     echo_interval: float = float(getattr(args, "echo_interval", 2.0))
-    d = _run_dir(name)
+    _prune_old_logs()
+    d = _state_dir(name)
+    log_d = _log_dir(name)
     # Reject if a previous run with the same name is still active.
     if d.is_dir():
         old_status = _read(d / "status")
@@ -476,19 +573,28 @@ def cmd_launch(args: argparse.Namespace) -> int:
                     )
             except ValueError:
                 pass
-        import shutil
         shutil.rmtree(d)
+    if log_d.is_dir():
+        shutil.rmtree(log_d)
     d.mkdir(parents=True, exist_ok=True)
+    log_d.mkdir(parents=True, exist_ok=True)
 
     _write(d / "command", _pretty_command(argv) + "\n")
     _write(d / "argv", json.dumps(argv))
     _write(d / "started_at", _now_iso() + "\n")
     _write(d / "status", "running\n")
     _write(d / "interactive", "1\n" if args.interactive else "0\n")
-    (d / "log").touch()
+    (log_d / "log").touch()
     if prompt_file:
-        # Snapshot the prompt-file path so introspection shows what was fed in.
+        # Snapshot the prompt-file path so introspection shows what was fed in,
+        # and copy the content into the persistent log dir for post-mortem
+        # context (done synchronously here, before the fork, so a crash can't
+        # lose it).
         _write(d / "prompt_file", prompt_file + "\n")
+        try:
+            shutil.copyfile(prompt_file, log_d / "prompt")
+        except OSError:
+            pass
     if echo:
         _write(d / "echo", f"{echo_interval}\n")
 
@@ -520,7 +626,8 @@ def cmd_launch(args: argparse.Namespace) -> int:
         print(f"agent-run: started '{name}' (pid {bg_pid})")
         if args.interactive:
             print(f"agent-run: interactive — steer with: agent-run steer {name} '<message>'")
-        print(f"agent-run: run_dir={d}")
+        print(f"agent-run: state_dir={d}")
+        print(f"agent-run: log_dir={log_d}")
         print(f"agent-run: poll:   agent-run status {name}")
         print(f"agent-run: logs:   agent-run tail {name}")
         return 0
@@ -534,12 +641,13 @@ def cmd_launch(args: argparse.Namespace) -> int:
         os._exit(0)
 
     # Grandchild: actually run the agent.
-    _runner(d, argv, args.interactive, w_ack, prompt_file, echo, echo_interval)
+    _runner(d, log_d, argv, args.interactive, w_ack, prompt_file, echo, echo_interval)
     return 0  # never reached
 
 
 def _runner(
-    run_dir: Path,
+    state_dir: Path,
+    log_dir: Path,
     argv: Sequence[str],
     interactive: bool,
     ready_fd: int,
@@ -553,9 +661,9 @@ def _runner(
     or forks a PTY child and shuttles FIFO <-> PTY master <-> log (interactive).
     """
     my_pid = os.getpid()
-    _write(run_dir / "pid", f"{my_pid}\n")
+    _write(state_dir / "pid", f"{my_pid}\n")
     # After setsid(), pid == pgid (we're the session & group leader).
-    _write(run_dir / "pgid", f"{os.getpgid(my_pid)}\n")
+    _write(state_dir / "pgid", f"{os.getpgid(my_pid)}\n")
 
     # Signal parent we're ready so it can print the launch banner.
     try:
@@ -572,18 +680,18 @@ def _runner(
     if devnull > 2:
         os.close(devnull)
 
-    log_fd = os.open(str(run_dir / "log"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    log_fd = os.open(str(log_dir / "log"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
 
     def _finalize(code: int) -> None:
-        if not (run_dir / "exit_code").exists():
-            _write(run_dir / "exit_code", f"{code}\n")
-            _write(run_dir / "ended_at", _now_iso() + "\n")
-            _write(run_dir / "status", "done\n" if code == 0 else "failed\n")
+        if not (state_dir / "exit_code").exists():
+            _write(state_dir / "exit_code", f"{code}\n")
+            _write(state_dir / "ended_at", _now_iso() + "\n")
+            _write(state_dir / "status", "done\n" if code == 0 else "failed\n")
 
     def _on_signal(signum: int, _frame) -> None:
         # Propagate to children, then finalize and exit.
         for aux in ("pty_pid", "keeper_pid", "echo_pid"):
-            raw = _read(run_dir / aux)
+            raw = _read(state_dir / aux)
             if raw:
                 try:
                     os.kill(int(raw), signal.SIGTERM)
@@ -603,16 +711,16 @@ def _runner(
         echo_pid = os.fork()
         if echo_pid == 0:
             try:
-                _echo_loop(run_dir, echo_interval)
+                _echo_loop(log_dir, echo_interval)
             finally:
                 os._exit(0)
-        _write(run_dir / "echo_pid", f"{echo_pid}\n")
+        _write(state_dir / "echo_pid", f"{echo_pid}\n")
 
     try:
         if interactive:
-            exit_code = _run_interactive(run_dir, argv, log_fd, prompt_file)
+            exit_code = _run_interactive(state_dir, argv, log_fd, prompt_file)
         else:
-            exit_code = _run_oneshot(run_dir, argv, log_fd, prompt_file)
+            exit_code = _run_oneshot(state_dir, argv, log_fd, prompt_file)
     except Exception as exc:  # noqa: BLE001
         try:
             os.write(log_fd, f"\nagent-run: runner crashed: {exc!r}\n".encode())
@@ -625,7 +733,7 @@ def _runner(
 
 
 def _run_oneshot(
-    run_dir: Path,
+    state_dir: Path,
     argv: Sequence[str],
     log_fd: int,
     prompt_file: Optional[str] = None,
@@ -661,12 +769,12 @@ def _run_oneshot(
 
 
 def _run_interactive(
-    run_dir: Path,
+    state_dir: Path,
     argv: Sequence[str],
     log_fd: int,
     prompt_file: Optional[str] = None,
 ) -> int:
-    fifo_path = run_dir / "stdin"
+    fifo_path = state_dir / "stdin"
 
     # Persistent keeper process: holds the FIFO open for writing so the reader
     # (the PTY runner) never sees EOF between steers. We fork a dedicated
@@ -702,7 +810,7 @@ def _run_interactive(
     except OSError:
         pass
     os.close(keeper_r)
-    _write(run_dir / "keeper_pid", f"{keeper_pid}\n")
+    _write(state_dir / "keeper_pid", f"{keeper_pid}\n")
 
     # Fork + PTY for the agent.
     pty_pid, master_fd = pty.fork()
@@ -713,7 +821,7 @@ def _run_interactive(
         except OSError as exc:
             sys.stderr.write(f"agent-run: exec failed: {exc}\n")
             os._exit(127)
-    _write(run_dir / "pty_pid", f"{pty_pid}\n")
+    _write(state_dir / "pty_pid", f"{pty_pid}\n")
 
     # If a prompt file was provided, fork a helper that waits for the TUI to
     # finish initializing (so the PTY is in raw mode and CR -> Enter), then
