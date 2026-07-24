@@ -157,3 +157,69 @@ class TestRenderLogSizing:
         assert out.count("abc") >= 1  # dedup may collapse to one
         # No truncation: every emitted 'abc' is intact.
         assert "ab\n" not in out
+
+
+# ---------------------------------------------------------------------------
+# RecursionError hardening — pyte's coroutine-based FSM can recurse past the
+# interpreter's limit on certain pathological ANSI/Ink redraw patterns (this
+# crashed 101/212 recent agent-run sessions in production). _render_log must
+# degrade to a plain-text ANSI-stripped rendering instead of propagating the
+# crash — the clean transcript is a convenience artifact, never a run-ending
+# hazard. We can't reliably reproduce the exact pyte-recursing byte pattern
+# in a portable unit test, so we simulate the failure at the seam
+# (ByteStream.feed) and assert the fallback kicks in and returns a string.
+# ---------------------------------------------------------------------------
+
+class TestRenderLogRecursionHardening:
+    def test_recursion_error_falls_back_to_plain_text(self, monkeypatch):
+        import pyte
+
+        def _boom(self, data):
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(pyte.ByteStream, "feed", _boom)
+        raw = b"\x1b[1;31mHELLO\x1b[0m world\r\n"
+        out = _render_log(raw)
+        assert isinstance(out, str)
+        # Fallback still strips the escape codes and keeps the visible text.
+        assert "HELLO world" in out
+        assert "\x1b" not in out
+
+    def test_other_pyte_exceptions_also_fall_back(self, monkeypatch):
+        """Not just RecursionError — any pyte-internal failure must degrade
+        gracefully rather than crash the run."""
+        import pyte
+
+        def _boom(self, data):
+            raise ValueError("simulated pyte internal failure")
+
+        monkeypatch.setattr(pyte.ByteStream, "feed", _boom)
+        raw = b"plain text, no escapes\r\n"
+        out = _render_log(raw)
+        assert "plain text, no escapes" in out
+
+    def test_fallback_dedupes_and_terminates_with_newline(self, monkeypatch):
+        import pyte
+
+        def _boom(self, data):
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(pyte.ByteStream, "feed", _boom)
+        raw = (b"loading\r\n" * 6) + b"done\r\n"
+        out = _render_log(raw)
+        assert out.endswith("\n")
+        assert out.count("loading") < 6
+        assert "done" in out
+
+    def test_deeply_nested_pathological_escape_blob_does_not_raise(self):
+        """A known pathological pattern: thousands of chained cursor-motion
+        and combining-character escape sequences with no plain-text runs in
+        between, modeling the kind of Ink redraw storm that triggered the
+        production RecursionErrors. Whether or not this specific blob
+        actually recurses pyte's FSM on the installed pyte version, the
+        contract holds either way: _render_log must return a string, never
+        raise."""
+        blob = (b"\x1b[1C\x1b[1D\x1b[s\x1b[u" * 50_000) + b"survived\r\n"
+        out = _render_log(blob)
+        assert isinstance(out, str)
+        assert "survived" in out

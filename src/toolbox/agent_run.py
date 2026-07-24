@@ -66,11 +66,13 @@ import fcntl
 import json
 import os
 import pty
+import re
 import select
 import shlex
 import shutil
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -314,6 +316,80 @@ def cmd_tail(args: argparse.Namespace) -> int:
 # clean (render PTY-captured logs into readable transcripts)
 # ---------------------------------------------------------------------------
 
+# Fallback ANSI stripper used when pyte itself can't safely render a log
+# (e.g. a RecursionError from a pathological escape-sequence pattern). Not
+# as faithful as a real VT100 replay — no cursor-motion collapsing — but it
+# never crashes, which is the point: the clean transcript is a convenience
+# artifact and must never take the run down with it.
+_OSC_RE = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_CSI_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]")
+_ESC_RE = re.compile(rb"\x1b.", re.DOTALL)
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Feeding pyte's coroutine-based FSM a pathological escape-sequence pattern
+# can recurse past this many frames; give it plenty of headroom (restored
+# immediately after) rather than tripping Python's conservative default.
+_PYTE_RECURSION_LIMIT = 10000
+# The C stack backing that higher Python recursion limit needs room too —
+# run the feed in a worker thread with a generous stack so the process
+# hits Python's RecursionError before the OS ever SIGSEGVs the thread.
+_PYTE_THREAD_STACK_SIZE = 64 * 1024 * 1024
+
+
+def _strip_ansi_fallback(raw: bytes) -> str:
+    """Best-effort plain-text rendering: strip ANSI/OSC escape sequences
+    with regexes instead of replaying them through a terminal emulator.
+    Used when the pyte-based renderer fails outright."""
+    text = _OSC_RE.sub(b"", raw)
+    text = _CSI_RE.sub(b"", text)
+    text = _ESC_RE.sub(b"", text)
+    decoded = text.decode("utf-8", errors="replace")
+    decoded = decoded.replace("\r\n", "\n").replace("\r", "\n")
+    decoded = _CTRL_RE.sub("", decoded)
+
+    deduped: List[str] = []
+    for line in (ln.rstrip() for ln in decoded.split("\n")):
+        if not deduped or deduped[-1] != line:
+            deduped.append(line)
+    while deduped and not deduped[-1]:
+        deduped.pop()
+    return "\n".join(deduped) + "\n"
+
+
+def _feed_pyte(stream, raw: bytes) -> None:
+    """Feed `raw` into a pyte ByteStream with a raised recursion limit and
+    a worker thread sized for it, so pathological escape sequences hit a
+    clean RecursionError instead of corrupting/crashing the interpreter."""
+    error: List[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            stream.feed(raw)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            error.append(exc)
+
+    old_limit = sys.getrecursionlimit()
+    old_stack_size = threading.stack_size()
+    sys.setrecursionlimit(max(old_limit, _PYTE_RECURSION_LIMIT))
+    try:
+        threading.stack_size(_PYTE_THREAD_STACK_SIZE)
+    except (ValueError, RuntimeError):
+        pass  # platform doesn't support a custom stack size — best effort
+    try:
+        t = threading.Thread(target=_worker)
+        t.start()
+        t.join()
+    finally:
+        sys.setrecursionlimit(old_limit)
+        try:
+            threading.stack_size(old_stack_size)
+        except (ValueError, RuntimeError):
+            pass
+
+    if error:
+        raise error[0]
+
+
 def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 100000) -> str:
     """Render a raw PTY-captured log (with ANSI/Ink redraw artifacts) into a
     plain-text transcript by replaying the byte stream through a VT100
@@ -322,7 +398,11 @@ def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 1
 
     Pyte is loaded lazily so the rest of agent-run keeps working even if the
     extra is not installed (and so we get a clear error message when it is
-    really needed).
+    really needed). If pyte itself fails to render (e.g. a RecursionError
+    triggered by a pathological escape-sequence pattern), this degrades to
+    a best-effort ANSI-stripped plain-text render rather than crashing —
+    the clean transcript is a convenience artifact and must never take the
+    run down with it.
     """
     try:
         import pyte  # type: ignore
@@ -334,7 +414,10 @@ def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 1
 
     screen = pyte.HistoryScreen(width, height, history=history, ratio=0.5)
     stream = pyte.ByteStream(screen)
-    stream.feed(raw)
+    try:
+        _feed_pyte(stream, raw)
+    except Exception:  # noqa: BLE001 - RecursionError included; never let clean/--echo crash the run
+        return _strip_ansi_fallback(raw)
 
     rows: List[str] = []
     # Past history rows that have scrolled off the top.
@@ -645,6 +728,59 @@ def cmd_launch(args: argparse.Namespace) -> int:
     return 0  # never reached
 
 
+def _teardown_children(state_dir: Path, grace: float = 2.0) -> None:
+    """SIGTERM (then SIGKILL after `grace` seconds) every child pid this
+    runner recorded (pty_pid / keeper_pid / echo_pid), reaping each one.
+
+    Called from both the runner's signal handler and its crash `except` so
+    a hard crash (e.g. an unhandled exception mid-render) can never leave
+    the launched agent — or the keeper/echo helpers — orphaned. All three
+    pids are always direct children of this process (forked or
+    pty.fork()'d in `_runner`/`_run_interactive`), so waitpid is valid here.
+    """
+    pids = []
+    for aux in ("pty_pid", "keeper_pid", "echo_pid"):
+        raw = _read(state_dir / aux)
+        if not raw:
+            continue
+        try:
+            pids.append(int(raw))
+        except ValueError:
+            pass
+    if not pids:
+        return
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    remaining = set(pids)
+    deadline = time.time() + grace
+    while remaining and time.time() < deadline:
+        for pid in list(remaining):
+            try:
+                wpid, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                remaining.discard(pid)
+                continue
+            if wpid == pid:
+                remaining.discard(pid)
+        if remaining:
+            time.sleep(0.1)
+
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+
 def _runner(
     state_dir: Path,
     log_dir: Path,
@@ -690,13 +826,7 @@ def _runner(
 
     def _on_signal(signum: int, _frame) -> None:
         # Propagate to children, then finalize and exit.
-        for aux in ("pty_pid", "keeper_pid", "echo_pid"):
-            raw = _read(state_dir / aux)
-            if raw:
-                try:
-                    os.kill(int(raw), signal.SIGTERM)
-                except (ValueError, ProcessLookupError):
-                    pass
+        _teardown_children(state_dir)
         _finalize(128 + signum)
         os._exit(128 + signum)
 
@@ -726,6 +856,11 @@ def _runner(
             os.write(log_fd, f"\nagent-run: runner crashed: {exc!r}\n".encode())
         except OSError:
             pass
+        # A crash mid-run may have skipped the normal cleanup path (e.g. an
+        # exception inside _run_interactive's select loop, before it reaches
+        # its own "kill keeper_pid" tail), leaving the launched agent (and
+        # keeper/echo helpers) orphaned. Never exit without reaping them.
+        _teardown_children(state_dir)
         exit_code = 1
 
     _finalize(exit_code)
