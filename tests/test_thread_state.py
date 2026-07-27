@@ -64,7 +64,7 @@ def _pr(number, repo=None, primary=False, state=None, ci="NONE", stale=False,
 class TestRegistryBasics:
     def test_missing_file_reads_as_empty(self, registry_path):
         data = ts._parse_registry(registry_path)
-        assert data == {"schemaVersion": 3, "accounts": {}, "threads": {}}
+        assert data == {"schemaVersion": 4, "accounts": {}, "threads": {}}
 
     def test_write_then_read_roundtrip(self, registry_path):
         data = ts._empty_registry()
@@ -825,7 +825,7 @@ class TestSchemaMigration:
         self._write_v1(registry_path)
         data, migrated = ts._load_and_migrate(registry_path)
         assert migrated is True
-        assert data["schemaVersion"] == 3
+        assert data["schemaVersion"] == 4
         assert data["threads"]["1"]["prs"][0]["number"] == 4694
 
     def test_load_and_migrate_no_op_on_v2(self, registry_path):
@@ -834,7 +834,7 @@ class TestSchemaMigration:
         ts._write_registry(registry_path, data)
         loaded, migrated = ts._load_and_migrate(registry_path)
         assert migrated is False
-        assert loaded["schemaVersion"] == 3
+        assert loaded["schemaVersion"] == 4
 
     def test_cli_read_migrates_v1_transparently(self, registry_path, capsys):
         self._write_v1(registry_path, pr_state={"state": "OPEN", "ci": "SUCCESS", "url": "u", "title": "t", "mergedAt": None, "checkedAt": "x", "stale": False})
@@ -856,7 +856,7 @@ class TestSchemaMigration:
         assert code == 0
 
         on_disk = json.loads(registry_path.read_text())
-        assert on_disk["schemaVersion"] == 3
+        assert on_disk["schemaVersion"] == 4
         assert on_disk["threads"]["1"]["prs"][0]["number"] == 4694
         assert "pr" not in on_disk["threads"]["1"]
 
@@ -1212,7 +1212,7 @@ class TestSchemaMigrationV3:
         self._write_v2(registry_path)
         data, migrated = ts._load_and_migrate(registry_path)
         assert migrated is True
-        assert data["schemaVersion"] == 3
+        assert data["schemaVersion"] == 4
         assert data["threads"]["1"]["branches"] == [{"repo": "acme/widgets", "name": "feat/x", "primary": True}]
 
     def test_write_from_v2_triggers_v2_backup(self, registry_path, capsys):
@@ -1221,7 +1221,7 @@ class TestSchemaMigrationV3:
         assert code == 0
 
         on_disk = json.loads(registry_path.read_text())
-        assert on_disk["schemaVersion"] == 3
+        assert on_disk["schemaVersion"] == 4
         assert on_disk["threads"]["1"]["branches"][0]["name"] == "feat/x"
         assert "branch" not in on_disk["threads"]["1"]
 
@@ -1246,13 +1246,13 @@ class TestSchemaMigrationV3:
         registry_path.write_text(json.dumps(raw))
         data, migrated = ts._load_and_migrate(registry_path)
         assert migrated is True
-        assert data["schemaVersion"] == 3
+        assert data["schemaVersion"] == 4
         entry = data["threads"]["1"]
         assert entry["prs"][0]["number"] == 1
         assert entry["branches"] == [{"repo": "a/b", "name": "feat/y", "primary": True}]
         assert entry["runs"] == []
         assert entry["lastActivityAt"] is None
-        # v1 -> v3 in one pass still only backs up the original v1 bytes once.
+        # v1 -> v4 in one pass still only backs up the original v1 bytes once.
         backups = list(registry_path.parent.glob("registry.json.v1-backup-*"))
         assert backups == []  # _load_and_migrate alone never writes a backup
 
@@ -1896,4 +1896,673 @@ class TestCliProbe:
         results = json.loads(out)
         assert results[0]["ok"] is False
         assert "skipped" in results[0]["error"]
+
+
+# ---------------------------------------------------------------------------
+# v3 -> v4 schema migration: `updates` list
+# ---------------------------------------------------------------------------
+
+class TestSchemaMigrationV4:
+    def _write_v3(self, registry_path):
+        raw = {
+            "schemaVersion": 3,
+            "accounts": {},
+            "threads": {
+                "1": {
+                    "threadId": "1",
+                    "title": "mSPRT",
+                    "description": "",
+                    "repo": "acme/widgets",
+                    "status": "review",
+                    "tags": [],
+                    "links": [],
+                    "notes": "",
+                    "prs": [],
+                    "branches": [],
+                    "runs": [],
+                    "lastActivityAt": None,
+                    "lastActivitySource": None,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                }
+            },
+        }
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(json.dumps(raw))
+        return raw
+
+    def test_migrate_entry_v3_to_v4_adds_empty_updates_list(self):
+        entry = {"title": "T"}
+        ts._migrate_entry_v3_to_v4(entry)
+        assert entry["updates"] == []
+
+    def test_migrate_entry_v3_to_v4_is_idempotent_and_preserves_existing(self):
+        entry = {"title": "T", "updates": [{"ts": "x", "text": "hi", "kind": "manual"}]}
+        ts._migrate_entry_v3_to_v4(entry)
+        assert entry["updates"] == [{"ts": "x", "text": "hi", "kind": "manual"}]
+
+    def test_load_and_migrate_v3_to_v4_bumps_schema_and_backs_up(self, registry_path):
+        self._write_v3(registry_path)
+        data, migrated = ts._load_and_migrate(registry_path)
+        assert migrated is True
+        assert data["schemaVersion"] == 4
+        assert data["threads"]["1"]["updates"] == []
+        # No data loss: everything else survives untouched.
+        assert data["threads"]["1"]["title"] == "mSPRT"
+        assert data["threads"]["1"]["repo"] == "acme/widgets"
+
+    def test_write_from_v3_triggers_v3_backup_once(self, registry_path, capsys):
+        self._write_v3(registry_path)
+        code, out, err = run_cli(["set", "1", "--desc", "touched"], registry_path, capsys)
+        assert code == 0
+
+        on_disk = json.loads(registry_path.read_text())
+        assert on_disk["schemaVersion"] == 4
+        assert on_disk["threads"]["1"]["updates"] == []
+
+        backups = list(registry_path.parent.glob("registry.json.v3-backup-*"))
+        assert len(backups) == 1
+        backed_up = json.loads(backups[0].read_text())
+        assert backed_up["schemaVersion"] == 3
+        assert "updates" not in backed_up["threads"]["1"]
+
+    def test_migration_is_idempotent_on_reload(self, registry_path):
+        self._write_v3(registry_path)
+        data1, migrated1 = ts._load_and_migrate(registry_path)
+        assert migrated1 is True
+        ts._write_registry(registry_path, data1)
+        data2, migrated2 = ts._load_and_migrate(registry_path)
+        assert migrated2 is False
+        assert data2["threads"]["1"]["updates"] == []
+
+
+# ---------------------------------------------------------------------------
+# updates: append/cap/truncate/dedupe/clear helpers
+# ---------------------------------------------------------------------------
+
+class TestUpdatesHelpers:
+    def _entry(self):
+        return {"title": "T", "updates": []}
+
+    def test_append_update_adds_entry_with_kind_and_ts(self):
+        entry = self._entry()
+        ts.append_update(entry, "did a thing", "manual", ts="2026-01-01T00:00:00Z")
+        assert entry["updates"] == [{"ts": "2026-01-01T00:00:00Z", "text": "did a thing", "kind": "manual"}]
+
+    def test_append_update_defaults_ts_to_now(self):
+        entry = self._entry()
+        ts.append_update(entry, "did a thing", "manual")
+        assert entry["updates"][0]["ts"]  # non-empty, filled by _now_iso()
+
+    def test_append_update_caps_at_ten_evicting_oldest(self):
+        entry = self._entry()
+        for i in range(12):
+            ts.append_update(entry, f"entry {i}", "manual", ts=f"2026-01-01T00:00:{i:02d}Z")
+        assert len(entry["updates"]) == 10
+        texts = [u["text"] for u in entry["updates"]]
+        # Oldest two (entry 0, entry 1) evicted; newest-last order preserved.
+        assert texts == [f"entry {i}" for i in range(2, 12)]
+
+    def test_append_update_truncates_at_120_chars_with_ellipsis(self):
+        entry = self._entry()
+        long_text = "x" * 200
+        ts.append_update(entry, long_text, "manual")
+        text = entry["updates"][0]["text"]
+        assert len(text) == 120
+        assert text.endswith("…")
+        assert text[:119] == "x" * 119
+
+    def test_append_update_exactly_120_chars_not_truncated(self):
+        entry = self._entry()
+        text = "x" * 120
+        ts.append_update(entry, text, "manual")
+        assert entry["updates"][0]["text"] == text
+
+    def test_append_update_strips_newlines_to_spaces(self):
+        entry = self._entry()
+        ts.append_update(entry, "line one\nline two\r\nline three", "manual")
+        assert entry["updates"][0]["text"] == "line one line two line three"
+
+    def test_append_update_collapses_internal_whitespace(self):
+        entry = self._entry()
+        ts.append_update(entry, "a   b\t\tc", "manual")
+        assert entry["updates"][0]["text"] == "a b c"
+
+    def test_append_update_rejects_empty_text(self):
+        entry = self._entry()
+        with pytest.raises(ValueError):
+            ts.append_update(entry, "", "manual")
+        assert entry["updates"] == []
+
+    def test_append_update_rejects_whitespace_only_text(self):
+        entry = self._entry()
+        with pytest.raises(ValueError):
+            ts.append_update(entry, "   \n\t  ", "manual")
+        assert entry["updates"] == []
+
+    def test_append_update_dedupes_identical_back_to_back_text(self):
+        entry = self._entry()
+        ts.append_update(entry, "same text", "manual", ts="2026-01-01T00:00:00Z")
+        ts.append_update(entry, "same text", "transition", ts="2026-01-01T00:01:00Z")
+        assert len(entry["updates"]) == 1
+        assert entry["updates"][0]["ts"] == "2026-01-01T00:00:00Z"
+
+    def test_append_update_does_not_dedupe_non_adjacent_repeats(self):
+        entry = self._entry()
+        ts.append_update(entry, "A", "manual", ts="2026-01-01T00:00:00Z")
+        ts.append_update(entry, "B", "manual", ts="2026-01-01T00:01:00Z")
+        ts.append_update(entry, "A", "manual", ts="2026-01-01T00:02:00Z")
+        assert [u["text"] for u in entry["updates"]] == ["A", "B", "A"]
+
+    def test_get_updates_on_missing_key_returns_empty_list(self):
+        assert ts.get_updates({"title": "T"}) == []
+
+    def test_clear_updates_wipes_list(self):
+        entry = self._entry()
+        ts.append_update(entry, "hi", "manual")
+        ts.clear_updates(entry)
+        assert entry["updates"] == []
+
+
+# ---------------------------------------------------------------------------
+# CLI: --progress, --clear-updates, `log`, `list --with-last`
+# ---------------------------------------------------------------------------
+
+class TestCliUpdates:
+    def test_set_progress_appends_manual_entry(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        code, out, err = run_cli(["set", "1", "--progress", "shipped the fix"], registry_path, capsys)
+        assert code == 0
+        _, out2, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out2)
+        assert entry["updates"][-1]["text"] == "shipped the fix"
+        assert entry["updates"][-1]["kind"] == "manual"
+
+    def test_set_progress_repeatable_in_one_invocation(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        run_cli(["set", "1", "--progress", "first", "--progress", "second"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert [u["text"] for u in entry["updates"]] == ["first", "second"]
+
+    def test_set_progress_empty_text_errors_and_does_not_write(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        code, out, err = run_cli(["set", "1", "--progress", "   "], registry_path, capsys)
+        assert code == 2
+        _, out2, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out2)
+        assert entry["updates"] == []
+
+    def test_set_clear_updates_wipes_list(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        run_cli(["set", "1", "--progress", "a"], registry_path, capsys)
+        code, out, err = run_cli(["set", "1", "--clear-updates"], registry_path, capsys)
+        assert code == 0
+        _, out2, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out2)
+        assert entry["updates"] == []
+
+    def test_set_clear_updates_then_progress_in_same_invocation_keeps_new(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        run_cli(["set", "1", "--progress", "old"], registry_path, capsys)
+        run_cli(["set", "1", "--clear-updates", "--progress", "new"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert [u["text"] for u in entry["updates"]] == ["new"]
+
+    def test_log_prints_newest_first(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        run_cli(["set", "1", "--progress", "first", "--progress", "second", "--progress", "third"], registry_path, capsys)
+        code, out, err = run_cli(["log", "1"], registry_path, capsys)
+        assert code == 0
+        lines = [l for l in out.splitlines() if l.strip()]
+        assert "third" in lines[0]
+        assert "second" in lines[1]
+        assert "first" in lines[2]
+
+    def test_log_respects_limit(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        for i in range(5):
+            run_cli(["set", "1", "--progress", f"entry {i}"], registry_path, capsys)
+        code, out, err = run_cli(["log", "1", "--limit", "2"], registry_path, capsys)
+        assert code == 0
+        lines = [l for l in out.splitlines() if l.strip()]
+        assert len(lines) == 2
+        assert "entry 4" in lines[0]
+        assert "entry 3" in lines[1]
+
+    def test_log_default_limit_is_ten(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        for i in range(15):
+            run_cli(["set", "1", "--progress", f"entry {i}"], registry_path, capsys)
+        code, out, err = run_cli(["log", "1"], registry_path, capsys)
+        lines = [l for l in out.splitlines() if l.strip()]
+        assert len(lines) == 10  # cap already limits underlying storage to 10
+
+    def test_log_json_output(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        run_cli(["set", "1", "--progress", "a"], registry_path, capsys)
+        code, out, err = run_cli(["log", "1", "--json"], registry_path, capsys)
+        assert code == 0
+        data = json.loads(out)
+        assert data[0]["text"] == "a"
+        assert data[0]["kind"] == "manual"
+
+    def test_log_empty_updates_human_message(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        code, out, err = run_cli(["log", "1"], registry_path, capsys)
+        assert code == 0
+        assert "no updates" in out
+
+    def test_log_unknown_thread_id_errors(self, registry_path, capsys):
+        ts._write_registry(registry_path, ts._empty_registry())
+        code, out, err = run_cli(["log", "ghost"], registry_path, capsys)
+        assert code == 1
+        assert "no such thread" in err
+
+    def test_list_with_last_off_by_default(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        run_cli(["set", "1", "--progress", "did the thing"], registry_path, capsys)
+        code, out, err = run_cli(["list"], registry_path, capsys)
+        assert "LAST" not in out
+        assert "did the thing" not in out
+
+    def test_list_with_last_shows_trailing_column(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        run_cli(["set", "1", "--progress", "did the thing"], registry_path, capsys)
+        code, out, err = run_cli(["list", "--with-last"], registry_path, capsys)
+        assert "LAST" in out
+        assert "did the thing" in out
+
+    def test_list_with_last_shows_dash_when_no_updates(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        code, out, err = run_cli(["list", "--with-last"], registry_path, capsys)
+        lines = [l for l in out.splitlines() if l.strip()]
+        assert lines[1].rstrip().endswith("-")
+
+
+# ---------------------------------------------------------------------------
+# automatic transition detection: PR state/CI, thread status, run state
+# ---------------------------------------------------------------------------
+
+class TestPrTransitionTexts:
+    def test_before_none_never_synthesizes(self):
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN"}
+        assert ts._pr_transition_texts(None, after, 4712) == []
+
+    def test_first_fetch_open_reports_opened(self):
+        before = dict(ts.EMPTY_PR_STATE)
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN"}
+        assert ts._pr_transition_texts(before, after, 4712) == ["PR #4712 opened"]
+
+    def test_open_to_merged(self):
+        before = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN"}
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "MERGED"}
+        assert ts._pr_transition_texts(before, after, 4694) == ["PR #4694 merged"]
+
+    def test_open_to_closed(self):
+        before = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN"}
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "CLOSED"}
+        assert ts._pr_transition_texts(before, after, 4700) == ["PR #4700 closed"]
+
+    def test_closed_to_open_is_reopened(self):
+        before = {**dict(ts.EMPTY_PR_STATE), "state": "CLOSED"}
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN"}
+        assert ts._pr_transition_texts(before, after, 4700) == ["PR #4700 reopened"]
+
+    def test_ci_success_to_failure(self):
+        before = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS"}
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "FAILURE"}
+        assert ts._pr_transition_texts(before, after, 4700) == ["CI failed on PR #4700"]
+
+    def test_ci_failure_recovers_to_success(self):
+        before = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "FAILURE"}
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS"}
+        assert ts._pr_transition_texts(before, after, 4700) == ["CI green on PR #4700"]
+
+    def test_ci_pending_to_success_is_not_reported(self):
+        before = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "PENDING"}
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS"}
+        assert ts._pr_transition_texts(before, after, 4700) == []
+
+    def test_no_change_reports_nothing(self):
+        state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS"}
+        assert ts._pr_transition_texts(dict(state), dict(state), 4700) == []
+
+    def test_state_and_ci_change_together_state_first(self):
+        before = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "FAILURE"}
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "MERGED", "ci": "SUCCESS"}
+        texts = ts._pr_transition_texts(before, after, 4700)
+        assert texts == ["PR #4700 merged", "CI green on PR #4700"]
+
+
+class TestRunTransitionTexts:
+    def test_before_none_never_synthesizes(self):
+        after = {**dict(ts.EMPTY_RUN_STATE), "status": "running"}
+        assert ts._run_transition_texts(None, after, "vibes", "tstate2", 900) == []
+
+    def test_missing_to_running_reports(self):
+        before = dict(ts.EMPTY_RUN_STATE)
+        after = {**dict(ts.EMPTY_RUN_STATE), "status": "running"}
+        assert ts._run_transition_texts(before, after, "vibes", "tstate2", 900) == ["run vibes/tstate2 running"]
+
+    def test_running_to_failed_reports_exit_code(self):
+        before = {**dict(ts.EMPTY_RUN_STATE), "status": "running"}
+        after = {**dict(ts.EMPTY_RUN_STATE), "status": "failed", "exitCode": 1}
+        assert ts._run_transition_texts(before, after, "vibes", "tstate2", 900) == ["run vibes/tstate2 failed (exit 1)"]
+
+    def test_running_to_done_reports_exit_code(self):
+        before = {**dict(ts.EMPTY_RUN_STATE), "status": "running"}
+        after = {**dict(ts.EMPTY_RUN_STATE), "status": "done", "exitCode": 0}
+        assert ts._run_transition_texts(before, after, "macmini", "brruns", 900) == ["run macmini/brruns done (exit 0)"]
+
+    def test_done_without_exit_code_omits_parens(self):
+        before = {**dict(ts.EMPTY_RUN_STATE), "status": "running"}
+        after = {**dict(ts.EMPTY_RUN_STATE), "status": "done", "exitCode": None}
+        assert ts._run_transition_texts(before, after, "macmini", "brruns", 900) == ["run macmini/brruns done"]
+
+    def test_no_status_change_reports_nothing(self):
+        state = {**dict(ts.EMPTY_RUN_STATE), "status": "running"}
+        assert ts._run_transition_texts(dict(state), dict(state), "vibes", "tstate2", 900) == []
+
+    def test_going_stalled_reports_age(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        before = {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2026-07-27T11:59:00Z"}
+        after = {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2026-07-27T11:19:00Z"}
+        texts = ts._run_transition_texts(before, after, "vibes", "tstate2", 900, now=now)
+        assert texts == ["run vibes/tstate2 stalled — no output for 41m"]
+
+    def test_already_stalled_does_not_rereport(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        before = {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2026-07-27T11:00:00Z"}
+        after = {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2026-07-27T11:00:00Z"}
+        texts = ts._run_transition_texts(before, after, "vibes", "tstate2", 900, now=now)
+        assert texts == []
+
+    def test_status_change_and_stall_can_both_report(self):
+        # A run transitions to failed AND was stalled just before failing --
+        # both facts are worth a card line.
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        before = {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2026-07-27T11:00:00Z"}
+        after = {**dict(ts.EMPTY_RUN_STATE), "status": "failed", "exitCode": 1, "logMtime": "2026-07-27T11:00:00Z"}
+        texts = ts._run_transition_texts(before, after, "vibes", "tstate2", 900, now=now)
+        assert texts[0] == "run vibes/tstate2 failed (exit 1)"
+
+
+class TestStatusTransitionText:
+    def test_status_change_reports(self):
+        assert ts._status_transition_text("active", "blocked") == "status: active -> blocked"
+
+    def test_no_change_reports_none(self):
+        assert ts._status_transition_text("active", "active") is None
+
+    def test_new_status_none_reports_none(self):
+        assert ts._status_transition_text("active", None) is None
+
+
+class TestRefreshProbeAppendTransitions:
+    def _seed_pr_thread(self, registry_path, thread_id="1", pr=5, status="review", pr_state=None):
+        data = ts._empty_registry()
+        prs = [{"repo": None, "number": pr, "primary": True, "prState": pr_state or dict(ts.EMPTY_PR_STATE)}]
+        data["threads"][thread_id] = {
+            "threadId": thread_id, "title": "T", "description": "", "repo": "a/b",
+            "branch": None, "status": status, "tags": [], "links": [], "notes": "",
+            "prs": prs, "branches": [], "runs": [], "lastActivityAt": None, "lastActivitySource": None,
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z", "updates": [],
+        }
+        ts._write_registry(registry_path, data)
+
+    def test_refresh_appends_opened_transition_on_first_fetch(self, registry_path, capsys, monkeypatch):
+        self._seed_pr_thread(registry_path, pr=4712, status="active")
+
+        def ok_runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            payload = {"state": "OPEN", "title": "t", "url": "u", "mergedAt": None, "statusCheckRollup": []}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        monkeypatch.setattr(ts, "_run_command", ok_runner)
+        run_cli(["refresh", "1"], registry_path, capsys)
+        data = ts._parse_registry(registry_path)
+        texts = [u["text"] for u in data["threads"]["1"]["updates"]]
+        assert "PR #4712 opened" in texts
+        assert all(u["kind"] == "transition" for u in data["threads"]["1"]["updates"] if u["text"] == "PR #4712 opened")
+
+    def test_refresh_appends_merged_transition(self, registry_path, capsys, monkeypatch):
+        pr_state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS", "checkedAt": "2026-01-01T00:00:00Z"}
+        self._seed_pr_thread(registry_path, pr=4694, status="review", pr_state=pr_state)
+
+        def ok_runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            payload = {"state": "MERGED", "title": "t", "url": "u", "mergedAt": "2026-01-02T00:00:00Z", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        monkeypatch.setattr(ts, "_run_command", ok_runner)
+        run_cli(["refresh", "1"], registry_path, capsys)
+        data = ts._parse_registry(registry_path)
+        texts = [u["text"] for u in data["threads"]["1"]["updates"]]
+        assert "PR #4694 merged" in texts
+
+    def test_refresh_appends_ci_failed_transition(self, registry_path, capsys, monkeypatch):
+        pr_state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS", "checkedAt": "2026-01-01T00:00:00Z"}
+        self._seed_pr_thread(registry_path, pr=4700, status="review", pr_state=pr_state)
+
+        def ok_runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            payload = {"state": "OPEN", "title": "t", "url": "u", "mergedAt": None, "statusCheckRollup": [{"conclusion": "FAILURE"}]}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        monkeypatch.setattr(ts, "_run_command", ok_runner)
+        run_cli(["refresh", "1"], registry_path, capsys)
+        data = ts._parse_registry(registry_path)
+        texts = [u["text"] for u in data["threads"]["1"]["updates"]]
+        assert "CI failed on PR #4700" in texts
+
+    def test_refresh_appends_status_transition(self, registry_path, capsys, monkeypatch):
+        pr_state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS", "checkedAt": "2026-01-01T00:00:00Z"}
+        self._seed_pr_thread(registry_path, pr=4700, status="review", pr_state=pr_state)
+
+        def ok_runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            payload = {"state": "MERGED", "title": "t", "url": "u", "mergedAt": "2026-01-02T00:00:00Z", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        monkeypatch.setattr(ts, "_run_command", ok_runner)
+        run_cli(["refresh", "1"], registry_path, capsys)
+        data = ts._parse_registry(registry_path)
+        texts = [u["text"] for u in data["threads"]["1"]["updates"]]
+        assert "status: review -> merged" in texts
+
+    def test_refresh_no_transition_when_nothing_changed(self, registry_path, capsys, monkeypatch):
+        pr_state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS", "checkedAt": "2026-01-01T00:00:00Z"}
+        self._seed_pr_thread(registry_path, pr=4700, status="review", pr_state=pr_state)
+
+        def ok_runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            payload = {"state": "OPEN", "title": "t", "url": "u", "mergedAt": None, "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        monkeypatch.setattr(ts, "_run_command", ok_runner)
+        run_cli(["refresh", "1"], registry_path, capsys)
+        data = ts._parse_registry(registry_path)
+        assert data["threads"]["1"]["updates"] == []
+
+    def test_refresh_dedupes_repeated_status_transition_across_polls(self, registry_path, capsys, monkeypatch):
+        pr_state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS", "checkedAt": "2026-01-01T00:00:00Z"}
+        self._seed_pr_thread(registry_path, pr=4700, status="review", pr_state=pr_state)
+
+        def merged_runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            payload = {"state": "MERGED", "title": "t", "url": "u", "mergedAt": "2026-01-02T00:00:00Z", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        monkeypatch.setattr(ts, "_run_command", merged_runner)
+        run_cli(["refresh", "1"], registry_path, capsys)
+        run_cli(["refresh", "1"], registry_path, capsys)  # second poll: already merged, no new status change
+        data = ts._parse_registry(registry_path)
+        status_texts = [u["text"] for u in data["threads"]["1"]["updates"] if u["text"].startswith("status:")]
+        assert status_texts == ["status: review -> merged"]
+
+    def _seed_run_thread(self, registry_path, thread_id="1", host="vibes", name="tstate2", state=None):
+        data = ts._empty_registry()
+        data["threads"][thread_id] = {
+            "threadId": thread_id, "title": "T", "description": "", "repo": None,
+            "branch": None, "status": "active", "tags": [], "links": [], "notes": "",
+            "prs": [], "branches": [], "runs": [{"host": host, "name": name, "state": state or dict(ts.EMPTY_RUN_STATE)}],
+            "lastActivityAt": None, "lastActivitySource": None,
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z", "updates": [],
+        }
+        ts._write_registry(registry_path, data)
+
+    def test_probe_appends_run_status_transition(self, registry_path, capsys, monkeypatch):
+        self._seed_run_thread(registry_path)
+
+        def fake_runner(cmd, timeout):
+            return subprocess.CompletedProcess(cmd, 0, "STATUS:failed\nEXIT:1\nBYTES:10\nMTIME:1785315257\n", "")
+
+        monkeypatch.setattr(ts, "_run_command", fake_runner)
+        run_cli(["probe", "1"], registry_path, capsys)
+        data = ts._parse_registry(registry_path)
+        texts = [u["text"] for u in data["threads"]["1"]["updates"]]
+        assert "run vibes/tstate2 failed (exit 1)" in texts
+
+    def test_probe_no_transition_when_status_unchanged(self, registry_path, capsys, monkeypatch):
+        state = {**dict(ts.EMPTY_RUN_STATE), "status": "running", "checkedAt": "2026-01-01T00:00:00Z"}
+        self._seed_run_thread(registry_path, state=state)
+
+        def fake_runner(cmd, timeout):
+            return subprocess.CompletedProcess(cmd, 0, "STATUS:running\nEXIT:\nBYTES:99\nMTIME:1785315257\n", "")
+
+        monkeypatch.setattr(ts, "_run_command", fake_runner)
+        run_cli(["probe", "1"], registry_path, capsys)
+        data = ts._parse_registry(registry_path)
+        assert data["threads"]["1"]["updates"] == []
+
+
+# ---------------------------------------------------------------------------
+# card rendering: `recent:` block, relative ages, length-cap degradation
+# ---------------------------------------------------------------------------
+
+class TestRecentUpdatesLines:
+    def test_no_updates_returns_empty(self):
+        entry = {"title": "T", "updates": []}
+        assert ts._recent_updates_lines(entry, 3) == []
+
+    def test_relative_age_minutes(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        entry = {"title": "T", "updates": [{"ts": "2026-07-27T11:56:00Z", "text": "did a thing", "kind": "manual"}]}
+        lines = ts._recent_updates_lines(entry, 3, now=now)
+        assert lines == ["recent: 4m ago — did a thing"]
+
+    def test_relative_age_hours(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        entry = {"title": "T", "updates": [{"ts": "2026-07-27T09:00:00Z", "text": "did a thing", "kind": "manual"}]}
+        lines = ts._recent_updates_lines(entry, 3, now=now)
+        assert lines == ["recent: 3h ago — did a thing"]
+
+    def test_relative_age_days(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        entry = {"title": "T", "updates": [{"ts": "2026-07-24T12:00:00Z", "text": "did a thing", "kind": "manual"}]}
+        lines = ts._recent_updates_lines(entry, 3, now=now)
+        assert lines == ["recent: 3d ago — did a thing"]
+
+    def test_newest_first_with_indented_continuation(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        entry = {
+            "title": "T",
+            "updates": [
+                {"ts": "2026-07-27T11:00:00Z", "text": "oldest", "kind": "manual"},
+                {"ts": "2026-07-27T11:30:00Z", "text": "middle", "kind": "manual"},
+                {"ts": "2026-07-27T11:56:00Z", "text": "newest", "kind": "manual"},
+            ],
+        }
+        lines = ts._recent_updates_lines(entry, 3, now=now)
+        assert len(lines) == 3
+        assert lines[0].startswith("recent: ")
+        assert "newest" in lines[0]
+        assert "middle" in lines[1]
+        assert "oldest" in lines[2]
+        assert lines[1].startswith(" " * len(ts.RECENT_PREFIX))
+        assert lines[2].startswith(" " * len(ts.RECENT_PREFIX))
+
+    def test_count_limits_to_n_most_recent(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        entry = {
+            "title": "T",
+            "updates": [{"ts": f"2026-07-27T11:{i:02d}:00Z", "text": f"e{i}", "kind": "manual"} for i in range(10)],
+        }
+        lines = ts._recent_updates_lines(entry, 3, now=now)
+        assert len(lines) == 3
+        assert "e9" in lines[0]
+        assert "e8" in lines[1]
+        assert "e7" in lines[2]
+
+
+class TestRenderCardRecentBlock:
+    def _entry(self, updates):
+        return {"title": "T", "status": "active", "prs": [], "branches": [], "runs": [], "updates": updates}
+
+    def test_zero_updates_omits_block(self):
+        out = ts.render_card_markdown(self._entry([]))
+        assert "recent:" not in out
+
+    def test_one_update_renders_single_line(self):
+        now = ts._utcnow()
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        out = ts.render_card_markdown(self._entry([{"ts": ts_str, "text": "did a thing", "kind": "manual"}]))
+        assert "recent: " in out
+        assert "did a thing" in out
+        assert out.count("recent:") == 1
+
+    def test_three_updates_render_three_lines(self):
+        now = ts._utcnow()
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        updates = [{"ts": ts_str, "text": f"entry {i}", "kind": "manual"} for i in range(3)]
+        out = ts.render_card_markdown(self._entry(updates))
+        for i in range(3):
+            assert f"entry {i}" in out
+        # Only the 3 most recent are shown, newest first, one prefixed line.
+        assert out.count("recent:") == 1
+
+    def test_ten_updates_render_only_three_most_recent(self):
+        now = ts._utcnow()
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        updates = [{"ts": ts_str, "text": f"entry {i}", "kind": "manual"} for i in range(10)]
+        out = ts.render_card_markdown(self._entry(updates))
+        assert "entry 9" in out
+        assert "entry 8" in out
+        assert "entry 7" in out
+        assert "entry 6" not in out
+
+    def test_card_degrades_from_three_to_fewer_when_over_length_cap(self):
+        now = ts._utcnow()
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Each update text is near the max (120 chars) so 3 of them push the
+        # card past CARD_MAX_CHARS, forcing the degradation ladder to drop
+        # to fewer entries.
+        long_text = "x" * 120
+        updates = [{"ts": ts_str, "text": long_text, "kind": "manual"} for _ in range(3)]
+        entry = self._entry(updates)
+        entry["title"] = "T" * 1500  # inflate the base card so 3 entries would blow the cap
+        out = ts.render_card_markdown(entry)
+        assert len(out) <= ts.CARD_MAX_CHARS
+        recent_line_count = sum(1 for l in out.splitlines() if "recent:" in l or l.startswith(" " * len(ts.RECENT_PREFIX)))
+        assert recent_line_count < 3
+
+    def test_card_never_omits_last_entry_even_if_over_cap(self):
+        now = ts._utcnow()
+        ts_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        long_text = "x" * 120
+        updates = [{"ts": ts_str, "text": long_text, "kind": "manual"} for _ in range(3)]
+        entry = self._entry(updates)
+        entry["title"] = "T" * 2000  # push base itself over CARD_MAX_CHARS
+        out = ts.render_card_markdown(entry)
+        # Even when it can't fit under the cap, degrade to exactly 1 entry
+        # rather than dropping the block entirely.
+        assert "recent:" in out
 

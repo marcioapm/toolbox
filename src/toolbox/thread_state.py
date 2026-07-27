@@ -12,15 +12,20 @@ Registry storage::
     ~/.config/thread-state/registry.json      default path
     $THREAD_STATE_REGISTRY / --registry PATH  overrides
 
-    {"schemaVersion": 3, "accounts": {...}, "threads": {"<threadId>": {...}}}
+    {"schemaVersion": 4, "accounts": {...}, "threads": {"<threadId>": {...}}}
 
 A thread entry carries a `prs` list (one or more PRs, each with its own
 `prState`), a `branches` list (one or more branches, one marked primary), and
 a `runs` list (agent-run tasks tracked on remote hosts, each with its own
 polled `state`). It also carries `lastActivityAt`/`lastActivitySource` — the
 last time something was visibly posted in the thread, either set directly or
-derived from a Discord message-id snowflake. A v1 registry (scalar `pr` +
-top-level `prState`) and a v2 registry (scalar `branch`) are migrated
+derived from a Discord message-id snowflake. It also carries an `updates`
+list — a rolling, capped work-summary log (`{"ts", "text", "kind"}`, newest
+last), appended explicitly via `set --progress` (`kind: "manual"`) or
+automatically by `refresh`/`probe` on a genuine state transition (`kind:
+"transition"`); see `append_update` and `_pr_transition_texts` /
+`_run_transition_texts`. A v1 registry (scalar `pr` + top-level `prState`), a
+v2 registry (scalar `branch`), and a v3 registry (no `updates`) are migrated
 automatically on first load, chaining through to the current version; see
 `_migrate_registry_data`.
 
@@ -42,6 +47,7 @@ Usage::
     thread-state card <threadId> [--format markdown|embed-json]
     thread-state title <threadId>
     thread-state scan <threadId> --file PATH [--apply]
+    thread-state log <threadId> [--limit N]
 
 A PR reference (REF) accepts `4694`, `#4694`, `owner/name#4694`, or a full
 `https://github.com/owner/name/pull/4694` URL. A branch reference accepts a
@@ -136,7 +142,19 @@ PR_REF_RE = re.compile(
 
 THREAD_TITLE_MAX = 100
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+# `updates` list caps: max entries retained (oldest evicted first) and max
+# chars per entry (hard-truncated with an ellipsis, since these render as
+# single dashboard lines, not a log blob).
+UPDATES_MAX_ENTRIES = 10
+UPDATE_TEXT_MAX_CHARS = 120
+
+# How many of the most recent `updates` the card shows, and the degradation
+# ladder (3 -> 2 -> 1) applied when the full card would exceed Discord's
+# practical message-length safety margin.
+CARD_RECENT_UPDATES = 3
+CARD_MAX_CHARS = 1800
 
 EMPTY_PR_STATE = {
     "state": None,
@@ -298,12 +316,18 @@ def _migrate_entry_v2_to_v3(entry: Dict[str, Any]) -> None:
     entry.setdefault("lastActivitySource", None)
 
 
+def _migrate_entry_v3_to_v4(entry: Dict[str, Any]) -> None:
+    """Mutate a single thread entry in place: add the new `updates` list.
+    A no-op if it already has one (idempotent)."""
+    entry.setdefault("updates", [])
+
+
 def _migrate_registry_data(data: Dict[str, Any]) -> bool:
     """Migrate an in-memory registry dict up to the current SCHEMA_VERSION,
-    applying v1->v2 and v2->v3 in order as needed. Idempotent — a no-op once
-    `schemaVersion` is already current. Returns True if any conversion
-    actually happened, so callers that persist to disk know whether to back
-    up the pre-migration file first."""
+    applying v1->v2, v2->v3, and v3->v4 in order as needed. Idempotent — a
+    no-op once `schemaVersion` is already current. Returns True if any
+    conversion actually happened, so callers that persist to disk know
+    whether to back up the pre-migration file first."""
     version = data.get("schemaVersion", 1)
     if version >= SCHEMA_VERSION:
         return False
@@ -315,6 +339,10 @@ def _migrate_registry_data(data: Dict[str, Any]) -> bool:
         for entry in data.get("threads", {}).values():
             _migrate_entry_v2_to_v3(entry)
         data["schemaVersion"] = 3
+    if data["schemaVersion"] < 4:
+        for entry in data.get("threads", {}).values():
+            _migrate_entry_v3_to_v4(entry)
+        data["schemaVersion"] = 4
     return True
 
 
@@ -711,6 +739,123 @@ def remove_run(entry: Dict[str, Any], host: str, name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# updates: rolling work-summary log (append/format/render)
+# ---------------------------------------------------------------------------
+
+def get_updates(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return entry.get("updates") or []
+
+
+def _normalize_update_text(text: str) -> str:
+    """Single dashboard line: strip newlines (replace with spaces), collapse
+    surrounding whitespace, then hard-truncate to UPDATE_TEXT_MAX_CHARS with
+    a trailing ellipsis if cut. Raises ValueError on empty/whitespace-only
+    text."""
+    normalized = " ".join(text.split())
+    if not normalized:
+        raise ValueError("update text must not be empty")
+    if len(normalized) > UPDATE_TEXT_MAX_CHARS:
+        normalized = normalized[: UPDATE_TEXT_MAX_CHARS - 1].rstrip() + "…"
+    return normalized
+
+
+def append_update(entry: Dict[str, Any], text: str, kind: str, ts: Optional[str] = None) -> None:
+    """Append one update entry, deduping against the current most-recent
+    entry (an identical `text` back-to-back is dropped rather than
+    duplicated), then evicting the oldest entries past UPDATES_MAX_ENTRIES.
+    Raises ValueError on empty/whitespace-only text."""
+    normalized = _normalize_update_text(text)
+    updates = entry.setdefault("updates", [])
+    if updates and updates[-1].get("text") == normalized:
+        return
+    updates.append({"ts": ts or _now_iso(), "text": normalized, "kind": kind})
+    if len(updates) > UPDATES_MAX_ENTRIES:
+        del updates[: len(updates) - UPDATES_MAX_ENTRIES]
+
+
+def clear_updates(entry: Dict[str, Any]) -> None:
+    entry["updates"] = []
+
+
+def _pr_transition_texts(before: Optional[Dict[str, Any]], after: Dict[str, Any], number: int) -> List[str]:
+    """Detect real state transitions between a PR's previous and freshly
+    fetched `prState`, in a fixed order (state change first, then CI). A
+    None `before` (no prior prState at all) never synthesizes a transition —
+    there is nothing to compare against. A PR's very first successful fetch
+    (old state None -> OPEN) DOES count as a transition ("opened"), since
+    that is genuinely new information for the card."""
+    if before is None:
+        return []
+    texts = []
+    old_state, new_state = before.get("state"), after.get("state")
+    if new_state != old_state:
+        if new_state == "MERGED":
+            texts.append(f"PR #{number} merged")
+        elif new_state == "CLOSED":
+            texts.append(f"PR #{number} closed")
+        elif new_state == "OPEN" and old_state is None:
+            texts.append(f"PR #{number} opened")
+        elif new_state == "OPEN":
+            texts.append(f"PR #{number} reopened")
+
+    old_ci, new_ci = before.get("ci"), after.get("ci")
+    if new_ci != old_ci:
+        if new_ci == "FAILURE":
+            texts.append(f"CI failed on PR #{number}")
+        elif old_ci == "FAILURE" and new_ci == "SUCCESS":
+            texts.append(f"CI green on PR #{number}")
+    return texts
+
+
+def _run_transition_texts(
+    before: Optional[Dict[str, Any]],
+    after: Dict[str, Any],
+    host: str,
+    name: str,
+    stall_threshold_seconds: float,
+    now: Optional[datetime] = None,
+) -> List[str]:
+    """Detect real state transitions between a run's previous and freshly
+    probed `state`: a status change, or a running run going stalled (log
+    hasn't grown in stall_threshold_seconds). A None `before` (no prior
+    state at all) never synthesizes a transition."""
+    if before is None:
+        return []
+    texts = []
+    old_status, new_status = before.get("status"), after.get("status")
+    if new_status != old_status and new_status is not None:
+        label = f"run {host}/{name}"
+        if new_status == "done":
+            exit_code = after.get("exitCode")
+            texts.append(f"{label} done" + (f" (exit {exit_code})" if exit_code is not None else ""))
+        elif new_status == "failed":
+            exit_code = after.get("exitCode")
+            texts.append(f"{label} failed" + (f" (exit {exit_code})" if exit_code is not None else ""))
+        else:
+            texts.append(f"{label} {new_status}")
+
+    was_stalled = run_is_stalled({"state": before}, stall_threshold_seconds, now=now)
+    is_stalled = run_is_stalled({"state": after}, stall_threshold_seconds, now=now)
+    if is_stalled and not was_stalled:
+        mtime = after.get("logMtime")
+        now = now or _utcnow()
+        age_str = "?"
+        if mtime:
+            try:
+                age_str = _humanize_age_seconds((now - _parse_iso(mtime)).total_seconds())
+            except ValueError:
+                age_str = "?"
+        texts.append(f"run {host}/{name} stalled — no output for {age_str}")
+    return texts
+
+
+def _status_transition_text(old_status: Optional[str], new_status: Optional[str]) -> Optional[str]:
+    if new_status is None or new_status == old_status:
+        return None
+    return f"status: {old_status} -> {new_status}"
+
+
+# ---------------------------------------------------------------------------
 # rendering: icon/color, title, card
 # ---------------------------------------------------------------------------
 
@@ -842,6 +987,29 @@ def _run_line(run: Dict[str, Any], now: Optional[datetime] = None) -> str:
     return line
 
 
+RECENT_PREFIX = "recent: "
+
+
+def _recent_updates_lines(entry: Dict[str, Any], count: int, now: Optional[datetime] = None) -> List[str]:
+    """The `count` most recent `updates`, newest first, each on its own
+    line prefixed with a compact relative age — `recent: 4m ago — text` for
+    the first line, indented to match for the rest. Empty when there are no
+    updates."""
+    updates = list(reversed(get_updates(entry)))[:count]
+    if not updates:
+        return []
+    now = now or _utcnow()
+    lines = []
+    for i, u in enumerate(updates):
+        try:
+            age = _humanize_age_seconds((now - _parse_iso(u["ts"])).total_seconds())
+        except (ValueError, TypeError, KeyError):
+            age = "?"
+        prefix = RECENT_PREFIX if i == 0 else " " * len(RECENT_PREFIX)
+        lines.append(f"{prefix}{age} ago — {u.get('text', '')}")
+    return lines
+
+
 def render_card_markdown(entry: Dict[str, Any]) -> str:
     """The pinned status card message body."""
     icon = _effective_icon(entry)
@@ -875,7 +1043,20 @@ def render_card_markdown(entry: Dict[str, Any]) -> str:
     if entry.get("notes"):
         lines.append(f"notes: {entry['notes']}")
 
-    return "\n".join(lines)
+    base = "\n".join(lines)
+
+    # `recent:` block, newest-first, with a length-cap degradation ladder
+    # (3 -> 2 -> 1 entries) so the card never blows past Discord's practical
+    # message-length safety margin. Omitted entirely when there are no
+    # updates.
+    for count in (CARD_RECENT_UPDATES, 2, 1):
+        recent_lines = _recent_updates_lines(entry, count)
+        if not recent_lines:
+            return base
+        candidate = base + "\n" + "\n".join(recent_lines)
+        if len(candidate) <= CARD_MAX_CHARS or count == 1:
+            return candidate
+    return base
 
 
 def render_card_embed(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -916,13 +1097,20 @@ def render_card_embed(entry: Dict[str, Any]) -> Dict[str, Any]:
 
 
 TABLE_MAX_WIDTH = 120
+TABLE_DESCRIPTION_MAX_WITH_LAST = 30
 
 
-def _format_table(entries: List[Dict[str, Any]], silent_map: Optional[Dict[Optional[str], Optional[float]]] = None) -> str:
+def _format_table(
+    entries: List[Dict[str, Any]],
+    silent_map: Optional[Dict[Optional[str], Optional[float]]] = None,
+    with_last: bool = False,
+) -> str:
     headers = ["", "THREAD", "TITLE", "STATUS", "PR"]
     if silent_map is not None:
         headers.append("SILENT")
     headers += ["CI", "DESCRIPTION"]
+    if with_last:
+        headers.append("LAST")
 
     rows = []
     for e in entries:
@@ -945,12 +1133,19 @@ def _format_table(entries: List[Dict[str, Any]], silent_map: Optional[Dict[Optio
         if silent_map is not None:
             sfs = silent_map.get(e.get("threadId"))
             row.append(_humanize_age_seconds(sfs) if sfs is not None else "?")
-        row += [ci, str(e.get("description", ""))]
+        description = str(e.get("description", ""))
+        if with_last and len(description) > TABLE_DESCRIPTION_MAX_WITH_LAST:
+            description = description[: TABLE_DESCRIPTION_MAX_WITH_LAST - 1].rstrip() + "…"
+        row.append(ci)
+        row.append(description)
+        if with_last:
+            updates = get_updates(e)
+            row.append(updates[-1]["text"] if updates else "-")
         rows.append(row)
 
-    # Truncate the DESCRIPTION column (last) as needed to keep the whole
-    # line under TABLE_MAX_WIDTH — every other column is short/fixed-shape,
-    # so description is the only one that can grow unbounded.
+    # Truncate the last column as needed to keep the whole line under
+    # TABLE_MAX_WIDTH — every other column is short/fixed-shape, so the
+    # last (free-text) column is the only one that can grow unbounded.
     fixed_widths = [
         max([len(headers[i])] + [len(r[i]) for r in rows]) for i in range(len(headers) - 1)
     ]
@@ -1330,6 +1525,19 @@ def _apply_last_activity_mutations(entry: Dict[str, Any], args: argparse.Namespa
         entry["lastActivitySource"] = "discord"
 
 
+def _apply_update_mutations(entry: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Apply --clear-updates (first, so a combined --clear-updates
+    --progress in one invocation ends with the new entries kept) then
+    --progress to `entry`. Raises _Abort(2, ...) on empty/whitespace text."""
+    if getattr(args, "clear_updates", False):
+        clear_updates(entry)
+    for text in getattr(args, "progress", None) or []:
+        try:
+            append_update(entry, text, "manual")
+        except ValueError as exc:
+            raise _Abort(2, f"thread-state: {exc}") from exc
+
+
 def _effective_silent_statuses(include_status_arg: Optional[str]) -> List[str]:
     """The statuses considered "expected to be progressing" for the silent
     detector: --include-status if given, else DEFAULT_SILENT_STATUSES — minus
@@ -1396,6 +1604,7 @@ def cmd_add(args: argparse.Namespace) -> int:
                 "runs": [],
                 "lastActivityAt": None,
                 "lastActivitySource": None,
+                "updates": [],
                 "createdAt": now,
                 "updatedAt": now,
             }
@@ -1447,6 +1656,7 @@ def cmd_set(args: argparse.Namespace) -> int:
             _apply_branch_mutations(entry, args)
             _apply_run_mutations(entry, args)
             _apply_last_activity_mutations(entry, args)
+            _apply_update_mutations(entry, args)
             entry["updatedAt"] = _now_iso()
             result = _entry_with_computed_pr(entry)
     except _Abort as exc:
@@ -1538,9 +1748,11 @@ def cmd_list(args: argparse.Namespace) -> int:
     elif not annotated:
         print("thread-state: no threads")
     else:
-        print(_format_table([e for e, _, _ in annotated], silent_map={
-            e.get("threadId"): sfs for e, sfs, _stalled in annotated
-        } if silent_seconds is not None else None))
+        print(_format_table(
+            [e for e, _, _ in annotated],
+            silent_map={e.get("threadId"): sfs for e, sfs, _stalled in annotated} if silent_seconds is not None else None,
+            with_last=bool(getattr(args, "with_last", False)),
+        ))
     return 0
 
 
@@ -1619,6 +1831,7 @@ def cmd_refresh(args: argparse.Namespace) -> int:
                     tid, idx, pr_state, error = fut.result()
                     entry = threads[tid]
                     p = get_prs(entry)[idx]
+                    before_state = dict(p.get("prState") or {})
                     if error is not None:
                         prev = dict(p.get("prState") or {})
                         prev["stale"] = True
@@ -1628,12 +1841,18 @@ def cmd_refresh(args: argparse.Namespace) -> int:
                         per_thread_errors.setdefault(tid, []).append(error)
                     else:
                         p["prState"] = pr_state
+                        for text in _pr_transition_texts(before_state, pr_state, p["number"]):
+                            append_update(entry, text, "transition")
 
                     per_thread_done[tid] += 1
                     if per_thread_done[tid] == per_thread_total[tid]:
+                        old_status = entry.get("status")
                         new_status = derive_thread_status(entry)
                         if new_status is not None:
                             entry["status"] = new_status
+                        status_text = _status_transition_text(old_status, new_status)
+                        if status_text:
+                            append_update(entry, status_text, "transition")
                         entry["updatedAt"] = _now_iso()
                         errs = per_thread_errors.get(tid)
                         if errs:
@@ -1708,6 +1927,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
                     tid, idx, state = fut.result()
                     entry = threads[tid]
                     r = get_runs(entry)[idx]
+                    before_state = dict(r.get("state") or {})
                     if state.get("error") is not None:
                         prev = dict(r.get("state") or EMPTY_RUN_STATE)
                         prev["stale"] = True
@@ -1717,6 +1937,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
                         per_thread_errors.setdefault(tid, []).append(state["error"])
                     else:
                         r["state"] = state
+                        for text in _run_transition_texts(
+                            before_state, state, r["host"], r["name"], CARD_STALL_THRESHOLD_SECONDS
+                        ):
+                            append_update(entry, text, "transition")
 
                     per_thread_done[tid] += 1
                     if per_thread_done[tid] == per_thread_total[tid]:
@@ -1789,6 +2013,33 @@ def cmd_title(args: argparse.Namespace) -> int:
         print(json.dumps({"title": title}))
     else:
         print(title)
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    path = _resolve_registry_path(args)
+    try:
+        with _read_only_registry(path) as data:
+            entry = data["threads"].get(args.thread_id)
+    except RegistryError as exc:
+        _err(str(exc))
+        return 3
+
+    if entry is None:
+        _err(f"thread-state: no such thread '{args.thread_id}'")
+        return 1
+
+    updates = list(reversed(get_updates(entry)))
+    if args.limit is not None:
+        updates = updates[: args.limit]
+
+    if args.json:
+        print(json.dumps(updates, indent=2, sort_keys=True))
+    elif not updates:
+        print("thread-state: no updates")
+    else:
+        for u in updates:
+            print(f"[{u.get('ts')}] ({u.get('kind')}) {u.get('text')}")
     return 0
 
 
@@ -1911,6 +2162,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_set.add_argument("--link", action="append")
     sp_set.add_argument("--note")
     sp_set.add_argument("--force", action="store_true", help="allow --add-run against an unknown host")
+    sp_set.add_argument("--progress", action="append", metavar="TEXT", help="append a manual work-summary entry to the updates log; repeatable")
+    sp_set.add_argument("--clear-updates", action="store_true", help="wipe the updates log")
     sp_set.add_argument("--json", action="store_true")
     sp_set.set_defaults(func=cmd_set)
 
@@ -1932,6 +2185,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--stalled", action="store_true",
         help="with --silent-for, only show entries that ALSO have a running run whose log hasn't grown in DURATION",
     )
+    sp_list.add_argument("--with-last", action="store_true", help="append a trailing column with the most recent update")
     sp_list.add_argument("--json", action="store_true")
     sp_list.set_defaults(func=cmd_list)
 
@@ -1981,6 +2235,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_scan.add_argument("--apply", action="store_true")
     sp_scan.add_argument("--json", action="store_true")
     sp_scan.set_defaults(func=cmd_scan)
+
+    sp_log = sub.add_parser("log", parents=[parent], help="print the updates (work-summary) history, newest first")
+    sp_log.add_argument("thread_id")
+    sp_log.add_argument("--limit", type=int, default=10)
+    sp_log.add_argument("--json", action="store_true")
+    sp_log.set_defaults(func=cmd_log)
 
     return p
 
