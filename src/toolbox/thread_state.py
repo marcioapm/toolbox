@@ -32,10 +32,11 @@ a duplicate. A v1 registry (scalar `pr` + top-level `prState`), a v2 registry
 identity fields) are migrated automatically on first load, chaining through
 to the current version; see `_migrate_registry_data`.
 
-Writes are atomic (temp file + os.replace) and guarded by an flock held for
-the whole read-modify-write, so concurrent invocations can't interleave and
-corrupt the file. A registry that fails to parse is never overwritten — it
-is copied to `registry.json.bad-<timestamp>` and the command exits non-zero.
+Writes are atomic (temp file + os.replace) and guarded by a per-registry
+in-process lock plus an advisory lock on a stable sidecar for the whole
+read-modify-write, so concurrent invocations can't interleave and corrupt the
+file. A registry that fails to parse is never overwritten — it is copied to
+`registry.json.bad-<timestamp>` and the command exits non-zero.
 
 Usage::
 
@@ -71,6 +72,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -456,11 +458,29 @@ def _write_registry(path: Path, data: Dict[str, Any]) -> None:
         raise
 
 
+_registry_thread_locks: Dict[Path, Any] = {}
+_registry_thread_locks_guard = threading.Lock()
+
+
+def _registry_lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def _registry_thread_lock(path: Path) -> Any:
+    resolved_path = path.expanduser().resolve()
+    with _registry_thread_locks_guard:
+        return _registry_thread_locks.setdefault(resolved_path, threading.RLock())
+
+
 @contextlib.contextmanager
 def _locked_registry(path: Path):
     """Exclusive-lock the registry for a read-modify-write. The yielded dict
     is only persisted if the block completes without raising — raise
     `_Abort` (or anything else) to discard in-progress changes.
+
+    The lock lives on a stable sidecar rather than the registry itself because
+    `_write_registry` replaces the registry inode. A per-path RLock supplies
+    the thread-level exclusion that flock cannot guarantee within one process.
 
     If the on-disk file is behind SCHEMA_VERSION, it is migrated in memory
     before being handed to the caller; the very first time that migration is
@@ -468,28 +488,29 @@ def _locked_registry(path: Path):
     `registry.json.v<N>-backup-<ts>` (N = the on-disk schemaVersion before
     migration) so no data can be lost."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        pre_migration_raw = path.read_text() if path.exists() and path.stat().st_size > 0 else None
-        pre_migration_version = 1
-        if pre_migration_raw:
-            try:
-                pre_migration_version = json.loads(pre_migration_raw).get("schemaVersion", 1)
-            except json.JSONDecodeError:
-                pass
-        data, migrated = _load_and_migrate(path)
-        yield data
-        if migrated and pre_migration_raw is not None:
-            backup = path.with_name(path.name + f".v{pre_migration_version}-backup-{_timestamp_slug()}")
-            try:
-                backup.write_text(pre_migration_raw)
-            except OSError:
-                pass
-        _write_registry(path, data)
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+    with _registry_thread_lock(path):
+        fd = os.open(_registry_lock_path(path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            pre_migration_raw = path.read_text() if path.exists() and path.stat().st_size > 0 else None
+            pre_migration_version = 1
+            if pre_migration_raw:
+                try:
+                    pre_migration_version = json.loads(pre_migration_raw).get("schemaVersion", 1)
+                except json.JSONDecodeError:
+                    pass
+            data, migrated = _load_and_migrate(path)
+            yield data
+            if migrated and pre_migration_raw is not None:
+                backup = path.with_name(path.name + f".v{pre_migration_version}-backup-{_timestamp_slug()}")
+                try:
+                    backup.write_text(pre_migration_raw)
+                except OSError:
+                    pass
+            _write_registry(path, data)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 @contextlib.contextmanager
@@ -497,19 +518,16 @@ def _read_only_registry(path: Path):
     """Shared-lock read of the registry. Never writes — a v1 file is
     migrated to v2 in memory for the caller's benefit, but the on-disk file
     is left exactly as it was."""
-    if not path.exists():
-        yield _empty_registry()
-        return
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _registry_thread_lock(path):
+        fd = os.open(_registry_lock_path(path), os.O_RDWR | os.O_CREAT, 0o644)
         try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
             data, _migrated = _load_and_migrate(path)
+            yield data
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
-        yield data
-    finally:
-        os.close(fd)
+            os.close(fd)
 
 
 # ---------------------------------------------------------------------------

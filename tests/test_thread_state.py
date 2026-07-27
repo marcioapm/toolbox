@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import multiprocessing
 import os
 import subprocess
 import threading
@@ -15,6 +16,12 @@ import time
 import pytest
 
 from toolbox import thread_state as ts
+
+
+def _add_thread_in_process(registry_path, number, start_event):
+    start_event.wait(timeout=10)
+    with ts._locked_registry(ts.Path(registry_path)) as data:
+        data["threads"][str(number)] = {"v": number}
 
 
 # ---------------------------------------------------------------------------
@@ -137,37 +144,84 @@ class TestLocking:
         t.start()
         assert entered.wait(timeout=5)
 
-        # A second exclusive lock attempt should block until released.
-        fd = os.open(registry_path, os.O_RDWR)
+        # The stable sidecar, not the replaceable registry inode, is locked.
+        fd = os.open(ts._registry_lock_path(registry_path), os.O_RDWR)
         try:
-            got_immediately = True
-            try:
+            with pytest.raises(BlockingIOError):
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                got_immediately = False
-            else:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            assert got_immediately is False
         finally:
             os.close(fd)
             release.set()
             t.join(timeout=5)
+        assert not t.is_alive()
 
     def test_concurrent_writers_do_not_clobber_each_other(self, registry_path):
+        for _ in range(100):
+            ts._write_registry(registry_path, ts._empty_registry())
+            start = threading.Event()
+            threads = [
+                threading.Thread(target=_add_thread_in_process, args=(registry_path, i, start))
+                for i in range(10)
+            ]
+            for thread in threads:
+                thread.start()
+            start.set()
+            for thread in threads:
+                thread.join(timeout=10)
+            assert not any(thread.is_alive() for thread in threads)
+
+            data = ts._parse_registry(registry_path)
+            assert set(data["threads"]) == {str(i) for i in range(10)}
+
+    def test_process_writers_do_not_clobber_each_other(self, registry_path):
         ts._write_registry(registry_path, ts._empty_registry())
-
-        def add_thread(n):
-            with ts._locked_registry(registry_path) as data:
-                data["threads"][str(n)] = {"v": n}
-
-        threads = [threading.Thread(target=add_thread, args=(i,)) for i in range(10)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        processes = [
+            context.Process(target=_add_thread_in_process, args=(str(registry_path), i, start))
+            for i in range(10)
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        for process in processes:
+            process.join(timeout=20)
+        assert [process.exitcode for process in processes] == [0] * len(processes)
 
         data = ts._parse_registry(registry_path)
-        assert set(data["threads"].keys()) == {str(i) for i in range(10)}
+        assert set(data["threads"]) == {str(i) for i in range(10)}
+
+    def test_independent_registry_paths_do_not_block_each_other(self, tmp_path):
+        first = tmp_path / "first" / "registry.json"
+        second = tmp_path / "second" / "registry.json"
+        ts._write_registry(first, ts._empty_registry())
+        ts._write_registry(second, ts._empty_registry())
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_finished = threading.Event()
+
+        def hold_first():
+            with ts._locked_registry(first):
+                first_entered.set()
+                release_first.wait(timeout=5)
+
+        def write_second():
+            with ts._locked_registry(second) as data:
+                data["threads"]["second"] = {"v": 2}
+            second_finished.set()
+
+        first_thread = threading.Thread(target=hold_first)
+        second_thread = threading.Thread(target=write_second)
+        first_thread.start()
+        assert first_entered.wait(timeout=5)
+        second_thread.start()
+        assert second_finished.wait(timeout=5)
+        release_first.set()
+        first_thread.join(timeout=5)
+        second_thread.join(timeout=5)
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert ts._parse_registry(second)["threads"] == {"second": {"v": 2}}
 
     def test_abort_inside_block_does_not_persist_changes(self, registry_path):
         ts._write_registry(registry_path, ts._empty_registry())
