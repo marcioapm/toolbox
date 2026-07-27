@@ -64,7 +64,7 @@ def _pr(number, repo=None, primary=False, state=None, ci="NONE", stale=False,
 class TestRegistryBasics:
     def test_missing_file_reads_as_empty(self, registry_path):
         data = ts._parse_registry(registry_path)
-        assert data == {"schemaVersion": 2, "accounts": {}, "threads": {}}
+        assert data == {"schemaVersion": 3, "accounts": {}, "threads": {}}
 
     def test_write_then_read_roundtrip(self, registry_path):
         data = ts._empty_registry()
@@ -825,7 +825,7 @@ class TestSchemaMigration:
         self._write_v1(registry_path)
         data, migrated = ts._load_and_migrate(registry_path)
         assert migrated is True
-        assert data["schemaVersion"] == 2
+        assert data["schemaVersion"] == 3
         assert data["threads"]["1"]["prs"][0]["number"] == 4694
 
     def test_load_and_migrate_no_op_on_v2(self, registry_path):
@@ -834,7 +834,7 @@ class TestSchemaMigration:
         ts._write_registry(registry_path, data)
         loaded, migrated = ts._load_and_migrate(registry_path)
         assert migrated is False
-        assert loaded["schemaVersion"] == 2
+        assert loaded["schemaVersion"] == 3
 
     def test_cli_read_migrates_v1_transparently(self, registry_path, capsys):
         self._write_v1(registry_path, pr_state={"state": "OPEN", "ci": "SUCCESS", "url": "u", "title": "t", "mergedAt": None, "checkedAt": "x", "stale": False})
@@ -856,7 +856,7 @@ class TestSchemaMigration:
         assert code == 0
 
         on_disk = json.loads(registry_path.read_text())
-        assert on_disk["schemaVersion"] == 2
+        assert on_disk["schemaVersion"] == 3
         assert on_disk["threads"]["1"]["prs"][0]["number"] == 4694
         assert "pr" not in on_disk["threads"]["1"]
 
@@ -1117,9 +1117,9 @@ class TestScanApplyAppends:
 
 class TestRenderCardMultiPr:
     def test_card_with_no_prs_renders_branch_line(self):
-        entry = {"title": "T", "status": "active", "branch": "feat/x", "prs": []}
+        entry = {"title": "T", "status": "active", "branches": [{"repo": None, "name": "feat/x", "primary": True}], "prs": []}
         out = ts.render_card_markdown(entry)
-        assert "branch: `feat/x`" in out
+        assert "branch: `feat/x` (primary)" in out
         assert "PR:" not in out
 
     def test_card_with_one_pr_renders_single_line(self):
@@ -1154,4 +1154,746 @@ class TestRenderCardMultiPr:
         embed = ts.render_card_embed(entry)
         pr_field = next(f for f in embed["fields"] if f["name"] == "PR")
         assert pr_field["value"] == "#1 (+2)"
+
+
+# ---------------------------------------------------------------------------
+# v2 -> v3 schema migration: branches, runs, lastActivityAt
+# ---------------------------------------------------------------------------
+
+class TestSchemaMigrationV3:
+    def _write_v2(self, registry_path, branch="feat/x", repo="acme/widgets"):
+        raw = {
+            "schemaVersion": 2,
+            "accounts": {},
+            "threads": {
+                "1": {
+                    "threadId": "1",
+                    "title": "mSPRT",
+                    "description": "",
+                    "repo": repo,
+                    "branch": branch,
+                    "status": "review",
+                    "tags": [],
+                    "links": [],
+                    "notes": "",
+                    "prs": [],
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                }
+            },
+        }
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(json.dumps(raw))
+        return raw
+
+    def test_migrate_entry_v2_to_v3_converts_scalar_branch_to_list(self):
+        entry = {"repo": "acme/widgets", "branch": "feat/x"}
+        ts._migrate_entry_v2_to_v3(entry)
+        assert "branch" not in entry
+        assert entry["branches"] == [{"repo": "acme/widgets", "name": "feat/x", "primary": True}]
+        assert entry["runs"] == []
+        assert entry["lastActivityAt"] is None
+        assert entry["lastActivitySource"] is None
+
+    def test_migrate_entry_v2_to_v3_with_no_branch_gets_empty_list(self):
+        entry = {"repo": None, "branch": None}
+        ts._migrate_entry_v2_to_v3(entry)
+        assert entry["branches"] == []
+        assert "branch" not in entry
+
+    def test_migrate_entry_v2_to_v3_is_idempotent(self):
+        entry = {"repo": "a/b", "branch": "feat/x"}
+        ts._migrate_entry_v2_to_v3(entry)
+        first = json.dumps(entry, sort_keys=True)
+        ts._migrate_entry_v2_to_v3(entry)
+        assert json.dumps(entry, sort_keys=True) == first
+
+    def test_load_and_migrate_v2_to_v3_bumps_schema_version_and_backs_up(self, registry_path, capsys):
+        self._write_v2(registry_path)
+        data, migrated = ts._load_and_migrate(registry_path)
+        assert migrated is True
+        assert data["schemaVersion"] == 3
+        assert data["threads"]["1"]["branches"] == [{"repo": "acme/widgets", "name": "feat/x", "primary": True}]
+
+    def test_write_from_v2_triggers_v2_backup(self, registry_path, capsys):
+        self._write_v2(registry_path)
+        code, out, err = run_cli(["set", "1", "--desc", "touched"], registry_path, capsys)
+        assert code == 0
+
+        on_disk = json.loads(registry_path.read_text())
+        assert on_disk["schemaVersion"] == 3
+        assert on_disk["threads"]["1"]["branches"][0]["name"] == "feat/x"
+        assert "branch" not in on_disk["threads"]["1"]
+
+        backups = list(registry_path.parent.glob("registry.json.v2-backup-*"))
+        assert len(backups) == 1
+        backed_up = json.loads(backups[0].read_text())
+        assert backed_up["schemaVersion"] == 2
+        assert backed_up["threads"]["1"]["branch"] == "feat/x"
+
+    def test_v1_registry_migrates_all_the_way_to_v3_in_one_pass(self, registry_path):
+        raw = {
+            "schemaVersion": 1,
+            "accounts": {},
+            "threads": {
+                "1": {
+                    "threadId": "1", "title": "A", "repo": "a/b", "pr": 1,
+                    "branch": "feat/y", "prState": None, "status": "active",
+                }
+            },
+        }
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(json.dumps(raw))
+        data, migrated = ts._load_and_migrate(registry_path)
+        assert migrated is True
+        assert data["schemaVersion"] == 3
+        entry = data["threads"]["1"]
+        assert entry["prs"][0]["number"] == 1
+        assert entry["branches"] == [{"repo": "a/b", "name": "feat/y", "primary": True}]
+        assert entry["runs"] == []
+        assert entry["lastActivityAt"] is None
+        # v1 -> v3 in one pass still only backs up the original v1 bytes once.
+        backups = list(registry_path.parent.glob("registry.json.v1-backup-*"))
+        assert backups == []  # _load_and_migrate alone never writes a backup
+
+    def test_migration_no_data_loss_multiple_v2_threads(self, registry_path):
+        raw = {
+            "schemaVersion": 2,
+            "accounts": {},
+            "threads": {
+                "1": {"threadId": "1", "title": "A", "repo": "a/b", "branch": "feat/1", "prs": [], "status": "active"},
+                "2": {"threadId": "2", "title": "B", "repo": "c/d", "branch": None, "prs": [], "status": "paused"},
+            },
+        }
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(json.dumps(raw))
+        data, migrated = ts._load_and_migrate(registry_path)
+        assert migrated is True
+        assert data["threads"]["1"]["branches"][0]["name"] == "feat/1"
+        assert data["threads"]["2"]["branches"] == []
+        assert data["threads"]["1"]["title"] == "A"
+        assert data["threads"]["2"]["status"] == "paused"
+
+
+# ---------------------------------------------------------------------------
+# branch helpers: get/add/remove/primary + ref parsing
+# ---------------------------------------------------------------------------
+
+class TestParseBranchRef:
+    def test_bare_name(self):
+        assert ts.parse_branch_ref("feat/x") == (None, "feat/x")
+
+    def test_repo_colon_name(self):
+        assert ts.parse_branch_ref("owner/name:feat/x") == ("owner/name", "feat/x")
+
+    def test_bare_name_falls_back_to_default_repo(self):
+        assert ts.parse_branch_ref("feat/x", default_repo="acme/widgets") == ("acme/widgets", "feat/x")
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            ts.parse_branch_ref("")
+
+    def test_missing_name_after_colon_raises(self):
+        with pytest.raises(ValueError):
+            ts.parse_branch_ref("owner/name:")
+
+
+class TestBranchHelpers:
+    def test_add_branch_appends_and_first_is_primary(self):
+        entry = {"repo": "a/b", "branches": []}
+        ts.add_branch(entry, None, "feat/1")
+        ts.add_branch(entry, None, "feat/2")
+        assert [b["name"] for b in entry["branches"]] == ["feat/1", "feat/2"]
+        assert entry["branches"][0]["primary"] is True
+        assert entry["branches"][1]["primary"] is False
+
+    def test_add_branch_dedupes_by_repo_and_name(self):
+        entry = {"repo": "a/b", "branches": []}
+        ts.add_branch(entry, None, "feat/1")
+        ts.add_branch(entry, "a/b", "feat/1")
+        assert len(entry["branches"]) == 1
+
+    def test_remove_branch_by_name(self):
+        entry = {"repo": "a/b", "branches": [ts_branch("feat/1"), ts_branch("feat/2")]}
+        assert ts.remove_branch(entry, None, "feat/1") is True
+        assert [b["name"] for b in entry["branches"]] == ["feat/2"]
+
+    def test_remove_branch_not_found_returns_false(self):
+        entry = {"repo": "a/b", "branches": [ts_branch("feat/1")]}
+        assert ts.remove_branch(entry, None, "nope") is False
+
+    def test_remove_primary_branch_promotes_next(self):
+        entry = {"repo": "a/b", "branches": [ts_branch("feat/1", primary=True), ts_branch("feat/2")]}
+        ts.remove_branch(entry, None, "feat/1")
+        assert entry["branches"][0]["primary"] is True
+        assert entry["branches"][0]["name"] == "feat/2"
+
+    def test_set_primary_branch_marks_exactly_one(self):
+        entry = {"repo": "a/b", "branches": [ts_branch("feat/1", primary=True), ts_branch("feat/2")]}
+        assert ts.set_primary_branch(entry, None, "feat/2") is True
+        assert entry["branches"][0]["primary"] is False
+        assert entry["branches"][1]["primary"] is True
+
+    def test_set_primary_branch_not_found_returns_false(self):
+        entry = {"repo": "a/b", "branches": [ts_branch("feat/1")]}
+        assert ts.set_primary_branch(entry, None, "nope") is False
+
+    def test_set_branches_single_replaces_whole_list(self):
+        entry = {"repo": "a/b", "branches": [ts_branch("feat/1"), ts_branch("feat/2")]}
+        ts.set_branches_single(entry, "a/b", "feat/3")
+        assert len(entry["branches"]) == 1
+        assert entry["branches"][0]["name"] == "feat/3"
+        assert entry["branches"][0]["primary"] is True
+
+
+def ts_branch(name, primary=False):
+    return {"repo": None, "name": name, "primary": primary}
+
+
+class TestCliBranches:
+    def test_branch_flag_sets_single_primary_branch(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--repo", "a/b", "--branch", "feat/x"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["branches"] == [{"repo": "a/b", "name": "feat/x", "primary": True}]
+        assert entry["branch"] == "feat/x"
+
+    def test_add_branch_flag_appends_multiple(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--repo", "a/b", "--add-branch", "feat/1", "--add-branch", "feat/2"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert sorted(b["name"] for b in entry["branches"]) == ["feat/1", "feat/2"]
+
+    def test_add_branch_accepts_repo_colon_form(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--repo", "a/b", "--add-branch", "c/d:feat/x"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["branches"][0]["repo"] == "c/d"
+
+    def test_set_rm_branch_removes_one(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--repo", "a/b", "--add-branch", "feat/1", "--add-branch", "feat/2"], registry_path, capsys)
+        run_cli(["set", "1", "--rm-branch", "feat/1"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert [b["name"] for b in entry["branches"]] == ["feat/2"]
+
+    def test_set_primary_branch_switches_primary(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--repo", "a/b", "--add-branch", "feat/1", "--add-branch", "feat/2"], registry_path, capsys)
+        run_cli(["set", "1", "--primary-branch", "feat/2"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["branch"] == "feat/2"
+
+    def test_set_primary_branch_unmatched_ref_errors(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--repo", "a/b", "--add-branch", "feat/1"], registry_path, capsys)
+        code, out, err = run_cli(["set", "1", "--primary-branch", "nope"], registry_path, capsys)
+        assert code == 2
+
+
+# ---------------------------------------------------------------------------
+# run helpers: host:name parsing, get/add/remove, unknown-host rejection
+# ---------------------------------------------------------------------------
+
+class TestParseRunRef:
+    def test_valid_host_colon_name(self):
+        assert ts.parse_run_ref("vibes:tstate2") == ("vibes", "tstate2")
+
+    def test_missing_colon_raises(self):
+        with pytest.raises(ValueError):
+            ts.parse_run_ref("vibes")
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            ts.parse_run_ref("")
+
+
+class TestRunHelpers:
+    def test_add_run_appends(self):
+        entry = {"runs": []}
+        ts.add_run(entry, "vibes", "tstate2")
+        assert entry["runs"] == [{"host": "vibes", "name": "tstate2", "state": dict(ts.EMPTY_RUN_STATE)}]
+
+    def test_add_run_dedupes_by_host_and_name(self):
+        entry = {"runs": []}
+        ts.add_run(entry, "vibes", "tstate2")
+        ts.add_run(entry, "vibes", "tstate2")
+        assert len(entry["runs"]) == 1
+
+    def test_add_run_different_host_same_name_not_deduped(self):
+        entry = {"runs": []}
+        ts.add_run(entry, "vibes", "tstate2")
+        ts.add_run(entry, "macmini", "tstate2")
+        assert len(entry["runs"]) == 2
+
+    def test_remove_run_by_host_and_name(self):
+        entry = {"runs": []}
+        ts.add_run(entry, "vibes", "tstate2")
+        ts.add_run(entry, "macmini", "other")
+        assert ts.remove_run(entry, "vibes", "tstate2") is True
+        assert [r["name"] for r in entry["runs"]] == ["other"]
+
+    def test_remove_run_not_found_returns_false(self):
+        entry = {"runs": []}
+        assert ts.remove_run(entry, "vibes", "nope") is False
+
+
+class TestCliRuns:
+    def test_add_run_flag_tracks_known_host(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--add-run", "vibes:tstate2"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["runs"] == [{"host": "vibes", "name": "tstate2", "state": dict(ts.EMPTY_RUN_STATE)}]
+
+    def test_add_run_unknown_host_rejected_without_force(self, registry_path, capsys):
+        code, out, err = run_cli(["add", "1", "--title", "T", "--add-run", "bogus-host:tstate2"], registry_path, capsys)
+        assert code == 2
+        assert "unknown host" in err
+
+    def test_add_run_unknown_host_allowed_with_force(self, registry_path, capsys):
+        code, out, err = run_cli(["add", "1", "--title", "T", "--add-run", "bogus-host:tstate2", "--force"], registry_path, capsys)
+        assert code == 0
+        _, out2, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out2)
+        assert entry["runs"][0]["host"] == "bogus-host"
+
+    def test_set_rm_run_removes_one(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--add-run", "vibes:a", "--add-run", "macmini:b"], registry_path, capsys)
+        run_cli(["set", "1", "--rm-run", "vibes:a"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert [r["name"] for r in entry["runs"]] == ["b"]
+
+
+# ---------------------------------------------------------------------------
+# Discord snowflake -> ISO-8601 decoding
+# ---------------------------------------------------------------------------
+
+class TestSnowflakeDecoding:
+    def test_known_snowflake_decodes_to_expected_timestamp(self):
+        # Verified independently: (1531198023408029736 >> 22) + 1420070400000
+        # lands on 2026-07-27T07:14:17Z.
+        iso = ts.snowflake_to_iso("1531198023408029736")
+        expected = ts._parse_iso("2026-07-27T07:14:17Z")
+        actual = ts._parse_iso(iso)
+        assert abs((actual - expected).total_seconds()) <= 1
+
+    def test_discord_epoch_zero_snowflake_is_discord_epoch(self):
+        iso = ts.snowflake_to_iso("0")
+        assert iso == "2015-01-01T00:00:00Z"
+
+    def test_cli_last_message_id_sets_last_activity_and_source(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--last-message-id", "1531198023408029736"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        actual = ts._parse_iso(entry["lastActivityAt"])
+        expected = ts._parse_iso("2026-07-27T07:14:17Z")
+        assert abs((actual - expected).total_seconds()) <= 1
+        assert entry["lastActivitySource"] == "discord"
+
+    def test_cli_last_activity_sets_manual_source(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--last-activity", "2026-01-01T00:00:00Z"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["lastActivityAt"] == "2026-01-01T00:00:00Z"
+        assert entry["lastActivitySource"] == "manual"
+
+
+# ---------------------------------------------------------------------------
+# duration parsing
+# ---------------------------------------------------------------------------
+
+class TestParseDuration:
+    @pytest.mark.parametrize("raw,seconds", [
+        ("35m", 35 * 60),
+        ("2h", 2 * 3600),
+        ("90s", 90),
+        ("1d", 86400),
+        ("0s", 0),
+    ])
+    def test_valid_durations(self, raw, seconds):
+        assert ts.parse_duration(raw) == seconds
+
+    @pytest.mark.parametrize("raw", ["", "5", "5x", "m5", "-5m", "5 m", "5.5m"])
+    def test_invalid_durations_raise(self, raw):
+        with pytest.raises(ValueError):
+            ts.parse_duration(raw)
+
+
+# ---------------------------------------------------------------------------
+# silent-thread detector: boundary conditions + --stalled
+# ---------------------------------------------------------------------------
+
+def _entry_for_silent(status="active", last_activity=None, runs=None):
+    return {
+        "threadId": "1", "title": "T", "status": status, "repo": "a/b",
+        "description": "", "tags": [], "links": [], "notes": "",
+        "prs": [], "branches": [], "runs": runs or [],
+        "lastActivityAt": last_activity, "lastActivitySource": "manual" if last_activity else None,
+        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+    }
+
+
+class TestSilentInfo:
+    def test_just_under_threshold_not_silent(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        last = "2026-07-27T11:31:00Z"  # 29 minutes ago
+        entry = _entry_for_silent(status="active", last_activity=last)
+        silent, silent_for, stalled = ts._silent_info(entry, 30 * 60, ["active", "review"], now=now)
+        assert silent is False
+
+    def test_just_over_threshold_is_silent(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        last = "2026-07-27T11:29:00Z"  # 31 minutes ago
+        entry = _entry_for_silent(status="active", last_activity=last)
+        silent, silent_for, stalled = ts._silent_info(entry, 30 * 60, ["active", "review"], now=now)
+        assert silent is True
+        assert silent_for == pytest.approx(31 * 60, abs=1)
+
+    def test_null_last_activity_treated_as_silent(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        entry = _entry_for_silent(status="active", last_activity=None)
+        silent, silent_for, stalled = ts._silent_info(entry, 30 * 60, ["active", "review"], now=now)
+        assert silent is True
+        assert silent_for is None  # distinct from a known age
+
+    def test_excluded_status_never_silent(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        entry = _entry_for_silent(status="merged", last_activity=None)
+        silent, silent_for, stalled = ts._silent_info(entry, 30 * 60, ["active", "review"], now=now)
+        assert silent is False
+
+    def test_status_outside_include_list_not_silent(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        entry = _entry_for_silent(status="blocked", last_activity=None)
+        silent, silent_for, stalled = ts._silent_info(entry, 30 * 60, ["active", "review"], now=now)
+        assert silent is False
+
+    def test_running_with_stale_logmtime_is_stalled(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        run = {"host": "vibes", "name": "x", "state": {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2026-07-27T11:00:00Z"}}
+        entry = _entry_for_silent(status="active", last_activity="2026-07-27T11:59:00Z", runs=[run])
+        silent, silent_for, stalled = ts._silent_info(entry, 30 * 60, ["active", "review"], now=now)
+        assert stalled is True
+
+    def test_running_with_fresh_logmtime_not_stalled(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        run = {"host": "vibes", "name": "x", "state": {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2026-07-27T11:59:00Z"}}
+        entry = _entry_for_silent(status="active", last_activity="2026-07-27T11:59:00Z", runs=[run])
+        silent, silent_for, stalled = ts._silent_info(entry, 30 * 60, ["active", "review"], now=now)
+        assert stalled is False
+
+    def test_done_run_never_stalled_regardless_of_logmtime(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        run = {"host": "vibes", "name": "x", "state": {**dict(ts.EMPTY_RUN_STATE), "status": "done", "logMtime": "2026-07-27T01:00:00Z"}}
+        entry = _entry_for_silent(status="active", last_activity=None, runs=[run])
+        silent, silent_for, stalled = ts._silent_info(entry, 30 * 60, ["active", "review"], now=now)
+        assert stalled is False
+
+
+class TestRunIsStalled:
+    def test_running_stale_logmtime(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        run = {"state": {"status": "running", "logMtime": "2026-07-27T11:00:00Z"}}
+        assert ts.run_is_stalled(run, 15 * 60, now=now) is True
+
+    def test_running_fresh_logmtime(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        run = {"state": {"status": "running", "logMtime": "2026-07-27T11:59:00Z"}}
+        assert ts.run_is_stalled(run, 15 * 60, now=now) is False
+
+    def test_not_running_never_stalled(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        run = {"state": {"status": "done", "logMtime": "2026-07-27T01:00:00Z"}}
+        assert ts.run_is_stalled(run, 15 * 60, now=now) is False
+
+    def test_running_without_logmtime_not_stalled(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        run = {"state": {"status": "running", "logMtime": None}}
+        assert ts.run_is_stalled(run, 15 * 60, now=now) is False
+
+
+class TestCliSilentAndListFiltering:
+    def _seed_silent(self, registry_path):
+        data = ts._empty_registry()
+        data["threads"]["silent1"] = _entry_for_silent(
+            status="active", last_activity="2020-01-01T00:00:00Z",
+        )
+        data["threads"]["silent1"]["threadId"] = "silent1"
+        data["threads"]["fresh1"] = _entry_for_silent(
+            status="active", last_activity=ts._now_iso(),
+        )
+        data["threads"]["fresh1"]["threadId"] = "fresh1"
+        data["threads"]["done1"] = _entry_for_silent(
+            status="done", last_activity="2020-01-01T00:00:00Z",
+        )
+        data["threads"]["done1"]["threadId"] = "done1"
+        ts._write_registry(registry_path, data)
+
+    def test_list_silent_for_filters_to_silent_entries_only(self, registry_path, capsys):
+        self._seed_silent(registry_path)
+        _, out, _ = run_cli(["list", "--silent-for", "30m", "--json"], registry_path, capsys)
+        entries = json.loads(out)
+        ids = {e["threadId"] for e in entries}
+        assert ids == {"silent1"}
+
+    def test_list_silent_for_json_includes_silentforseconds_and_stalled(self, registry_path, capsys):
+        self._seed_silent(registry_path)
+        _, out, _ = run_cli(["list", "--silent-for", "30m", "--json"], registry_path, capsys)
+        entries = json.loads(out)
+        assert "silentForSeconds" in entries[0]
+        assert "stalled" in entries[0]
+
+    def test_list_silent_for_human_output_has_silent_column(self, registry_path, capsys):
+        self._seed_silent(registry_path)
+        _, out, _ = run_cli(["list", "--silent-for", "30m"], registry_path, capsys)
+        assert "SILENT" in out
+
+    def test_silent_alias_command_matches_list_silent_for(self, registry_path, capsys):
+        self._seed_silent(registry_path)
+        _, out1, _ = run_cli(["list", "--silent-for", "30m", "--json"], registry_path, capsys)
+        _, out2, _ = run_cli(["silent", "--for", "30m", "--json"], registry_path, capsys)
+        entries1, entries2 = json.loads(out1), json.loads(out2)
+        assert [e["threadId"] for e in entries1] == [e["threadId"] for e in entries2]
+        assert [e["stalled"] for e in entries1] == [e["stalled"] for e in entries2]
+        # silentForSeconds is computed against "now" independently on each
+        # call -- assert closeness rather than exact equality.
+        for e1, e2 in zip(entries1, entries2):
+            assert abs(e1["silentForSeconds"] - e2["silentForSeconds"]) < 5
+
+    def test_silent_alias_default_duration_is_30m(self, registry_path, capsys):
+        self._seed_silent(registry_path)
+        code, out, err = run_cli(["silent", "--json"], registry_path, capsys)
+        assert code == 0
+        entries = json.loads(out)
+        ids = {e["threadId"] for e in entries}
+        assert ids == {"silent1"}
+
+    def test_stalled_flag_requires_running_run_with_stale_logmtime(self, registry_path, capsys):
+        data = ts._empty_registry()
+        stalled_run = {"host": "vibes", "name": "x", "state": {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2020-01-01T00:00:00Z"}}
+        e1 = _entry_for_silent(status="active", last_activity="2020-01-01T00:00:00Z", runs=[stalled_run])
+        e1["threadId"] = "stalled1"
+        e2 = _entry_for_silent(status="active", last_activity="2020-01-01T00:00:00Z")
+        e2["threadId"] = "silentonly"
+        data["threads"]["stalled1"] = e1
+        data["threads"]["silentonly"] = e2
+        ts._write_registry(registry_path, data)
+
+        _, out, _ = run_cli(["list", "--silent-for", "30m", "--stalled", "--json"], registry_path, capsys)
+        entries = json.loads(out)
+        assert {e["threadId"] for e in entries} == {"stalled1"}
+
+    def test_include_status_override_widens_silent_set(self, registry_path, capsys):
+        data = ts._empty_registry()
+        e = _entry_for_silent(status="blocked", last_activity="2020-01-01T00:00:00Z")
+        e["threadId"] = "b1"
+        data["threads"]["b1"] = e
+        ts._write_registry(registry_path, data)
+
+        _, out, _ = run_cli(["list", "--silent-for", "30m", "--json"], registry_path, capsys)
+        assert json.loads(out) == []
+
+        _, out2, _ = run_cli(["list", "--silent-for", "30m", "--include-status", "blocked", "--json"], registry_path, capsys)
+        assert {e["threadId"] for e in json.loads(out2)} == {"b1"}
+
+    def test_include_status_cannot_reintroduce_never_silent_statuses(self, registry_path, capsys):
+        data = ts._empty_registry()
+        e = _entry_for_silent(status="merged", last_activity="2020-01-01T00:00:00Z")
+        e["threadId"] = "m1"
+        data["threads"]["m1"] = e
+        ts._write_registry(registry_path, data)
+
+        _, out, _ = run_cli(["list", "--silent-for", "30m", "--include-status", "merged", "--json"], registry_path, capsys)
+        assert json.loads(out) == []
+
+    def test_invalid_silent_for_duration_errors(self, registry_path, capsys):
+        code, out, err = run_cli(["list", "--silent-for", "bogus"], registry_path, capsys)
+        assert code == 2
+
+
+# ---------------------------------------------------------------------------
+# card rendering with runs
+# ---------------------------------------------------------------------------
+
+class TestRenderCardRuns:
+    def test_run_line_shows_host_name_and_status(self):
+        entry = {
+            "title": "T", "status": "active", "prs": [], "branches": [],
+            "runs": [{"host": "vibes", "name": "tstate2", "state": {**dict(ts.EMPTY_RUN_STATE), "status": "running"}}],
+        }
+        out = ts.render_card_markdown(entry)
+        assert "run: vibes/tstate2 running" in out
+
+    def test_run_line_shows_log_age(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        state = {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2026-07-27T11:56:00Z"}
+        run = {"host": "vibes", "name": "tstate2", "state": state}
+        line = ts._run_line(run, now=now)
+        assert "log 4m ago" in line
+
+    def test_run_line_shows_stall_warning_when_stalled(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        state = {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2026-07-27T11:00:00Z"}
+        run = {"host": "vibes", "name": "tstate2", "state": state}
+        line = ts._run_line(run, now=now)
+        assert "⚠️ no output for" in line
+
+    def test_run_line_no_stall_warning_when_fresh(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        state = {**dict(ts.EMPTY_RUN_STATE), "status": "running", "logMtime": "2026-07-27T11:59:00Z"}
+        run = {"host": "vibes", "name": "tstate2", "state": state}
+        line = ts._run_line(run, now=now)
+        assert "⚠️" not in line
+
+    def test_run_line_no_stall_warning_when_done(self):
+        now = ts._parse_iso("2026-07-27T12:00:00Z")
+        state = {**dict(ts.EMPTY_RUN_STATE), "status": "done", "logMtime": "2026-07-27T01:00:00Z"}
+        run = {"host": "vibes", "name": "tstate2", "state": state}
+        line = ts._run_line(run, now=now)
+        assert "⚠️" not in line
+
+
+# ---------------------------------------------------------------------------
+# probe command: SSH output parsing (macOS + Linux stat), failure isolation
+# ---------------------------------------------------------------------------
+
+class TestProbeRun:
+    def test_running_task_parses_status_exit_bytes_mtime(self):
+        def fake_runner(cmd, timeout):
+            stdout = "STATUS:running\nEXIT:\nBYTES:1234\nMTIME:1785315257\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout, "")
+
+        state = ts.probe_run("vibes", "tstate2", 8, fake_runner)
+        assert state["status"] == "running"
+        assert state["exitCode"] is None
+        assert state["logBytes"] == 1234
+        assert state["logMtime"] is not None
+        assert state["stale"] is False
+        assert state["error"] is None
+
+    def test_macos_stat_dialect_epoch_parses_same_as_linux(self):
+        # Both `stat -f %m` (macOS) and `stat -c %Y` (Linux) print a bare
+        # epoch integer -- probe_run's parsing doesn't care which produced
+        # it, only that MTIME is a number.
+        def fake_runner_mac(cmd, timeout):
+            return subprocess.CompletedProcess(cmd, 0, "STATUS:done\nEXIT:0\nBYTES:99\nMTIME:1785315257\n", "")
+
+        def fake_runner_linux(cmd, timeout):
+            return subprocess.CompletedProcess(cmd, 0, "STATUS:done\nEXIT:0\nBYTES:99\nMTIME:1785315257\n", "")
+
+        state_mac = ts.probe_run("vibes", "x", 8, fake_runner_mac)
+        state_linux = ts.probe_run("macmini", "x", 8, fake_runner_linux)
+        assert state_mac["logMtime"] == state_linux["logMtime"]
+        assert state_mac["exitCode"] == 0
+
+    def test_missing_status_file_reports_missing(self):
+        def fake_runner(cmd, timeout):
+            stdout = f"STATUS:{ts.PROBE_MISSING_MARKER}\nEXIT:\nBYTES:\nMTIME:\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout, "")
+
+        state = ts.probe_run("vibes", "gone", 8, fake_runner)
+        assert state["status"] == "missing"
+        assert state["exitCode"] is None
+        assert state["error"] is None
+
+    def test_ssh_timeout_marks_stale_never_raises(self):
+        def fake_runner(cmd, timeout):
+            raise subprocess.TimeoutExpired(cmd, timeout)
+
+        state = ts.probe_run("vibes", "x", 8, fake_runner)
+        assert state["stale"] is True
+        assert "timed out" in state["error"]
+
+    def test_ssh_oserror_marks_stale_never_raises(self):
+        def fake_runner(cmd, timeout):
+            raise OSError("ssh not found")
+
+        state = ts.probe_run("vibes", "x", 8, fake_runner)
+        assert state["stale"] is True
+        assert "ssh not found" in state["error"]
+
+    def test_ssh_nonzero_exit_marks_stale(self):
+        def fake_runner(cmd, timeout):
+            return subprocess.CompletedProcess(cmd, 255, "", "Connection refused")
+
+        state = ts.probe_run("vibes", "x", 8, fake_runner)
+        assert state["stale"] is True
+        assert "Connection refused" in state["error"]
+
+    def test_probe_command_tries_both_stat_dialects(self):
+        cmd = ts._build_probe_command("tstate2")
+        assert "stat -f %m" in cmd
+        assert "stat -c %Y" in cmd
+
+
+class TestCliProbe:
+    def test_probe_updates_run_state_from_ssh(self, registry_path, capsys, monkeypatch):
+        run_cli(["add", "1", "--title", "T", "--add-run", "vibes:tstate2"], registry_path, capsys)
+
+        def fake_runner(cmd, timeout):
+            stdout = "STATUS:running\nEXIT:\nBYTES:42\nMTIME:1785315257\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout, "")
+
+        monkeypatch.setattr(ts, "_run_command", fake_runner)
+        code, out, err = run_cli(["probe", "1"], registry_path, capsys)
+        assert code == 0
+
+        _, out2, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out2)
+        assert entry["runs"][0]["state"]["status"] == "running"
+        assert entry["runs"][0]["state"]["logBytes"] == 42
+
+    def test_probe_per_run_failure_isolated_others_still_update(self, registry_path, capsys, monkeypatch):
+        run_cli(["add", "1", "--title", "T", "--add-run", "vibes:a", "--add-run", "macmini:b"], registry_path, capsys)
+
+        def flaky_runner(cmd, timeout):
+            if "vibes" in cmd:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            return subprocess.CompletedProcess(cmd, 0, "STATUS:done\nEXIT:0\nBYTES:5\nMTIME:1785315257\n", "")
+
+        monkeypatch.setattr(ts, "_run_command", flaky_runner)
+        code, out, err = run_cli(["probe", "1"], registry_path, capsys)
+
+        _, out2, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out2)
+        by_host = {r["host"]: r for r in entry["runs"]}
+        assert by_host["vibes"]["state"]["stale"] is True
+        assert by_host["vibes"]["state"]["error"]
+        assert by_host["macmini"]["state"]["stale"] is False
+        assert by_host["macmini"]["state"]["status"] == "done"
+
+    def test_probe_never_crashes_and_preserves_cache_on_failure(self, registry_path, capsys, monkeypatch):
+        run_cli(["add", "1", "--title", "T", "--add-run", "vibes:a"], registry_path, capsys)
+        data = ts._parse_registry(registry_path)
+        data["threads"]["1"]["runs"][0]["state"] = {
+            "status": "running", "exitCode": None, "logBytes": 999, "logMtime": "2026-01-01T00:00:00Z",
+            "checkedAt": "2026-01-01T00:00:00Z", "stale": False, "error": None,
+        }
+        ts._write_registry(registry_path, data)
+
+        def crashy_runner(cmd, timeout):
+            raise OSError("ssh binary missing")
+
+        monkeypatch.setattr(ts, "_run_command", crashy_runner)
+        code, out, err = run_cli(["probe", "--all"], registry_path, capsys)
+        assert code == 0  # --all always exits zero regardless of per-thread errors
+
+        data = ts._parse_registry(registry_path)
+        state = data["threads"]["1"]["runs"][0]["state"]
+        assert state["logBytes"] == 999  # cache never wiped
+        assert state["stale"] is True
+
+    def test_probe_unknown_thread_id_errors(self, registry_path, capsys):
+        ts._write_registry(registry_path, ts._empty_registry())
+        code, out, err = run_cli(["probe", "ghost"], registry_path, capsys)
+        assert code == 2
+        assert "unknown" in err
+
+    def test_probe_skips_entries_without_runs(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        code, out, err = run_cli(["probe", "--all", "--json"], registry_path, capsys)
+        assert code == 0
+        results = json.loads(out)
+        assert results[0]["ok"] is False
+        assert "skipped" in results[0]["error"]
 

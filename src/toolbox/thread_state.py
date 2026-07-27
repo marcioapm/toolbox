@@ -12,12 +12,17 @@ Registry storage::
     ~/.config/thread-state/registry.json      default path
     $THREAD_STATE_REGISTRY / --registry PATH  overrides
 
-    {"schemaVersion": 2, "accounts": {...}, "threads": {"<threadId>": {...}}}
+    {"schemaVersion": 3, "accounts": {...}, "threads": {"<threadId>": {...}}}
 
-A thread entry carries a `prs` list — one or more PRs, each with its own
-`prState` — rather than a single PR. A v1 registry (scalar `pr` +
-top-level `prState`) is migrated automatically on first load; see
-`_migrate_registry`.
+A thread entry carries a `prs` list (one or more PRs, each with its own
+`prState`), a `branches` list (one or more branches, one marked primary), and
+a `runs` list (agent-run tasks tracked on remote hosts, each with its own
+polled `state`). It also carries `lastActivityAt`/`lastActivitySource` — the
+last time something was visibly posted in the thread, either set directly or
+derived from a Discord message-id snowflake. A v1 registry (scalar `pr` +
+top-level `prState`) and a v2 registry (scalar `branch`) are migrated
+automatically on first load, chaining through to the current version; see
+`_migrate_registry_data`.
 
 Writes are atomic (temp file + os.replace) and guarded by an flock held for
 the whole read-modify-write, so concurrent invocations can't interleave and
@@ -29,15 +34,18 @@ Usage::
     thread-state add <threadId> --title T [--repo R] [--pr N] [--add-pr REF] ...
     thread-state set <threadId> [--title T] [--status S] [--add-pr REF] [--rm-pr REF] [--primary-pr REF] ...
     thread-state rm <threadId>
-    thread-state list [--status S] [--repo R] [--tag T]
+    thread-state list [--status S] [--repo R] [--tag T] [--silent-for DURATION] [--stalled]
+    thread-state silent [--for DURATION]
     thread-state show <threadId>
     thread-state refresh [<threadId>... | --all]
+    thread-state probe [<threadId>... | --all]
     thread-state card <threadId> [--format markdown|embed-json]
     thread-state title <threadId>
     thread-state scan <threadId> --file PATH [--apply]
 
 A PR reference (REF) accepts `4694`, `#4694`, `owner/name#4694`, or a full
-`https://github.com/owner/name/pull/4694` URL.
+`https://github.com/owner/name/pull/4694` URL. A branch reference accepts a
+bare branch name or `repo:branch`. A run reference is `host:name`.
 
 Every command accepts --json for machine-readable stdout output.
 """
@@ -65,6 +73,22 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 STATUSES = ("active", "review", "blocked", "merged", "closed", "paused", "done")
+
+# Hosts `--add-run`/`probe` know how to reach. Adding a run against any other
+# host requires --force (typo guard — these tasks run unattended, a silent
+# typo in a host name would mean the run is polled forever and never flagged).
+KNOWN_HOSTS = ("vibes", "macmini", "marcio-xps")
+
+# Statuses considered "expected to be progressing" by the silent-thread
+# detector; overridable with --include-status. Never includes a resolved
+# status (merged/closed/done/paused) regardless of override.
+DEFAULT_SILENT_STATUSES = ("active", "review")
+NEVER_SILENT_STATUSES = ("merged", "closed", "done", "paused")
+
+# Card rendering's own (fixed) threshold for flagging a `running` agent-run
+# as producing no output — independent of `list --silent-for`'s caller-given
+# duration, since the card has no DURATION argument to take one from.
+CARD_STALL_THRESHOLD_SECONDS = 15 * 60
 
 STATUS_EMOJI = {
     "active": "🟢",
@@ -112,7 +136,7 @@ PR_REF_RE = re.compile(
 
 THREAD_TITLE_MAX = 100
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 EMPTY_PR_STATE = {
     "state": None,
@@ -124,6 +148,26 @@ EMPTY_PR_STATE = {
     "stale": False,
     "error": None,
 }
+
+EMPTY_RUN_STATE = {
+    "status": "missing",
+    "exitCode": None,
+    "logBytes": None,
+    "logMtime": None,
+    "checkedAt": None,
+    "stale": False,
+    "error": None,
+}
+
+# Discord snowflake -> Unix epoch: snowflakes encode a millisecond timestamp
+# relative to the "Discord Epoch" (2015-01-01T00:00:00Z) in their high 42
+# bits. See https://discord.com/developers/docs/reference#snowflakes.
+DISCORD_EPOCH_MS = 1420070400000
+
+RUN_HOST_NAME_RE = re.compile(r"^(?P<host>[\w.-]+):(?P<name>[\w.-]+)$")
+
+DURATION_RE = re.compile(r"^(?P<value>\d+)(?P<unit>s|m|h|d)$")
+DURATION_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 class RegistryError(Exception):
@@ -149,6 +193,12 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _utcnow() -> datetime:
+    """Wraps `datetime.now(timezone.utc)` behind a seam tests can
+    monkeypatch for deterministic silent/stalled-detector assertions."""
+    return datetime.now(timezone.utc)
+
+
 def _err(message: str) -> None:
     print(message, file=sys.stderr)
 
@@ -163,6 +213,45 @@ def _split_tags(raw: Optional[str]) -> List[str]:
     if not raw:
         return []
     return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def snowflake_to_iso(snowflake: str) -> str:
+    """Decode a Discord message-id snowflake into an ISO-8601 UTC timestamp,
+    per Discord's documented scheme: the top 42 bits are milliseconds since
+    the Discord Epoch (2015-01-01T00:00:00Z). Doing this decode ourselves
+    (rather than asking the caller to pass a timestamp) avoids clock-skew
+    mistakes at the call site."""
+    epoch_ms = (int(snowflake) >> 22) + DISCORD_EPOCH_MS
+    return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_duration(raw: str) -> int:
+    """Parse a duration like `35m`, `2h`, `90s`, `1d` into seconds. Raises
+    ValueError on anything else (no unit, unknown unit, negative, etc.)."""
+    m = DURATION_RE.match(raw.strip())
+    if not m:
+        raise ValueError(f"invalid duration '{raw}' (expected e.g. 35m, 2h, 90s, 1d)")
+    return int(m.group("value")) * DURATION_UNIT_SECONDS[m.group("unit")]
+
+
+def _parse_iso(ts: str) -> datetime:
+    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def _humanize_age_seconds(seconds: float) -> str:
+    """A short age string like `41m`, `11h`, `2d` — the coarsest unit that
+    doesn't round to 0."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+    days = hours // 24
+    return f"{days}d"
 
 
 # ---------------------------------------------------------------------------
@@ -192,16 +281,40 @@ def _migrate_entry_v1_to_v2(entry: Dict[str, Any]) -> None:
         entry["prs"] = []
 
 
+def _migrate_entry_v2_to_v3(entry: Dict[str, Any]) -> None:
+    """Mutate a single thread entry in place: scalar `branch` -> `branches`
+    list, plus the new `runs`/`lastActivityAt`/`lastActivitySource` fields.
+    A no-op if it already has a `branches` list (idempotent)."""
+    if "branches" in entry:
+        entry.pop("branch", None)
+    else:
+        branch = entry.pop("branch", None)
+        if branch:
+            entry["branches"] = [{"repo": entry.get("repo"), "name": branch, "primary": True}]
+        else:
+            entry["branches"] = []
+    entry.setdefault("runs", [])
+    entry.setdefault("lastActivityAt", None)
+    entry.setdefault("lastActivitySource", None)
+
+
 def _migrate_registry_data(data: Dict[str, Any]) -> bool:
-    """Migrate an in-memory registry dict from v1 to v2 (`prs` list per
-    entry). Idempotent — a no-op once `schemaVersion` is already >= 2.
-    Returns True if a v1 -> v2 conversion actually happened, so callers that
-    persist to disk know whether to back up the pre-migration file first."""
-    if data.get("schemaVersion", 1) >= SCHEMA_VERSION:
+    """Migrate an in-memory registry dict up to the current SCHEMA_VERSION,
+    applying v1->v2 and v2->v3 in order as needed. Idempotent — a no-op once
+    `schemaVersion` is already current. Returns True if any conversion
+    actually happened, so callers that persist to disk know whether to back
+    up the pre-migration file first."""
+    version = data.get("schemaVersion", 1)
+    if version >= SCHEMA_VERSION:
         return False
-    for entry in data.get("threads", {}).values():
-        _migrate_entry_v1_to_v2(entry)
-    data["schemaVersion"] = SCHEMA_VERSION
+    if version < 2:
+        for entry in data.get("threads", {}).values():
+            _migrate_entry_v1_to_v2(entry)
+        data["schemaVersion"] = 2
+    if data["schemaVersion"] < 3:
+        for entry in data.get("threads", {}).values():
+            _migrate_entry_v2_to_v3(entry)
+        data["schemaVersion"] = 3
     return True
 
 
@@ -292,19 +405,26 @@ def _locked_registry(path: Path):
     is only persisted if the block completes without raising — raise
     `_Abort` (or anything else) to discard in-progress changes.
 
-    If the on-disk file is still v1, it is migrated to v2 in memory before
-    being handed to the caller; the very first time that migration is about
-    to be persisted, the pre-migration bytes are backed up to
-    `registry.json.v1-backup-<ts>` so no data can be lost."""
+    If the on-disk file is behind SCHEMA_VERSION, it is migrated in memory
+    before being handed to the caller; the very first time that migration is
+    about to be persisted, the pre-migration bytes are backed up to
+    `registry.json.v<N>-backup-<ts>` (N = the on-disk schemaVersion before
+    migration) so no data can be lost."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         pre_migration_raw = path.read_text() if path.exists() and path.stat().st_size > 0 else None
+        pre_migration_version = 1
+        if pre_migration_raw:
+            try:
+                pre_migration_version = json.loads(pre_migration_raw).get("schemaVersion", 1)
+            except json.JSONDecodeError:
+                pass
         data, migrated = _load_and_migrate(path)
         yield data
         if migrated and pre_migration_raw is not None:
-            backup = path.with_name(path.name + f".v1-backup-{_timestamp_slug()}")
+            backup = path.with_name(path.name + f".v{pre_migration_version}-backup-{_timestamp_slug()}")
             try:
                 backup.write_text(pre_migration_raw)
             except OSError:
@@ -468,6 +588,129 @@ def derive_thread_status(entry: Dict[str, Any]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# branch helpers: get/add/remove/primary (mirrors the multi-PR helpers above)
+# ---------------------------------------------------------------------------
+
+def _branch_repo(branch_entry: Dict[str, Any], thread_repo: Optional[str]) -> Optional[str]:
+    return branch_entry.get("repo") or thread_repo
+
+
+def get_branches(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return entry.get("branches") or []
+
+
+def primary_branch(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The branch marked `primary: true`, or the first branch if none is
+    marked."""
+    branches = get_branches(entry)
+    if not branches:
+        return None
+    for b in branches:
+        if b.get("primary"):
+            return b
+    return branches[0]
+
+
+def set_branches_single(entry: Dict[str, Any], repo: Optional[str], name: str) -> None:
+    """`--branch B` semantics: replace the branch list with exactly this
+    one, marked primary."""
+    entry["branches"] = [{"repo": repo, "name": name, "primary": True}]
+
+
+def add_branch(entry: Dict[str, Any], repo: Optional[str], name: str) -> None:
+    """Append a branch, deduping by (effective repo, name). Re-adding an
+    existing branch is a no-op."""
+    thread_repo = entry.get("repo")
+    target_repo = repo or thread_repo
+    branches = entry.setdefault("branches", [])
+    for b in branches:
+        if _branch_repo(b, thread_repo) == target_repo and b.get("name") == name:
+            return
+    branches.append({"repo": repo, "name": name, "primary": not branches})
+
+
+def remove_branch(entry: Dict[str, Any], repo: Optional[str], name: str) -> bool:
+    """Remove a branch by (effective repo, name). Returns True if removed.
+    If the removed branch was primary and branches remain, the new first
+    branch becomes primary."""
+    thread_repo = entry.get("repo")
+    target_repo = repo or thread_repo
+    branches = get_branches(entry)
+    for i, b in enumerate(branches):
+        if _branch_repo(b, thread_repo) == target_repo and b.get("name") == name:
+            was_primary = bool(b.get("primary"))
+            del branches[i]
+            if was_primary and branches:
+                branches[0]["primary"] = True
+            return True
+    return False
+
+
+def set_primary_branch(entry: Dict[str, Any], repo: Optional[str], name: str) -> bool:
+    """Mark exactly one branch (by effective repo, name) as primary,
+    clearing the flag on all others. Returns True if the target was found."""
+    thread_repo = entry.get("repo")
+    target_repo = repo or thread_repo
+    branches = get_branches(entry)
+    found = False
+    for b in branches:
+        is_target = _branch_repo(b, thread_repo) == target_repo and b.get("name") == name
+        b["primary"] = is_target
+        found = found or is_target
+    return found
+
+
+def parse_branch_ref(ref: str, default_repo: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """Parse a `--add-branch`/`--rm-branch`/`--primary-branch` argument into
+    (repo_or_None, name). Accepts a bare branch name or `repo:branch`."""
+    ref = ref.strip()
+    if ":" in ref:
+        repo, name = ref.split(":", 1)
+        if not repo or not name:
+            raise ValueError(f"invalid branch reference '{ref}' (expected BRANCH or repo:BRANCH)")
+        return repo, name
+    if not ref:
+        raise ValueError("invalid branch reference '' (expected BRANCH or repo:BRANCH)")
+    return default_repo, ref
+
+
+# ---------------------------------------------------------------------------
+# run helpers: host:name parsing, get/add/remove
+# ---------------------------------------------------------------------------
+
+def parse_run_ref(ref: str) -> Tuple[str, str]:
+    """Parse a `--add-run`/`--rm-run` argument of the form `host:name`."""
+    m = RUN_HOST_NAME_RE.match(ref.strip())
+    if not m:
+        raise ValueError(f"invalid run reference '{ref}' (expected host:name)")
+    return m.group("host"), m.group("name")
+
+
+def get_runs(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return entry.get("runs") or []
+
+
+def add_run(entry: Dict[str, Any], host: str, name: str) -> None:
+    """Append a run, deduping by (host, name). Re-adding an existing run is
+    a no-op."""
+    runs = entry.setdefault("runs", [])
+    for r in runs:
+        if r.get("host") == host and r.get("name") == name:
+            return
+    runs.append({"host": host, "name": name, "state": dict(EMPTY_RUN_STATE)})
+
+
+def remove_run(entry: Dict[str, Any], host: str, name: str) -> bool:
+    """Remove a run by (host, name). Returns True if a run was removed."""
+    runs = get_runs(entry)
+    for i, r in enumerate(runs):
+        if r.get("host") == host and r.get("name") == name:
+            del runs[i]
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # rendering: icon/color, title, card
 # ---------------------------------------------------------------------------
 
@@ -547,10 +790,64 @@ def _pr_line(entry: Dict[str, Any], p: Dict[str, Any]) -> str:
     return line
 
 
+def _branch_line(entry: Dict[str, Any]) -> str:
+    """`branch: feat/x (primary), feat/y` for the card, when there are no
+    PRs but there ARE branches."""
+    branches = get_branches(entry)
+    parts = []
+    for b in branches:
+        label = f"`{b['name']}`"
+        if b.get("primary"):
+            label += " (primary)"
+        parts.append(label)
+    return "branch: " + ", ".join(parts)
+
+
+def run_is_stalled(run: Dict[str, Any], threshold_seconds: float, now: Optional[datetime] = None) -> bool:
+    """A run is "stalled" when it claims `status == running` but its log
+    hasn't grown in at least `threshold_seconds` — the high-confidence
+    "agent claims to be working but is producing nothing" signal."""
+    state = run.get("state") or {}
+    if state.get("status") != "running":
+        return False
+    mtime = state.get("logMtime")
+    if not mtime:
+        return False
+    now = now or _utcnow()
+    try:
+        age = (now - _parse_iso(mtime)).total_seconds()
+    except ValueError:
+        return False
+    return age >= threshold_seconds
+
+
+def _run_line(run: Dict[str, Any], now: Optional[datetime] = None) -> str:
+    """`run: host/name status (log 4m ago)` for the card, with a loud
+    `⚠️ no output for Nm` marker when stalled."""
+    state = run.get("state") or {}
+    status = state.get("status", "missing")
+    line = f"run: {run.get('host')}/{run.get('name')} {status}"
+    mtime = state.get("logMtime")
+    now = now or _utcnow()
+    age_str = None
+    if mtime:
+        try:
+            age_str = _humanize_age_seconds((now - _parse_iso(mtime)).total_seconds())
+        except ValueError:
+            age_str = None
+    if age_str is not None:
+        line += f" (log {age_str} ago)"
+    if run_is_stalled(run, CARD_STALL_THRESHOLD_SECONDS, now=now) and age_str is not None:
+        line += f" ⚠️ no output for {age_str}"
+    return line
+
+
 def render_card_markdown(entry: Dict[str, Any]) -> str:
     """The pinned status card message body."""
     icon = _effective_icon(entry)
     prs = get_prs(entry)
+    branches = get_branches(entry)
+    runs = get_runs(entry)
 
     lines = [f"{icon} **{entry.get('title', '')}** — {entry.get('status', '')}"]
     if entry.get("description"):
@@ -559,13 +856,17 @@ def render_card_markdown(entry: Dict[str, Any]) -> str:
     meta = []
     if entry.get("repo"):
         meta.append(f"repo: {entry['repo']}")
-    if not prs and entry.get("branch"):
-        meta.append(f"branch: `{entry['branch']}`")
     if meta:
         lines.append(" | ".join(meta))
 
+    if not prs and branches:
+        lines.append(_branch_line(entry))
+
     for p in prs:
         lines.append(_pr_line(entry, p))
+
+    for r in runs:
+        lines.append(_run_line(r))
 
     if entry.get("tags"):
         lines.append("tags: " + ", ".join(entry["tags"]))
@@ -580,6 +881,7 @@ def render_card_markdown(entry: Dict[str, Any]) -> str:
 def render_card_embed(entry: Dict[str, Any]) -> Dict[str, Any]:
     """A Discord embed object, ready to hand to a Discord client."""
     prs = get_prs(entry)
+    branches = get_branches(entry)
     primary = primary_pr(entry)
     primary_state = (primary or {}).get("prState") or {}
 
@@ -591,8 +893,12 @@ def render_card_embed(entry: Dict[str, Any]) -> Dict[str, Any]:
         if len(prs) > 1:
             pr_value += f" (+{len(prs) - 1})"
         fields.append({"name": "PR", "value": pr_value, "inline": True})
-    if not prs and entry.get("branch"):
-        fields.append({"name": "Branch", "value": entry["branch"], "inline": True})
+    if not prs and branches:
+        primary_b = primary_branch(entry)
+        branch_value = primary_b["name"]
+        if len(branches) > 1:
+            branch_value += f" (+{len(branches) - 1})"
+        fields.append({"name": "Branch", "value": branch_value, "inline": True})
     if primary_state.get("ci"):
         fields.append({"name": "CI", "value": primary_state["ci"], "inline": True})
     fields.append({"name": "Status", "value": entry.get("status", ""), "inline": True})
@@ -609,8 +915,15 @@ def render_card_embed(entry: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _format_table(entries: List[Dict[str, Any]]) -> str:
-    headers = ["", "THREAD", "TITLE", "STATUS", "PR", "CI", "DESCRIPTION"]
+TABLE_MAX_WIDTH = 120
+
+
+def _format_table(entries: List[Dict[str, Any]], silent_map: Optional[Dict[Optional[str], Optional[float]]] = None) -> str:
+    headers = ["", "THREAD", "TITLE", "STATUS", "PR"]
+    if silent_map is not None:
+        headers.append("SILENT")
+    headers += ["CI", "DESCRIPTION"]
+
     rows = []
     for e in entries:
         prs = get_prs(e)
@@ -622,18 +935,32 @@ def _format_table(entries: List[Dict[str, Any]]) -> str:
         else:
             pr_col = "-"
         ci = ((primary or {}).get("prState") or {}).get("ci") or "-"
-        rows.append([
+        row = [
             _effective_icon(e),
             str(e.get("threadId", "")),
             str(e.get("title", "")),
             str(e.get("status", "")),
             pr_col,
-            ci,
-            str(e.get("description", "")),
-        ])
-    widths = [
-        max([len(headers[i])] + [len(r[i]) for r in rows]) for i in range(len(headers))
+        ]
+        if silent_map is not None:
+            sfs = silent_map.get(e.get("threadId"))
+            row.append(_humanize_age_seconds(sfs) if sfs is not None else "?")
+        row += [ci, str(e.get("description", ""))]
+        rows.append(row)
+
+    # Truncate the DESCRIPTION column (last) as needed to keep the whole
+    # line under TABLE_MAX_WIDTH — every other column is short/fixed-shape,
+    # so description is the only one that can grow unbounded.
+    fixed_widths = [
+        max([len(headers[i])] + [len(r[i]) for r in rows]) for i in range(len(headers) - 1)
     ]
+    sep_width = 2 * (len(headers) - 1)
+    budget = max(10, TABLE_MAX_WIDTH - sum(fixed_widths) - sep_width)
+    for r in rows:
+        if len(r[-1]) > budget:
+            r[-1] = r[-1][: max(0, budget - 1)].rstrip() + "…"
+
+    widths = fixed_widths + [max([len(headers[-1])] + [len(r[-1]) for r in rows])]
 
     def fmt_row(cols: List[str]) -> str:
         # Don't pad the last column — descriptions are free text.
@@ -648,16 +975,18 @@ def _format_table(entries: List[Dict[str, Any]]) -> str:
 
 def _format_entry_human(entry: Dict[str, Any]) -> str:
     prs = get_prs(entry)
+    branches = get_branches(entry)
+    runs = get_runs(entry)
     lines = [
         f"threadId: {entry.get('threadId')}",
         f"title: {entry.get('title')}",
         f"status: {_effective_icon(entry)} {entry.get('status')}",
         f"repo: {entry.get('repo') or '-'}",
-        f"branch: {entry.get('branch') or '-'}",
         f"description: {entry.get('description') or '-'}",
         f"tags: {', '.join(entry.get('tags') or []) or '-'}",
         f"links: {', '.join(entry.get('links') or []) or '-'}",
         f"notes: {entry.get('notes') or '-'}",
+        f"lastActivityAt: {entry.get('lastActivityAt') or '-'} ({entry.get('lastActivitySource') or '-'})",
         f"createdAt: {entry.get('createdAt')}",
         f"updatedAt: {entry.get('updatedAt')}",
     ]
@@ -668,6 +997,17 @@ def _format_entry_human(entry: Dict[str, Any]) -> str:
         lines.append(
             f"pr[{marker}]: {repo}#{p.get('number')} state={pr_state.get('state')} "
             f"ci={pr_state.get('ci')} stale={pr_state.get('stale')} checkedAt={pr_state.get('checkedAt')}"
+        )
+    for b in branches:
+        marker = "*" if b.get("primary") else " "
+        repo = _branch_repo(b, entry.get("repo")) or "-"
+        lines.append(f"branch[{marker}]: {repo}:{b.get('name')}")
+    for r in runs:
+        state = r.get("state") or {}
+        lines.append(
+            f"run: {r.get('host')}/{r.get('name')} status={state.get('status')} "
+            f"exitCode={state.get('exitCode')} logBytes={state.get('logBytes')} "
+            f"logMtime={state.get('logMtime')} stale={state.get('stale')}"
         )
     return "\n".join(lines)
 
@@ -753,6 +1093,99 @@ def fetch_pr_state(
 
 
 # ---------------------------------------------------------------------------
+# agent-run probing over SSH (subprocess-injected so tests never touch the
+# network or a real ssh binary)
+# ---------------------------------------------------------------------------
+
+PROBE_LINE_RE = re.compile(r"^(STATUS|EXIT|BYTES|MTIME):(.*)$")
+PROBE_MISSING_MARKER = "__TSTATE_MISSING__"
+
+
+def _build_probe_command(name: str) -> str:
+    """The remote shell one-liner for a single agent-run `name`, per the
+    split-storage convention (ephemeral /tmp, persistent /var/tmp). Prefixing
+    each value with a tag makes parsing order-independent, and trying both
+    `stat` dialects (macOS `-f %m`, Linux `-c %Y`) in one `||` chain means we
+    never need to know which OS the host runs — the wrong one just fails
+    silently and falls through."""
+    status_path = f"/tmp/agent-runs/{name}/status"
+    exit_path = f"/tmp/agent-runs/{name}/exit_code"
+    log_path = f"/var/tmp/agent-runs/{name}/log"
+    return (
+        f'echo "STATUS:$(cat {status_path} 2>/dev/null || echo {PROBE_MISSING_MARKER})"; '
+        f'echo "EXIT:$(cat {exit_path} 2>/dev/null)"; '
+        f'echo "BYTES:$(wc -c < {log_path} 2>/dev/null)"; '
+        f'echo "MTIME:$(stat -f %m {log_path} 2>/dev/null || stat -c %Y {log_path} 2>/dev/null)"'
+    )
+
+
+def _parse_probe_output(stdout: str) -> Dict[str, Optional[str]]:
+    fields: Dict[str, Optional[str]] = {"STATUS": None, "EXIT": None, "BYTES": None, "MTIME": None}
+    for line in stdout.splitlines():
+        m = PROBE_LINE_RE.match(line.strip())
+        if m:
+            fields[m.group(1)] = m.group(2).strip() or None
+    return fields
+
+
+def probe_run(host: str, name: str, timeout: int, runner) -> Dict[str, Any]:
+    """Poll one agent-run task over SSH and return a fresh `state` dict.
+    Never raises — any failure (SSH error, timeout, unparseable output)
+    returns `stale: True` + `error` so the caller can fall back to the
+    previously cached state instead of losing it."""
+    cmd = [
+        "ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
+        host, _build_probe_command(name),
+    ]
+    try:
+        proc = runner(cmd, timeout + 5)
+    except subprocess.TimeoutExpired:
+        return {"stale": True, "error": f"ssh timed out after {timeout}s"}
+    except OSError as exc:
+        return {"stale": True, "error": f"ssh failed to run: {exc}"}
+
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip() or f"ssh exited {proc.returncode}"
+        return {"stale": True, "error": err}
+
+    fields = _parse_probe_output(proc.stdout or "")
+    checked_at = _now_iso()
+
+    if fields["STATUS"] is None or fields["STATUS"] == PROBE_MISSING_MARKER:
+        return {
+            "status": "missing", "exitCode": None, "logBytes": None, "logMtime": None,
+            "checkedAt": checked_at, "stale": False, "error": None,
+        }
+
+    exit_code = None
+    if fields["EXIT"] is not None:
+        try:
+            exit_code = int(fields["EXIT"])
+        except ValueError:
+            exit_code = None
+
+    log_bytes = None
+    if fields["BYTES"] is not None:
+        try:
+            log_bytes = int(fields["BYTES"])
+        except ValueError:
+            log_bytes = None
+
+    log_mtime = None
+    if fields["MTIME"] is not None:
+        try:
+            epoch = int(fields["MTIME"])
+            log_mtime = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (ValueError, OverflowError, OSError):
+            log_mtime = None
+
+    return {
+        "status": fields["STATUS"], "exitCode": exit_code, "logBytes": log_bytes, "logMtime": log_mtime,
+        "checkedAt": checked_at, "stale": False, "error": None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # PR-reference scanning
 # ---------------------------------------------------------------------------
 
@@ -803,12 +1236,15 @@ def best_match(matches: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def _entry_with_computed_pr(entry: Dict[str, Any]) -> Dict[str, Any]:
-    """A shallow copy of `entry` for JSON output, with a read-only `pr` field
-    (the primary PR's number, or null) so old consumers that only knew the
-    v1 scalar `pr` field don't hard-break."""
+    """A shallow copy of `entry` for JSON output, with read-only `pr` and
+    `branch` fields (the primary PR's number / primary branch's name, or
+    null) so old consumers that only knew the v1/v2 scalar fields don't
+    hard-break."""
     out = dict(entry)
     primary = primary_pr(entry)
     out["pr"] = primary.get("number") if primary else None
+    primary_b = primary_branch(entry)
+    out["branch"] = primary_b.get("name") if primary_b else None
     return out
 
 
@@ -833,6 +1269,104 @@ def _apply_pr_mutations(entry: Dict[str, Any], args: argparse.Namespace) -> None
         raise _Abort(2, f"thread-state: {exc}") from exc
 
 
+def _apply_branch_mutations(entry: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Apply --branch/--add-branch/--rm-branch/--primary-branch to `entry`,
+    in that order. Raises _Abort(2, ...) on a bad reference or an unmatched
+    --primary-branch."""
+    try:
+        if getattr(args, "branch", None) is not None:
+            set_branches_single(entry, entry.get("repo"), args.branch)
+        for ref in getattr(args, "add_branch", None) or []:
+            repo, name = parse_branch_ref(ref, entry.get("repo"))
+            add_branch(entry, repo, name)
+        for ref in getattr(args, "rm_branch", None) or []:
+            repo, name = parse_branch_ref(ref, entry.get("repo"))
+            remove_branch(entry, repo, name)
+        primary_ref = getattr(args, "primary_branch", None)
+        if primary_ref:
+            repo, name = parse_branch_ref(primary_ref, entry.get("repo"))
+            if not set_primary_branch(entry, repo, name):
+                raise _Abort(2, f"thread-state: --primary-branch {primary_ref} does not match any branch on this thread")
+    except ValueError as exc:
+        raise _Abort(2, f"thread-state: {exc}") from exc
+
+
+def _apply_run_mutations(entry: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Apply --add-run/--rm-run to `entry`. Rejects an unknown host unless
+    --force is set. Raises _Abort(2, ...) on a bad reference or unknown
+    host."""
+    force = bool(getattr(args, "force", False))
+    try:
+        for ref in getattr(args, "add_run", None) or []:
+            host, name = parse_run_ref(ref)
+            if host not in KNOWN_HOSTS and not force:
+                raise _Abort(
+                    2,
+                    f"thread-state: unknown host '{host}' (known hosts: {', '.join(KNOWN_HOSTS)}; use --force to add anyway)",
+                )
+            add_run(entry, host, name)
+        for ref in getattr(args, "rm_run", None) or []:
+            host, name = parse_run_ref(ref)
+            remove_run(entry, host, name)
+    except ValueError as exc:
+        raise _Abort(2, f"thread-state: {exc}") from exc
+
+
+def _apply_last_activity_mutations(entry: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Apply --last-activity/--last-message-id to `entry`. The two are
+    mutually exclusive at the CLI level (argparse doesn't enforce it here,
+    so a caller passing both gets --last-message-id's decoded value win,
+    applied second)."""
+    last_activity = getattr(args, "last_activity", None)
+    if last_activity is not None:
+        entry["lastActivityAt"] = last_activity
+        entry["lastActivitySource"] = "manual"
+    last_message_id = getattr(args, "last_message_id", None)
+    if last_message_id is not None:
+        try:
+            entry["lastActivityAt"] = snowflake_to_iso(last_message_id)
+        except (ValueError, OverflowError) as exc:
+            raise _Abort(2, f"thread-state: invalid --last-message-id '{last_message_id}': {exc}") from exc
+        entry["lastActivitySource"] = "discord"
+
+
+def _effective_silent_statuses(include_status_arg: Optional[str]) -> List[str]:
+    """The statuses considered "expected to be progressing" for the silent
+    detector: --include-status if given, else DEFAULT_SILENT_STATUSES — minus
+    anything in NEVER_SILENT_STATUSES, which can never be overridden back
+    in."""
+    statuses = _split_tags(include_status_arg) if include_status_arg else list(DEFAULT_SILENT_STATUSES)
+    return [s for s in statuses if s not in NEVER_SILENT_STATUSES]
+
+
+def _silent_info(
+    entry: Dict[str, Any],
+    threshold_seconds: float,
+    include_statuses: List[str],
+    now: Optional[datetime] = None,
+) -> Tuple[bool, Optional[float], bool]:
+    """Returns (silent, silentForSeconds, stalled) for one entry against a
+    DURATION threshold. `silentForSeconds` is None when `lastActivityAt` is
+    null — silent-but-distinct: an unknown age, not a zero age."""
+    now = now or _utcnow()
+    if entry.get("status") not in include_statuses:
+        return False, None, False
+
+    last = entry.get("lastActivityAt")
+    if last is None:
+        silent_for: Optional[float] = None
+        silent = True
+    else:
+        try:
+            silent_for = (now - _parse_iso(last)).total_seconds()
+        except ValueError:
+            silent_for = None
+        silent = silent_for is None or silent_for >= threshold_seconds
+
+    stalled = any(run_is_stalled(r, threshold_seconds, now=now) for r in get_runs(entry))
+    return silent, silent_for, stalled
+
+
 def cmd_add(args: argparse.Namespace) -> int:
     path = _resolve_registry_path(args)
     try:
@@ -853,16 +1387,22 @@ def cmd_add(args: argparse.Namespace) -> int:
                 "title": args.title,
                 "description": args.desc or "",
                 "repo": args.repo,
-                "branch": args.branch,
                 "status": status,
                 "tags": _split_tags(args.tags),
                 "links": list(args.link or []),
                 "notes": "",
                 "prs": [],
+                "branches": [],
+                "runs": [],
+                "lastActivityAt": None,
+                "lastActivitySource": None,
                 "createdAt": now,
                 "updatedAt": now,
             }
             _apply_pr_mutations(entry, args)
+            _apply_branch_mutations(entry, args)
+            _apply_run_mutations(entry, args)
+            _apply_last_activity_mutations(entry, args)
             threads[args.thread_id] = entry
     except _Abort as exc:
         _err(exc.message)
@@ -892,8 +1432,6 @@ def cmd_set(args: argparse.Namespace) -> int:
                 entry["description"] = args.desc
             if args.repo is not None:
                 entry["repo"] = args.repo
-            if args.branch is not None:
-                entry["branch"] = args.branch
             if args.status is not None:
                 try:
                     entry["status"] = _validate_status(args.status)
@@ -906,6 +1444,9 @@ def cmd_set(args: argparse.Namespace) -> int:
             if args.note is not None:
                 entry["notes"] = args.note
             _apply_pr_mutations(entry, args)
+            _apply_branch_mutations(entry, args)
+            _apply_run_mutations(entry, args)
+            _apply_last_activity_mutations(entry, args)
             entry["updatedAt"] = _now_iso()
             result = _entry_with_computed_pr(entry)
     except _Abort as exc:
@@ -958,15 +1499,56 @@ def cmd_list(args: argparse.Namespace) -> int:
         entries = [e for e in entries if e.get("repo") == args.repo]
     if args.tag:
         entries = [e for e in entries if args.tag in (e.get("tags") or [])]
+
+    silent_for = getattr(args, "silent_for", None)
+    stalled_only = bool(getattr(args, "stalled", False))
+    silent_seconds: Optional[int] = None
+    if silent_for is not None:
+        try:
+            silent_seconds = parse_duration(silent_for)
+        except ValueError as exc:
+            _err(f"thread-state: {exc}")
+            return 2
+
     entries.sort(key=lambda e: (e.get("title") or "", e.get("threadId") or ""))
 
+    if silent_seconds is not None:
+        include_statuses = _effective_silent_statuses(getattr(args, "include_status", None))
+        now = _utcnow()
+        annotated = []
+        for e in entries:
+            silent, silent_for_seconds, stalled = _silent_info(e, silent_seconds, include_statuses, now=now)
+            if not silent:
+                continue
+            if stalled_only and not stalled:
+                continue
+            annotated.append((e, silent_for_seconds, stalled))
+    else:
+        annotated = [(e, None, False) for e in entries]
+
     if args.json:
-        print(json.dumps([_entry_with_computed_pr(e) for e in entries], indent=2, sort_keys=True))
-    elif not entries:
+        out = []
+        for e, silent_for_seconds, stalled in annotated:
+            item = _entry_with_computed_pr(e)
+            if silent_seconds is not None:
+                item["silentForSeconds"] = silent_for_seconds
+                item["stalled"] = stalled
+            out.append(item)
+        print(json.dumps(out, indent=2, sort_keys=True))
+    elif not annotated:
         print("thread-state: no threads")
     else:
-        print(_format_table(entries))
+        print(_format_table([e for e, _, _ in annotated], silent_map={
+            e.get("threadId"): sfs for e, sfs, _stalled in annotated
+        } if silent_seconds is not None else None))
     return 0
+
+
+def cmd_silent(args: argparse.Namespace) -> int:
+    """Thin alias for `list --silent-for` — a stable cron entrypoint."""
+    list_args = argparse.Namespace(**vars(args))
+    list_args.silent_for = args.for_duration
+    return cmd_list(list_args)
 
 
 def cmd_show(args: argparse.Namespace) -> int:
@@ -1074,6 +1656,92 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         for r in sorted(results, key=lambda r: r["threadId"]):
             if r["ok"]:
                 print(f"{r['threadId']}: refreshed ({len(r['prs'])} pr(s))")
+            else:
+                print(f"{r['threadId']}: ERROR {r['error']}")
+
+    if args.all:
+        return 0
+    return 1 if any(not r["ok"] for r in results) else 0
+
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    path = _resolve_registry_path(args)
+    results: List[Dict[str, Any]] = []
+    try:
+        with _locked_registry(path) as data:
+            threads = data["threads"]
+
+            if args.all:
+                ids = list(threads.keys())
+            else:
+                ids = args.thread_ids
+                missing = [tid for tid in ids if tid not in threads]
+                if missing:
+                    raise _Abort(2, f"thread-state: unknown thread id(s): {', '.join(missing)}")
+
+            # Flatten every run of every targeted thread into one global job
+            # list so the 6-worker cap applies across ALL runs, not per thread.
+            jobs: List[Tuple[str, int]] = []
+            for tid in ids:
+                entry = threads[tid]
+                for idx, _r in enumerate(get_runs(entry)):
+                    jobs.append((tid, idx))
+            targets_tids = {tid for tid, _ in jobs}
+            skipped = [tid for tid in ids if tid not in targets_tids]
+
+            def _work(tid: str, idx: int):
+                entry = threads[tid]
+                r = get_runs(entry)[idx]
+                state = probe_run(r["host"], r["name"], args.timeout, _run_command)
+                return tid, idx, state
+
+            per_thread_total: Dict[str, int] = {}
+            for tid, _idx in jobs:
+                per_thread_total[tid] = per_thread_total.get(tid, 0) + 1
+            per_thread_done: Dict[str, int] = {tid: 0 for tid in targets_tids}
+            per_thread_errors: Dict[str, List[str]] = {}
+
+            worker_count = min(REFRESH_MAX_WORKERS, len(jobs)) or 1
+            with ThreadPoolExecutor(max_workers=worker_count) as ex:
+                futures = {ex.submit(_work, tid, idx): (tid, idx) for tid, idx in jobs}
+                for fut in as_completed(futures):
+                    tid, idx, state = fut.result()
+                    entry = threads[tid]
+                    r = get_runs(entry)[idx]
+                    if state.get("error") is not None:
+                        prev = dict(r.get("state") or EMPTY_RUN_STATE)
+                        prev["stale"] = True
+                        prev["error"] = state["error"]
+                        prev["checkedAt"] = _now_iso()
+                        r["state"] = prev
+                        per_thread_errors.setdefault(tid, []).append(state["error"])
+                    else:
+                        r["state"] = state
+
+                    per_thread_done[tid] += 1
+                    if per_thread_done[tid] == per_thread_total[tid]:
+                        entry["updatedAt"] = _now_iso()
+                        errs = per_thread_errors.get(tid)
+                        if errs:
+                            results.append({"threadId": tid, "ok": False, "error": "; ".join(errs)})
+                        else:
+                            results.append({"threadId": tid, "ok": True, "runs": get_runs(entry)})
+
+            for tid in skipped:
+                results.append({"threadId": tid, "ok": False, "error": "no runs tracked, skipped"})
+    except _Abort as exc:
+        _err(exc.message)
+        return exc.code
+    except RegistryError as exc:
+        _err(str(exc))
+        return 3
+
+    if args.json:
+        print(json.dumps(results, indent=2, sort_keys=True))
+    else:
+        for r in sorted(results, key=lambda r: r["threadId"]):
+            if r["ok"]:
+                print(f"{r['threadId']}: probed ({len(r['runs'])} run(s))")
             else:
                 print(f"{r['threadId']}: ERROR {r['error']}")
 
@@ -1195,6 +1863,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="path to registry.json (default: ~/.config/thread-state/registry.json or $THREAD_STATE_REGISTRY)",
     )
 
+    def _add_branch_run_activity_args(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--branch", help="set the branch list to exactly this one, primary")
+        sp.add_argument("--add-branch", action="append", metavar="[REPO:]BRANCH", help="append a branch; repeatable")
+        sp.add_argument("--rm-branch", action="append", metavar="[REPO:]BRANCH", help="remove a branch by reference; repeatable")
+        sp.add_argument("--primary-branch", metavar="[REPO:]BRANCH", help="mark which branch is primary")
+        sp.add_argument("--add-run", action="append", metavar="HOST:NAME", help="track an agent-run task; repeatable")
+        sp.add_argument("--rm-run", action="append", metavar="HOST:NAME", help="stop tracking an agent-run task; repeatable")
+        sp.add_argument("--last-activity", metavar="ISO8601", help="set lastActivityAt directly (source=manual)")
+        sp.add_argument("--last-message-id", metavar="SNOWFLAKE", help="derive lastActivityAt from a Discord message id (source=discord)")
+
     p = argparse.ArgumentParser(
         prog="thread-state",
         description="Registry + GitHub polling + rendering for long-lived coding threads.",
@@ -1211,7 +1889,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_add.add_argument("--primary-pr", metavar="REF", help="mark which PR is primary")
     sp_add.add_argument("--desc")
     sp_add.add_argument("--tags")
-    sp_add.add_argument("--branch")
+    _add_branch_run_activity_args(sp_add)
     sp_add.add_argument("--status", default="active")
     sp_add.add_argument("--link", action="append")
     sp_add.add_argument("--force", action="store_true")
@@ -1228,10 +1906,11 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_set.add_argument("--primary-pr", metavar="REF", help="mark which PR is primary")
     sp_set.add_argument("--desc")
     sp_set.add_argument("--tags")
-    sp_set.add_argument("--branch")
+    _add_branch_run_activity_args(sp_set)
     sp_set.add_argument("--status")
     sp_set.add_argument("--link", action="append")
     sp_set.add_argument("--note")
+    sp_set.add_argument("--force", action="store_true", help="allow --add-run against an unknown host")
     sp_set.add_argument("--json", action="store_true")
     sp_set.set_defaults(func=cmd_set)
 
@@ -1244,8 +1923,27 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_list.add_argument("--status")
     sp_list.add_argument("--repo")
     sp_list.add_argument("--tag")
+    sp_list.add_argument("--silent-for", metavar="DURATION", help="only show threads silent for longer than DURATION (e.g. 35m, 2h, 90s, 1d)")
+    sp_list.add_argument(
+        "--include-status", metavar="A,B",
+        help="statuses considered 'expected to be progressing' for --silent-for (default: active,review)",
+    )
+    sp_list.add_argument(
+        "--stalled", action="store_true",
+        help="with --silent-for, only show entries that ALSO have a running run whose log hasn't grown in DURATION",
+    )
     sp_list.add_argument("--json", action="store_true")
     sp_list.set_defaults(func=cmd_list)
+
+    sp_silent = sub.add_parser("silent", parents=[parent], help="alias for `list --silent-for` (cron entrypoint)")
+    sp_silent.add_argument("--for", dest="for_duration", metavar="DURATION", default="30m")
+    sp_silent.add_argument("--status")
+    sp_silent.add_argument("--repo")
+    sp_silent.add_argument("--tag")
+    sp_silent.add_argument("--include-status", metavar="A,B")
+    sp_silent.add_argument("--stalled", action="store_true")
+    sp_silent.add_argument("--json", action="store_true")
+    sp_silent.set_defaults(func=cmd_silent)
 
     sp_show = sub.add_parser("show", parents=[parent], help="show one thread entry")
     sp_show.add_argument("thread_id")
@@ -1258,6 +1956,13 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_refresh.add_argument("--timeout", type=int, default=GH_TIMEOUT_DEFAULT)
     sp_refresh.add_argument("--json", action="store_true")
     sp_refresh.set_defaults(func=cmd_refresh)
+
+    sp_probe = sub.add_parser("probe", parents=[parent], help="poll agent-run tasks over SSH and refresh cached run state")
+    sp_probe.add_argument("thread_ids", nargs="*")
+    sp_probe.add_argument("--all", action="store_true")
+    sp_probe.add_argument("--timeout", type=int, default=8)
+    sp_probe.add_argument("--json", action="store_true")
+    sp_probe.set_defaults(func=cmd_probe)
 
     sp_card = sub.add_parser("card", parents=[parent], help="render the pinned status card")
     sp_card.add_argument("thread_id")
