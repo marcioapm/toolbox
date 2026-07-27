@@ -12,7 +12,7 @@ Registry storage::
     ~/.config/thread-state/registry.json      default path
     $THREAD_STATE_REGISTRY / --registry PATH  overrides
 
-    {"schemaVersion": 4, "accounts": {...}, "threads": {"<threadId>": {...}}}
+    {"schemaVersion": 5, "accounts": {...}, "threads": {"<threadId>": {...}}}
 
 A thread entry carries a `prs` list (one or more PRs, each with its own
 `prState`), a `branches` list (one or more branches, one marked primary), and
@@ -24,10 +24,13 @@ list — a rolling, capped work-summary log (`{"ts", "text", "kind"}`, newest
 last), appended explicitly via `set --progress` (`kind: "manual"`) or
 automatically by `refresh`/`probe` on a genuine state transition (`kind:
 "transition"`); see `append_update` and `_pr_transition_texts` /
-`_run_transition_texts`. A v1 registry (scalar `pr` + top-level `prState`), a
-v2 registry (scalar `branch`), and a v3 registry (no `updates`) are migrated
-automatically on first load, chaining through to the current version; see
-`_migrate_registry_data`.
+`_run_transition_texts`. It also carries `cardMessageId`/`parentChannelId`/
+`discordName` — the identity of the pinned Discord status-card message, so an
+automated monitor can edit it in place instead of rediscovering it or posting
+a duplicate. A v1 registry (scalar `pr` + top-level `prState`), a v2 registry
+(scalar `branch`), a v3 registry (no `updates`), and a v4 registry (no card
+identity fields) are migrated automatically on first load, chaining through
+to the current version; see `_migrate_registry_data`.
 
 Writes are atomic (temp file + os.replace) and guarded by an flock held for
 the whole read-modify-write, so concurrent invocations can't interleave and
@@ -142,7 +145,7 @@ PR_REF_RE = re.compile(
 
 THREAD_TITLE_MAX = 100
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # `updates` list caps: max entries retained (oldest evicted first) and max
 # chars per entry (hard-truncated with an ellipsis, since these render as
@@ -181,6 +184,11 @@ EMPTY_RUN_STATE = {
 # relative to the "Discord Epoch" (2015-01-01T00:00:00Z) in their high 42
 # bits. See https://discord.com/developers/docs/reference#snowflakes.
 DISCORD_EPOCH_MS = 1420070400000
+
+# A Discord snowflake is a decimal-digit string (fits in an unsigned 64-bit
+# int, but validation only cares that it's all digits — `--card-message-id`/
+# `--parent-channel-id` reject anything else with a clear error).
+SNOWFLAKE_RE = re.compile(r"^\d+$")
 
 RUN_HOST_NAME_RE = re.compile(r"^(?P<host>[\w.-]+):(?P<name>[\w.-]+)$")
 
@@ -250,6 +258,14 @@ def parse_duration(raw: str) -> int:
     if not m:
         raise ValueError(f"invalid duration '{raw}' (expected e.g. 35m, 2h, 90s, 1d)")
     return int(m.group("value")) * DURATION_UNIT_SECONDS[m.group("unit")]
+
+
+def validate_snowflake(raw: str) -> str:
+    """Validate a Discord snowflake CLI argument (decimal digits only).
+    Raises ValueError on anything else."""
+    if not SNOWFLAKE_RE.match(raw):
+        raise ValueError(f"invalid snowflake '{raw}' (expected a string of decimal digits)")
+    return raw
 
 
 def _parse_iso(ts: str) -> datetime:
@@ -322,10 +338,19 @@ def _migrate_entry_v3_to_v4(entry: Dict[str, Any]) -> None:
     entry.setdefault("updates", [])
 
 
+def _migrate_entry_v4_to_v5(entry: Dict[str, Any]) -> None:
+    """Mutate a single thread entry in place: add the new `cardMessageId`/
+    `parentChannelId`/`discordName` fields, defaulting to null. A no-op if
+    they're already present (idempotent)."""
+    entry.setdefault("cardMessageId", None)
+    entry.setdefault("parentChannelId", None)
+    entry.setdefault("discordName", None)
+
+
 def _migrate_registry_data(data: Dict[str, Any]) -> bool:
     """Migrate an in-memory registry dict up to the current SCHEMA_VERSION,
-    applying v1->v2, v2->v3, and v3->v4 in order as needed. Idempotent — a
-    no-op once `schemaVersion` is already current. Returns True if any
+    applying v1->v2, v2->v3, v3->v4, and v4->v5 in order as needed. Idempotent
+    — a no-op once `schemaVersion` is already current. Returns True if any
     conversion actually happened, so callers that persist to disk know
     whether to back up the pre-migration file first."""
     version = data.get("schemaVersion", 1)
@@ -343,6 +368,10 @@ def _migrate_registry_data(data: Dict[str, Any]) -> bool:
         for entry in data.get("threads", {}).values():
             _migrate_entry_v3_to_v4(entry)
         data["schemaVersion"] = 4
+    if data["schemaVersion"] < 5:
+        for entry in data.get("threads", {}).values():
+            _migrate_entry_v4_to_v5(entry)
+        data["schemaVersion"] = 5
     return True
 
 
@@ -1182,6 +1211,9 @@ def _format_entry_human(entry: Dict[str, Any]) -> str:
         f"links: {', '.join(entry.get('links') or []) or '-'}",
         f"notes: {entry.get('notes') or '-'}",
         f"lastActivityAt: {entry.get('lastActivityAt') or '-'} ({entry.get('lastActivitySource') or '-'})",
+        f"discord: cardMessageId={entry.get('cardMessageId') or '-'} "
+        f"parentChannelId={entry.get('parentChannelId') or '-'} "
+        f"name={entry.get('discordName') or '-'}",
         f"createdAt: {entry.get('createdAt')}",
         f"updatedAt: {entry.get('updatedAt')}",
     ]
@@ -1538,6 +1570,28 @@ def _apply_update_mutations(entry: Dict[str, Any], args: argparse.Namespace) -> 
             raise _Abort(2, f"thread-state: {exc}") from exc
 
 
+def _apply_discord_meta_mutations(entry: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Apply --card-message-id/--parent-channel-id/--discord-name (and, on
+    `set`, --clear-card-message-id) to `entry`. --clear-card-message-id is
+    applied first, so a combined --clear-card-message-id --card-message-id
+    in one invocation ends with the new id kept. Raises _Abort(2, ...) on an
+    invalid snowflake."""
+    if getattr(args, "clear_card_message_id", False):
+        entry["cardMessageId"] = None
+    try:
+        card_message_id = getattr(args, "card_message_id", None)
+        if card_message_id is not None:
+            entry["cardMessageId"] = validate_snowflake(card_message_id)
+        parent_channel_id = getattr(args, "parent_channel_id", None)
+        if parent_channel_id is not None:
+            entry["parentChannelId"] = validate_snowflake(parent_channel_id)
+    except ValueError as exc:
+        raise _Abort(2, f"thread-state: {exc}") from exc
+    discord_name = getattr(args, "discord_name", None)
+    if discord_name is not None:
+        entry["discordName"] = discord_name
+
+
 def _effective_silent_statuses(include_status_arg: Optional[str]) -> List[str]:
     """The statuses considered "expected to be progressing" for the silent
     detector: --include-status if given, else DEFAULT_SILENT_STATUSES — minus
@@ -1605,6 +1659,9 @@ def cmd_add(args: argparse.Namespace) -> int:
                 "lastActivityAt": None,
                 "lastActivitySource": None,
                 "updates": [],
+                "cardMessageId": None,
+                "parentChannelId": None,
+                "discordName": None,
                 "createdAt": now,
                 "updatedAt": now,
             }
@@ -1612,6 +1669,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             _apply_branch_mutations(entry, args)
             _apply_run_mutations(entry, args)
             _apply_last_activity_mutations(entry, args)
+            _apply_discord_meta_mutations(entry, args)
             threads[args.thread_id] = entry
     except _Abort as exc:
         _err(exc.message)
@@ -1657,6 +1715,7 @@ def cmd_set(args: argparse.Namespace) -> int:
             _apply_run_mutations(entry, args)
             _apply_last_activity_mutations(entry, args)
             _apply_update_mutations(entry, args)
+            _apply_discord_meta_mutations(entry, args)
             entry["updatedAt"] = _now_iso()
             result = _entry_with_computed_pr(entry)
     except _Abort as exc:
@@ -2124,6 +2183,11 @@ def _build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--last-activity", metavar="ISO8601", help="set lastActivityAt directly (source=manual)")
         sp.add_argument("--last-message-id", metavar="SNOWFLAKE", help="derive lastActivityAt from a Discord message id (source=discord)")
 
+    def _add_discord_meta_args(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--card-message-id", metavar="SNOWFLAKE", help="the Discord message id of the pinned status card")
+        sp.add_argument("--parent-channel-id", metavar="SNOWFLAKE", help="the Discord parent-channel id this thread lives under")
+        sp.add_argument("--discord-name", metavar="NAME", help="the last known raw Discord thread name")
+
     p = argparse.ArgumentParser(
         prog="thread-state",
         description="Registry + GitHub polling + rendering for long-lived coding threads.",
@@ -2141,6 +2205,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_add.add_argument("--desc")
     sp_add.add_argument("--tags")
     _add_branch_run_activity_args(sp_add)
+    _add_discord_meta_args(sp_add)
     sp_add.add_argument("--status", default="active")
     sp_add.add_argument("--link", action="append")
     sp_add.add_argument("--force", action="store_true")
@@ -2158,6 +2223,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_set.add_argument("--desc")
     sp_set.add_argument("--tags")
     _add_branch_run_activity_args(sp_set)
+    _add_discord_meta_args(sp_set)
+    sp_set.add_argument("--clear-card-message-id", action="store_true", help="clear cardMessageId (set it to null)")
     sp_set.add_argument("--status")
     sp_set.add_argument("--link", action="append")
     sp_set.add_argument("--note")

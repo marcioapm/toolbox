@@ -64,7 +64,7 @@ def _pr(number, repo=None, primary=False, state=None, ci="NONE", stale=False,
 class TestRegistryBasics:
     def test_missing_file_reads_as_empty(self, registry_path):
         data = ts._parse_registry(registry_path)
-        assert data == {"schemaVersion": 4, "accounts": {}, "threads": {}}
+        assert data == {"schemaVersion": 5, "accounts": {}, "threads": {}}
 
     def test_write_then_read_roundtrip(self, registry_path):
         data = ts._empty_registry()
@@ -825,7 +825,7 @@ class TestSchemaMigration:
         self._write_v1(registry_path)
         data, migrated = ts._load_and_migrate(registry_path)
         assert migrated is True
-        assert data["schemaVersion"] == 4
+        assert data["schemaVersion"] == 5
         assert data["threads"]["1"]["prs"][0]["number"] == 4694
 
     def test_load_and_migrate_no_op_on_v2(self, registry_path):
@@ -834,7 +834,7 @@ class TestSchemaMigration:
         ts._write_registry(registry_path, data)
         loaded, migrated = ts._load_and_migrate(registry_path)
         assert migrated is False
-        assert loaded["schemaVersion"] == 4
+        assert loaded["schemaVersion"] == 5
 
     def test_cli_read_migrates_v1_transparently(self, registry_path, capsys):
         self._write_v1(registry_path, pr_state={"state": "OPEN", "ci": "SUCCESS", "url": "u", "title": "t", "mergedAt": None, "checkedAt": "x", "stale": False})
@@ -856,7 +856,7 @@ class TestSchemaMigration:
         assert code == 0
 
         on_disk = json.loads(registry_path.read_text())
-        assert on_disk["schemaVersion"] == 4
+        assert on_disk["schemaVersion"] == 5
         assert on_disk["threads"]["1"]["prs"][0]["number"] == 4694
         assert "pr" not in on_disk["threads"]["1"]
 
@@ -1212,7 +1212,7 @@ class TestSchemaMigrationV3:
         self._write_v2(registry_path)
         data, migrated = ts._load_and_migrate(registry_path)
         assert migrated is True
-        assert data["schemaVersion"] == 4
+        assert data["schemaVersion"] == 5
         assert data["threads"]["1"]["branches"] == [{"repo": "acme/widgets", "name": "feat/x", "primary": True}]
 
     def test_write_from_v2_triggers_v2_backup(self, registry_path, capsys):
@@ -1221,7 +1221,7 @@ class TestSchemaMigrationV3:
         assert code == 0
 
         on_disk = json.loads(registry_path.read_text())
-        assert on_disk["schemaVersion"] == 4
+        assert on_disk["schemaVersion"] == 5
         assert on_disk["threads"]["1"]["branches"][0]["name"] == "feat/x"
         assert "branch" not in on_disk["threads"]["1"]
 
@@ -1246,7 +1246,7 @@ class TestSchemaMigrationV3:
         registry_path.write_text(json.dumps(raw))
         data, migrated = ts._load_and_migrate(registry_path)
         assert migrated is True
-        assert data["schemaVersion"] == 4
+        assert data["schemaVersion"] == 5
         entry = data["threads"]["1"]
         assert entry["prs"][0]["number"] == 1
         assert entry["branches"] == [{"repo": "a/b", "name": "feat/y", "primary": True}]
@@ -1945,7 +1945,7 @@ class TestSchemaMigrationV4:
         self._write_v3(registry_path)
         data, migrated = ts._load_and_migrate(registry_path)
         assert migrated is True
-        assert data["schemaVersion"] == 4
+        assert data["schemaVersion"] == 5
         assert data["threads"]["1"]["updates"] == []
         # No data loss: everything else survives untouched.
         assert data["threads"]["1"]["title"] == "mSPRT"
@@ -1957,7 +1957,7 @@ class TestSchemaMigrationV4:
         assert code == 0
 
         on_disk = json.loads(registry_path.read_text())
-        assert on_disk["schemaVersion"] == 4
+        assert on_disk["schemaVersion"] == 5
         assert on_disk["threads"]["1"]["updates"] == []
 
         backups = list(registry_path.parent.glob("registry.json.v3-backup-*"))
@@ -1974,6 +1974,97 @@ class TestSchemaMigrationV4:
         data2, migrated2 = ts._load_and_migrate(registry_path)
         assert migrated2 is False
         assert data2["threads"]["1"]["updates"] == []
+
+
+# ---------------------------------------------------------------------------
+# v4 -> v5 schema migration: `cardMessageId`/`parentChannelId`/`discordName`
+# ---------------------------------------------------------------------------
+
+class TestSchemaMigrationV5:
+    def _write_v4(self, registry_path):
+        raw = {
+            "schemaVersion": 4,
+            "accounts": {},
+            "threads": {
+                "1": {
+                    "threadId": "1",
+                    "title": "mSPRT",
+                    "description": "",
+                    "repo": "acme/widgets",
+                    "status": "review",
+                    "tags": [],
+                    "links": [],
+                    "notes": "",
+                    "prs": [],
+                    "branches": [],
+                    "runs": [],
+                    "lastActivityAt": None,
+                    "lastActivitySource": None,
+                    "updates": [],
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                }
+            },
+        }
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(json.dumps(raw))
+        return raw
+
+    def test_migrate_entry_v4_to_v5_adds_null_defaults(self):
+        entry = {"title": "T"}
+        ts._migrate_entry_v4_to_v5(entry)
+        assert entry["cardMessageId"] is None
+        assert entry["parentChannelId"] is None
+        assert entry["discordName"] is None
+
+    def test_migrate_entry_v4_to_v5_is_idempotent_and_preserves_existing(self):
+        entry = {
+            "title": "T",
+            "cardMessageId": "123",
+            "parentChannelId": "456",
+            "discordName": "old-name",
+        }
+        ts._migrate_entry_v4_to_v5(entry)
+        assert entry["cardMessageId"] == "123"
+        assert entry["parentChannelId"] == "456"
+        assert entry["discordName"] == "old-name"
+
+    def test_load_and_migrate_v4_to_v5_bumps_schema_and_backs_up(self, registry_path):
+        self._write_v4(registry_path)
+        data, migrated = ts._load_and_migrate(registry_path)
+        assert migrated is True
+        assert data["schemaVersion"] == 5
+        entry = data["threads"]["1"]
+        assert entry["cardMessageId"] is None
+        assert entry["parentChannelId"] is None
+        assert entry["discordName"] is None
+        # No data loss: everything else survives untouched.
+        assert entry["title"] == "mSPRT"
+        assert entry["repo"] == "acme/widgets"
+
+    def test_write_from_v4_triggers_v4_backup_once(self, registry_path, capsys):
+        self._write_v4(registry_path)
+        code, out, err = run_cli(["set", "1", "--desc", "touched"], registry_path, capsys)
+        assert code == 0
+
+        on_disk = json.loads(registry_path.read_text())
+        assert on_disk["schemaVersion"] == 5
+        assert on_disk["threads"]["1"]["cardMessageId"] is None
+
+        backups = list(registry_path.parent.glob("registry.json.v4-backup-*"))
+        assert len(backups) == 1
+        backed_up = json.loads(backups[0].read_text())
+        assert backed_up["schemaVersion"] == 4
+        assert "cardMessageId" not in backed_up["threads"]["1"]
+
+    def test_migration_is_idempotent_on_reload(self, registry_path):
+        self._write_v4(registry_path)
+        data1, migrated1 = ts._load_and_migrate(registry_path)
+        assert migrated1 is True
+        ts._write_registry(registry_path, data1)
+        data2, migrated2 = ts._load_and_migrate(registry_path)
+        assert migrated2 is False
+        assert data2["threads"]["1"]["cardMessageId"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -2565,4 +2656,147 @@ class TestRenderCardRecentBlock:
         # Even when it can't fit under the cap, degrade to exactly 1 entry
         # rather than dropping the block entirely.
         assert "recent:" in out
+
+
+# ---------------------------------------------------------------------------
+# Discord card identity: cardMessageId/parentChannelId/discordName
+# ---------------------------------------------------------------------------
+
+class TestSnowflakeValidation:
+    def test_validate_snowflake_accepts_decimal_digits(self):
+        assert ts.validate_snowflake("1531198023408029736") == "1531198023408029736"
+
+    def test_validate_snowflake_accepts_zero(self):
+        assert ts.validate_snowflake("0") == "0"
+
+    def test_validate_snowflake_rejects_non_digits(self):
+        with pytest.raises(ValueError):
+            ts.validate_snowflake("abc123")
+
+    def test_validate_snowflake_rejects_empty(self):
+        with pytest.raises(ValueError):
+            ts.validate_snowflake("")
+
+    def test_validate_snowflake_rejects_negative(self):
+        with pytest.raises(ValueError):
+            ts.validate_snowflake("-123")
+
+    def test_validate_snowflake_rejects_leading_plus(self):
+        with pytest.raises(ValueError):
+            ts.validate_snowflake("+123")
+
+    def test_validate_snowflake_rejects_whitespace(self):
+        with pytest.raises(ValueError):
+            ts.validate_snowflake(" 123")
+
+
+class TestDiscordCardIdentityCli:
+    def test_add_sets_card_message_id_and_parent_channel_id(self, registry_path, capsys):
+        code, out, err = run_cli(
+            [
+                "add", "1", "--title", "T",
+                "--card-message-id", "111111111111111111",
+                "--parent-channel-id", "222222222222222222",
+                "--discord-name", "raw-thread-name",
+            ],
+            registry_path, capsys,
+        )
+        assert code == 0
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["cardMessageId"] == "111111111111111111"
+        assert entry["parentChannelId"] == "222222222222222222"
+        assert entry["discordName"] == "raw-thread-name"
+
+    def test_add_defaults_card_identity_fields_to_null(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["cardMessageId"] is None
+        assert entry["parentChannelId"] is None
+        assert entry["discordName"] is None
+
+    def test_add_rejects_invalid_card_message_id(self, registry_path, capsys):
+        code, out, err = run_cli(
+            ["add", "1", "--title", "T", "--card-message-id", "not-a-snowflake"],
+            registry_path, capsys,
+        )
+        assert code == 2
+        assert "invalid snowflake" in err
+        assert "Traceback" not in err
+
+    def test_add_rejects_invalid_parent_channel_id(self, registry_path, capsys):
+        code, out, err = run_cli(
+            ["add", "1", "--title", "T", "--parent-channel-id", "xyz"],
+            registry_path, capsys,
+        )
+        assert code == 2
+        assert "invalid snowflake" in err
+        assert "Traceback" not in err
+
+    def test_set_updates_card_message_id(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        code, out, err = run_cli(["set", "1", "--card-message-id", "333333333333333333"], registry_path, capsys)
+        assert code == 0
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["cardMessageId"] == "333333333333333333"
+
+    def test_set_rejects_invalid_card_message_id(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        code, out, err = run_cli(["set", "1", "--card-message-id", "abc"], registry_path, capsys)
+        assert code == 2
+        assert "invalid snowflake" in err
+        assert "Traceback" not in err
+
+    def test_set_clears_card_message_id(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--card-message-id", "444444444444444444"], registry_path, capsys)
+        code, out, err = run_cli(["set", "1", "--clear-card-message-id"], registry_path, capsys)
+        assert code == 0
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["cardMessageId"] is None
+
+    def test_clear_then_set_in_same_invocation_keeps_new_value(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T", "--card-message-id", "555555555555555555"], registry_path, capsys)
+        run_cli(
+            ["set", "1", "--clear-card-message-id", "--card-message-id", "666666666666666666"],
+            registry_path, capsys,
+        )
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["cardMessageId"] == "666666666666666666"
+
+    def test_set_roundtrips_parent_channel_id_and_discord_name(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        run_cli(
+            ["set", "1", "--parent-channel-id", "777777777777777777", "--discord-name", "new-name"],
+            registry_path, capsys,
+        )
+        _, out, _ = run_cli(["show", "1", "--json"], registry_path, capsys)
+        entry = json.loads(out)
+        assert entry["parentChannelId"] == "777777777777777777"
+        assert entry["discordName"] == "new-name"
+
+    def test_human_show_includes_discord_card_identity(self, registry_path, capsys):
+        run_cli(
+            [
+                "add", "1", "--title", "T",
+                "--card-message-id", "888888888888888888",
+                "--parent-channel-id", "999999999999999999",
+                "--discord-name", "thread-name",
+            ],
+            registry_path, capsys,
+        )
+        _, out, _ = run_cli(["show", "1"], registry_path, capsys)
+        assert "888888888888888888" in out
+        assert "999999999999999999" in out
+        assert "thread-name" in out
+
+    def test_human_show_renders_dash_when_unset(self, registry_path, capsys):
+        run_cli(["add", "1", "--title", "T"], registry_path, capsys)
+        _, out, _ = run_cli(["show", "1"], registry_path, capsys)
+        discord_line = next(l for l in out.splitlines() if l.startswith("discord:"))
+        assert discord_line == "discord: cardMessageId=- parentChannelId=- name=-"
+
 
