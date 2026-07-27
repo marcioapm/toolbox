@@ -38,6 +38,16 @@ read-modify-write, so concurrent invocations can't interleave and corrupt the
 file. A registry that fails to parse is never overwritten — it is copied to
 `registry.json.bad-<timestamp>` and the command exits non-zero.
 
+`refresh` derives a thread's `status` from its polled PR states (see
+`derive_thread_status`), but only ever sets `active` or `blocked`
+automatically: an OPEN PR with failing CI sets `blocked`, and that clears
+back to `active` once no PR is both open and failing. `merged`/`closed`/
+`done`/`paused` are manual-only — `refresh` never sets them, since "every
+currently-known PR is merged" is not proof a thread's workstream is
+finished (long-running threads keep opening new PRs against the same
+registry entry). Use `set --status` to move a thread into or out of one of
+those explicitly.
+
 Usage::
 
     thread-state add <threadId> --title T [--repo R] [--pr N] [--add-pr REF] ...
@@ -632,33 +642,40 @@ def set_primary_pr(entry: Dict[str, Any], repo: Optional[str], number: int) -> b
 def derive_thread_status(entry: Dict[str, Any]) -> Optional[str]:
     """Derive an overall thread status from its PR set, per the rules in
     the module docstring. Returns None when no status change should be
-    applied (e.g. no PRs at all, or the existing status should be kept)."""
+    applied (e.g. no PRs at all, or the existing status should be kept).
+
+    `merged`/`closed`/`done`/`paused` are manual-only terminal-ish statuses —
+    this function never *sets* them. A thread's known PR list is not
+    necessarily complete: long-running workstream threads keep opening new
+    PRs against the same thread, so "all known PRs are merged" is not
+    sufficient evidence the workstream itself is finished. When that
+    happens while the thread is in an in-flight status (active/review/
+    blocked), the merge is already visible in the PR list and the updates
+    log, so the safe move is to leave `status` alone (return None) rather
+    than flip it to `merged`/`closed` and silently discard whatever the
+    human had set."""
     prs = get_prs(entry)
     if not prs:
         return None
 
+    current = entry.get("status")
     states = [(p.get("prState") or {}).get("state") for p in prs]
     cis = [(p.get("prState") or {}).get("ci") for p in prs]
 
     if any(s == "OPEN" and ci == "FAILURE" for s, ci in zip(states, cis)):
         return "blocked"
 
-    if all(s == "MERGED" for s in states):
-        return "merged"
-
-    if (
-        any(s == "CLOSED" for s in states)
-        and all(s in ("CLOSED", "MERGED") for s in states)
-        and not any(s == "OPEN" for s in states)
-    ):
-        return "closed"
-
     if any(s == "OPEN" for s in states):
-        current = entry.get("status")
         if current in ("review", "blocked", "paused"):
             return current
         return "active"
 
+    # No PR is OPEN and none is failing CI -- all are MERGED/CLOSED. This
+    # clears an auto-set `blocked` (no more failing open PR to justify it)
+    # but never promotes the thread to a manual-only status like
+    # merged/closed on its own.
+    if current == "blocked":
+        return "active"
     return None
 
 
@@ -830,7 +847,10 @@ def _pr_transition_texts(before: Optional[Dict[str, Any]], after: Dict[str, Any]
     None `before` (no prior prState at all) never synthesizes a transition —
     there is nothing to compare against. A PR's very first successful fetch
     (old state None -> OPEN) DOES count as a transition ("opened"), since
-    that is genuinely new information for the card."""
+    that is genuinely new information for the card. CI transitions are only
+    reported while the PR is currently OPEN — once merged/closed, its
+    statusCheckRollup reflects stale/unrelated post-merge job runs, not
+    something worth surfacing."""
     if before is None:
         return []
     texts = []
@@ -846,7 +866,7 @@ def _pr_transition_texts(before: Optional[Dict[str, Any]], after: Dict[str, Any]
             texts.append(f"PR #{number} reopened")
 
     old_ci, new_ci = before.get("ci"), after.get("ci")
-    if new_ci != old_ci:
+    if new_state == "OPEN" and new_ci != old_ci:
         if new_ci == "FAILURE":
             texts.append(f"CI failed on PR #{number}")
         elif old_ci == "FAILURE" and new_ci == "SUCCESS":
@@ -964,7 +984,10 @@ def render_title(entry: Dict[str, Any]) -> str:
 
 def _pr_line(entry: Dict[str, Any], p: Dict[str, Any]) -> str:
     """One `PR: [#N](url) STATE · CI state` line for the card, with the
-    primary PR bolded and a per-PR stale warning."""
+    primary PR bolded and a per-PR stale warning. CI is only meaningful while
+    a PR is OPEN — a MERGED/CLOSED PR's statusCheckRollup reflects whatever
+    unrelated job last ran against that branch post-merge, so the CI segment
+    (and its ⚠️) is suppressed once the PR is resolved."""
     number = p["number"]
     repo = _pr_repo(p, entry.get("repo")) or ""
     pr_state = p.get("prState") or {}
@@ -974,9 +997,11 @@ def _pr_line(entry: Dict[str, Any], p: Dict[str, Any]) -> str:
     label = f"[#{number}]({url})" if url else f"#{number}"
     if p.get("primary"):
         label = f"**{label}**"
-    line = f"PR: {label} {state} · CI {ci}"
-    if ci == "FAILURE":
-        line += " ⚠️"
+    line = f"PR: {label} {state}"
+    if state == "OPEN":
+        line += f" · CI {ci}"
+        if ci == "FAILURE":
+            line += " ⚠️"
     if pr_state.get("stale"):
         line += f" — ⚠️ stale (last checked: {pr_state.get('checkedAt', '?')})"
     return line
@@ -1127,7 +1152,7 @@ def render_card_embed(entry: Dict[str, Any]) -> Dict[str, Any]:
         if len(branches) > 1:
             branch_value += f" (+{len(branches) - 1})"
         fields.append({"name": "Branch", "value": branch_value, "inline": True})
-    if primary_state.get("ci"):
+    if primary_state.get("state") == "OPEN" and primary_state.get("ci"):
         fields.append({"name": "CI", "value": primary_state["ci"], "inline": True})
     fields.append({"name": "Status", "value": entry.get("status", ""), "inline": True})
     if entry.get("tags"):
@@ -1170,6 +1195,8 @@ def _format_table(
         else:
             pr_col = "-"
         ci = ((primary or {}).get("prState") or {}).get("ci") or "-"
+        if not primary or (primary.get("prState") or {}).get("state") != "OPEN":
+            ci = "-"
         row = [
             _effective_icon(e),
             str(e.get("threadId", "")),
@@ -1286,28 +1313,56 @@ def _gh_account_for(repo: str, accounts: Dict[str, str]) -> Optional[str]:
     return accounts.get(owner)
 
 
+def _fetch_gh_token(account: str, timeout: int, runner) -> Optional[str]:
+    """Look up a token for `account` via `gh auth token`, which — unlike `gh
+    auth switch` — only reads local credential storage and never mutates any
+    shared active-account state, so it's safe to call from multiple threads
+    concurrently without one call clobbering another's account selection."""
+    try:
+        proc = runner(["gh", "auth", "token", "--user", account], timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    token = (proc.stdout or "").strip()
+    return token or None
+
+
 def fetch_pr_state(
     repo: str,
     pr: int,
     accounts: Dict[str, str],
     timeout: int,
     runner,
+    token_cache: Optional[Dict[str, str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Fetch fresh PR state via `gh`, switching accounts first if the repo's
-    owner maps to one. Returns (prState, None) on success or (None, error)
-    on any failure — never raises, so callers can always fall back to the
-    previously cached state."""
-    account = _gh_account_for(repo, accounts)
-    if account:
-        try:
-            runner(["gh", "auth", "switch", "--user", account], timeout)
-        except (subprocess.TimeoutExpired, OSError):
-            pass  # best-effort — gh may already be on the right account
+    """Fetch fresh PR state via `gh`. If the repo's owner maps to a known
+    account, its token is resolved via `gh auth token` (cached in
+    `token_cache` so concurrent PRs for the same account don't repeat the
+    lookup) and passed as `GH_TOKEN` on the `gh pr view` invocation itself —
+    never via the global, stateful `gh auth switch`, which raced across
+    concurrent refreshes for different owners' PRs (each worker thread would
+    clobber the others' active account mid-poll). Returns (prState, None) on
+    success or (None, error) on any failure — never raises, so callers can
+    always fall back to the previously cached state."""
+    if token_cache is None:
+        token_cache = {}
 
     cmd = [
         "gh", "pr", "view", str(pr), "--repo", repo,
         "--json", "state,title,url,mergedAt,statusCheckRollup",
     ]
+
+    account = _gh_account_for(repo, accounts)
+    if account:
+        token = token_cache.get(account)
+        if token is None:
+            token = _fetch_gh_token(account, timeout, runner)
+            if token:
+                token_cache[account] = token
+        if token:
+            cmd = ["env", f"GH_TOKEN={token}", *cmd]
+
     try:
         proc = runner(cmd, timeout)
     except subprocess.TimeoutExpired:
@@ -1888,11 +1943,19 @@ def cmd_refresh(args: argparse.Namespace) -> int:
             targets_tids = {tid for tid, _ in jobs}
             skipped = [tid for tid in ids if tid not in targets_tids]
 
+            # Shared across worker threads so concurrent PRs for the same
+            # account resolve its token once; a lookup race just means an
+            # occasional duplicate `gh auth token` call, never a correctness
+            # issue (see fetch_pr_state).
+            token_cache: Dict[str, str] = {}
+
             def _work(tid: str, idx: int):
                 entry = threads[tid]
                 p = get_prs(entry)[idx]
                 repo = _pr_repo(p, entry.get("repo"))
-                pr_state, error = fetch_pr_state(repo, p["number"], accounts, args.timeout, _run_command)
+                pr_state, error = fetch_pr_state(
+                    repo, p["number"], accounts, args.timeout, _run_command, token_cache
+                )
                 return tid, idx, pr_state, error
 
             per_thread_total: Dict[str, int] = {}

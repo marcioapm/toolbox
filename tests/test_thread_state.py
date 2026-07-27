@@ -407,22 +407,26 @@ class TestAccountSwitching:
         accounts = {**ts.DEFAULT_ACCOUNTS, "customorg": "custom-user"}
         assert ts._gh_account_for("customorg/repo", accounts) == "custom-user"
 
-    def test_fetch_pr_state_switches_account_before_view(self):
+    def test_fetch_pr_state_resolves_token_and_passes_via_env_before_view(self):
         calls = []
 
         def fake_runner(cmd, timeout):
             calls.append(cmd)
             if cmd[:2] == ["gh", "auth"]:
-                return subprocess.CompletedProcess(cmd, 0, "", "")
+                assert cmd == ["gh", "auth", "token", "--user", "marcio-absmartly"]
+                return subprocess.CompletedProcess(cmd, 0, "tok-123\n", "")
             payload = {"state": "OPEN", "title": "t", "url": "u", "mergedAt": None, "statusCheckRollup": []}
             return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
 
         pr_state, err = ts.fetch_pr_state("absmartly/foo", 1, ts.DEFAULT_ACCOUNTS, 20, fake_runner)
         assert err is None
-        assert calls[0] == ["gh", "auth", "switch", "--user", "marcio-absmartly"]
-        assert calls[1][0:3] == ["gh", "pr", "view"]
+        assert calls[0] == ["gh", "auth", "token", "--user", "marcio-absmartly"]
+        assert calls[1][:2] == ["env", "GH_TOKEN=tok-123"]
+        assert "view" in calls[1]
+        # Never mutates any global/shared gh account state.
+        assert not any(c[:3] == ["gh", "auth", "switch"] for c in calls)
 
-    def test_fetch_pr_state_skips_switch_for_unknown_owner(self):
+    def test_fetch_pr_state_skips_token_lookup_for_unknown_owner(self):
         calls = []
 
         def fake_runner(cmd, timeout):
@@ -433,6 +437,85 @@ class TestAccountSwitching:
         ts.fetch_pr_state("unknown/foo", 1, ts.DEFAULT_ACCOUNTS, 20, fake_runner)
         assert len(calls) == 1
         assert calls[0][0:3] == ["gh", "pr", "view"]
+
+    def test_fetch_pr_state_caches_token_across_calls(self):
+        token_lookups = []
+
+        def fake_runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                token_lookups.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, "tok-abc\n", "")
+            payload = {"state": "OPEN", "title": "t", "url": "u", "mergedAt": None, "statusCheckRollup": []}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        cache = {}
+        ts.fetch_pr_state("absmartly/foo", 1, ts.DEFAULT_ACCOUNTS, 20, fake_runner, cache)
+        ts.fetch_pr_state("absmartly/bar", 2, ts.DEFAULT_ACCOUNTS, 20, fake_runner, cache)
+        assert len(token_lookups) == 1  # second call reused the cached token
+
+    def test_fetch_pr_state_falls_back_to_no_env_when_token_lookup_fails(self):
+        calls = []
+
+        def fake_runner(cmd, timeout):
+            calls.append(cmd)
+            if cmd[:2] == ["gh", "auth"]:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            payload = {"state": "OPEN", "title": "t", "url": "u", "mergedAt": None, "statusCheckRollup": []}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        pr_state, err = ts.fetch_pr_state("absmartly/foo", 1, ts.DEFAULT_ACCOUNTS, 20, fake_runner)
+        assert err is None
+        assert calls[1][:3] == ["gh", "pr", "view"]  # no env prefix injected
+
+    def test_concurrent_multi_owner_refresh_never_cross_contaminates_account(
+        self, registry_path, capsys, monkeypatch
+    ):
+        """Regression for the `gh auth switch` race: fan out a refresh across
+        PRs from two different account owners and fail loudly if a `gh pr
+        view` call for one owner ever sees the other owner's token — the
+        exact corruption observed live as a falsely-stale
+        marcioapm/llm-proxy#77 under concurrent refresh."""
+        data = ts._empty_registry()
+        for i in range(6):
+            data["threads"][f"absmartly-{i}"] = {
+                "threadId": f"absmartly-{i}", "title": "T", "description": "",
+                "repo": "absmartly/foo", "branch": None, "status": "review",
+                "tags": [], "links": [], "notes": "",
+                "prs": [{"repo": None, "number": 100 + i, "primary": True, "prState": dict(ts.EMPTY_PR_STATE)}],
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+            }
+            data["threads"][f"marcioapm-{i}"] = {
+                "threadId": f"marcioapm-{i}", "title": "T", "description": "",
+                "repo": "marcioapm/llm-proxy", "branch": None, "status": "review",
+                "tags": [], "links": [], "notes": "",
+                "prs": [{"repo": None, "number": 200 + i, "primary": True, "prState": dict(ts.EMPTY_PR_STATE)}],
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+            }
+        ts._write_registry(registry_path, data)
+
+        bad_calls = []
+
+        def fake_runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                account = cmd[-1]
+                return subprocess.CompletedProcess(cmd, 0, f"tok-{account}\n", "")
+            # Determine which account's token (if any) this specific `gh pr
+            # view` invocation was launched with, and check it matches the
+            # repo it's viewing -- this is where the old switch-then-view
+            # race would fail under concurrency.
+            repo = cmd[cmd.index("--repo") + 1]
+            expected_account = ts._gh_account_for(repo, ts.DEFAULT_ACCOUNTS)
+            if cmd[0] == "env":
+                got_account = cmd[1].removeprefix("GH_TOKEN=tok-")
+                if got_account != expected_account:
+                    bad_calls.append((repo, got_account))
+            payload = {"state": "OPEN", "title": "t", "url": "u", "mergedAt": None, "statusCheckRollup": []}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        monkeypatch.setattr(ts, "_run_command", fake_runner)
+        code, out, err = run_cli(["refresh", "--all"], registry_path, capsys)
+        assert code == 0
+        assert bad_calls == []
 
 
 class TestFetchPrStateParsing:
@@ -512,17 +595,24 @@ class TestDeriveThreadStatus:
         }
         assert ts.derive_thread_status(entry) == "blocked"
 
-    def test_all_merged_is_merged(self):
+    def test_all_merged_leaves_in_flight_status_alone(self):
+        # merged/closed/done/paused are manual-only -- refresh must never
+        # *set* them, since a thread's known PR list may not be complete
+        # (long-running workstreams keep opening new PRs).
         entry = {"status": "review", "prs": [_pr(1, state="MERGED"), _pr(2, state="MERGED")]}
-        assert ts.derive_thread_status(entry) == "merged"
+        assert ts.derive_thread_status(entry) is None
 
-    def test_all_closed_no_open_is_closed(self):
+    def test_all_closed_no_open_leaves_in_flight_status_alone(self):
         entry = {"status": "review", "prs": [_pr(1, state="CLOSED"), _pr(2, state="CLOSED")]}
-        assert ts.derive_thread_status(entry) == "closed"
+        assert ts.derive_thread_status(entry) is None
 
-    def test_mix_of_closed_and_merged_no_open_is_closed(self):
+    def test_mix_of_closed_and_merged_no_open_leaves_in_flight_status_alone(self):
         entry = {"status": "review", "prs": [_pr(1, state="CLOSED"), _pr(2, state="MERGED")]}
-        assert ts.derive_thread_status(entry) == "closed"
+        assert ts.derive_thread_status(entry) is None
+
+    def test_all_merged_with_active_status_leaves_it_alone(self):
+        entry = {"status": "active", "prs": [_pr(1, state="MERGED"), _pr(2, state="MERGED")]}
+        assert ts.derive_thread_status(entry) is None
 
     def test_open_pr_leaves_review_status_as_review(self):
         entry = {"status": "review", "prs": [_pr(1, state="OPEN", ci="SUCCESS")]}
@@ -549,13 +639,18 @@ class TestDeriveThreadStatus:
         entry = {"status": "blocked", "prs": [_pr(1, state="OPEN", ci="SUCCESS")]}
         assert ts.derive_thread_status(entry) == "blocked"
 
-    def test_manual_blocked_cleared_once_all_prs_merged(self):
+    def test_manual_blocked_cleared_to_active_once_all_prs_merged(self):
+        # blocked was auto-set for a failing open PR; once nothing is open
+        # or failing, it clears back to active -- never promoted to the
+        # manual-only "merged" status.
         entry = {"status": "blocked", "prs": [_pr(1, state="MERGED")]}
-        assert ts.derive_thread_status(entry) == "merged"
+        assert ts.derive_thread_status(entry) == "active"
 
-    def test_manual_paused_cleared_once_all_prs_closed(self):
+    def test_manual_paused_left_alone_once_all_prs_closed(self):
+        # paused is manual-only -- refresh must never touch it, whether to
+        # set it or to clear it.
         entry = {"status": "paused", "prs": [_pr(1, state="CLOSED")]}
-        assert ts.derive_thread_status(entry) == "closed"
+        assert ts.derive_thread_status(entry) is None
 
     def test_mixed_open_and_merged_with_no_failure_leaves_sticky_status(self):
         entry = {
@@ -563,6 +658,18 @@ class TestDeriveThreadStatus:
             "prs": [_pr(1, state="OPEN", ci="SUCCESS"), _pr(2, state="MERGED")],
         }
         assert ts.derive_thread_status(entry) == "blocked"
+
+    def test_workstream_thread_with_all_merged_prs_stays_active_not_merged(self):
+        # Regression: long-running workstream threads (Task 01-07, LLM
+        # Proxy, mSPRT) keep opening new PRs against the same thread. The
+        # thread's known `prs` list reflects only what's been added so far,
+        # not the workstream's full lifetime -- "all known PRs merged" must
+        # never be treated as proof the whole thread is done.
+        entry = {
+            "status": "active",
+            "prs": [_pr(1, state="MERGED"), _pr(2, state="MERGED"), _pr(3, state="MERGED")],
+        }
+        assert ts.derive_thread_status(entry) is None
 
 
 # ---------------------------------------------------------------------------
@@ -629,12 +736,12 @@ class TestRefreshCli:
         code, out, err = run_cli(["refresh", "--all"], registry_path, capsys)
         assert code == 0
 
-    def test_successful_refresh_updates_prstate_and_derives_status(self, registry_path, capsys, monkeypatch):
+    def test_successful_refresh_updates_prstate_but_leaves_manual_status_alone(self, registry_path, capsys, monkeypatch):
         self._seed(registry_path, status="review")
 
         def ok_runner(cmd, timeout):
             if cmd[:2] == ["gh", "auth"]:
-                return subprocess.CompletedProcess(cmd, 0, "", "")
+                return subprocess.CompletedProcess(cmd, 0, "tok\n", "")
             payload = {"state": "MERGED", "title": "t", "url": "u", "mergedAt": "2026-01-02T00:00:00Z", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
             return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
 
@@ -644,7 +751,9 @@ class TestRefreshCli:
 
         data = ts._parse_registry(registry_path)
         entry = data["threads"]["1"]
-        assert entry["status"] == "merged"
+        # All known PRs merged is not proof the workstream itself is done --
+        # refresh must never auto-set the manual-only "merged" status.
+        assert entry["status"] == "review"
         assert entry["prs"][0]["prState"]["ci"] == "SUCCESS"
         assert entry["prs"][0]["prState"]["stale"] is False
 
@@ -661,6 +770,31 @@ class TestRefreshCli:
         run_cli(["refresh", "1"], registry_path, capsys)
         data = ts._parse_registry(registry_path)
         assert data["threads"]["1"]["status"] == "blocked"
+
+    def test_refresh_workstream_with_multiple_merged_prs_keeps_manual_review_status(
+        self, registry_path, capsys, monkeypatch
+    ):
+        # End-to-end regression for the live-rollout bug: a workstream thread
+        # (e.g. mSPRT) has several PRs already merged and one manually set to
+        # "review" while a new PR is being worked on. Refresh polling all of
+        # them (all report MERGED here, simulating "no PR currently open")
+        # must not flip the thread to "merged" and wipe out the review flag.
+        extra = [
+            {"repo": None, "number": 6, "primary": False, "prState": dict(ts.EMPTY_PR_STATE)},
+            {"repo": None, "number": 7, "primary": False, "prState": dict(ts.EMPTY_PR_STATE)},
+        ]
+        self._seed(registry_path, pr=5, status="review", extra_prs=extra)
+
+        def ok_runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return subprocess.CompletedProcess(cmd, 0, "tok\n", "")
+            payload = {"state": "MERGED", "title": "t", "url": "u", "mergedAt": "2026-01-02T00:00:00Z", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        monkeypatch.setattr(ts, "_run_command", ok_runner)
+        run_cli(["refresh", "1"], registry_path, capsys)
+        data = ts._parse_registry(registry_path)
+        assert data["threads"]["1"]["status"] == "review"
 
     def test_refresh_unknown_thread_id_errors(self, registry_path, capsys):
         ts._write_registry(registry_path, ts._empty_registry())
@@ -1208,6 +1342,55 @@ class TestRenderCardMultiPr:
         embed = ts.render_card_embed(entry)
         pr_field = next(f for f in embed["fields"] if f["name"] == "PR")
         assert pr_field["value"] == "#1 (+2)"
+
+    def test_merged_pr_with_failing_ci_suppresses_ci_segment_and_warning(self):
+        # Bug: a MERGED PR's statusCheckRollup reflects stale post-merge job
+        # runs, not the PR's own health -- CI must not render on it at all.
+        entry = {
+            "title": "T", "status": "merged",
+            "prs": [_pr(1, primary=True, state="MERGED", ci="FAILURE")],
+        }
+        out = ts.render_card_markdown(entry)
+        line = next(l for l in out.splitlines() if l.startswith("PR:"))
+        assert "CI" not in line
+        assert "⚠️" not in line
+        assert "MERGED" in line
+
+    def test_closed_pr_with_failing_ci_suppresses_ci_segment_and_warning(self):
+        entry = {
+            "title": "T", "status": "closed",
+            "prs": [_pr(1, primary=True, state="CLOSED", ci="FAILURE")],
+        }
+        out = ts.render_card_markdown(entry)
+        line = next(l for l in out.splitlines() if l.startswith("PR:"))
+        assert "CI" not in line
+        assert "⚠️" not in line
+
+    def test_open_pr_with_failing_ci_still_shows_ci_segment_and_warning(self):
+        entry = {
+            "title": "T", "status": "blocked",
+            "prs": [_pr(1, primary=True, state="OPEN", ci="FAILURE")],
+        }
+        out = ts.render_card_markdown(entry)
+        line = next(l for l in out.splitlines() if l.startswith("PR:"))
+        assert "CI FAILURE" in line
+        assert "⚠️" in line
+
+    def test_card_embed_omits_ci_field_for_merged_primary_pr(self):
+        entry = {
+            "title": "T", "status": "merged",
+            "prs": [_pr(1, primary=True, state="MERGED", ci="FAILURE")],
+        }
+        embed = ts.render_card_embed(entry)
+        assert not any(f["name"] == "CI" for f in embed["fields"])
+
+    def test_list_table_ci_column_dashed_for_merged_primary_pr(self):
+        entries = [{
+            "threadId": "1", "title": "T", "status": "merged", "description": "",
+            "prs": [_pr(1, primary=True, state="MERGED", ci="FAILURE")],
+        }]
+        table = ts._format_table(entries)
+        assert "FAILURE" not in table
 
 
 # ---------------------------------------------------------------------------
@@ -2375,10 +2558,22 @@ class TestPrTransitionTexts:
         assert ts._pr_transition_texts(dict(state), dict(state), 4700) == []
 
     def test_state_and_ci_change_together_state_first(self):
+        # CI is only reported while the PR is still OPEN -- once merged, its
+        # rollup reflects unrelated post-merge job runs.
         before = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "FAILURE"}
         after = {**dict(ts.EMPTY_PR_STATE), "state": "MERGED", "ci": "SUCCESS"}
         texts = ts._pr_transition_texts(before, after, 4700)
-        assert texts == ["PR #4700 merged", "CI green on PR #4700"]
+        assert texts == ["PR #4700 merged"]
+
+    def test_ci_change_suppressed_once_pr_is_merged(self):
+        before = {**dict(ts.EMPTY_PR_STATE), "state": "MERGED", "ci": "SUCCESS"}
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "MERGED", "ci": "FAILURE"}
+        assert ts._pr_transition_texts(before, after, 4700) == []
+
+    def test_ci_change_suppressed_once_pr_is_closed(self):
+        before = {**dict(ts.EMPTY_PR_STATE), "state": "CLOSED", "ci": "SUCCESS"}
+        after = {**dict(ts.EMPTY_PR_STATE), "state": "CLOSED", "ci": "FAILURE"}
+        assert ts._pr_transition_texts(before, after, 4700) == []
 
 
 class TestRunTransitionTexts:
@@ -2506,6 +2701,26 @@ class TestRefreshProbeAppendTransitions:
         assert "CI failed on PR #4700" in texts
 
     def test_refresh_appends_status_transition(self, registry_path, capsys, monkeypatch):
+        # blocked was auto-set for a failing open PR; once it merges (no
+        # more open/failing PR), status clears back to active -- a genuine,
+        # reportable transition. (All-merged does NOT flip status to the
+        # manual-only "merged" -- see test_refresh_never_sets_manual_only_status_on_merge.)
+        pr_state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "FAILURE", "checkedAt": "2026-01-01T00:00:00Z"}
+        self._seed_pr_thread(registry_path, pr=4700, status="blocked", pr_state=pr_state)
+
+        def ok_runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            payload = {"state": "MERGED", "title": "t", "url": "u", "mergedAt": "2026-01-02T00:00:00Z", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        monkeypatch.setattr(ts, "_run_command", ok_runner)
+        run_cli(["refresh", "1"], registry_path, capsys)
+        data = ts._parse_registry(registry_path)
+        texts = [u["text"] for u in data["threads"]["1"]["updates"]]
+        assert "status: blocked -> active" in texts
+
+    def test_refresh_never_sets_manual_only_status_on_merge(self, registry_path, capsys, monkeypatch):
         pr_state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS", "checkedAt": "2026-01-01T00:00:00Z"}
         self._seed_pr_thread(registry_path, pr=4700, status="review", pr_state=pr_state)
 
@@ -2518,8 +2733,10 @@ class TestRefreshProbeAppendTransitions:
         monkeypatch.setattr(ts, "_run_command", ok_runner)
         run_cli(["refresh", "1"], registry_path, capsys)
         data = ts._parse_registry(registry_path)
-        texts = [u["text"] for u in data["threads"]["1"]["updates"]]
-        assert "status: review -> merged" in texts
+        entry = data["threads"]["1"]
+        assert entry["status"] == "review"
+        texts = [u["text"] for u in entry["updates"]]
+        assert not any(t.startswith("status:") for t in texts)
 
     def test_refresh_no_transition_when_nothing_changed(self, registry_path, capsys, monkeypatch):
         pr_state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS", "checkedAt": "2026-01-01T00:00:00Z"}
@@ -2537,8 +2754,8 @@ class TestRefreshProbeAppendTransitions:
         assert data["threads"]["1"]["updates"] == []
 
     def test_refresh_dedupes_repeated_status_transition_across_polls(self, registry_path, capsys, monkeypatch):
-        pr_state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "SUCCESS", "checkedAt": "2026-01-01T00:00:00Z"}
-        self._seed_pr_thread(registry_path, pr=4700, status="review", pr_state=pr_state)
+        pr_state = {**dict(ts.EMPTY_PR_STATE), "state": "OPEN", "ci": "FAILURE", "checkedAt": "2026-01-01T00:00:00Z"}
+        self._seed_pr_thread(registry_path, pr=4700, status="blocked", pr_state=pr_state)
 
         def merged_runner(cmd, timeout):
             if cmd[:2] == ["gh", "auth"]:
@@ -2548,10 +2765,10 @@ class TestRefreshProbeAppendTransitions:
 
         monkeypatch.setattr(ts, "_run_command", merged_runner)
         run_cli(["refresh", "1"], registry_path, capsys)
-        run_cli(["refresh", "1"], registry_path, capsys)  # second poll: already merged, no new status change
+        run_cli(["refresh", "1"], registry_path, capsys)  # second poll: already active, no new status change
         data = ts._parse_registry(registry_path)
         status_texts = [u["text"] for u in data["threads"]["1"]["updates"] if u["text"].startswith("status:")]
-        assert status_texts == ["status: review -> merged"]
+        assert status_texts == ["status: blocked -> active"]
 
     def _seed_run_thread(self, registry_path, thread_id="1", host="vibes", name="tstate2", state=None):
         data = ts._empty_registry()
