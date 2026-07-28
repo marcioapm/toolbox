@@ -1997,6 +1997,134 @@ class TestCycleDiscordWiring:
         assert result["renames_applied"] == 0
 
 
+class TestCycleOverlapGuard:
+    """R2-5 (high, ROUND2-FINDINGS.md, spec §12): "Guard against overlap
+    ... add a DB-level lock as belt-and-braces." Absent a lock, two
+    concurrent `threadctl cycle` invocations (e.g. a manual run
+    overlapping the timer) would each poll GitHub and issue a full,
+    independent set of Discord renames for the same threads."""
+
+    def test_second_concurrent_cycle_is_skipped_not_run(self, db_path, capsys, monkeypatch):
+        """Simulates two overlapping cycle processes by acquiring the lock
+        directly (as the first cycle's run_cycle would, mid-flight) before
+        invoking a second run_cycle — the second must back off entirely,
+        performing no GitHub polling and no Discord writes."""
+        _bind(db_path, capsys, thread_id="t1", title="Thread one")
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+
+        conn = tc.connect_db(db_path)
+        try:
+            assert tc._try_acquire_cycle_lock(conn, now) is True
+        finally:
+            conn.close()
+
+        def forbidden_runner(cmd, timeout):
+            raise AssertionError("second overlapping cycle must not poll GitHub at all")
+
+        transport = FakeTransport()
+        result = tc.run_cycle(db_path, runner=forbidden_runner, token="tok", transport=transport)
+        assert result["skipped_overlap"] is True
+        assert result["refreshed"] == 0
+        assert result["pins_changed"] == 0
+        assert result["renames_applied"] == 0
+        assert transport.calls == []
+
+    def test_lock_is_released_after_a_normal_cycle_so_the_next_one_runs(self, db_path, capsys, monkeypatch):
+        _bind(db_path, capsys, thread_id="t1", title="Thread one")
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+        monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+
+        def runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return __import__("subprocess").CompletedProcess(cmd, 0, "token\n", "")
+            return __import__("subprocess").CompletedProcess(
+                cmd, 0, json.dumps(_graphql_payload(pr_1=_github_pr(ci="NONE"))), ""
+            )
+
+        result1 = tc.run_cycle(db_path, runner=runner, token=None, transport=lambda *a, **k: None, dry_run=True)
+        assert result1["skipped_overlap"] is False
+
+        conn = tc.connect_db(db_path)
+        try:
+            assert tc._get_meta(conn, "cycle_lock_at") is None
+        finally:
+            conn.close()
+
+        result2 = tc.run_cycle(db_path, runner=runner, token=None, transport=lambda *a, **k: None, dry_run=True)
+        assert result2["skipped_overlap"] is False
+
+    def test_lock_is_released_even_if_the_cycle_body_raises(self, db_path, capsys, monkeypatch):
+        """The lock must not leak if something inside the cycle body
+        raises — otherwise one crashed cycle would deadlock every future
+        cycle until CYCLE_LOCK_STALE_AFTER_S passes."""
+        _bind(db_path, capsys, thread_id="t1", title="Thread one")
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+
+        def boom_runner(cmd, timeout):
+            raise RuntimeError("simulated crash mid-cycle")
+
+        with pytest.raises(RuntimeError):
+            tc.run_cycle(db_path, runner=boom_runner, token=None, transport=lambda *a, **k: None, dry_run=True)
+
+        conn = tc.connect_db(db_path)
+        try:
+            assert tc._get_meta(conn, "cycle_lock_at") is None
+        finally:
+            conn.close()
+
+    def test_stale_lock_older_than_threshold_is_reclaimed(self, db_path, capsys, monkeypatch):
+        """A lock left behind by a process that crashed/was killed without
+        releasing it must not deadlock every future cycle forever — after
+        CYCLE_LOCK_STALE_AFTER_S it is treated as abandoned and reclaimed."""
+        _bind(db_path, capsys, thread_id="t1", title="Thread one")
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+
+        stale_lock_time = datetime(2026, 7, 28, 11, 0, tzinfo=timezone.utc)  # 1h ago
+        conn = tc.connect_db(db_path)
+        try:
+            assert tc._try_acquire_cycle_lock(conn, stale_lock_time) is True
+        finally:
+            conn.close()
+
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)  # well past CYCLE_LOCK_STALE_AFTER_S
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+        monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+
+        def runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return __import__("subprocess").CompletedProcess(cmd, 0, "token\n", "")
+            return __import__("subprocess").CompletedProcess(
+                cmd, 0, json.dumps(_graphql_payload(pr_1=_github_pr(ci="NONE"))), ""
+            )
+
+        result = tc.run_cycle(db_path, runner=runner, token=None, transport=lambda *a, **k: None, dry_run=True)
+        assert result["skipped_overlap"] is False
+
+    def test_recent_lock_within_threshold_is_not_reclaimed(self, db_path, capsys, monkeypatch):
+        recent_lock_time = datetime(2026, 7, 28, 11, 58, tzinfo=timezone.utc)  # 2 min ago
+        conn = tc.connect_db(db_path)
+        try:
+            assert tc._try_acquire_cycle_lock(conn, recent_lock_time) is True
+        finally:
+            conn.close()
+
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+
+        def forbidden_runner(cmd, timeout):
+            raise AssertionError("must not run: lock is still fresh")
+
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+        result = tc.run_cycle(db_path, runner=forbidden_runner, token=None, transport=lambda *a, **k: None, dry_run=True)
+        assert result["skipped_overlap"] is True
+
+
 # ---------------------------------------------------------------------------
 # migrate: import from the old thread-state registry.json
 # ---------------------------------------------------------------------------

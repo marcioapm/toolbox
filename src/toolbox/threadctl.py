@@ -402,6 +402,60 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: Optional[str]) -> None:
         )
 
 
+# R2-5 (high, ROUND2-FINDINGS.md): spec §12 explicitly requires a DB-level
+# lock against overlapping cycles ("Guard against overlap... add a
+# DB-level lock as belt-and-braces"). systemd Type=oneshot + timer
+# semantics already serialise invocations in the common case, but that is
+# a scheduler-level guarantee, not a DB-level one — a manual `threadctl
+# cycle` run overlapping the timer, or a misconfigured second timer, would
+# otherwise have two processes each issue a full set of Discord renames
+# concurrently. A lock held longer than this is treated as abandoned (the
+# process that held it crashed/was killed without releasing it) and
+# reclaimed, rather than deadlocking every future cycle forever — cycles
+# normally finish in well under a minute.
+CYCLE_LOCK_STALE_AFTER_S = 600
+_CYCLE_LOCK_META_KEY = "cycle_lock_at"
+
+
+def _try_acquire_cycle_lock(conn: sqlite3.Connection, now: datetime) -> bool:
+    """Atomically check-and-set a lock timestamp in `meta` under
+    `BEGIN IMMEDIATE`, so the read-then-write itself is not racy between
+    two concurrent `threadctl cycle` processes (a plain SELECT-then-UPDATE
+    without an immediate write lock would let both processes read "no
+    lock" before either writes one). Returns True if the lock was
+    acquired (or reclaimed from staleness), False if another cycle is
+    genuinely in flight."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key=?", (_CYCLE_LOCK_META_KEY,)
+        ).fetchone()
+        if row is not None and row["value"]:
+            try:
+                locked_at = _parse_iso(row["value"])
+                stale = (now - locked_at).total_seconds() >= CYCLE_LOCK_STALE_AFTER_S
+            except (ValueError, TypeError):
+                stale = True
+            if not stale:
+                conn.rollback()
+                return False
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_CYCLE_LOCK_META_KEY, now.strftime("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _release_cycle_lock(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM meta WHERE key=?", (_CYCLE_LOCK_META_KEY,))
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # cycle: GitHub polling and desired-name recomputation
 # ---------------------------------------------------------------------------
@@ -1232,7 +1286,19 @@ def run_cycle(
     `sqlite3.OperationalError: database is locked` with a raw traceback.
     `_poll_due_prs` and `reconcile_discord` each commit incrementally
     (per repo-batch, per thread) instead, so the lock is only ever held for
-    the brief duration of an actual DB write."""
+    the brief duration of an actual DB write.
+
+    R2-5 (high, ROUND2-FINDINGS.md, spec §12): a DB-level cycle-overlap
+    guard sits at the very top, before any polling or Discord I/O starts.
+    systemd `Type=oneshot` + timer semantics already serialise scheduled
+    invocations, but that is a scheduler-level guarantee — a manually
+    triggered `threadctl cycle` overlapping the timer (or a misconfigured
+    second timer/host) would otherwise let two processes each poll GitHub
+    and issue a full independent set of Discord renames concurrently for
+    the same threads. If the lock can't be acquired (another cycle is
+    genuinely in flight), this returns immediately having done no polling
+    and no Discord I/O at all — `skipped_overlap: True` in the result
+    signals this to the caller/CLI."""
     config = {**_load_cycle_config(), **(config or {})}
     accounts = accounts or DEFAULT_ACCOUNTS
     if token is None:
@@ -1241,19 +1307,32 @@ def run_cycle(
     conn = connect_db(db_path)
     try:
         now = _utcnow()
-        refreshed, poll_errors = _poll_due_prs(conn, now, config, runner, accounts)
-        threads = recompute_desired_names(conn, now, config["stale_after_min"])
-        conn.commit()
-        pins_changed, renames_applied, discord_errors = reconcile_discord(
-            conn, now, config, token, transport, dry_run
-        )
-        return {
-            "refreshed": refreshed,
-            "errors": poll_errors + discord_errors,
-            "threads": threads,
-            "pins_changed": pins_changed,
-            "renames_applied": renames_applied,
-        }
+        if not _try_acquire_cycle_lock(conn, now):
+            return {
+                "refreshed": 0,
+                "errors": 0,
+                "threads": 0,
+                "pins_changed": 0,
+                "renames_applied": 0,
+                "skipped_overlap": True,
+            }
+        try:
+            refreshed, poll_errors = _poll_due_prs(conn, now, config, runner, accounts)
+            threads = recompute_desired_names(conn, now, config["stale_after_min"])
+            conn.commit()
+            pins_changed, renames_applied, discord_errors = reconcile_discord(
+                conn, now, config, token, transport, dry_run
+            )
+            return {
+                "refreshed": refreshed,
+                "errors": poll_errors + discord_errors,
+                "threads": threads,
+                "pins_changed": pins_changed,
+                "renames_applied": renames_applied,
+                "skipped_overlap": False,
+            }
+        finally:
+            _release_cycle_lock(conn)
     finally:
         conn.close()
 
@@ -1264,6 +1343,9 @@ def cmd_cycle(args: argparse.Namespace) -> int:
     except (OSError, tomllib.TOMLDecodeError, sqlite3.Error) as exc:
         _err(f"threadctl: cycle failed: {exc}")
         return 1
+    if result.get("skipped_overlap"):
+        print("threadctl: cycle skipped: another cycle is already in flight (R2-5 overlap guard)")
+        return 0
     mode = " (dry run)" if args.dry_run else ""
     print(
         f"threadctl: cycle{mode}: refreshed {result['refreshed']} PR(s), "
