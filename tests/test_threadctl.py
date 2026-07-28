@@ -5,6 +5,7 @@ and migration from the old thread-state registry.json. All Discord/GitHub
 calls are mocked — no live API calls."""
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import sqlite3
@@ -1316,6 +1317,99 @@ class TestDiscordTransportNetworkErrors:
         resp = _real_discord_transport("PATCH", "https://discord.com/api/v10/channels/1", "tok", {"name": "x"}, 15)
         assert resp.status == 429
         assert resp.data == {"retry_after": 5}
+
+
+class _FakeHTTPResponse:
+    """Minimal context-manager stand-in for the object `urlopen()` returns,
+    so R2-3 tests can control exactly what `.read()` does/raises without
+    touching real sockets."""
+
+    def __init__(self, status=200, read_result=None, read_raises=None):
+        self.status = status
+        self._read_result = read_result
+        self._read_raises = read_raises
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        if self._read_raises is not None:
+            raise self._read_raises
+        return self._read_result
+
+
+class TestDiscordTransportReadAndParseErrors:
+    """R2-3 (regression of C2, ROUND2-FINDINGS.md): the old exception
+    handling covered only what `urlopen()` itself could raise. `resp.read()`
+    and `json.loads(body)` sat OUTSIDE any try/except, so exceptions that
+    occur precisely AFTER Discord has already applied the write —
+    non-JSON 2xx bodies, truncated reads, connection resets mid-read —
+    used to escape uncaught and trigger the R2-1 rollback of DB state for
+    a write that had, in fact, already succeeded."""
+
+    def test_non_json_2xx_body_returns_synthetic_response_not_raises(self, monkeypatch):
+        """A proxy/CDN interstitial can return HTTP 200 with an HTML body
+        instead of JSON. `json.loads` on that raises `JSONDecodeError` (a
+        ValueError) — this used to be completely uncaught."""
+        def fake_urlopen(req, timeout):
+            return _FakeHTTPResponse(status=200, read_result=b"<html>upstream proxy error</html>")
+
+        monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+        resp = _real_discord_transport("PATCH", "https://discord.com/api/v10/channels/1", "tok", {"name": "x"}, 15)
+        assert resp.status == 0
+        assert resp.data is not None
+
+    def test_incomplete_read_returns_synthetic_response_not_raises(self, monkeypatch):
+        """`http.client.IncompleteRead` — the connection dropped mid-body,
+        after Discord's server had already processed the write."""
+        def fake_urlopen(req, timeout):
+            return _FakeHTTPResponse(
+                status=200, read_raises=http.client.IncompleteRead(b"partial")
+            )
+
+        monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+        resp = _real_discord_transport("PATCH", "https://discord.com/api/v10/channels/1", "tok", {"name": "x"}, 15)
+        assert resp.status == 0
+
+    def test_connection_reset_during_read_returns_synthetic_response_not_raises(self, monkeypatch):
+        """`ConnectionResetError` is an `OSError` subclass, NOT a
+        `URLError` — the old except tuple did not cover it."""
+        def fake_urlopen(req, timeout):
+            return _FakeHTTPResponse(status=200, read_raises=ConnectionResetError("connection reset by peer"))
+
+        monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+        resp = _real_discord_transport("PATCH", "https://discord.com/api/v10/channels/1", "tok", {"name": "x"}, 15)
+        assert resp.status == 0
+
+    def test_httperror_non_json_body_returns_synthetic_response_not_raises(self, monkeypatch):
+        """Same treatment for `HTTPError.read()` at the error path: a
+        non-JSON error body (e.g. an HTML 502 page from a CDN in front of
+        Discord) must not raise out of the transport."""
+        def fake_urlopen(req, timeout):
+            raise urllib.error.HTTPError(
+                "url", 502, "bad gateway", {}, __import__("io").BytesIO(b"<html>bad gateway</html>")
+            )
+
+        monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+        resp = _real_discord_transport("PATCH", "https://discord.com/api/v10/channels/1", "tok", {"name": "x"}, 15)
+        assert resp.status == 502
+        assert resp.data is None
+
+    def test_httperror_read_incomplete_read_returns_synthetic_response_not_raises(self, monkeypatch):
+        class BoomOnReadHTTPError(urllib.error.HTTPError):
+            def read(self, *a, **k):
+                raise http.client.IncompleteRead(b"partial")
+
+        def fake_urlopen(req, timeout):
+            raise BoomOnReadHTTPError("url", 500, "server error", {}, __import__("io").BytesIO(b""))
+
+        monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+        resp = _real_discord_transport("PATCH", "https://discord.com/api/v10/channels/1", "tok", {"name": "x"}, 15)
+        assert resp.status == 500
+        assert resp.data is None
 
 
 class TestReconcileDiscordCommitsPerThread:

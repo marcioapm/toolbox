@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import http.client
 import json
 import os
 import re
@@ -798,6 +799,22 @@ class DiscordResponse:
 def _discord_transport(
     method: str, url: str, token: str, payload: Optional[Dict[str, Any]], timeout: int
 ) -> DiscordResponse:
+    """R2-3 (regression of C2, ROUND2-FINDINGS.md): the old exception
+    handling only covered failures `urlopen()` itself could raise.
+    `resp.read()` and `json.loads(body)` sat OUTSIDE any try/except, so a
+    non-JSON 2xx body (a proxy/CDN interstitial), `http.client.
+    IncompleteRead` (the connection dropped mid-body), or
+    `ConnectionResetError` (an `OSError` subclass, not a `URLError`) mid-
+    read would escape uncaught. These are exactly the failure modes that
+    occur AFTER Discord has already applied the write server-side — an
+    uncaught exception here used to propagate into `reconcile_discord` and
+    trigger a rollback of DB state for a write that had, in fact, already
+    succeeded (the R2-1 failure mode). The whole `with urlopen(...)` body,
+    including the read+parse, is now inside the try, and the except tuple
+    covers OSError (catches ConnectionResetError, IncompleteRead is also
+    an OSError subclass via http.client.HTTPException... but explicitly
+    listed for clarity) and json.JSONDecodeError. Same treatment for
+    `HTTPError.read()`/parse below."""
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         url,
@@ -810,22 +827,34 @@ def _discord_transport(
             body = resp.read()
             return DiscordResponse(resp.status, json.loads(body) if body else None)
     except urllib.error.HTTPError as exc:
-        body = exc.read()
         try:
+            body = exc.read()
             parsed = json.loads(body) if body else None
-        except json.JSONDecodeError:
+        except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException, json.JSONDecodeError):
             parsed = None
         return DiscordResponse(exc.code, parsed)
-    except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
-        # CRITICAL 2: a transient network blip (DNS failure, connection
-        # reset, read timeout, TLS error — none of which are HTTPError)
-        # must not raise out of the transport. An uncaught exception here
-        # used to escape reconcile_discord mid-cycle and roll back an
-        # entire `with conn:` transaction, discarding DB state for renames
-        # that had *already* succeeded on Discord — burning a real
-        # rename-slot on the inevitable retry. status=0 is not a valid
-        # Discord HTTP status, so callers treat it like any other non-2xx
-        # failure and simply report+skip this thread.
+    except (
+        urllib.error.URLError,
+        OSError,
+        TimeoutError,
+        socket.timeout,
+        ssl.SSLError,
+        http.client.HTTPException,
+        json.JSONDecodeError,
+    ) as exc:
+        # CRITICAL 2 / R2-3: a transient network blip (DNS failure,
+        # connection reset, read timeout, TLS error, truncated body, or a
+        # non-JSON 2xx body) — none of which are HTTPError — must not
+        # raise out of the transport. An uncaught exception here used to
+        # escape reconcile_discord mid-cycle and roll back DB state for
+        # writes that had *already* succeeded on Discord — burning a real
+        # rename-slot / creating a duplicate pin on the inevitable retry.
+        # status=0 is not a valid Discord HTTP status, so callers treat it
+        # like any other non-2xx failure and simply report+skip this
+        # thread. Note: OSError is a superset that also covers
+        # ConnectionResetError and (via http.client) IncompleteRead;
+        # URLError is included explicitly since it is NOT an OSError
+        # subclass.
         return DiscordResponse(0, {"error": str(exc)})
 
 
