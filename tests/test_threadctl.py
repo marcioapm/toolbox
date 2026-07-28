@@ -6,7 +6,10 @@ calls are mocked — no live API calls."""
 from __future__ import annotations
 
 import json
+import socket
 import sqlite3
+import ssl
+import urllib.error
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -17,6 +20,11 @@ from toolbox import threadctl as tc
 # safety fixture below stubs it for every other test), so the dedicated
 # token-resolution tests can still exercise the real implementation.
 _real_resolve_discord_token = tc._resolve_discord_token
+
+# Same idea for _discord_transport: the safety fixture below replaces it
+# with a forbidding stub for every other test, but the dedicated transport
+# tests need the real implementation to verify its exception handling.
+_real_discord_transport = tc._discord_transport
 
 
 @pytest.fixture(autouse=True)
@@ -81,6 +89,17 @@ class TestDatabaseBasics:
         finally:
             conn.close()
 
+    def test_busy_timeout_is_30_seconds(self, db_path):
+        """CRITICAL 3: raised from 5000ms to 30000ms — 5s was easily
+        exceeded by an agent command contending with the cycle's `gh`/
+        Discord I/O, surfacing a raw `database is locked` traceback."""
+        conn = tc.connect_db(db_path)
+        try:
+            timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            assert timeout == tc.DB_BUSY_TIMEOUT_MS
+        finally:
+            conn.close()
+
     def test_db_env_var_resolution(self, tmp_path, monkeypatch, capsys):
         env_db = tmp_path / "envstate.db"
         monkeypatch.setenv("THREADCTL_DB", str(env_db))
@@ -96,6 +115,139 @@ class TestDatabaseBasics:
         assert code == 0
         assert flag_db.exists()
         assert not env_db.exists()
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL 3: locked-DB retry for agent commands, incremental cycle commits
+# ---------------------------------------------------------------------------
+
+class TestRetryOnLocked:
+    """Agent-facing write commands must retry a couple of times on
+    `sqlite3.OperationalError: database is locked/busy` and, failing that,
+    print a clean one-line message — never a raw traceback. A failed
+    `touch` used to mean a thread silently going 💤 while an agent was
+    actively working, the exact false signal threadctl exists to
+    eliminate."""
+
+    def test_retries_and_succeeds_after_transient_lock(self):
+        calls = {"n": 0}
+
+        @tc._retry_on_locked(retries=3, backoff_s=0)
+        def flaky(args):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise sqlite3.OperationalError("database is locked")
+            return 0
+
+        assert flaky(None) == 0
+        assert calls["n"] == 2
+
+    def test_gives_up_after_retries_with_clean_message_not_traceback(self, capsys):
+        @tc._retry_on_locked(retries=2, backoff_s=0)
+        def always_locked(args):
+            raise sqlite3.OperationalError("database is locked")
+
+        code = always_locked(None)
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "database busy" in err
+        assert "Traceback" not in err
+
+    def test_non_lock_operational_errors_are_not_swallowed(self):
+        @tc._retry_on_locked(retries=3, backoff_s=0)
+        def other_error(args):
+            raise sqlite3.OperationalError("no such table: threads")
+
+        with pytest.raises(sqlite3.OperationalError):
+            other_error(None)
+
+    def test_touch_command_is_wrapped_with_retry(self, db_path, capsys):
+        assert tc.cmd_touch.__wrapped__ is not None
+
+
+class TestCycleIncrementalCommits:
+    """CRITICAL 3: the cycle must not hold the SQLite write lock across all
+    of its network I/O — `_poll_due_prs` commits per repo-batch and
+    `reconcile_discord` commits per thread, instead of one `with conn:`
+    wrapping the entire cycle. Verified by asserting a concurrent writer on
+    a second connection succeeds *during* a slow step of the cycle."""
+
+    def test_recompute_desired_names_skips_update_when_unchanged(self, db_path, capsys, monkeypatch):
+        """CRITICAL 3 also calls out: recompute_desired_names rewrote all
+        25 thread rows every minute regardless of change. Now it must skip
+        the UPDATE (and updated_at bump) when desired_name is unchanged."""
+        _bind(db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE threads SET desired_name='🟢 Experiment recompute', updated_at='2020-01-01T00:00:00Z' "
+                    "WHERE thread_id='t1'"
+                )
+            now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+            tc.recompute_desired_names(conn, now, 30)
+            conn.commit()
+            thread = tc.get_thread(conn, "t1")
+            # updated_at must NOT have been touched — the UPDATE was skipped.
+            assert thread["updated_at"] == "2020-01-01T00:00:00Z"
+        finally:
+            conn.close()
+
+    def test_recompute_desired_names_writes_when_changed(self, db_path, capsys):
+        _bind(db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE threads SET desired_name='stale value', updated_at='2020-01-01T00:00:00Z' "
+                    "WHERE thread_id='t1'"
+                )
+            now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+            tc.recompute_desired_names(conn, now, 30)
+            conn.commit()
+            thread = tc.get_thread(conn, "t1")
+            assert thread["desired_name"] != "stale value"
+            assert thread["updated_at"] != "2020-01-01T00:00:00Z"
+        finally:
+            conn.close()
+
+    def test_poll_due_prs_commits_between_repo_batches(self, db_path, capsys, monkeypatch):
+        """Poll two repos; _poll_due_prs must commit after each repo's
+        batch rather than holding one transaction across the whole poll
+        (CRITICAL 3) — verified by checking both threads' PR state landed
+        even though the poll processes repos one at a time."""
+        _bind(db_path, capsys, thread_id="t1", title="One", repo="absmartly/abs")
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        _bind(db_path, capsys, thread_id="t2", title="Two", repo="marcioapm/toolbox")
+        run_cli(["add-pr", "t2", "1"], db_path, capsys)
+
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+
+        def runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return __import__("subprocess").CompletedProcess(cmd, 0, "token\n", "")
+            payload = _graphql_payload(pr_1=_github_pr(ci="FAILURE"))
+            return __import__("subprocess").CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        conn = tc.connect_db(db_path)
+        try:
+            refreshed, errors = tc._poll_due_prs(
+                conn, now, {"pr_recheck_min_s": 150, "max_pr_checks_per_cycle": 40}, runner, tc.DEFAULT_ACCOUNTS
+            )
+            assert refreshed == 2
+            assert errors == 0
+        finally:
+            conn.close()
+
+        # A brand new connection (simulating a concurrent agent command)
+        # must see both repos' writes — proving each batch was committed,
+        # not held in one uncommitted transaction for the whole poll.
+        conn2 = tc.connect_db(db_path)
+        try:
+            assert tc.get_prs(conn2, "t1")[0]["ci"] == "FAILURE"
+            assert tc.get_prs(conn2, "t2")[0]["ci"] == "FAILURE"
+        finally:
+            conn2.close()
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +881,23 @@ def _github_pr(
     state="OPEN", ci="SUCCESS", review="APPROVED", mergeable="MERGEABLE",
     draft=False, title="Implement thing", url="https://github.com/absmartly/abs/pull/1",
 ):
-    nodes = [] if ci == "NONE" else [{"conclusion": ci, "status": None}]
+    """Builds one `pullRequest` node using the verified-correct real shape
+    (commits -> nodes -> commit -> statusCheckRollup{state, contexts}; see
+    ADDENDUM.md / tests/fixtures/graphql_*.json) — for cycle-level tests
+    below that only care about downstream behaviour (staggering,
+    terminal-freeze, desired-name persistence), not the GraphQL contract
+    itself. The contract itself is exercised directly against RECORDED
+    fixtures in TestGithubPolling, per CRITICAL 1: the old version of this
+    helper invented the same nonexistent `statusCheckRollup { nodes {...} }`
+    shape the code emitted, so 100% of polling tests passed against a
+    schema that doesn't exist — this helper must never again drift from
+    what GitHub actually returns."""
+    rollup = None if ci == "NONE" else {
+        "state": ci,
+        "contexts": {"nodes": [
+            {"__typename": "CheckRun", "conclusion": ci, "status": "COMPLETED", "name": "build"},
+        ]},
+    }
     return {
         "state": state,
         "mergeable": mergeable,
@@ -737,13 +905,21 @@ def _github_pr(
         "isDraft": draft,
         "title": title,
         "url": url,
-        "statusCheckRollup": {"nodes": nodes},
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": rollup}}]},
     }
 
 
 class TestGithubPolling:
-    def test_fetches_one_batched_graphql_query_with_account_token(self, monkeypatch):
+    def test_fetches_batched_graphql_query_against_recorded_fixture(self, monkeypatch, fixtures_dir):
+        """Drives fetch_repo_pr_states from a REAL recorded GraphQL response
+        (absmartly/abs PRs 4615, 4547, 4620 — see ADDENDUM.md), not a
+        hand-invented shape. This is exactly the trap CRITICAL 1 warns
+        about: the old `_github_pr()` fixture invented the same
+        nonexistent `statusCheckRollup { nodes {...} }` shape the code
+        emitted, so 100% of polling tests passed against a schema that
+        does not exist."""
         monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+        payload = json.loads((fixtures_dir / "graphql_open_varied.json").read_text())
         calls = []
 
         def runner(cmd, timeout):
@@ -751,39 +927,79 @@ class TestGithubPolling:
             if cmd[:2] == ["gh", "auth"]:
                 assert cmd == ["gh", "auth", "token", "--user", "marcio-absmartly"]
                 return __import__("subprocess").CompletedProcess(cmd, 0, "tok\n", "")
-            payload = _graphql_payload(pr_1=_github_pr(), pr_2=_github_pr(ci="PENDING"))
             return __import__("subprocess").CompletedProcess(cmd, 0, json.dumps(payload), "")
 
-        states, error = tc.fetch_repo_pr_states(
-            "absmartly/abs", [1, 2], tc.DEFAULT_ACCOUNTS, 20, runner
+        states, error, graphql_errors = tc.fetch_repo_pr_states(
+            "absmartly/abs", [4615, 4547, 4620], tc.DEFAULT_ACCOUNTS, 20, runner
         )
 
         assert error is None
-        assert states[1]["ci"] == "SUCCESS"
-        assert states[2]["ci"] == "PENDING"
-        assert states[1]["review"] == "APPROVED"
-        assert states[1]["checked_at"] == "2026-07-28T12:00:00Z"
+        assert graphql_errors == []
+        assert states[4615]["ci"] == "SUCCESS"
+        assert states[4615]["review"] == "APPROVED"
+        assert states[4615]["mergeable"] == "MERGEABLE"
+        assert states[4547]["ci"] == "FAILURE"
+        assert states[4547]["review"] == "REVIEW_REQUIRED"
+        assert states[4620]["ci"] == "SUCCESS"
+        assert states[4615]["checked_at"] == "2026-07-28T12:00:00Z"
         assert calls[1][:2] == ["env", "GH_TOKEN=tok"]
         query = next(part for part in calls[1] if part.startswith("query="))
-        assert "pullRequest(number: 1)" in query
-        assert "pullRequest(number: 2)" in query
+        assert "pullRequest(number: 4615)" in query
+        assert "pullRequest(number: 4547)" in query
+        # The verified-correct shape (CRITICAL 1): commits(last:1) ->
+        # statusCheckRollup { state contexts(last:100) { ... } }, NOT the
+        # nonexistent `statusCheckRollup { nodes {...} }`.
+        assert "commits(last: 1)" in query
+        assert "contexts(last: 100)" in query
+        assert "... on CheckRun" in query
+        assert "... on StatusContext" in query
+        assert "statusCheckRollup { nodes" not in query
         assert not any(call[:3] == ["gh", "auth", "switch"] for call in calls)
 
-    @pytest.mark.parametrize("rollup,expected", [
-        ([{"conclusion": "FAILURE", "status": None}], "FAILURE"),
-        ([{"conclusion": None, "status": "IN_PROGRESS"}], "PENDING"),
-        ([], "NONE"),
-    ])
-    def test_ci_derivation(self, rollup, expected):
-        assert tc._derive_ci(rollup) == expected
+    def test_ci_derivation_from_real_rollup_shapes(self, fixtures_dir):
+        """`_derive_ci` against real `statusCheckRollup` objects extracted
+        from recorded fixtures (not hand-invented dicts) — `rollup.state`
+        is SUCCESS/FAILURE/PENDING and is the primary, simplest-correct
+        source of truth (ADDENDUM.md)."""
+        open_varied = json.loads((fixtures_dir / "graphql_open_varied.json").read_text())
+        terminal = json.loads((fixtures_dir / "graphql_terminal_and_missing.json").read_text())
+        toolbox_pr7 = json.loads((fixtures_dir / "graphql_toolbox_pr7.json").read_text())
+
+        def rollup_of(payload, alias):
+            node = payload["data"]["repository"][alias]
+            return node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+
+        assert tc._derive_ci(rollup_of(open_varied, "pr_4615")) == "SUCCESS"
+        assert tc._derive_ci(rollup_of(open_varied, "pr_4547")) == "FAILURE"
+        assert tc._derive_ci(rollup_of(open_varied, "pr_4620")) == "SUCCESS"
+        assert tc._derive_ci(rollup_of(terminal, "pr_4720")) == "SUCCESS"
+        assert tc._derive_ci(rollup_of(terminal, "pr_4716")) == "FAILURE"
+        assert tc._derive_ci(rollup_of(toolbox_pr7, "pr_7")) == "FAILURE"
+
+    def test_ci_derivation_none_rollup_means_no_checks_configured(self):
+        assert tc._derive_ci(None) == "NONE"
+
+    def test_ci_derivation_falls_back_to_contexts_for_unrecognised_rollup_state(self):
+        # Defensive fallback: a rollup.state GitHub might add that we don't
+        # map yet still derives correctly from the CheckRun/StatusContext
+        # union in `contexts`.
+        rollup = {
+            "state": "SOMETHING_NEW",
+            "contexts": {"nodes": [
+                {"__typename": "CheckRun", "conclusion": "FAILURE", "status": "COMPLETED", "name": "build"},
+                {"__typename": "StatusContext", "state": "SUCCESS", "context": "CodeRabbit"},
+            ]},
+        }
+        assert tc._derive_ci(rollup) == "FAILURE"
 
     def test_graphql_failure_is_returned_not_raised(self):
         def runner(cmd, timeout):
             return __import__("subprocess").CompletedProcess(cmd, 1, "", "bad credentials")
 
-        states, error = tc.fetch_repo_pr_states("unknown/repo", [1], {}, 20, runner)
+        states, error, graphql_errors = tc.fetch_repo_pr_states("unknown/repo", [1], {}, 20, runner)
         assert states is None
         assert error == "bad credentials"
+        assert graphql_errors == []
 
     def test_malformed_graphql_repository_is_returned_not_raised(self):
         def runner(cmd, timeout):
@@ -791,9 +1007,86 @@ class TestGithubPolling:
                 cmd, 0, json.dumps({"data": {"repository": None}}), ""
             )
 
-        states, error = tc.fetch_repo_pr_states("unknown/repo", [1], {}, 20, runner)
+        states, error, graphql_errors = tc.fetch_repo_pr_states("unknown/repo", [1], {}, 20, runner)
         assert states is None
         assert "invalid GraphQL JSON" in error
+
+    def test_partial_failure_missing_pr_does_not_wipe_sibling_pr_state(self, fixtures_dir):
+        """A missing PR (pr_9999999 -> null alias + a top-level NOT_FOUND
+        error) must not prevent the other two good aliases (pr_4720
+        MERGED, pr_4716 CLOSED) in the SAME response from coming back
+        usable — verified against the real recorded response
+        (ADDENDUM.md behaviours #2/#3)."""
+        payload = json.loads((fixtures_dir / "graphql_terminal_and_missing.json").read_text())
+
+        def runner(cmd, timeout):
+            return __import__("subprocess").CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        states, error, graphql_errors = tc.fetch_repo_pr_states(
+            "absmartly/abs", [4720, 4716, 9999999], {}, 20, runner
+        )
+        assert error is None
+        assert states[4720] is not None
+        assert states[4720]["state"] == "MERGED"
+        assert states[4716] is not None
+        assert states[4716]["state"] == "CLOSED"
+        assert states[9999999] is None
+        assert len(graphql_errors) == 1
+        assert "9999999" in graphql_errors[0]
+
+    def test_merged_pr_mergeable_unknown_is_preserved_not_treated_as_conflicting(self, fixtures_dir):
+        """Behaviour #5: MERGED PRs report mergeable=UNKNOWN — this must
+        pass through as-is, never be coerced into CONFLICTING."""
+        payload = json.loads((fixtures_dir / "graphql_terminal_and_missing.json").read_text())
+
+        def runner(cmd, timeout):
+            return __import__("subprocess").CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        states, error, _ = tc.fetch_repo_pr_states("absmartly/abs", [4720], {}, 20, runner)
+        assert states[4720]["mergeable"] == "UNKNOWN"
+        assert states[4720]["state"] == "MERGED"
+        pr = {**states[4720], "primary": False, "number": 4720, "draft": False}
+        # MERGED is terminal and checked first in pr_icon — mergeable being
+        # unexpected/falsy must not fall through to the CONFLICTING branch.
+        assert tc.pr_icon(pr) == "🟣"
+
+    def test_trailing_non_json_text_after_gh_stdout_parses_cleanly(self, fixtures_dir):
+        """`gh` appends a human-readable error line AFTER the JSON body
+        when a query aliases a nonexistent PR (captured verbatim from a
+        real invocation in raw_gh_stdout.txt). A naive `json.loads` raises
+        `JSONDecodeError: Extra data` on this; the parser must tolerate
+        it (behaviour #4)."""
+        raw = (fixtures_dir / "graphql_terminal_and_missing.raw_gh_stdout.txt").read_text()
+        assert "gh: Could not resolve to a PullRequest" in raw  # sanity: the trap really is there
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(raw)  # the naive approach really does fail
+
+        def runner(cmd, timeout):
+            return __import__("subprocess").CompletedProcess(cmd, 0, raw, "")
+
+        states, error, graphql_errors = tc.fetch_repo_pr_states(
+            "absmartly/abs", [4720, 4716, 9999999], {}, 20, runner
+        )
+        assert error is None
+        assert states[4720]["state"] == "MERGED"
+        assert states[9999999] is None
+        assert len(graphql_errors) == 1
+
+    def test_toolbox_pr7_real_fixture_open_failing_ci(self, fixtures_dir):
+        """marcioapm/toolbox#7 — OPEN, reviewDecision null (never
+        requested review), rollup FAILURE (one pytest matrix leg failed,
+        the rest cancelled)."""
+        payload = json.loads((fixtures_dir / "graphql_toolbox_pr7.json").read_text())
+
+        def runner(cmd, timeout):
+            return __import__("subprocess").CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        states, error, _ = tc.fetch_repo_pr_states("marcioapm/toolbox", [7], {}, 20, runner)
+        assert error is None
+        assert states[7]["state"] == "OPEN"
+        assert states[7]["ci"] == "FAILURE"
+        assert states[7]["review"] == "NONE"  # reviewDecision null -> our NONE default
+
 
     def test_cycle_staggers_oldest_prs_and_honours_cap(self, db_path, capsys, monkeypatch):
         _bind(db_path, capsys)
@@ -897,6 +1190,102 @@ class TestGithubPolling:
             thread = tc.get_thread(conn, "t1")
             assert thread["desired_name"] == "🔴 Experiment recompute · 🔴#1"
             assert thread["applied_name"] is None
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Discord: transport network-error handling (CRITICAL 2)
+# ---------------------------------------------------------------------------
+
+class TestDiscordTransportNetworkErrors:
+    """`_discord_transport` used to only catch `HTTPError` (a well-formed
+    4xx/5xx response). A transient network blip — DNS failure, connection
+    reset, read timeout, TLS error — raised straight out of the transport,
+    which used to escape `reconcile_discord` mid-cycle and roll back the
+    whole `with conn:` transaction, discarding DB state for renames that
+    had ALREADY succeeded on Discord for threads processed earlier in the
+    same cycle. This is what actually generates the duplicate-rename bug:
+    the next cycle sees `applied_name` reverted and re-issues the PATCH."""
+
+    def test_urlerror_returns_synthetic_response_not_raises(self, monkeypatch):
+        def fake_urlopen(req, timeout):
+            raise urllib.error.URLError("nodename nor servname provided")
+
+        monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+        resp = _real_discord_transport("PATCH", "https://discord.com/api/v10/channels/1", "tok", {"name": "x"}, 15)
+        assert resp.status == 0
+        assert resp.data is not None
+
+    def test_socket_timeout_returns_synthetic_response_not_raises(self, monkeypatch):
+        def fake_urlopen(req, timeout):
+            raise socket.timeout("timed out")
+
+        monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+        resp = _real_discord_transport("PATCH", "https://discord.com/api/v10/channels/1", "tok", {"name": "x"}, 15)
+        assert resp.status == 0
+
+    def test_ssl_error_returns_synthetic_response_not_raises(self, monkeypatch):
+        def fake_urlopen(req, timeout):
+            raise ssl.SSLError("bad handshake")
+
+        monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+        resp = _real_discord_transport("PATCH", "https://discord.com/api/v10/channels/1", "tok", {"name": "x"}, 15)
+        assert resp.status == 0
+
+    def test_httperror_still_handled_as_before(self, monkeypatch):
+        def fake_urlopen(req, timeout):
+            raise urllib.error.HTTPError("url", 429, "rate limited", {}, __import__("io").BytesIO(b'{"retry_after": 5}'))
+
+        monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+        resp = _real_discord_transport("PATCH", "https://discord.com/api/v10/channels/1", "tok", {"name": "x"}, 15)
+        assert resp.status == 429
+        assert resp.data == {"retry_after": 5}
+
+
+class TestReconcileDiscordCommitsPerThread:
+    """CRITICAL 2: reconcile_discord must commit per-thread, so one
+    thread's Discord failure doesn't roll back another thread's already-
+    successful DB writes in the same cycle. Simulates the reviewer's
+    reproduction: t1's pin+rename succeed, t2's rename explodes with an
+    unexpected exception — t1's state must survive."""
+
+    def test_one_threads_exception_does_not_roll_back_another_threads_success(self, db_path, capsys, monkeypatch):
+        _bind(db_path, capsys, thread_id="t1", title="Thread one")
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        _bind(db_path, capsys, thread_id="t2", title="Thread two")
+        run_cli(["add-pr", "t2", "1"], db_path, capsys)
+
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute("UPDATE threads SET desired_name='🟢 t1 new' WHERE thread_id='t1'")
+                conn.execute("UPDATE threads SET desired_name='🟢 t2 new' WHERE thread_id='t2'")
+        finally:
+            conn.close()
+
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+
+        class BoomTransport:
+            def __call__(self, method, url, token, payload, timeout):
+                if "/channels/t2" in url and method == "PATCH":
+                    raise RuntimeError("simulated unexpected crash")
+                if method == "POST":
+                    return tc.DiscordResponse(201, {"id": "555"})
+                return tc.DiscordResponse(200, {"id": "555"})
+
+        conn = tc.connect_db(db_path)
+        try:
+            pins_changed, renames_applied, errors = tc.reconcile_discord(
+                conn, now, {"rename_min_interval_s": 330}, "tok", BoomTransport(), dry_run=False
+            )
+            assert errors >= 1
+            t1 = tc.get_thread(conn, "t1")
+            assert t1["applied_name"] == "🟢 t1 new"
+            t2 = tc.get_thread(conn, "t2")
+            # t2's own crash means its rename did NOT apply, but that must
+            # not undo t1's already-successful rename above.
+            assert t2["applied_name"] != "🟢 t2 new"
         finally:
             conn.close()
 
@@ -1463,3 +1852,272 @@ class TestMigrate:
             assert tc.get_prs(conn, "t1") == []
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# HIGH 4: migration with null/invalid repo must not crash the cycle
+# ---------------------------------------------------------------------------
+
+class TestMigrateInvalidRepo:
+    """RAX VERIFIED: 11 of 25 live threads have `"repo": null`. The old
+    `_migrate_thread` did `repo = entry.get("repo") or ""`, silently
+    storing owner='' repo=''. `_check_pr_owner` then compared ''=='' and
+    passed, `add-pr` could insert a PR with repo='', and `_graphql_query`'s
+    `''.split('/', 1)` raised uncaught — which, per the old CRITICAL 2
+    all-in-one-transaction bug, rolled back polling+renaming for ALL 25
+    threads because of one bad row."""
+
+    def test_null_repo_is_imported_as_null_not_empty_string(self, db_path, tmp_path, capsys):
+        registry = _registry(t1=_old_thread(repo=None))
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            assert thread["repo"] is None
+            assert thread["owner"] is None
+        finally:
+            conn.close()
+
+    def test_invalid_repo_shape_is_also_imported_as_null(self, db_path, tmp_path, capsys):
+        registry = _registry(t1=_old_thread(repo="not-a-valid-repo-shape"))
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            assert thread["repo"] is None
+            assert thread["owner"] is None
+        finally:
+            conn.close()
+
+    def test_migrate_prints_loud_summary_of_threads_needing_manual_bind(self, db_path, tmp_path, capsys):
+        registry = _registry(
+            t1=_old_thread(thread_id="t1", repo=None),
+            t2=_old_thread(thread_id="t2", repo="absmartly/abs"),
+            t3=_old_thread(thread_id="t3", repo=None),
+        )
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        code, out, err = run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        assert code == 0
+        assert "WARNING" in err
+        assert "t1" in err
+        assert "t3" in err
+        assert "bind --repo" in err or "bind" in err
+
+    def test_valid_repo_thread_unaffected_by_others_invalid(self, db_path, tmp_path, capsys):
+        registry = _registry(
+            bad=_old_thread(thread_id="bad", repo=None),
+            good=_old_thread(thread_id="good", repo="absmartly/abs"),
+        )
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            assert tc.get_thread(conn, "good")["repo"] == "absmartly/abs"
+        finally:
+            conn.close()
+
+    def test_pr_with_no_usable_repo_is_skipped_not_inserted(self, db_path, tmp_path, capsys):
+        registry = _registry(t1=_old_thread(repo=None, prs=[_old_pr(repo=None)]))
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            assert tc.get_prs(conn, "t1") == []
+        finally:
+            conn.close()
+
+    def test_bind_repairs_a_null_repo_thread(self, db_path, tmp_path, capsys):
+        registry = _registry(t1=_old_thread(repo=None))
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        code, out, err = run_cli(
+            ["bind", "t1", "--title", "Fixed", "--repo", "absmartly/abs"], db_path, capsys
+        )
+        assert code == 0
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            assert thread["repo"] == "absmartly/abs"
+            assert thread["owner"] == "absmartly"
+        finally:
+            conn.close()
+
+
+class TestPollDuePrsSkipsInvalidRepo:
+    """HIGH 4, poller side: a PR row with a NULL/invalid repo (e.g. a
+    migrated thread nobody has `bind --repo`'d yet) must be skipped and
+    recorded to history, never crash `_graphql_query`'s `repo.split('/')`
+    and, via that, the whole cycle."""
+
+    def test_null_repo_pr_is_skipped_and_recorded_not_raised(self, db_path, capsys, monkeypatch):
+        """A PR row with an invalid repo (empty string — the shape the old
+        code used to silently store; `prs.repo` stays NOT NULL, so this is
+        the realistic "bad data slipped in" case, e.g. from a pre-fix DB)
+        must not crash `_graphql_query`'s `repo.split('/')` and, via that,
+        the whole cycle."""
+        _bind(db_path, capsys, thread_id="t1", repo="absmartly/abs")
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO prs (thread_id, repo, number, is_primary, created_at) VALUES (?, ?, ?, 0, ?)",
+                    ("t1", "", 1, tc._now_iso()),
+                )
+        finally:
+            conn.close()
+
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+
+        def runner(cmd, timeout):
+            raise AssertionError("must not call gh for a PR with no usable repo")
+
+        conn = tc.connect_db(db_path)
+        try:
+            refreshed, errors = tc._poll_due_prs(
+                conn, now, {"pr_recheck_min_s": 150, "max_pr_checks_per_cycle": 40}, runner, tc.DEFAULT_ACCOUNTS
+            )
+            assert refreshed == 0
+            assert errors == 1
+            history = conn.execute("SELECT * FROM history WHERE thread_id='t1' AND kind='error'").fetchall()
+            assert len(history) == 1
+            assert "invalid repo" in history[0]["text"]
+        finally:
+            conn.close()
+
+    def test_valid_repo_pr_on_other_thread_still_polled_when_sibling_has_invalid_repo(
+        self, db_path, capsys, monkeypatch
+    ):
+        _bind(db_path, capsys, thread_id="good", repo="absmartly/abs")
+        run_cli(["add-pr", "good", "1"], db_path, capsys)
+
+        _bind(db_path, capsys, thread_id="bad", repo="absmartly/abs")
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                # Force an invalid-repo PR directly — simulates bad data
+                # that slipped in from a pre-fix DB or a future code path
+                # that doesn't validate as strictly as add-pr/migrate now do.
+                conn.execute(
+                    "INSERT INTO prs (thread_id, repo, number, is_primary, created_at) VALUES (?, ?, ?, 0, ?)",
+                    ("bad", "", 1, tc._now_iso()),
+                )
+        finally:
+            conn.close()
+
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+
+        def runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return __import__("subprocess").CompletedProcess(cmd, 0, "token\n", "")
+            payload = _graphql_payload(pr_1=_github_pr(ci="SUCCESS"))
+            return __import__("subprocess").CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        conn = tc.connect_db(db_path)
+        try:
+            refreshed, errors = tc._poll_due_prs(
+                conn, now, {"pr_recheck_min_s": 150, "max_pr_checks_per_cycle": 40}, runner, tc.DEFAULT_ACCOUNTS
+            )
+            assert refreshed == 1  # good/1 still polled
+            assert errors == 1     # bad/1 recorded as an error, not raised
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# HIGH 5: pinned message length cap + mention sanitisation
+# ---------------------------------------------------------------------------
+
+class TestRenderPinBodyCapAndSanitisation:
+    def test_body_under_cap_is_unchanged(self):
+        thread = {"title": "Small thread"}
+        prs = [{"repo": "absmartly/abs", "number": 1, "primary": True, "state": "OPEN",
+                "ci": "SUCCESS", "review": "APPROVED", "mergeable": "MERGEABLE",
+                "title": "A normal PR title", "url": "https://github.com/absmartly/abs/pull/1"}]
+        body = tc.render_pin_body(thread, prs)
+        assert len(body) <= tc.DISCORD_MESSAGE_MAX
+        assert "A normal PR title" in body
+
+    def test_many_prs_is_capped_at_discord_message_max(self):
+        """LLM Proxy-style thread: enough PRs (14+) to exceed Discord's
+        2000-char message limit if rendered unconditionally."""
+        thread = {"title": "LLM Proxy"}
+        prs = [
+            {
+                "repo": "absmartly/abs", "number": 1000 + i, "primary": (i == 0), "state": "OPEN",
+                "ci": "SUCCESS", "review": "APPROVED", "mergeable": "MERGEABLE",
+                "title": "A reasonably long pull request title describing the change in detail " * 2,
+                "url": f"https://github.com/absmartly/abs/pull/{1000 + i}",
+            }
+            for i in range(30)
+        ]
+        body = tc.render_pin_body(thread, prs)
+        assert len(body) <= tc.DISCORD_MESSAGE_MAX
+
+    def test_capped_body_notes_how_many_were_omitted(self):
+        thread = {"title": "Many PRs"}
+        prs = [
+            {
+                "repo": "absmartly/abs", "number": 2000 + i, "primary": False, "state": "OPEN",
+                "ci": "SUCCESS", "review": "APPROVED", "mergeable": "MERGEABLE",
+                "title": "x" * 150, "url": f"https://github.com/absmartly/abs/pull/{2000 + i}",
+            }
+            for i in range(40)
+        ]
+        body = tc.render_pin_body(thread, prs)
+        assert len(body) <= tc.DISCORD_MESSAGE_MAX
+        assert "omitted" in body
+
+    def test_everyone_mention_in_pr_title_is_neutralised(self):
+        thread = {"title": "x"}
+        prs = [{"repo": "absmartly/abs", "number": 1, "primary": True, "state": "OPEN",
+                "ci": "SUCCESS", "review": "APPROVED", "mergeable": "MERGEABLE",
+                "title": "@everyone please review", "url": "https://github.com/absmartly/abs/pull/1"}]
+        body = tc.render_pin_body(thread, prs)
+        assert "@everyone" not in body
+        assert "everyone" in body  # the visible text survives, just defused
+
+    def test_here_mention_in_pr_title_is_neutralised(self):
+        thread = {"title": "x"}
+        prs = [{"repo": "absmartly/abs", "number": 1, "primary": True, "state": "OPEN",
+                "ci": "SUCCESS", "review": "APPROVED", "mergeable": "MERGEABLE",
+                "title": "@here fix this now", "url": "https://github.com/absmartly/abs/pull/1"}]
+        body = tc.render_pin_body(thread, prs)
+        assert "@here" not in body
+
+    def test_role_mention_in_pr_title_is_neutralised(self):
+        thread = {"title": "x"}
+        prs = [{"repo": "absmartly/abs", "number": 1, "primary": True, "state": "OPEN",
+                "ci": "SUCCESS", "review": "APPROVED", "mergeable": "MERGEABLE",
+                "title": "ping <@&123456789012345678> please", "url": "https://github.com/absmartly/abs/pull/1"}]
+        body = tc.render_pin_body(thread, prs)
+        assert "<@&123456789012345678>" not in body
+
+    def test_user_mention_in_pr_title_is_neutralised(self):
+        thread = {"title": "x"}
+        prs = [{"repo": "absmartly/abs", "number": 1, "primary": True, "state": "OPEN",
+                "ci": "SUCCESS", "review": "APPROVED", "mergeable": "MERGEABLE",
+                "title": "cc <@123456789012345678>", "url": "https://github.com/absmartly/abs/pull/1"}]
+        body = tc.render_pin_body(thread, prs)
+        assert "<@123456789012345678>" not in body
+
+    def test_thread_title_mention_is_also_neutralised(self):
+        thread = {"title": "@everyone read this"}
+        body = tc.render_pin_body(thread, [])
+        assert "@everyone" not in body
+
+    def test_mention_in_middle_of_normal_title_still_defused(self):
+        thread = {"title": "x"}
+        prs = [{"repo": "absmartly/abs", "number": 1, "primary": True, "state": "OPEN",
+                "ci": "SUCCESS", "review": "APPROVED", "mergeable": "MERGEABLE",
+                "title": "fix bug reported by @everyone in standup", "url": "https://github.com/absmartly/abs/pull/1"}]
+        body = tc.render_pin_body(thread, prs)
+        assert "@everyone" not in body
+        assert "fix bug reported by" in body

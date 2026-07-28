@@ -52,12 +52,17 @@ pin reconciliation (see `reconcile_pin` in the cycle module section).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import functools
 import json
 import os
 import re
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -81,8 +86,8 @@ SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS threads (
   thread_id      TEXT PRIMARY KEY,
   title          TEXT NOT NULL,
-  owner          TEXT NOT NULL,
-  repo           TEXT NOT NULL,
+  owner          TEXT,
+  repo           TEXT,
   status         TEXT NOT NULL,
   question       INTEGER NOT NULL DEFAULT 0,
   bound_at       TEXT NOT NULL,
@@ -324,15 +329,24 @@ def render_title(thread: Dict[str, Any], prs: List[Dict[str, Any]], stale: bool)
 # database: connection, schema, history
 # ---------------------------------------------------------------------------
 
+DB_BUSY_TIMEOUT_MS = 30000
+
+
 def connect_db(path: Path) -> sqlite3.Connection:
     """Open (creating if needed) the threadctl SQLite DB with WAL mode and a
-    short busy_timeout, so many agents hitting the DB concurrently while the
+    busy_timeout generous enough to ride out the cycle's network I/O
+    (CRITICAL 3: previously 5000ms, which an agent command could exceed
+    while the cycle held the write lock across `gh`/Discord calls — now
+    that both `_poll_due_prs` and `reconcile_discord` commit incrementally
+    instead of holding the lock for the whole cycle, 30s is pure headroom
+    against an individual slow write, not a substitute for short
+    transactions), so many agents hitting the DB concurrently while the
     cycle runs don't block each other or corrupt state."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=10)
+    conn = sqlite3.connect(str(path), timeout=DB_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA_SQL)
     conn.commit()
@@ -398,6 +412,21 @@ GH_TIMEOUT_S = 20
 CI_FAILURE_STATES = frozenset({"FAILURE", "ERROR"})
 CI_PENDING_STATES = frozenset({"PENDING", "IN_PROGRESS", "QUEUED"})
 
+# PR states that are terminal (never transition back to OPEN). Once a PR's
+# state is one of these, the poller checks it exactly once more to confirm
+# the transition, then freezes it (`checked_at` stays set forever after).
+TERMINAL_STATES = frozenset({"MERGED", "CLOSED"})
+
+
+def _just_became_terminal(old_state: Optional[str], new_state: str) -> bool:
+    """True the one time a PR's state transitions from non-terminal (or
+    unknown) into MERGED/CLOSED. Spec §8: "MERGED/CLOSED PRs are terminal —
+    check once more after transition, then freeze." That confirming poll is
+    what clears `checked_at` back to `None` so `_due_prs` immediately picks
+    it up one final time; after that confirming poll, `old_state` is
+    already terminal and this returns False, freezing the PR for good."""
+    return old_state not in TERMINAL_STATES and new_state in TERMINAL_STATES
+
 
 def _run_command(cmd: List[str], timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -443,25 +472,72 @@ def _fetch_gh_token(account: str, timeout: int, runner) -> Optional[str]:
     return token or None
 
 
-def _derive_ci(rollup: Optional[List[Dict[str, Any]]]) -> str:
+# GraphQL's `StatusCheckRollup.state` values, mapped into our own
+# SUCCESS|FAILURE|PENDING|NONE vocabulary (see schema comment on `prs.ci`).
+CI_ROLLUP_STATE_MAP = {
+    "SUCCESS": "SUCCESS",
+    "FAILURE": "FAILURE",
+    "ERROR": "FAILURE",
+    "PENDING": "PENDING",
+    "EXPECTED": "PENDING",
+    "ACTION_REQUIRED": "PENDING",
+}
+
+
+def _context_conclusion(ctx: Dict[str, Any]) -> str:
+    """Normalize one heterogeneous `statusCheckRollup.contexts` node into an
+    uppercase conclusion-ish token. The union has two shapes distinguished
+    by `__typename`: `CheckRun` (GitHub Actions etc.) carries
+    `conclusion`/`status`; `StatusContext` (legacy commit statuses, e.g.
+    CodeRabbit) carries `state`. Falls back to trying all three fields for
+    a node with no/unknown `__typename`."""
+    typename = ctx.get("__typename")
+    if typename == "CheckRun":
+        return str(ctx.get("conclusion") or ctx.get("status") or "").upper()
+    if typename == "StatusContext":
+        return str(ctx.get("state") or "").upper()
+    return str(ctx.get("conclusion") or ctx.get("state") or ctx.get("status") or "").upper()
+
+
+def _derive_ci(rollup: Optional[Dict[str, Any]]) -> str:
+    """Derive our SUCCESS|FAILURE|PENDING|NONE vocabulary from a real
+    `statusCheckRollup` object (`{state, contexts: {nodes: [...]}}}`,
+    verified against `.taskdocs/fixtures/*.json` — see ADDENDUM.md).
+    `rollup["state"]` is the simplest correct source and is used first.
+    `rollup.contexts.nodes` — the heterogeneous CheckRun/StatusContext union
+    — is only consulted as a defensive fallback for a rollup state GitHub
+    might add that we don't recognise yet. `rollup` is `None` when the repo
+    has no checks configured on that commit at all (no CI wired up)."""
     if not rollup:
         return "NONE"
-    states = {
-        str(item.get("conclusion") or item.get("status") or item.get("state") or "").upper()
-        for item in rollup
-    }
-    if states & CI_FAILURE_STATES:
+    mapped = CI_ROLLUP_STATE_MAP.get(str(rollup.get("state") or "").upper())
+    if mapped:
+        return mapped
+
+    contexts = ((rollup.get("contexts") or {}).get("nodes")) or []
+    if not contexts:
+        return "NONE"
+    conclusions = {_context_conclusion(c) for c in contexts}
+    if conclusions & CI_FAILURE_STATES:
         return "FAILURE"
-    if states & CI_PENDING_STATES:
+    if conclusions & CI_PENDING_STATES:
         return "PENDING"
     return "SUCCESS"
 
 
+# The verified-correct query shape (ADDENDUM.md): `statusCheckRollup` has no
+# `nodes` field of its own (that was CRITICAL 1 — the old query never
+# validated against GitHub's schema at all). CI detail lives under
+# `commits(last: 1) -> nodes -> commit -> statusCheckRollup`, and
+# `contexts(last: 100)` is a `StatusCheckRollupContext` union requiring
+# inline fragments for its two concrete shapes.
 def _graphql_query(repo: str, numbers: List[int]) -> str:
     owner, name = repo.split("/", 1)
     fields = " ".join(
         f"pr_{number}: pullRequest(number: {number}) {{ state mergeable reviewDecision isDraft title url "
-        "statusCheckRollup { nodes { conclusion status } } }"
+        "commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(last: 100) { nodes { "
+        "__typename ... on CheckRun { conclusion status name } ... on StatusContext { state context } "
+        "} } } } } } }"
         for number in numbers
     )
     return f'query {{ repository(owner: "{owner}", name: "{name}") {{ {fields} }} }}'
@@ -470,17 +546,36 @@ def _graphql_query(repo: str, numbers: List[int]) -> str:
 def _parse_graphql_pr(node: Optional[Dict[str, Any]], checked_at: str) -> Optional[Dict[str, Any]]:
     if node is None:
         return None
-    rollup = (node.get("statusCheckRollup") or {}).get("nodes")
+    commit_nodes = (node.get("commits") or {}).get("nodes") or []
+    rollup = None
+    if commit_nodes:
+        rollup = (commit_nodes[0].get("commit") or {}).get("statusCheckRollup")
     return {
         "state": node.get("state") or "OPEN",
         "ci": _derive_ci(rollup),
         "review": node.get("reviewDecision") or "NONE",
+        # MERGED PRs report mergeable=UNKNOWN (verified in fixtures) — never
+        # treat UNKNOWN as CONFLICTING; passed through as-is here, and
+        # `pr_icon` only branches on mergeable=='CONFLICTING' explicitly.
         "mergeable": node.get("mergeable") or "UNKNOWN",
         "is_draft": int(bool(node.get("isDraft"))),
         "pr_title": node.get("title") or "",
         "url": node.get("url") or "",
         "checked_at": checked_at,
     }
+
+
+def _parse_gh_graphql_stdout(stdout: str) -> Dict[str, Any]:
+    """Parse `gh api graphql` stdout, tolerating trailing non-JSON text.
+
+    `gh` appends a human-readable error line after the JSON body when a
+    query references a nonexistent resource (e.g. `gh: Could not resolve to
+    a PullRequest with the number of 9999999.`) — verified in
+    `.taskdocs/fixtures/graphql_terminal_and_missing.raw_gh_stdout.txt`. A
+    naive `json.loads` raises `JSONDecodeError: Extra data` on that
+    trailing text, so we decode just the leading JSON object and ignore
+    whatever (if anything) follows it."""
+    return json.JSONDecoder().raw_decode(stdout.strip())[0]
 
 
 def fetch_repo_pr_states(
@@ -490,16 +585,24 @@ def fetch_repo_pr_states(
     timeout: int,
     runner,
     token_cache: Optional[Dict[str, str]] = None,
-) -> Tuple[Optional[Dict[int, Optional[Dict[str, Any]]]], Optional[str]]:
+) -> Tuple[Optional[Dict[int, Optional[Dict[str, Any]]]], Optional[str], List[str]]:
     """Fetch selected PRs from one repository with one GraphQL request.
 
     Account tokens are resolved locally and passed only to this subprocess;
     this avoids the shared mutable active-account state of `gh auth switch`.
-    """
+
+    Returns `(states, fatal_error, graphql_errors)`. `fatal_error` is set
+    only when the whole request is unusable (gh failed to run, non-JSON
+    output, no `data.repository` at all). `graphql_errors` carries any
+    top-level GraphQL `errors` entries (e.g. a `NOT_FOUND` for one alias)
+    even when `states` is otherwise usable — a partial failure must not
+    wipe good PR state for sibling aliases in the same response (verified
+    in `.taskdocs/fixtures/graphql_terminal_and_missing.json`, where
+    `pr_9999999` comes back `null` alongside two good PRs)."""
     if token_cache is None:
         token_cache = {}
     if not numbers:
-        return {}, None
+        return {}, None, []
 
     cmd = ["gh", "api", "graphql", "-f", f"query={_graphql_query(repo, numbers)}"]
     account = _gh_account_for(repo, accounts)
@@ -515,42 +618,57 @@ def fetch_repo_pr_states(
     try:
         proc = runner(cmd, timeout)
     except subprocess.TimeoutExpired:
-        return None, f"gh timed out after {timeout}s"
+        return None, f"gh timed out after {timeout}s", []
     except OSError as exc:
-        return None, f"gh failed to run: {exc}"
+        return None, f"gh failed to run: {exc}", []
     if proc.returncode != 0:
-        return None, (proc.stderr or "").strip() or f"gh exited {proc.returncode}"
+        return None, (proc.stderr or "").strip() or f"gh exited {proc.returncode}", []
     try:
-        payload = json.loads(proc.stdout)
+        payload = _parse_gh_graphql_stdout(proc.stdout)
         repository = payload["data"]["repository"]
         if not isinstance(repository, dict):
             raise TypeError("missing repository object")
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        return None, f"gh returned invalid GraphQL JSON: {exc}"
+        return None, f"gh returned invalid GraphQL JSON: {exc}", []
+
+    graphql_errors = [
+        str(e.get("message") or e) for e in (payload.get("errors") or [])
+    ]
 
     checked_at = _now_iso()
     states = {
         number: _parse_graphql_pr(repository.get(f"pr_{number}"), checked_at)
         for number in numbers
     }
-    return states, None
+    return states, None, graphql_errors
 
 
 def _due_prs(conn: sqlite3.Connection, now: datetime, recheck_min_s: int, limit: int) -> List[sqlite3.Row]:
-    cutoff = (now.timestamp() - recheck_min_s)
-    rows = conn.execute(
-        "SELECT * FROM prs WHERE state IS NULL OR state='OPEN' OR "
-        "(state IN ('MERGED', 'CLOSED') AND checked_at IS NULL) "
-        "ORDER BY CASE WHEN checked_at IS NULL THEN 0 ELSE 1 END, checked_at ASC, id ASC"
+    """PRs due for a GitHub re-check: non-terminal (state IS NULL/OPEN), or
+    terminal-but-never-confirmed (checked_at IS NULL — the one-more-poll
+    rule), whose `checked_at` (if any) is older than `recheck_min_s`.
+    Pushed into SQL rather than loaded-then-filtered in Python: our
+    timestamps are fixed-width `%Y-%m-%dT%H:%M:%SZ`, so lexicographic
+    comparison is chronological comparison and SQLite can do the cutoff and
+    the LIMIT directly. NULLs sort first under ASC by default, so the old
+    `CASE WHEN checked_at IS NULL THEN 0 ELSE 1 END` ORDER BY prefix was a
+    no-op; dropped here.
+
+    Note: this no longer parses `checked_at` in Python, so a malformed
+    value (e.g. from an unvalidated pre-migration registry.json) is simply
+    treated as "due" rather than raising and crashing the whole cycle —
+    a deliberate, strictly-better behaviour change (see
+    REVIEW-SIMPLIFIER.md #4)."""
+    cutoff = datetime.fromtimestamp(now.timestamp() - recheck_min_s, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    return conn.execute(
+        "SELECT * FROM prs WHERE (state IS NULL OR state='OPEN' OR "
+        "(state IN ('MERGED', 'CLOSED') AND checked_at IS NULL)) "
+        "AND (checked_at IS NULL OR checked_at < ?) "
+        "ORDER BY checked_at ASC, id ASC LIMIT ?",
+        (cutoff, limit),
     ).fetchall()
-    due = []
-    for row in rows:
-        checked_at = row["checked_at"]
-        if checked_at is None or _parse_iso(checked_at).timestamp() < cutoff:
-            due.append(row)
-            if len(due) == limit:
-                break
-    return due
 
 
 def _poll_due_prs(
@@ -568,24 +686,51 @@ def _poll_due_prs(
     refreshed = errors = 0
     token_cache: Dict[str, str] = {}
     for repo, prs in by_repo.items():
-        states, error = fetch_repo_pr_states(
+        # HIGH 4: a thread/PR migrated with an invalid/empty repo (e.g. the
+        # 11 live threads with repo=null) must not blow up `_graphql_query`
+        # (`''.split('/', 1)` -> ValueError) and, via that, the whole
+        # cycle. Skip just these PRs and record why, per thread.
+        if not repo or not REPO_RE.match(repo):
+            errors += len(prs)
+            for pr in prs:
+                _record_history(
+                    conn, pr["thread_id"], "error",
+                    f"GitHub poll skipped: invalid repo '{repo}' on PR #{pr['number']} "
+                    "(run `threadctl bind --repo owner/name` to fix)",
+                )
+            conn.commit()
+            continue
+
+        states, error, graphql_errors = fetch_repo_pr_states(
             repo, [p["number"] for p in prs], accounts, GH_TIMEOUT_S, runner, token_cache
         )
         if error is not None:
             errors += len(prs)
             for pr in prs:
                 _record_history(conn, pr["thread_id"], "error", f"GitHub poll {repo}#{pr['number']}: {error}")
+            conn.commit()
             continue
         assert states is not None
+        # Top-level GraphQL `errors` (e.g. NOT_FOUND for one alias) are
+        # recorded, not silently ignored — but they don't abort processing
+        # of the other, still-usable aliases in the same response.
+        if graphql_errors:
+            for message in graphql_errors:
+                _record_history(conn, prs[0]["thread_id"], "error", f"GraphQL {repo}: {message}")
         for pr in prs:
             state = states.get(pr["number"])
             if state is None:
                 errors += 1
                 _record_history(conn, pr["thread_id"], "error", f"GitHub poll {repo}#{pr['number']}: PR not found")
                 continue
-            checked_at = None if (
-                pr["state"] not in ("MERGED", "CLOSED") and state["state"] in ("MERGED", "CLOSED")
-            ) else state["checked_at"]
+            # Spec §8 / REVIEW-SIMPLIFIER.md #3: MERGED/CLOSED is terminal —
+            # confirm the transition with one more poll (checked_at ->
+            # None, so `_due_prs` picks it straight back up), then freeze
+            # (checked_at -> the real timestamp) forever after.
+            if _just_became_terminal(pr["state"], state["state"]):
+                checked_at = None
+            else:
+                checked_at = state["checked_at"]
             conn.execute(
                 "UPDATE prs SET state=?, ci=?, review=?, mergeable=?, is_draft=?, pr_title=?, url=?, checked_at=? "
                 "WHERE id=?",
@@ -595,6 +740,9 @@ def _poll_due_prs(
                 ),
             )
             refreshed += 1
+        # CRITICAL 3: commit per repo-batch rather than holding the write
+        # lock across every remaining `gh` subprocess in the cycle.
+        conn.commit()
     return refreshed, errors
 
 
@@ -606,11 +754,15 @@ def recompute_desired_names(conn: sqlite3.Connection, now: datetime, stale_after
         icon = effective_thread_icon(thread_data, prs)
         stale = is_stale(icon, thread["last_touch_at"], now, stale_after_min)
         desired_name = render_title(thread_data, prs, stale)
+        count += 1
+        # CRITICAL 3: skip the write entirely when nothing changed, instead
+        # of rewriting all 25 thread rows every minute regardless.
+        if desired_name == thread["desired_name"]:
+            continue
         conn.execute(
             "UPDATE threads SET desired_name=?, updated_at=? WHERE thread_id=?",
             (desired_name, _now_iso(), thread["thread_id"]),
         )
-        count += 1
     return count
 
 
@@ -653,6 +805,17 @@ def _discord_transport(
         except json.JSONDecodeError:
             parsed = None
         return DiscordResponse(exc.code, parsed)
+    except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
+        # CRITICAL 2: a transient network blip (DNS failure, connection
+        # reset, read timeout, TLS error — none of which are HTTPError)
+        # must not raise out of the transport. An uncaught exception here
+        # used to escape reconcile_discord mid-cycle and roll back an
+        # entire `with conn:` transaction, discarding DB state for renames
+        # that had *already* succeeded on Discord — burning a real
+        # rename-slot on the inevitable retry. status=0 is not a valid
+        # Discord HTTP status, so callers treat it like any other non-2xx
+        # failure and simply report+skip this thread.
+        return DiscordResponse(0, {"error": str(exc)})
 
 
 def _resolve_discord_token(
@@ -691,20 +854,119 @@ def _pr_repo_short(repo: str) -> str:
     return repo.split("/", 1)[-1]
 
 
+# Discord message content hard cap (spec §9 references Discord's 2000-char
+# limit). Leave a little headroom for the truncation marker itself.
+DISCORD_MESSAGE_MAX = 2000
+
+# Zero-width space (U+200B) spliced into mention triggers neutralises them
+# without changing what a human reading the pinned message sees. A PR
+# titled literally "@everyone" must not ping the whole server (HIGH 5).
+_MENTION_RE = re.compile(r"@everyone|@here|<@[!&]?\d+>")
+
+
+def _neutralise_mentions(text: str) -> str:
+    """Defuse @everyone/@here/<@user>/<@&role> mention syntax in
+    user-controlled text (PR titles) before it ever reaches a Discord
+    message body."""
+    return _MENTION_RE.sub(lambda m: m.group(0)[0] + "\u200b" + m.group(0)[1:], text)
+
+
 def render_pin_body(thread: Dict[str, Any], prs: List[Dict[str, Any]]) -> str:
     """The pinned status message body: every PR ever tracked (including
     merged/closed — unlike the title, which only shows OPEN PRs), each
     repo-qualified (never bare, unlike title rendering) so the list reads
-    unambiguously as PRs accumulate over a thread's life (spec section 9)."""
-    lines = [f"**{thread.get('title', '')}**"]
+    unambiguously as PRs accumulate over a thread's life (spec section 9).
+
+    HIGH 5: capped to Discord's 2000-char message limit (a thread with
+    enough PRs — e.g. 14 — can otherwise exceed it), truncating whole PR
+    lines from the bottom and noting how many were dropped. PR titles are
+    untrusted (an agent-opened PR titled `@everyone` would otherwise ping
+    the server) and are neutralised before being interpolated.
+    """
+    lines = [f"**{_neutralise_mentions(thread.get('title', ''))}**"]
     for p in sorted(prs, key=lambda p: (not p.get("primary"), p["number"])):
         parts = [pr_icon(p), f"{_pr_repo_short(p['repo'])}#{p['number']}"]
         if p.get("title"):
-            parts.append(p["title"])
+            parts.append(_neutralise_mentions(p["title"]))
         if p.get("url"):
             parts.append(p["url"])
         lines.append(" ".join(parts))
-    return "\n".join(lines)
+
+    body = "\n".join(lines)
+    if len(body) <= DISCORD_MESSAGE_MAX:
+        return body
+
+    # Drop PR lines from the bottom (keeping the header) until it fits,
+    # then note how many were omitted.
+    header = lines[0]
+    pr_lines = lines[1:]
+    for keep in range(len(pr_lines) - 1, -1, -1):
+        dropped = len(pr_lines) - keep
+        kept_block = ("\n" + "\n".join(pr_lines[:keep])) if keep else ""
+        candidate = header + kept_block + f"\n_…and {dropped} more PR(s) omitted (length limit)_"
+        if len(candidate) <= DISCORD_MESSAGE_MAX:
+            return candidate
+    # Pathological: even the header + omitted-note doesn't fit. Best effort.
+    return header[:DISCORD_MESSAGE_MAX]
+
+
+def _unpin_stale(
+    conn: sqlite3.Connection, thread_id: str, pin_message_id: str, token: str, transport
+) -> Tuple[bool, Optional[str]]:
+    """reconcile_pin mode 1: the thread has zero PRs left but still has a
+    pinned message from before (e.g. the last PR was rm-pr'd, or a `bind`
+    wiped everything) — unpin it and forget it."""
+    resp = transport(
+        "DELETE", f"{DISCORD_API}/channels/{thread_id}/pins/{pin_message_id}", token, None, DISCORD_TIMEOUT_S
+    )
+    if resp.status not in (200, 204):
+        return False, f"failed to unpin stale message: HTTP {resp.status}"
+    conn.execute("UPDATE threads SET pin_message_id=NULL WHERE thread_id=?", (thread_id,))
+    _set_meta(conn, f"pin_body:{thread_id}", None)
+    _record_history(conn, thread_id, "pin", "unpinned (no PRs tracked)")
+    return True, None
+
+
+def _create_and_pin(
+    conn: sqlite3.Connection, thread_id: str, body: str, token: str, transport
+) -> Tuple[bool, Optional[str]]:
+    """reconcile_pin mode 2: no pinned message exists yet — post one and
+    pin it (spec §9: created on the first add-pr for a thread)."""
+    resp = transport("POST", f"{DISCORD_API}/channels/{thread_id}/messages", token, {"content": body}, DISCORD_TIMEOUT_S)
+    if resp.status not in (200, 201):
+        return False, f"failed to create pin message: HTTP {resp.status}"
+    message_id = str((resp.data or {}).get("id") or "")
+    if not message_id:
+        return False, "pin message created but response had no id"
+    pin_resp = transport(
+        "PUT", f"{DISCORD_API}/channels/{thread_id}/pins/{message_id}", token, None, DISCORD_TIMEOUT_S
+    )
+    if pin_resp.status not in (200, 204):
+        return False, f"created pin message {message_id} but failed to pin it: HTTP {pin_resp.status}"
+    conn.execute("UPDATE threads SET pin_message_id=? WHERE thread_id=?", (message_id, thread_id))
+    _set_meta(conn, f"pin_body:{thread_id}", body)
+    _record_history(conn, thread_id, "pin", f"created and pinned message {message_id}")
+    return True, None
+
+
+def _edit_pin_if_changed(
+    conn: sqlite3.Connection, thread_id: str, pin_message_id: str, body: str, token: str, transport
+) -> Tuple[bool, Optional[str]]:
+    """reconcile_pin mode 3: a pinned message already exists — edit it in
+    place, but only if the rendered body actually changed (compared
+    against the cached body in `meta`), to avoid a pointless PATCH every
+    cycle."""
+    meta_key = f"pin_body:{thread_id}"
+    if _get_meta(conn, meta_key) == body:
+        return False, None
+    resp = transport(
+        "PATCH", f"{DISCORD_API}/channels/{thread_id}/messages/{pin_message_id}", token, {"content": body}, DISCORD_TIMEOUT_S
+    )
+    if resp.status != 200:
+        return False, f"failed to edit pin message: HTTP {resp.status}"
+    _set_meta(conn, meta_key, body)
+    _record_history(conn, thread_id, "pin", "edited pin message")
+    return True, None
 
 
 def reconcile_pin(
@@ -718,57 +980,30 @@ def reconcile_pin(
     """Cycle step 3: create/edit/unpin the pinned status message for one
     thread. Returns (applied, error). DB fields (`pin_message_id`, the
     cached pin body in `meta`) only ever change in lockstep with a confirmed
-    Discord write — a missing token or --dry-run leaves both untouched."""
+    Discord write.
+
+    The dry-run/no-token guard is hoisted to the very top (simplifier #1):
+    every mode below either performs a Discord write or is a pure no-op
+    returning (False, None), so this is exactly behaviour-preserving, and
+    it makes "the cycle writes nothing in dry-run" obvious at a glance —
+    the most important safety property of this function. The three modes
+    themselves (unpin / create+pin / edit-if-changed) are disjoint and
+    split into their own helpers (simplifier #2)."""
+    if dry_run or not token:
+        return False, None
+
     thread_id = thread["thread_id"]
     pin_message_id = thread["pin_message_id"]
-    meta_key = f"pin_body:{thread_id}"
 
     if not prs:
         if pin_message_id is None:
             return False, None
-        if dry_run or not token:
-            return False, None
-        resp = transport(
-            "DELETE", f"{DISCORD_API}/channels/{thread_id}/pins/{pin_message_id}", token, None, DISCORD_TIMEOUT_S
-        )
-        if resp.status not in (200, 204):
-            return False, f"failed to unpin stale message: HTTP {resp.status}"
-        conn.execute("UPDATE threads SET pin_message_id=NULL WHERE thread_id=?", (thread_id,))
-        _set_meta(conn, meta_key, None)
-        _record_history(conn, thread_id, "pin", "unpinned (no PRs tracked)")
-        return True, None
+        return _unpin_stale(conn, thread_id, pin_message_id, token, transport)
 
     body = render_pin_body(dict(thread), prs)
-    if dry_run or not token:
-        return False, None
-
     if pin_message_id is None:
-        resp = transport("POST", f"{DISCORD_API}/channels/{thread_id}/messages", token, {"content": body}, DISCORD_TIMEOUT_S)
-        if resp.status not in (200, 201):
-            return False, f"failed to create pin message: HTTP {resp.status}"
-        message_id = str((resp.data or {}).get("id") or "")
-        if not message_id:
-            return False, "pin message created but response had no id"
-        pin_resp = transport(
-            "PUT", f"{DISCORD_API}/channels/{thread_id}/pins/{message_id}", token, None, DISCORD_TIMEOUT_S
-        )
-        if pin_resp.status not in (200, 204):
-            return False, f"created pin message {message_id} but failed to pin it: HTTP {pin_resp.status}"
-        conn.execute("UPDATE threads SET pin_message_id=? WHERE thread_id=?", (message_id, thread_id))
-        _set_meta(conn, meta_key, body)
-        _record_history(conn, thread_id, "pin", f"created and pinned message {message_id}")
-        return True, None
-
-    if _get_meta(conn, meta_key) == body:
-        return False, None
-    resp = transport(
-        "PATCH", f"{DISCORD_API}/channels/{thread_id}/messages/{pin_message_id}", token, {"content": body}, DISCORD_TIMEOUT_S
-    )
-    if resp.status != 200:
-        return False, f"failed to edit pin message: HTTP {resp.status}"
-    _set_meta(conn, meta_key, body)
-    _record_history(conn, thread_id, "pin", "edited pin message")
-    return True, None
+        return _create_and_pin(conn, thread_id, body, token, transport)
+    return _edit_pin_if_changed(conn, thread_id, pin_message_id, body, token, transport)
 
 
 def reconcile_rename(
@@ -833,26 +1068,47 @@ def reconcile_discord(
 ) -> Tuple[int, int, int]:
     """Cycle steps 3-4 for every thread: pin reconciliation, then rename
     reconciliation (rename is always last, per spec). Returns
-    (pins_changed, renames_applied, errors)."""
+    (pins_changed, renames_applied, errors).
+
+    CRITICAL 2: commits per thread, not once for the whole cycle. The old
+    single `with conn:` around the entire cycle meant one thread's
+    transport exception (`_discord_transport` used to only catch
+    `HTTPError`, not `URLError`/timeout/`SSLError`) would roll back *every*
+    thread's DB state in the same transaction — including renames/pins
+    that had ALREADY succeeded on Discord for threads processed earlier in
+    the loop. The next cycle would then see `applied_name`/`pin_message_id`
+    reverted to their old values and re-issue the POST/PUT/PATCH, creating
+    a second pinned message and burning a second rename slot against the
+    2-per-10-min-per-thread limit — exactly the failure this whole design
+    exists to prevent. Each thread's pin+rename work is now also wrapped in
+    try/except so a bug or unexpected exception for one thread can't take
+    down the rest of the cycle either; it's recorded to `history` and the
+    loop continues."""
     pins_changed = renames_applied = errors = 0
     for thread in get_all_threads(conn):
         thread_id = thread["thread_id"]
-        prs = [_pr_to_dict(pr) for pr in get_prs(conn, thread_id)]
+        try:
+            prs = [_pr_to_dict(pr) for pr in get_prs(conn, thread_id)]
 
-        applied, error = reconcile_pin(conn, thread, prs, token, transport, dry_run)
-        if error:
-            errors += 1
-            _record_history(conn, thread_id, "error", f"pin reconcile: {error}")
-        elif applied:
-            pins_changed += 1
+            applied, error = reconcile_pin(conn, thread, prs, token, transport, dry_run)
+            if error:
+                errors += 1
+                _record_history(conn, thread_id, "error", f"pin reconcile: {error}")
+            elif applied:
+                pins_changed += 1
 
-        # Re-fetch: reconcile_pin may have just cleared pin_message_id.
-        thread = get_thread(conn, thread_id)
-        applied, error = reconcile_rename(conn, thread, now, config, token, transport, dry_run)
-        if error:
+            # Re-fetch: reconcile_pin may have just cleared pin_message_id.
+            thread = get_thread(conn, thread_id)
+            applied, error = reconcile_rename(conn, thread, now, config, token, transport, dry_run)
+            if error:
+                errors += 1
+            elif applied:
+                renames_applied += 1
+        except Exception as exc:  # noqa: BLE001 - isolate one thread's failure from the rest of the cycle
+            conn.rollback()
             errors += 1
-        elif applied:
-            renames_applied += 1
+            _record_history(conn, thread_id, "error", f"discord reconcile crashed: {exc}")
+        conn.commit()
     return pins_changed, renames_applied, errors
 
 
@@ -870,7 +1126,18 @@ def run_cycle(
     name, then reconcile the pinned message and thread rename against
     Discord (the cycle is the only Discord writer in threadctl — see module
     docstring). `--dry-run` still polls GitHub and recomputes DB state, but
-    `reconcile_pin`/`reconcile_rename` skip every Discord write."""
+    `reconcile_pin`/`reconcile_rename` skip every Discord write.
+
+    CRITICAL 2/3: unlike the old implementation, this does NOT wrap the
+    whole cycle in one `with conn:` transaction. Holding the write lock
+    across every `gh` subprocess (up to 20s each) and Discord request (up
+    to 15s each, up to 3/thread) starved concurrent agent commands
+    (`touch`, `add-pr`, ...) of the write lock for the whole cycle
+    duration — with only a 5s busy_timeout, those commands would raise
+    `sqlite3.OperationalError: database is locked` with a raw traceback.
+    `_poll_due_prs` and `reconcile_discord` each commit incrementally
+    (per repo-batch, per thread) instead, so the lock is only ever held for
+    the brief duration of an actual DB write."""
     config = {**_load_cycle_config(), **(config or {})}
     accounts = accounts or DEFAULT_ACCOUNTS
     if token is None:
@@ -879,12 +1146,12 @@ def run_cycle(
     conn = connect_db(db_path)
     try:
         now = _utcnow()
-        with conn:
-            refreshed, poll_errors = _poll_due_prs(conn, now, config, runner, accounts)
-            threads = recompute_desired_names(conn, now, config["stale_after_min"])
-            pins_changed, renames_applied, discord_errors = reconcile_discord(
-                conn, now, config, token, transport, dry_run
-            )
+        refreshed, poll_errors = _poll_due_prs(conn, now, config, runner, accounts)
+        threads = recompute_desired_names(conn, now, config["stale_after_min"])
+        conn.commit()
+        pins_changed, renames_applied, discord_errors = reconcile_discord(
+            conn, now, config, token, transport, dry_run
+        )
         return {
             "refreshed": refreshed,
             "errors": poll_errors + discord_errors,
@@ -916,18 +1183,92 @@ def cmd_cycle(args: argparse.Namespace) -> int:
 # commands: bind / touch / set / add-pr / rm-pr / primary-pr / show / list
 # ---------------------------------------------------------------------------
 
-def cmd_bind(args: argparse.Namespace) -> int:
-    path = _resolve_db_path(args)
+@contextlib.contextmanager
+def _open_db(path: Path):
+    """Common connect/try/finally-close frame, previously copy-pasted
+    across all 8 `cmd_*` handlers (REVIEW-SIMPLIFIER.md #5)."""
     conn = connect_db(path)
     try:
-        repo = args.repo
-        if not REPO_RE.match(repo):
-            _err(f"threadctl: invalid --repo '{repo}' (expected owner/name)")
-            return 2
-        owner = repo.split("/", 1)[0]
-        title, truncated = _enforce_title(args.title)
-        now = _now_iso()
+        yield conn
+    finally:
+        conn.close()
 
+
+def _require_thread(conn: sqlite3.Connection, thread_id: str) -> Optional[sqlite3.Row]:
+    """The "no such thread, bind it first" guard, previously copy-pasted
+    across 5 write-path `cmd_*` handlers. Prints the standard error and
+    returns None on a miss; callers do `if thread is None: return 1`."""
+    thread = get_thread(conn, thread_id)
+    if thread is None:
+        _err(f"threadctl: no such thread '{thread_id}' (bind it first)")
+    return thread
+
+
+def _bump_touch_clock(conn: sqlite3.Connection, thread_id: str, now: str) -> None:
+    """The last_touch_at/updated_at UPDATE, previously copy-pasted across
+    5 write-path `cmd_*` handlers — bind/touch/set/add-pr/rm-pr/primary-pr
+    all reset the staleness clock as a side effect."""
+    conn.execute(
+        "UPDATE threads SET last_touch_at=?, updated_at=? WHERE thread_id=?",
+        (now, now, thread_id),
+    )
+
+
+def _load_pr_target(thread: sqlite3.Row, ref: str) -> Optional[Tuple[Optional[str], int]]:
+    """The parse-ref-or-print-and-fail block, previously copy-pasted across
+    add-pr/rm-pr/primary-pr. Returns (repo, number) or None (having already
+    printed the error) on failure; callers do `if target is None: return 2`."""
+    try:
+        return parse_pr_ref(ref, thread["repo"])
+    except ValueError as exc:
+        _err(f"threadctl: {exc}")
+        return None
+
+
+def _is_db_locked_error(exc: sqlite3.OperationalError) -> bool:
+    return "locked" in str(exc).lower() or "busy" in str(exc).lower()
+
+
+def _retry_on_locked(retries: int = 3, backoff_s: float = 0.5):
+    """CRITICAL 3: agent-facing write commands must never surface a raw
+    `sqlite3.OperationalError: database is locked` traceback just because
+    the cycle happened to be mid-write at the same instant — that's a
+    failed `touch` = a thread silently going 💤 while an agent is actively
+    working, the exact false signal threadctl exists to eliminate.
+    `busy_timeout` (30s, see connect_db) already absorbs the vast majority
+    of contention by blocking inside SQLite before raising; this decorator
+    is the last line of defense — a couple of short retries, then a clean
+    one-line message instead of a stack trace."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(args: argparse.Namespace) -> int:
+            last_exc: Optional[sqlite3.OperationalError] = None
+            for attempt in range(retries):
+                try:
+                    return func(args)
+                except sqlite3.OperationalError as exc:
+                    if not _is_db_locked_error(exc):
+                        raise
+                    last_exc = exc
+                    if attempt < retries - 1:
+                        time.sleep(backoff_s * (attempt + 1))
+            _err(f"threadctl: database busy, try again in a moment ({last_exc})")
+            return 1
+        return wrapper
+    return decorator
+
+
+@_retry_on_locked()
+def cmd_bind(args: argparse.Namespace) -> int:
+    repo = args.repo
+    if not REPO_RE.match(repo):
+        _err(f"threadctl: invalid --repo '{repo}' (expected owner/name)")
+        return 2
+    owner = repo.split("/", 1)[0]
+    title, truncated = _enforce_title(args.title)
+    now = _now_iso()
+
+    with _open_db(_resolve_db_path(args)) as conn:
         with conn:
             existing = get_thread(conn, args.thread_id)
             if existing is not None:
@@ -961,42 +1302,31 @@ def cmd_bind(args: argparse.Namespace) -> int:
             _err(f"threadctl: title truncated to {THREAD_TITLE_MAX} chars: '{title}'")
         print(f"threadctl: bound '{args.thread_id}' to {repo}")
         return 0
-    finally:
-        conn.close()
 
 
+@_retry_on_locked()
 def cmd_touch(args: argparse.Namespace) -> int:
-    path = _resolve_db_path(args)
-    conn = connect_db(path)
-    try:
-        now = _now_iso()
+    now = _now_iso()
+    with _open_db(_resolve_db_path(args)) as conn:
         with conn:
-            if get_thread(conn, args.thread_id) is None:
-                _err(f"threadctl: no such thread '{args.thread_id}' (bind it first)")
+            if _require_thread(conn, args.thread_id) is None:
                 return 1
-            conn.execute(
-                "UPDATE threads SET last_touch_at=?, updated_at=? WHERE thread_id=?",
-                (now, now, args.thread_id),
-            )
+            _bump_touch_clock(conn, args.thread_id, now)
             _record_history(conn, args.thread_id, "touch", args.note)
         print(f"threadctl: touched '{args.thread_id}'")
         return 0
-    finally:
-        conn.close()
 
 
+@_retry_on_locked()
 def cmd_set(args: argparse.Namespace) -> int:
-    path = _resolve_db_path(args)
-    conn = connect_db(path)
-    try:
-        if args.question and args.answered:
-            _err("threadctl: --question and --answered are mutually exclusive")
-            return 2
+    if args.question and args.answered:
+        _err("threadctl: --question and --answered are mutually exclusive")
+        return 2
 
+    with _open_db(_resolve_db_path(args)) as conn:
         with conn:
-            thread = get_thread(conn, args.thread_id)
+            thread = _require_thread(conn, args.thread_id)
             if thread is None:
-                _err(f"threadctl: no such thread '{args.thread_id}' (bind it first)")
                 return 1
 
             now = _now_iso()
@@ -1033,8 +1363,6 @@ def cmd_set(args: argparse.Namespace) -> int:
 
         print(f"threadctl: updated '{args.thread_id}'")
         return 0
-    finally:
-        conn.close()
 
 
 def _check_pr_owner(thread: sqlite3.Row, repo: Optional[str]) -> Optional[str]:
@@ -1049,19 +1377,16 @@ def _check_pr_owner(thread: sqlite3.Row, repo: Optional[str]) -> Optional[str]:
     return None
 
 
+@_retry_on_locked()
 def cmd_add_pr(args: argparse.Namespace) -> int:
-    path = _resolve_db_path(args)
-    conn = connect_db(path)
-    try:
-        thread = get_thread(conn, args.thread_id)
+    with _open_db(_resolve_db_path(args)) as conn:
+        thread = _require_thread(conn, args.thread_id)
         if thread is None:
-            _err(f"threadctl: no such thread '{args.thread_id}' (bind it first)")
             return 1
-        try:
-            repo, number = parse_pr_ref(args.ref, thread["repo"])
-        except ValueError as exc:
-            _err(f"threadctl: {exc}")
+        target = _load_pr_target(thread, args.ref)
+        if target is None:
             return 2
+        repo, number = target
         err = _check_pr_owner(thread, repo)
         if err:
             _err(f"threadctl: {err}")
@@ -1090,33 +1415,25 @@ def cmd_add_pr(args: argparse.Namespace) -> int:
                     "UPDATE prs SET is_primary=1 WHERE thread_id=? AND repo=? AND number=?",
                     (args.thread_id, repo, number),
                 )
-            conn.execute(
-                "UPDATE threads SET last_touch_at=?, updated_at=? WHERE thread_id=?",
-                (now, now, args.thread_id),
-            )
+            _bump_touch_clock(conn, args.thread_id, now)
             verb = "already tracked" if existing is not None else "added"
             suffix = " (primary)" if make_primary else ""
             _record_history(conn, args.thread_id, "pr", f"{verb} {repo}#{number}{suffix}")
 
         print(f"threadctl: {repo}#{number} tracked on '{args.thread_id}'" + (" (primary)" if make_primary else ""))
         return 0
-    finally:
-        conn.close()
 
 
+@_retry_on_locked()
 def cmd_rm_pr(args: argparse.Namespace) -> int:
-    path = _resolve_db_path(args)
-    conn = connect_db(path)
-    try:
-        thread = get_thread(conn, args.thread_id)
+    with _open_db(_resolve_db_path(args)) as conn:
+        thread = _require_thread(conn, args.thread_id)
         if thread is None:
-            _err(f"threadctl: no such thread '{args.thread_id}' (bind it first)")
             return 1
-        try:
-            repo, number = parse_pr_ref(args.ref, thread["repo"])
-        except ValueError as exc:
-            _err(f"threadctl: {exc}")
+        target = _load_pr_target(thread, args.ref)
+        if target is None:
             return 2
+        repo, number = target
 
         with conn:
             row = conn.execute(
@@ -1135,31 +1452,23 @@ def cmd_rm_pr(args: argparse.Namespace) -> int:
                 if nxt is not None:
                     conn.execute("UPDATE prs SET is_primary=1 WHERE id=?", (nxt["id"],))
             now = _now_iso()
-            conn.execute(
-                "UPDATE threads SET last_touch_at=?, updated_at=? WHERE thread_id=?",
-                (now, now, args.thread_id),
-            )
+            _bump_touch_clock(conn, args.thread_id, now)
             _record_history(conn, args.thread_id, "pr", f"removed {repo}#{number}")
 
         print(f"threadctl: removed {repo}#{number} from '{args.thread_id}'")
         return 0
-    finally:
-        conn.close()
 
 
+@_retry_on_locked()
 def cmd_primary_pr(args: argparse.Namespace) -> int:
-    path = _resolve_db_path(args)
-    conn = connect_db(path)
-    try:
-        thread = get_thread(conn, args.thread_id)
+    with _open_db(_resolve_db_path(args)) as conn:
+        thread = _require_thread(conn, args.thread_id)
         if thread is None:
-            _err(f"threadctl: no such thread '{args.thread_id}' (bind it first)")
             return 1
-        try:
-            repo, number = parse_pr_ref(args.ref, thread["repo"])
-        except ValueError as exc:
-            _err(f"threadctl: {exc}")
+        target = _load_pr_target(thread, args.ref)
+        if target is None:
             return 2
+        repo, number = target
 
         with conn:
             row = conn.execute(
@@ -1172,16 +1481,11 @@ def cmd_primary_pr(args: argparse.Namespace) -> int:
             conn.execute("UPDATE prs SET is_primary=0 WHERE thread_id=?", (args.thread_id,))
             conn.execute("UPDATE prs SET is_primary=1 WHERE id=?", (row["id"],))
             now = _now_iso()
-            conn.execute(
-                "UPDATE threads SET last_touch_at=?, updated_at=? WHERE thread_id=?",
-                (now, now, args.thread_id),
-            )
+            _bump_touch_clock(conn, args.thread_id, now)
             _record_history(conn, args.thread_id, "pr", f"primary -> {repo}#{number}")
 
         print(f"threadctl: {repo}#{number} is now primary on '{args.thread_id}'")
         return 0
-    finally:
-        conn.close()
 
 
 def _pr_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -1246,9 +1550,7 @@ def _format_thread_human(thread: sqlite3.Row, prs: List[sqlite3.Row]) -> str:
 
 
 def cmd_show(args: argparse.Namespace) -> int:
-    path = _resolve_db_path(args)
-    conn = connect_db(path)
-    try:
+    with _open_db(_resolve_db_path(args)) as conn:
         thread = get_thread(conn, args.thread_id)
         if thread is None:
             _err(f"threadctl: no such thread '{args.thread_id}'")
@@ -1259,14 +1561,10 @@ def cmd_show(args: argparse.Namespace) -> int:
         else:
             print(_format_thread_human(thread, prs))
         return 0
-    finally:
-        conn.close()
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    path = _resolve_db_path(args)
-    conn = connect_db(path)
-    try:
+    with _open_db(_resolve_db_path(args)) as conn:
         threads = get_all_threads(conn)
         if args.json:
             out = [_thread_to_dict(t, get_prs(conn, t["thread_id"])) for t in threads]
@@ -1280,8 +1578,6 @@ def cmd_list(args: argparse.Namespace) -> int:
                 q = " ❓" if t["question"] else ""
                 print(f"{t['thread_id']}  {t['title']}  [{t['status']}{q}]  {pr_summary}")
         return 0
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1303,9 +1599,26 @@ MIGRATE_STATUS_MAP = {
 }
 
 
-def _migrate_thread(conn: sqlite3.Connection, thread_id: str, entry: Dict[str, Any]) -> None:
-    repo = entry.get("repo") or ""
-    owner = repo.split("/", 1)[0] if repo else ""
+def _migrate_thread(conn: sqlite3.Connection, thread_id: str, entry: Dict[str, Any]) -> bool:
+    """Import one thread from the old registry. Returns True if the
+    thread's repo was invalid/missing and had to be imported as NULL
+    (HIGH 4) — the caller aggregates these into a loud summary so a human
+    can `bind --repo` them by hand.
+
+    HIGH 4 root cause: the old code did `repo = entry.get("repo") or ""`,
+    silently storing owner='' repo=''. `_check_pr_owner` then compared
+    ''=='' and passed, so `add-pr` could insert a PR with repo='', and
+    `_graphql_query`'s `''.split('/', 1)` raised `ValueError: not enough
+    values to unpack` — uncaught, and (via the old single-transaction
+    CRITICAL 2 bug) that one bad thread rolled back polling+renaming for
+    all 25. Fixed at the boundary: validate against REPO_RE here and store
+    NULL (not '') for anything invalid; the poller (`_poll_due_prs`) and
+    `_graphql_query`'s callers already skip+record a NULL/invalid repo
+    instead of raising."""
+    raw_repo = entry.get("repo")
+    repo_invalid = not raw_repo or not REPO_RE.match(raw_repo)
+    repo = None if repo_invalid else raw_repo
+    owner = None if repo_invalid else raw_repo.split("/", 1)[0]
     title, _truncated = _enforce_title(entry.get("title") or thread_id)
     old_status = entry.get("status") or "active"
     status = MIGRATE_STATUS_MAP.get(old_status, "active")
@@ -1326,7 +1639,10 @@ def _migrate_thread(conn: sqlite3.Connection, thread_id: str, entry: Dict[str, A
     for pr in entry.get("prs") or []:
         pr_repo = pr.get("repo") or repo
         number = pr.get("number")
-        if number is None:
+        if number is None or not pr_repo or not REPO_RE.match(pr_repo):
+            # A PR with no usable repo (inherits the thread's invalid repo,
+            # or has none of its own) would otherwise crash the poller the
+            # same way as HIGH 4 — skip it here instead of importing junk.
             continue
         pr_state = pr.get("prState") or {}
         conn.execute(
@@ -1339,24 +1655,34 @@ def _migrate_thread(conn: sqlite3.Connection, thread_id: str, entry: Dict[str, A
                 now,
             ),
         )
-    _record_history(conn, thread_id, "bind", f"migrated from thread-state registry.json (status={old_status})")
+    note = f"migrated from thread-state registry.json (status={old_status})"
+    if repo_invalid:
+        note += f"; invalid/missing repo '{raw_repo}' imported as NULL — run `threadctl bind --repo owner/name` to fix"
+    _record_history(conn, thread_id, "bind", note)
+    return repo_invalid
 
 
-def migrate_registry(conn: sqlite3.Connection, registry: Dict[str, Any]) -> Tuple[int, List[str]]:
+def migrate_registry(conn: sqlite3.Connection, registry: Dict[str, Any]) -> Tuple[int, List[str], List[str]]:
     """Import every thread from an old thread-state registry dict. Returns
-    (imported_count, skipped_thread_ids) — a thread already present in the
-    DB is left untouched and reported as skipped, so migrate is safe to
-    re-run without clobbering live state."""
+    (imported_count, skipped_thread_ids, invalid_repo_thread_ids) — a
+    thread already present in the DB is left untouched and reported as
+    skipped, so migrate is safe to re-run without clobbering live state.
+    `invalid_repo_thread_ids` (HIGH 4) lists every thread imported with a
+    NULL repo because the source data had none/an unparseable one — e.g.
+    the 11 of 25 live threads with `"repo": null` — so a human can follow
+    up with `bind --repo`."""
     imported = 0
     skipped = []
+    invalid_repo = []
     threads = registry.get("threads") or {}
     for thread_id, entry in threads.items():
         if get_thread(conn, thread_id) is not None:
             skipped.append(thread_id)
             continue
-        _migrate_thread(conn, thread_id, entry)
+        if _migrate_thread(conn, thread_id, entry):
+            invalid_repo.append(thread_id)
         imported += 1
-    return imported, skipped
+    return imported, skipped, invalid_repo
 
 
 def cmd_migrate(args: argparse.Namespace) -> int:
@@ -1370,20 +1696,23 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         _err(f"threadctl: '{src}' is not valid JSON: {exc}")
         return 1
 
-    path = _resolve_db_path(args)
-    conn = connect_db(path)
-    try:
-        with conn:
-            imported, skipped = migrate_registry(conn, data)
-    except sqlite3.Error as exc:
-        _err(f"threadctl: migration failed: {exc}")
-        return 1
-    finally:
-        conn.close()
+    with _open_db(_resolve_db_path(args)) as conn:
+        try:
+            with conn:
+                imported, skipped, invalid_repo = migrate_registry(conn, data)
+        except sqlite3.Error as exc:
+            _err(f"threadctl: migration failed: {exc}")
+            return 1
 
     print(f"threadctl: migrated {imported} thread(s) from '{src}'")
     if skipped:
         _err(f"threadctl: skipped {len(skipped)} already-bound thread(s): {', '.join(sorted(skipped))}")
+    if invalid_repo:
+        _err(
+            f"threadctl: WARNING — {len(invalid_repo)} thread(s) imported with an invalid/missing repo, "
+            f"as NULL (polling+renaming paused for them until fixed): {', '.join(sorted(invalid_repo))}"
+        )
+        _err("threadctl: fix each with: threadctl bind <thread_id> --title \"...\" --repo owner/name")
     print(f"threadctl: '{src}' left untouched as a backup")
     return 0
 
