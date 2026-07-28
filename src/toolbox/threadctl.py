@@ -621,14 +621,25 @@ def fetch_repo_pr_states(
         return None, f"gh timed out after {timeout}s", []
     except OSError as exc:
         return None, f"gh failed to run: {exc}", []
-    if proc.returncode != 0:
-        return None, (proc.stderr or "").strip() or f"gh exited {proc.returncode}", []
+
+    # R2-4 (round-2 critical): `gh api graphql` exits 1 on ANY top-level
+    # GraphQL error (e.g. one alias referencing a nonexistent PR) while
+    # still writing fully usable `data` for the other aliases to stdout —
+    # verified live (ADDENDUM.md, .taskdocs/fixtures/graphql_terminal_and_
+    # missing.raw_gh_stdout.txt). The old code checked `proc.returncode !=
+    # 0` and returned early BEFORE ever looking at stdout, so a single bad
+    # PR number discarded the whole batch's good data every cycle forever.
+    # Parse stdout FIRST, unconditionally. `returncode` only matters as a
+    # fallback explanation when stdout turns out to be genuinely
+    # unusable — it must never gate whether we even attempt to parse.
     try:
         payload = _parse_gh_graphql_stdout(proc.stdout)
         repository = payload["data"]["repository"]
         if not isinstance(repository, dict):
             raise TypeError("missing repository object")
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        if proc.returncode != 0:
+            return None, (proc.stderr or "").strip() or f"gh exited {proc.returncode}", []
         return None, f"gh returned invalid GraphQL JSON: {exc}", []
 
     graphql_errors = [

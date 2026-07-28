@@ -1016,11 +1016,16 @@ class TestGithubPolling:
         error) must not prevent the other two good aliases (pr_4720
         MERGED, pr_4716 CLOSED) in the SAME response from coming back
         usable — verified against the real recorded response
-        (ADDENDUM.md behaviours #2/#3)."""
+        (ADDENDUM.md behaviours #2/#3).
+
+        R2-4: `gh api graphql` exits 1 (not 0) whenever top-level `errors`
+        are present, even though `data` is fully usable — this is real
+        `gh` behaviour (ADDENDUM.md, verified live), not an invented one.
+        returncode=0 here would not exercise the actual regression."""
         payload = json.loads((fixtures_dir / "graphql_terminal_and_missing.json").read_text())
 
         def runner(cmd, timeout):
-            return __import__("subprocess").CompletedProcess(cmd, 0, json.dumps(payload), "")
+            return __import__("subprocess").CompletedProcess(cmd, 1, json.dumps(payload), "")
 
         states, error, graphql_errors = tc.fetch_repo_pr_states(
             "absmartly/abs", [4720, 4716, 9999999], {}, 20, runner
@@ -1055,14 +1060,21 @@ class TestGithubPolling:
         when a query aliases a nonexistent PR (captured verbatim from a
         real invocation in raw_gh_stdout.txt). A naive `json.loads` raises
         `JSONDecodeError: Extra data` on this; the parser must tolerate
-        it (behaviour #4)."""
+        it (behaviour #4).
+
+        R2-4: this exact invocation is the one Rax verified live —
+        `gh api graphql` exited 1 while stdout (this raw fixture) still
+        carried both good `data` and the top-level `errors`. returncode=0
+        would not be the real `gh` behaviour and would not exercise the
+        bug (fetch_repo_pr_states used to bail out on non-zero returncode
+        before ever looking at stdout)."""
         raw = (fixtures_dir / "graphql_terminal_and_missing.raw_gh_stdout.txt").read_text()
         assert "gh: Could not resolve to a PullRequest" in raw  # sanity: the trap really is there
         with pytest.raises(json.JSONDecodeError):
             json.loads(raw)  # the naive approach really does fail
 
         def runner(cmd, timeout):
-            return __import__("subprocess").CompletedProcess(cmd, 0, raw, "")
+            return __import__("subprocess").CompletedProcess(cmd, 1, raw, "")
 
         states, error, graphql_errors = tc.fetch_repo_pr_states(
             "absmartly/abs", [4720, 4716, 9999999], {}, 20, runner
@@ -1071,6 +1083,69 @@ class TestGithubPolling:
         assert states[4720]["state"] == "MERGED"
         assert states[9999999] is None
         assert len(graphql_errors) == 1
+
+    def test_returncode_1_does_not_discard_good_data_end_to_end(self, db_path, capsys, monkeypatch, fixtures_dir):
+        """R2-4 end-to-end regression, driven exactly as Rax reproduced it
+        live: `gh api graphql` exits 1 (a NOT_FOUND alias in the same
+        batch) while stdout still carries usable data for the OTHER PRs.
+        Before the fix, `_poll_due_prs` (via `fetch_repo_pr_states`
+        bailing out on `returncode != 0` before parsing stdout) discarded
+        the entire repo batch every cycle: `checked_at` for the good PRs
+        stayed NULL forever, so they were re-fetched (and re-discarded)
+        every single cycle. This test fails against d062d5d and passes
+        after the fix: the good PR (#4720) must come out of the cycle with
+        state populated and `checked_at` set (not NULL, not perpetually
+        due), while only the missing PR (#9999999) is reported as an
+        error."""
+        _bind(db_path, capsys, thread_id="t1", repo="absmartly/abs")
+        run_cli(["add-pr", "t1", "4720"], db_path, capsys)
+        run_cli(["add-pr", "t1", "9999999"], db_path, capsys)
+
+        raw = (fixtures_dir / "graphql_terminal_and_missing.raw_gh_stdout.txt").read_text()
+        monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+
+        def runner(cmd, timeout):
+            # Real `gh` behaviour: exit 1 whenever top-level `errors` are
+            # present, even though `data` is fully usable for the other
+            # aliases (ADDENDUM.md, verified live).
+            return __import__("subprocess").CompletedProcess(cmd, 1, raw, "")
+
+        result = tc.run_cycle(db_path, runner=runner, token=None, transport=lambda *a, **k: None, dry_run=True)
+        assert result["refreshed"] == 1  # only #4720 is in the fixture's usable data
+        assert result["errors"] == 1  # #9999999 alone is reported as unusable
+
+        conn = tc.connect_db(db_path)
+        try:
+            pr_4720 = conn.execute("SELECT * FROM prs WHERE number=4720").fetchone()
+            assert pr_4720["state"] == "MERGED"
+            pr_missing = conn.execute("SELECT * FROM prs WHERE number=9999999").fetchone()
+            assert pr_missing["state"] is None
+            history_kinds = [
+                r["text"] for r in conn.execute(
+                    "SELECT text FROM history WHERE thread_id='t1' AND kind='error'"
+                )
+            ]
+            assert any("9999999" in (t or "") for t in history_kinds)
+        finally:
+            conn.close()
+
+        # MERGED is a fresh terminal transition, so spec's "one more poll"
+        # rule deliberately leaves checked_at NULL after this first cycle
+        # (see _just_became_terminal) — that's correct, not the bug. Run a
+        # second cycle: THIS is where the pre-fix code would have kept
+        # discarding the whole batch (including #4720) forever, because
+        # `fetch_repo_pr_states` bailed out on returncode=1 before parsing
+        # stdout on every single cycle. After the fix, the second poll
+        # confirms the transition and freezes checked_at for good.
+        result2 = tc.run_cycle(db_path, runner=runner, token=None, transport=lambda *a, **k: None, dry_run=True)
+        assert result2["refreshed"] == 1
+        conn = tc.connect_db(db_path)
+        try:
+            pr_4720 = conn.execute("SELECT * FROM prs WHERE number=4720").fetchone()
+            assert pr_4720["state"] == "MERGED"
+            assert pr_4720["checked_at"] is not None  # now frozen, not stuck NULL forever
+        finally:
+            conn.close()
 
     def test_toolbox_pr7_real_fixture_open_failing_ci(self, fixtures_dir):
         """marcioapm/toolbox#7 — OPEN, reviewDecision null (never
