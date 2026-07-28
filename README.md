@@ -14,6 +14,7 @@ A collection of lightweight CLI tools for AI content generation and chat operati
 | `slackcli` | Lightweight Slack client (channels, messages, search, reactions) | `SLACK_USER_TOKEN` |
 | `llm-usage` | Monitor LLM token usage, costs, and quotas across providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` |
 | `agent-run` | Background wrapper for coding agents (Claude Code, Codex…) with PTY steering + live log streaming | — |
+| `threadctl` | SQLite-backed state for long-lived coding threads, with GitHub PR polling and Discord write ownership | `gh auth` (GitHub), Discord bot token |
 
 ## Install
 
@@ -449,6 +450,112 @@ options:
 
 ---
 
+## threadctl
+
+SQLite-backed state for long-lived coding threads (one row per Discord
+thread), with GitHub PR polling and Discord write ownership. Supersedes the
+old `thread-state` tool. State lives in `~/.config/threadctl/state.db`
+(SQLite, WAL mode) instead of a JSON registry, so many agents can read/write
+concurrently while a 1-minute cron/systemd timer runs `threadctl cycle`.
+
+The core design rule: **`threadctl cycle` is the only writer to Discord.**
+Agent-facing commands (`bind`, `touch`, `set`, `add-pr`, `rm-pr`,
+`primary-pr`) only ever touch SQLite. The cycle command recomputes each
+thread's icon/title, reconciles its pinned status message, and renames the
+Discord thread — coalescing many small agent updates into a single rename
+instead of burning one of Discord's 2-renames-per-10-minutes limit per
+update.
+
+### Usage
+
+```bash
+# Bind a Discord thread to a repo (fresh start — destructive on rebind)
+threadctl bind 1234567890 --title "Fix flaky upload test" --repo marcioapm/toolbox
+
+# Reset the staleness clock without touching the question flag
+threadctl touch 1234567890 --note "still investigating"
+
+# Update title/status, raise or clear the question flag
+threadctl set 1234567890 --status active
+threadctl set 1234567890 --question
+threadctl set 1234567890 --answered
+
+# Track a PR (accepts 4694, #4694, owner/name#4694, or a full URL)
+threadctl add-pr 1234567890 4694 --primary
+threadctl rm-pr 1234567890 4694
+threadctl primary-pr 1234567890 4694
+
+# Inspect state
+threadctl show 1234567890
+threadctl show 1234567890 --json
+threadctl list --json
+
+# Poll GitHub, recompute titles, reconcile Discord (pin + rename)
+threadctl cycle
+threadctl cycle --dry-run
+
+# One-shot import from the old thread-state registry.json (safe to re-run;
+# already-bound threads are skipped, not overwritten; source file untouched)
+threadctl migrate --from ~/.config/thread-state/registry.json
+```
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `bind` | Bind (or destructively rebind) a thread to a repo |
+| `touch` | Reset the staleness clock (never clears the question flag) |
+| `set` | Update title/status, raise/clear the question flag |
+| `add-pr` / `rm-pr` / `primary-pr` | Track, untrack, or promote a PR on a thread |
+| `show` / `list` | Inspect one thread or all threads |
+| `cycle` | Poll GitHub, recompute desired titles, reconcile Discord (the only Discord writer) |
+| `migrate` | One-shot import from the old `thread-state` JSON registry |
+
+### Config
+
+Optional `~/.config/threadctl/config.toml`:
+
+```toml
+[cycle]
+stale_after_min = 30
+pr_recheck_min_s = 150
+max_pr_checks_per_cycle = 40
+
+[discord]
+rename_min_interval_s = 330
+token = "..."
+```
+
+### Discord token resolution
+
+`threadctl cycle` resolves a bot token in this order:
+
+1. `$THREADCTL_DISCORD_TOKEN`
+2. `discord.token` in `~/.config/threadctl/config.toml`
+3. `.channels.discord.token` in `~/.openclaw/openclaw.json` (fallback)
+
+### GitHub auth
+
+PR polling shells out to `gh api graphql` and resolves a token per-account
+via `gh auth token --user <account>` — run `gh auth login` for each GitHub
+account whose repos you track.
+
+### Running `cycle` on a timer
+
+Unit files are shipped under `contrib/systemd/` but are **not** installed
+automatically — copy them yourself:
+
+```bash
+cp contrib/systemd/threadctl-cycle.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now threadctl-cycle.timer
+```
+
+This runs `threadctl cycle` once a minute via a oneshot service + timer
+pair.
+
+---
+
 ## For LLMs / AI Agents
 
 All tools follow the same patterns:
@@ -498,6 +605,13 @@ agent-run status build                    # running | done | failed
 agent-run -i chat claude --permission-mode bypassPermissions
 agent-run steer chat 'Also add tests for edge cases.'
 agent-run kill chat                       # clean kill of the whole group
+
+# threadctl: DB-only agent updates; `cycle` (cron) is the sole Discord writer
+threadctl bind 1234567890 --title "Fix flaky upload test" --repo marcioapm/toolbox
+threadctl touch 1234567890 --note "still investigating"
+threadctl add-pr 1234567890 4694 --primary
+threadctl set 1234567890 --status merged
+threadctl show 1234567890 --json
 ```
 
 ---

@@ -1,0 +1,8 @@
+[Unit]
+Description=threadctl cycle — poll GitHub and reconcile Discord thread state
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/threadctl cycle
