@@ -1412,6 +1412,158 @@ class TestDiscordTransportReadAndParseErrors:
         assert resp.data is None
 
 
+class TestDiscordTransportUserAgentHeader:
+    """Live-rollout bug: every Discord write returned HTTP 403 error code
+    1010 (Cloudflare's "missing/invalid User-Agent" rejection), confirmed
+    by an A/B test against the same token/message seconds apart — the only
+    difference was the presence of a `User-Agent` header. Reads (GET)
+    worked; writes with {Authorization, Content-Type} but no User-Agent
+    got 403/1010. This bug shipped past 228 tests because the Discord
+    transport was mocked everywhere and no test ever looked at the actual
+    header dict `_discord_transport` builds. These tests call the REAL
+    `_discord_transport` (captured as `_real_discord_transport` before the
+    autouse safety fixture stubs it out) with `urlopen` faked at the
+    lowest level, and assert on the `urllib.request.Request` object it
+    actually constructs — not on a `FakeTransport` stub that takes headers
+    for granted. Deleting the `User-Agent` line in `_discord_transport`
+    makes every one of these fail."""
+
+    @pytest.mark.parametrize(
+        "method,url",
+        [
+            # PATCH rename (reconcile_rename)
+            ("PATCH", f"{tc.DISCORD_API}/channels/t1"),
+            # POST message (reconcile_pin: _create_and_pin)
+            ("POST", f"{tc.DISCORD_API}/channels/t1/messages"),
+            # PATCH message (reconcile_pin: _edit_pin_if_changed)
+            ("PATCH", f"{tc.DISCORD_API}/channels/t1/messages/555"),
+            # PUT pin (reconcile_pin: _create_and_pin)
+            ("PUT", f"{tc.DISCORD_API}/channels/t1/pins/555"),
+            # DELETE pin (reconcile_pin: _unpin_stale)
+            ("DELETE", f"{tc.DISCORD_API}/channels/t1/pins/555"),
+        ],
+    )
+    def test_real_transport_sends_nonempty_user_agent(self, monkeypatch, method, url):
+        captured_requests = []
+
+        def fake_urlopen(req, timeout):
+            captured_requests.append(req)
+            return _FakeHTTPResponse(status=200, read_result=b'{"id": "1"}')
+
+        monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+        resp = _real_discord_transport(method, url, "tok", {"name": "x"} if method in ("PATCH", "POST") else None, 15)
+
+        assert resp.status == 200
+        assert len(captured_requests) == 1
+        req = captured_requests[0]
+        # `Request.headers` normalizes keys to "User-agent" (urllib's own
+        # capitalization convention) — use get_header for the
+        # case-insensitive lookup real HTTP clients use.
+        user_agent = req.get_header("User-agent")
+        assert user_agent is not None
+        assert user_agent.strip() != ""
+        assert user_agent == tc.DISCORD_USER_AGENT
+
+    def test_user_agent_header_would_be_missing_if_line_removed(self, monkeypatch):
+        """Sanity check that this test class actually detects the
+        regression: build headers the OLD (buggy) way and confirm the
+        assertion this class relies on fails against it."""
+        old_buggy_headers = {"Authorization": "Bot tok", "Content-Type": "application/json"}
+        req = tc.urllib.request.Request(
+            f"{tc.DISCORD_API}/channels/t1", method="PATCH", headers=old_buggy_headers
+        )
+        assert req.get_header("User-agent") is None
+
+    def test_reconcile_rename_real_transport_sends_user_agent(self, monkeypatch, db_path, capsys):
+        """Integration-level: drive the actual `reconcile_rename` call
+        site (not a hand-rolled call into the transport) through the real
+        `_discord_transport`, so this also proves the call site is wired
+        up to the transport that sets the header — not just that the
+        transport function is capable of it in isolation."""
+        _bind(db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE threads SET desired_name=?, applied_name=? WHERE thread_id='t1'",
+                    ("🟢 new", "🟢 old"),
+                )
+            thread = tc.get_thread(conn, "t1")
+
+            captured_requests = []
+
+            def fake_urlopen(req, timeout):
+                captured_requests.append(req)
+                return _FakeHTTPResponse(status=200, read_result=b'{"name": "new"}')
+
+            monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+            now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+            applied, error = tc.reconcile_rename(
+                conn, thread, now, {"rename_min_interval_s": 330}, "tok", _real_discord_transport, dry_run=False
+            )
+            conn.commit()
+            assert error is None
+            assert applied is True
+            assert len(captured_requests) == 1
+            assert captured_requests[0].get_header("User-agent") == tc.DISCORD_USER_AGENT
+        finally:
+            conn.close()
+
+    def test_reconcile_pin_create_and_pin_real_transport_sends_user_agent(self, monkeypatch, db_path, capsys):
+        """Integration-level for the POST message + PUT pin call sites."""
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            prs = [tc._pr_to_dict(p) for p in tc.get_prs(conn, "t1")]
+
+            captured_requests = []
+
+            def fake_urlopen(req, timeout):
+                captured_requests.append(req)
+                if req.get_method() == "POST":
+                    return _FakeHTTPResponse(status=201, read_result=b'{"id": "555"}')
+                return _FakeHTTPResponse(status=204, read_result=b"")
+
+            monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+            applied, error = tc.reconcile_pin(conn, thread, prs, "tok", _real_discord_transport, dry_run=False)
+            conn.commit()
+            assert error is None
+            assert applied is True
+            assert len(captured_requests) == 2  # POST message, then PUT pin
+            for req in captured_requests:
+                assert req.get_header("User-agent") == tc.DISCORD_USER_AGENT
+        finally:
+            conn.close()
+
+    def test_reconcile_pin_unpin_stale_real_transport_sends_user_agent(self, monkeypatch, db_path, capsys):
+        """Integration-level for the DELETE pin call site."""
+        _bind(db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute("UPDATE threads SET pin_message_id='555' WHERE thread_id='t1'")
+                tc._set_meta(conn, "pin_body:t1", "old body")
+            thread = tc.get_thread(conn, "t1")
+
+            captured_requests = []
+
+            def fake_urlopen(req, timeout):
+                captured_requests.append(req)
+                return _FakeHTTPResponse(status=204, read_result=b"")
+
+            monkeypatch.setattr(tc.urllib.request, "urlopen", fake_urlopen)
+            applied, error = tc.reconcile_pin(conn, thread, [], "tok", _real_discord_transport, dry_run=False)
+            conn.commit()
+            assert error is None
+            assert applied is True
+            assert len(captured_requests) == 1
+            assert captured_requests[0].get_header("User-agent") == tc.DISCORD_USER_AGENT
+        finally:
+            conn.close()
+
+
 class TestReconcileDiscordCommitsPerThread:
     """CRITICAL 2: reconcile_discord must commit per-thread, so one
     thread's Discord failure doesn't roll back another thread's already-

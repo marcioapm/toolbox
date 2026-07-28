@@ -838,6 +838,12 @@ def recompute_desired_names(conn: sqlite3.Connection, now: datetime, stale_after
 
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_TIMEOUT_S = 15
+# Discord requires a User-Agent header on every request (documented format:
+# "DiscordBot ($url, $version)"); Cloudflare rejects requests without one
+# with HTTP 403 / error code 1010, even for otherwise well-authorized,
+# well-permissioned requests. Confirmed live: A/B against the same token,
+# same request, seconds apart — no User-Agent -> 403/1010, with it -> 200.
+DISCORD_USER_AGENT = "DiscordBot (https://github.com/marcioapm/toolbox, 1.0)"
 
 
 class DiscordResponse:
@@ -874,7 +880,11 @@ def _discord_transport(
         url,
         data=data,
         method=method,
-        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+            "User-Agent": DISCORD_USER_AGENT,
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
