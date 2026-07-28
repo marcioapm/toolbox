@@ -56,7 +56,9 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -366,6 +368,272 @@ def get_prs(conn: sqlite3.Connection, thread_id: str) -> List[sqlite3.Row]:
 
 def get_all_threads(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     return conn.execute("SELECT * FROM threads ORDER BY title ASC, thread_id ASC").fetchall()
+
+
+# ---------------------------------------------------------------------------
+# cycle: GitHub polling and desired-name recomputation
+# ---------------------------------------------------------------------------
+
+DEFAULT_PR_RECHECK_MIN_S = 150
+DEFAULT_MAX_PR_CHECKS_PER_CYCLE = 40
+DEFAULT_RENAME_MIN_INTERVAL_S = 330
+GH_TIMEOUT_S = 20
+CI_FAILURE_STATES = frozenset({"FAILURE", "ERROR"})
+CI_PENDING_STATES = frozenset({"PENDING", "IN_PROGRESS", "QUEUED"})
+
+
+def _run_command(cmd: List[str], timeout: int) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _load_cycle_config(config_path: Optional[Path] = None) -> Dict[str, int]:
+    """Read optional cycle tunables without making configuration mandatory."""
+    config = {
+        "stale_after_min": DEFAULT_STALE_AFTER_MIN,
+        "pr_recheck_min_s": DEFAULT_PR_RECHECK_MIN_S,
+        "max_pr_checks_per_cycle": DEFAULT_MAX_PR_CHECKS_PER_CYCLE,
+        "rename_min_interval_s": DEFAULT_RENAME_MIN_INTERVAL_S,
+    }
+    path = config_path or Path.home() / ".config" / "threadctl" / "config.toml"
+    if not path.exists():
+        return config
+    with path.open("rb") as f:
+        data = tomllib.load(f)
+    cycle = data.get("cycle", {})
+    discord = data.get("discord", {})
+    for key in ("stale_after_min", "pr_recheck_min_s", "max_pr_checks_per_cycle"):
+        value = cycle.get(key)
+        if isinstance(value, int) and value > 0:
+            config[key] = value
+    value = discord.get("rename_min_interval_s")
+    if isinstance(value, int) and value > 0:
+        config["rename_min_interval_s"] = value
+    return config
+
+
+def _gh_account_for(repo: str, accounts: Dict[str, str]) -> Optional[str]:
+    return accounts.get(repo.split("/", 1)[0])
+
+
+def _fetch_gh_token(account: str, timeout: int, runner) -> Optional[str]:
+    try:
+        proc = runner(["gh", "auth", "token", "--user", account], timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    token = (proc.stdout or "").strip()
+    return token or None
+
+
+def _derive_ci(rollup: Optional[List[Dict[str, Any]]]) -> str:
+    if not rollup:
+        return "NONE"
+    states = {
+        str(item.get("conclusion") or item.get("status") or item.get("state") or "").upper()
+        for item in rollup
+    }
+    if states & CI_FAILURE_STATES:
+        return "FAILURE"
+    if states & CI_PENDING_STATES:
+        return "PENDING"
+    return "SUCCESS"
+
+
+def _graphql_query(repo: str, numbers: List[int]) -> str:
+    owner, name = repo.split("/", 1)
+    fields = " ".join(
+        f"pr_{number}: pullRequest(number: {number}) {{ state mergeable reviewDecision isDraft title url "
+        "statusCheckRollup { nodes { conclusion status } } }"
+        for number in numbers
+    )
+    return f'query {{ repository(owner: "{owner}", name: "{name}") {{ {fields} }} }}'
+
+
+def _parse_graphql_pr(node: Optional[Dict[str, Any]], checked_at: str) -> Optional[Dict[str, Any]]:
+    if node is None:
+        return None
+    rollup = (node.get("statusCheckRollup") or {}).get("nodes")
+    return {
+        "state": node.get("state") or "OPEN",
+        "ci": _derive_ci(rollup),
+        "review": node.get("reviewDecision") or "NONE",
+        "mergeable": node.get("mergeable") or "UNKNOWN",
+        "is_draft": int(bool(node.get("isDraft"))),
+        "pr_title": node.get("title") or "",
+        "url": node.get("url") or "",
+        "checked_at": checked_at,
+    }
+
+
+def fetch_repo_pr_states(
+    repo: str,
+    numbers: List[int],
+    accounts: Dict[str, str],
+    timeout: int,
+    runner,
+    token_cache: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[Dict[int, Optional[Dict[str, Any]]]], Optional[str]]:
+    """Fetch selected PRs from one repository with one GraphQL request.
+
+    Account tokens are resolved locally and passed only to this subprocess;
+    this avoids the shared mutable active-account state of `gh auth switch`.
+    """
+    if token_cache is None:
+        token_cache = {}
+    if not numbers:
+        return {}, None
+
+    cmd = ["gh", "api", "graphql", "-f", f"query={_graphql_query(repo, numbers)}"]
+    account = _gh_account_for(repo, accounts)
+    if account:
+        token = token_cache.get(account)
+        if token is None:
+            token = _fetch_gh_token(account, timeout, runner)
+            if token:
+                token_cache[account] = token
+        if token:
+            cmd = ["env", f"GH_TOKEN={token}", *cmd]
+
+    try:
+        proc = runner(cmd, timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"gh timed out after {timeout}s"
+    except OSError as exc:
+        return None, f"gh failed to run: {exc}"
+    if proc.returncode != 0:
+        return None, (proc.stderr or "").strip() or f"gh exited {proc.returncode}"
+    try:
+        payload = json.loads(proc.stdout)
+        repository = payload["data"]["repository"]
+        if not isinstance(repository, dict):
+            raise TypeError("missing repository object")
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return None, f"gh returned invalid GraphQL JSON: {exc}"
+
+    checked_at = _now_iso()
+    states = {
+        number: _parse_graphql_pr(repository.get(f"pr_{number}"), checked_at)
+        for number in numbers
+    }
+    return states, None
+
+
+def _due_prs(conn: sqlite3.Connection, now: datetime, recheck_min_s: int, limit: int) -> List[sqlite3.Row]:
+    cutoff = (now.timestamp() - recheck_min_s)
+    rows = conn.execute(
+        "SELECT * FROM prs WHERE state IS NULL OR state='OPEN' OR "
+        "(state IN ('MERGED', 'CLOSED') AND checked_at IS NULL) "
+        "ORDER BY CASE WHEN checked_at IS NULL THEN 0 ELSE 1 END, checked_at ASC, id ASC"
+    ).fetchall()
+    due = []
+    for row in rows:
+        checked_at = row["checked_at"]
+        if checked_at is None or _parse_iso(checked_at).timestamp() < cutoff:
+            due.append(row)
+            if len(due) == limit:
+                break
+    return due
+
+
+def _poll_due_prs(
+    conn: sqlite3.Connection,
+    now: datetime,
+    config: Dict[str, int],
+    runner,
+    accounts: Dict[str, str],
+) -> Tuple[int, int]:
+    due = _due_prs(conn, now, config["pr_recheck_min_s"], config["max_pr_checks_per_cycle"])
+    by_repo: Dict[str, List[sqlite3.Row]] = {}
+    for pr in due:
+        by_repo.setdefault(pr["repo"], []).append(pr)
+
+    refreshed = errors = 0
+    token_cache: Dict[str, str] = {}
+    for repo, prs in by_repo.items():
+        states, error = fetch_repo_pr_states(
+            repo, [p["number"] for p in prs], accounts, GH_TIMEOUT_S, runner, token_cache
+        )
+        if error is not None:
+            errors += len(prs)
+            for pr in prs:
+                _record_history(conn, pr["thread_id"], "error", f"GitHub poll {repo}#{pr['number']}: {error}")
+            continue
+        assert states is not None
+        for pr in prs:
+            state = states.get(pr["number"])
+            if state is None:
+                errors += 1
+                _record_history(conn, pr["thread_id"], "error", f"GitHub poll {repo}#{pr['number']}: PR not found")
+                continue
+            checked_at = None if (
+                pr["state"] not in ("MERGED", "CLOSED") and state["state"] in ("MERGED", "CLOSED")
+            ) else state["checked_at"]
+            conn.execute(
+                "UPDATE prs SET state=?, ci=?, review=?, mergeable=?, is_draft=?, pr_title=?, url=?, checked_at=? "
+                "WHERE id=?",
+                (
+                    state["state"], state["ci"], state["review"], state["mergeable"], state["is_draft"],
+                    state["pr_title"], state["url"], checked_at, pr["id"],
+                ),
+            )
+            refreshed += 1
+    return refreshed, errors
+
+
+def recompute_desired_names(conn: sqlite3.Connection, now: datetime, stale_after_min: int) -> int:
+    count = 0
+    for thread in get_all_threads(conn):
+        prs = [_pr_to_dict(pr) for pr in get_prs(conn, thread["thread_id"])]
+        thread_data = dict(thread)
+        icon = effective_thread_icon(thread_data, prs)
+        stale = is_stale(icon, thread["last_touch_at"], now, stale_after_min)
+        desired_name = render_title(thread_data, prs, stale)
+        conn.execute(
+            "UPDATE threads SET desired_name=?, updated_at=? WHERE thread_id=?",
+            (desired_name, _now_iso(), thread["thread_id"]),
+        )
+        count += 1
+    return count
+
+
+def run_cycle(
+    db_path: Path,
+    *,
+    runner=_run_command,
+    config: Optional[Dict[str, int]] = None,
+    accounts: Optional[Dict[str, str]] = None,
+) -> Dict[str, int]:
+    """Poll due PRs and persist the DB-derived name for every thread.
+
+    Discord pin/name writes deliberately remain absent here until their
+    reconcilers are added; this chunk only implements cycle steps 1 and 2.
+    """
+    config = {**_load_cycle_config(), **(config or {})}
+    accounts = accounts or DEFAULT_ACCOUNTS
+    conn = connect_db(db_path)
+    try:
+        now = _utcnow()
+        with conn:
+            refreshed, errors = _poll_due_prs(conn, now, config, runner, accounts)
+            threads = recompute_desired_names(conn, now, config["stale_after_min"])
+        return {"refreshed": refreshed, "errors": errors, "threads": threads}
+    finally:
+        conn.close()
+
+
+def cmd_cycle(args: argparse.Namespace) -> int:
+    try:
+        result = run_cycle(_resolve_db_path(args))
+    except (OSError, tomllib.TOMLDecodeError, sqlite3.Error) as exc:
+        _err(f"threadctl: cycle failed: {exc}")
+        return 1
+    mode = " (dry run)" if args.dry_run else ""
+    print(
+        f"threadctl: cycle{mode}: refreshed {result['refreshed']} PR(s), "
+        f"recomputed {result['threads']} thread(s), {result['errors']} error(s)"
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +1065,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_show.add_argument("thread_id")
     sp_show.add_argument("--json", action="store_true")
     sp_show.set_defaults(func=cmd_show)
+
+    sp_cycle = sub.add_parser("cycle", parents=[parent], help="poll GitHub and recompute desired Discord names")
+    sp_cycle.add_argument("--dry-run", action="store_true", help="report the cycle without Discord writes")
+    sp_cycle.set_defaults(func=cmd_cycle)
 
     sp_list = sub.add_parser("list", parents=[parent], help="list all threads")
     sp_list.add_argument("--json", action="store_true")

@@ -694,3 +694,186 @@ class TestRenderTitle:
         title = tc.render_title(thread, prs, stale=True)
         assert title.endswith("💤")
         assert len(title) <= 100
+
+
+# ---------------------------------------------------------------------------
+# GitHub GraphQL polling + database-only cycle
+# ---------------------------------------------------------------------------
+
+
+def _graphql_payload(**prs):
+    return {"data": {"repository": prs}}
+
+
+def _github_pr(
+    state="OPEN", ci="SUCCESS", review="APPROVED", mergeable="MERGEABLE",
+    draft=False, title="Implement thing", url="https://github.com/absmartly/abs/pull/1",
+):
+    nodes = [] if ci == "NONE" else [{"conclusion": ci, "status": None}]
+    return {
+        "state": state,
+        "mergeable": mergeable,
+        "reviewDecision": review,
+        "isDraft": draft,
+        "title": title,
+        "url": url,
+        "statusCheckRollup": {"nodes": nodes},
+    }
+
+
+class TestGithubPolling:
+    def test_fetches_one_batched_graphql_query_with_account_token(self, monkeypatch):
+        monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+        calls = []
+
+        def runner(cmd, timeout):
+            calls.append(cmd)
+            if cmd[:2] == ["gh", "auth"]:
+                assert cmd == ["gh", "auth", "token", "--user", "marcio-absmartly"]
+                return __import__("subprocess").CompletedProcess(cmd, 0, "tok\n", "")
+            payload = _graphql_payload(pr_1=_github_pr(), pr_2=_github_pr(ci="PENDING"))
+            return __import__("subprocess").CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        states, error = tc.fetch_repo_pr_states(
+            "absmartly/abs", [1, 2], tc.DEFAULT_ACCOUNTS, 20, runner
+        )
+
+        assert error is None
+        assert states[1]["ci"] == "SUCCESS"
+        assert states[2]["ci"] == "PENDING"
+        assert states[1]["review"] == "APPROVED"
+        assert states[1]["checked_at"] == "2026-07-28T12:00:00Z"
+        assert calls[1][:2] == ["env", "GH_TOKEN=tok"]
+        query = next(part for part in calls[1] if part.startswith("query="))
+        assert "pullRequest(number: 1)" in query
+        assert "pullRequest(number: 2)" in query
+        assert not any(call[:3] == ["gh", "auth", "switch"] for call in calls)
+
+    @pytest.mark.parametrize("rollup,expected", [
+        ([{"conclusion": "FAILURE", "status": None}], "FAILURE"),
+        ([{"conclusion": None, "status": "IN_PROGRESS"}], "PENDING"),
+        ([], "NONE"),
+    ])
+    def test_ci_derivation(self, rollup, expected):
+        assert tc._derive_ci(rollup) == expected
+
+    def test_graphql_failure_is_returned_not_raised(self):
+        def runner(cmd, timeout):
+            return __import__("subprocess").CompletedProcess(cmd, 1, "", "bad credentials")
+
+        states, error = tc.fetch_repo_pr_states("unknown/repo", [1], {}, 20, runner)
+        assert states is None
+        assert error == "bad credentials"
+
+    def test_malformed_graphql_repository_is_returned_not_raised(self):
+        def runner(cmd, timeout):
+            return __import__("subprocess").CompletedProcess(
+                cmd, 0, json.dumps({"data": {"repository": None}}), ""
+            )
+
+        states, error = tc.fetch_repo_pr_states("unknown/repo", [1], {}, 20, runner)
+        assert states is None
+        assert "invalid GraphQL JSON" in error
+
+    def test_cycle_staggers_oldest_prs_and_honours_cap(self, db_path, capsys, monkeypatch):
+        _bind(db_path, capsys)
+        for number in (1, 2, 3):
+            run_cli(["add-pr", "t1", str(number)], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute("UPDATE prs SET checked_at='2026-07-28T10:00:00Z' WHERE number=1")
+                conn.execute("UPDATE prs SET checked_at='2026-07-28T11:00:00Z' WHERE number=2")
+                conn.execute("UPDATE prs SET checked_at='2026-07-28T11:59:00Z' WHERE number=3")
+        finally:
+            conn.close()
+        now = __import__("datetime").datetime(2026, 7, 28, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+        monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+        fetched = []
+
+        def runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return __import__("subprocess").CompletedProcess(cmd, 0, "token\n", "")
+            query = next(part for part in cmd if part.startswith("query="))
+            fetched.extend(int(number) for number in __import__("re").findall(r"pullRequest\(number: (\d+)\)", query))
+            payload = _graphql_payload(
+                **{f"pr_{n}": _github_pr(url=f"https://github.com/absmartly/abs/pull/{n}") for n in fetched}
+            )
+            return __import__("subprocess").CompletedProcess(cmd, 0, json.dumps(payload), "")
+
+        result = tc.run_cycle(
+            db_path,
+            runner=runner,
+            config={"stale_after_min": 30, "pr_recheck_min_s": 150, "max_pr_checks_per_cycle": 2},
+        )
+        assert result == {"refreshed": 2, "errors": 0, "threads": 1}
+        assert fetched == [1, 2]
+
+    def test_terminal_pr_is_confirmed_once_then_frozen(self, db_path, capsys, monkeypatch):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        now = __import__("datetime").datetime(2026, 7, 28, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+        monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+        calls = []
+
+        def runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return __import__("subprocess").CompletedProcess(cmd, 0, "token\n", "")
+            calls.append(cmd)
+            return __import__("subprocess").CompletedProcess(
+                cmd, 0, json.dumps(_graphql_payload(pr_1=_github_pr(state="MERGED"))), ""
+            )
+
+        assert tc.run_cycle(db_path, runner=runner)["refreshed"] == 1
+        conn = tc.connect_db(db_path)
+        try:
+            assert tc.get_prs(conn, "t1")[0]["checked_at"] is None
+        finally:
+            conn.close()
+        assert tc.run_cycle(db_path, runner=runner)["refreshed"] == 1
+        assert tc.run_cycle(db_path, runner=runner)["refreshed"] == 0
+        assert len(calls) == 2
+
+    def test_terminal_pr_is_not_polled_again_after_confirmation(self, db_path, capsys, monkeypatch):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE prs SET state='MERGED', checked_at='2026-07-28T10:00:00Z' WHERE number=1"
+                )
+        finally:
+            conn.close()
+        now = __import__("datetime").datetime(2026, 7, 28, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+
+        def runner(cmd, timeout):
+            raise AssertionError("terminal PR must not be fetched again")
+
+        assert tc.run_cycle(db_path, runner=runner)["refreshed"] == 0
+
+    def test_cycle_persists_desired_name_from_refreshed_pr_state(self, db_path, capsys, monkeypatch):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        now = __import__("datetime").datetime(2026, 7, 28, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+        monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+
+        def runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return __import__("subprocess").CompletedProcess(cmd, 0, "token\n", "")
+            return __import__("subprocess").CompletedProcess(
+                cmd, 0, json.dumps(_graphql_payload(pr_1=_github_pr(ci="FAILURE"))), ""
+            )
+
+        assert tc.run_cycle(db_path, runner=runner)["refreshed"] == 1
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            assert thread["desired_name"] == "🔴 Experiment recompute · 🔴#1"
+            assert thread["applied_name"] is None
+        finally:
+            conn.close()
