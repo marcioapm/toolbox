@@ -7,10 +7,30 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from toolbox import threadctl as tc
+
+# Captured before any test can monkeypatch tc._resolve_discord_token (the
+# safety fixture below stubs it for every other test), so the dedicated
+# token-resolution tests can still exercise the real implementation.
+_real_resolve_discord_token = tc._resolve_discord_token
+
+
+@pytest.fixture(autouse=True)
+def _no_live_discord_calls(monkeypatch):
+    """Hard safety net: never resolve a real Discord token or hit the real
+    HTTP transport, even if a test forgets to stub them explicitly. Real
+    Discord threads are registered against this bot — a stray call burns a
+    real rate-limit slot."""
+    monkeypatch.setattr(tc, "_resolve_discord_token", lambda *a, **k: None)
+
+    def _forbidden_transport(*args, **kwargs):
+        raise AssertionError("test attempted a live Discord transport call — stub `transport` explicitly")
+
+    monkeypatch.setattr(tc, "_discord_transport", _forbidden_transport)
 
 
 @pytest.fixture
@@ -807,7 +827,9 @@ class TestGithubPolling:
             runner=runner,
             config={"stale_after_min": 30, "pr_recheck_min_s": 150, "max_pr_checks_per_cycle": 2},
         )
-        assert result == {"refreshed": 2, "errors": 0, "threads": 1}
+        assert result["refreshed"] == 2
+        assert result["errors"] == 0
+        assert result["threads"] == 1
         assert fetched == [1, 2]
 
     def test_terminal_pr_is_confirmed_once_then_frozen(self, db_path, capsys, monkeypatch):
@@ -877,3 +899,379 @@ class TestGithubPolling:
             assert thread["applied_name"] is None
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Discord: token resolution
+# ---------------------------------------------------------------------------
+
+class TestDiscordTokenResolution:
+    def test_env_var_wins(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("THREADCTL_DISCORD_TOKEN", "env-tok")
+        assert _real_resolve_discord_token(tmp_path / "missing.toml", tmp_path / "missing.json") == "env-tok"
+
+    def test_config_toml_used_when_no_env(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("THREADCTL_DISCORD_TOKEN", raising=False)
+        cfg = tmp_path / "config.toml"
+        cfg.write_text('[discord]\ntoken = "cfg-tok"\n')
+        assert _real_resolve_discord_token(cfg, tmp_path / "missing.json") == "cfg-tok"
+
+    def test_openclaw_fallback_used_last(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("THREADCTL_DISCORD_TOKEN", raising=False)
+        oc = tmp_path / "openclaw.json"
+        oc.write_text(json.dumps({"channels": {"discord": {"token": "oc-tok"}}}))
+        assert _real_resolve_discord_token(tmp_path / "missing.toml", oc) == "oc-tok"
+
+    def test_returns_none_when_nothing_configured(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("THREADCTL_DISCORD_TOKEN", raising=False)
+        assert _real_resolve_discord_token(tmp_path / "missing.toml", tmp_path / "missing.json") is None
+
+    def test_config_toml_wins_over_openclaw_fallback(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("THREADCTL_DISCORD_TOKEN", raising=False)
+        cfg = tmp_path / "config.toml"
+        cfg.write_text('[discord]\ntoken = "cfg-tok"\n')
+        oc = tmp_path / "openclaw.json"
+        oc.write_text(json.dumps({"channels": {"discord": {"token": "oc-tok"}}}))
+        assert _real_resolve_discord_token(cfg, oc) == "cfg-tok"
+
+
+# ---------------------------------------------------------------------------
+# Discord: pinned message reconciliation
+# ---------------------------------------------------------------------------
+
+class FakeTransport:
+    """Records calls and returns scripted DiscordResponse objects keyed by
+    (method, url-prefix), falling back to a 200 no-op response."""
+
+    def __init__(self, script=None):
+        self.script = script or {}
+        self.calls = []
+
+    def __call__(self, method, url, token, payload, timeout):
+        self.calls.append((method, url, token, payload))
+        for (m, prefix), resp in self.script.items():
+            if method == m and url.startswith(prefix):
+                return resp
+        return tc.DiscordResponse(200, {"id": "999"})
+
+
+class TestReconcilePin:
+    def test_creates_and_pins_message_on_first_pr(self, db_path, capsys):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            prs = [tc._pr_to_dict(p) for p in tc.get_prs(conn, "t1")]
+            transport = FakeTransport({("POST", f"{tc.DISCORD_API}/channels/t1/messages"): tc.DiscordResponse(201, {"id": "555"})})
+            applied, error = tc.reconcile_pin(conn, thread, prs, "tok", transport, dry_run=False)
+            conn.commit()
+            assert error is None
+            assert applied is True
+            assert [c[:2] for c in transport.calls] == [
+                ("POST", f"{tc.DISCORD_API}/channels/t1/messages"),
+                ("PUT", f"{tc.DISCORD_API}/channels/t1/pins/555"),
+            ]
+            assert tc.get_thread(conn, "t1")["pin_message_id"] == "555"
+        finally:
+            conn.close()
+
+    def test_edits_in_place_when_content_changed(self, db_path, capsys):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute("UPDATE threads SET pin_message_id='555' WHERE thread_id='t1'")
+                tc._set_meta(conn, "pin_body:t1", "stale old body")
+            thread = tc.get_thread(conn, "t1")
+            prs = [tc._pr_to_dict(p) for p in tc.get_prs(conn, "t1")]
+            transport = FakeTransport()
+            applied, error = tc.reconcile_pin(conn, thread, prs, "tok", transport, dry_run=False)
+            conn.commit()
+            assert error is None
+            assert applied is True
+            assert transport.calls[0][:2] == ("PATCH", f"{tc.DISCORD_API}/channels/t1/messages/555")
+        finally:
+            conn.close()
+
+    def test_skips_edit_when_content_unchanged(self, db_path, capsys):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            prs = [tc._pr_to_dict(p) for p in tc.get_prs(conn, "t1")]
+            body = tc.render_pin_body(dict(thread), prs)
+            with conn:
+                conn.execute("UPDATE threads SET pin_message_id='555' WHERE thread_id='t1'")
+                tc._set_meta(conn, "pin_body:t1", body)
+            thread = tc.get_thread(conn, "t1")
+            transport = FakeTransport()
+            applied, error = tc.reconcile_pin(conn, thread, prs, "tok", transport, dry_run=False)
+            assert error is None
+            assert applied is False
+            assert transport.calls == []
+        finally:
+            conn.close()
+
+    def test_unpins_and_forgets_when_no_prs_remain(self, db_path, capsys):
+        _bind(db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute("UPDATE threads SET pin_message_id='555' WHERE thread_id='t1'")
+                tc._set_meta(conn, "pin_body:t1", "old body")
+            thread = tc.get_thread(conn, "t1")
+            transport = FakeTransport()
+            applied, error = tc.reconcile_pin(conn, thread, [], "tok", transport, dry_run=False)
+            conn.commit()
+            assert error is None
+            assert applied is True
+            assert transport.calls[0][:2] == ("DELETE", f"{tc.DISCORD_API}/channels/t1/pins/555")
+            assert tc.get_thread(conn, "t1")["pin_message_id"] is None
+            assert tc._get_meta(conn, "pin_body:t1") is None
+        finally:
+            conn.close()
+
+    def test_dry_run_makes_no_discord_calls(self, db_path, capsys):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            prs = [tc._pr_to_dict(p) for p in tc.get_prs(conn, "t1")]
+            transport = FakeTransport()
+            applied, error = tc.reconcile_pin(conn, thread, prs, "tok", transport, dry_run=True)
+            assert applied is False
+            assert error is None
+            assert transport.calls == []
+        finally:
+            conn.close()
+
+    def test_missing_token_makes_no_discord_calls(self, db_path, capsys):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            prs = [tc._pr_to_dict(p) for p in tc.get_prs(conn, "t1")]
+            transport = FakeTransport()
+            applied, error = tc.reconcile_pin(conn, thread, prs, None, transport, dry_run=False)
+            assert applied is False
+            assert error is None
+            assert transport.calls == []
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Discord: rename reconciliation
+# ---------------------------------------------------------------------------
+
+class TestReconcileRename:
+    def _thread_row(self, db_path, capsys, **overrides):
+        _bind(db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            if overrides:
+                set_clause = ", ".join(f"{k}=?" for k in overrides)
+                with conn:
+                    conn.execute(f"UPDATE threads SET {set_clause} WHERE thread_id='t1'", tuple(overrides.values()))
+            return tc.get_thread(conn, "t1")
+        finally:
+            conn.close()
+
+    def test_skips_when_desired_equals_applied(self, db_path, capsys):
+        thread = self._thread_row(db_path, capsys, desired_name="🟢 x", applied_name="🟢 x")
+        transport = FakeTransport()
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        applied, error = tc.reconcile_rename(None, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=False)
+        assert applied is False
+        assert error is None
+        assert transport.calls == []
+
+    def test_skips_when_desired_is_none(self, db_path, capsys):
+        thread = self._thread_row(db_path, capsys)
+        transport = FakeTransport()
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        applied, error = tc.reconcile_rename(None, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=False)
+        assert applied is False
+        assert transport.calls == []
+
+    def test_skips_within_min_interval(self, db_path, capsys):
+        thread = self._thread_row(
+            db_path, capsys,
+            desired_name="🟢 new", applied_name="🟢 old",
+            last_rename_at="2026-07-28T11:58:00Z",
+        )
+        transport = FakeTransport()
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        applied, error = tc.reconcile_rename(None, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=False)
+        assert applied is False
+        assert transport.calls == []
+
+    def test_renames_after_min_interval_elapsed(self, db_path, capsys):
+        thread = self._thread_row(
+            db_path, capsys,
+            desired_name="🟢 new", applied_name="🟢 old",
+            last_rename_at="2026-07-28T11:00:00Z",
+        )
+        conn = tc.connect_db(db_path)
+        try:
+            transport = FakeTransport()
+            now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+            applied, error = tc.reconcile_rename(conn, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=False)
+            conn.commit()
+            assert error is None
+            assert applied is True
+            assert transport.calls == [("PATCH", f"{tc.DISCORD_API}/channels/t1", "tok", {"name": "🟢 new"})]
+            updated = tc.get_thread(conn, "t1")
+            assert updated["applied_name"] == "🟢 new"
+            assert updated["last_rename_at"] is not None
+        finally:
+            conn.close()
+
+    def test_skips_within_backoff_window(self, db_path, capsys):
+        thread = self._thread_row(
+            db_path, capsys,
+            desired_name="🟢 new", applied_name="🟢 old",
+            rename_backoff_until="2026-07-28T12:05:00Z",
+        )
+        transport = FakeTransport()
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        applied, error = tc.reconcile_rename(None, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=False)
+        assert applied is False
+        assert transport.calls == []
+
+    def test_429_sets_backoff_and_records_history(self, db_path, capsys):
+        thread = self._thread_row(db_path, capsys, desired_name="🟢 new", applied_name="🟢 old")
+        conn = tc.connect_db(db_path)
+        try:
+            transport = FakeTransport({
+                ("PATCH", f"{tc.DISCORD_API}/channels/t1"): tc.DiscordResponse(429, {"retry_after": 42.5}),
+            })
+            now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+            applied, error = tc.reconcile_rename(conn, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=False)
+            conn.commit()
+            assert applied is False
+            assert error is None
+            updated = tc.get_thread(conn, "t1")
+            assert updated["applied_name"] == "🟢 old"
+            expected_backoff = (now + timedelta(seconds=42.5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            assert updated["rename_backoff_until"] == expected_backoff
+            kinds = [r["kind"] for r in conn.execute("SELECT kind FROM history WHERE thread_id='t1'")]
+            assert "rename" in kinds
+        finally:
+            conn.close()
+
+    def test_dry_run_makes_no_rename_call(self, db_path, capsys):
+        thread = self._thread_row(db_path, capsys, desired_name="🟢 new", applied_name="🟢 old")
+        transport = FakeTransport()
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        applied, error = tc.reconcile_rename(None, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=True)
+        assert applied is False
+        assert transport.calls == []
+
+    def test_missing_token_makes_no_rename_call(self, db_path, capsys):
+        thread = self._thread_row(db_path, capsys, desired_name="🟢 new", applied_name="🟢 old")
+        transport = FakeTransport()
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        applied, error = tc.reconcile_rename(None, thread, now, {"rename_min_interval_s": 330}, None, transport, dry_run=False)
+        assert applied is False
+        assert transport.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Discord: full cycle wiring (reconcile_discord + run_cycle)
+# ---------------------------------------------------------------------------
+
+class TestCycleDiscordWiring:
+    def test_cycle_creates_pin_and_renames_thread_end_to_end(self, db_path, capsys, monkeypatch):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+        monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+
+        def runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return __import__("subprocess").CompletedProcess(cmd, 0, "token\n", "")
+            return __import__("subprocess").CompletedProcess(
+                cmd, 0, json.dumps(_graphql_payload(pr_1=_github_pr(ci="FAILURE"))), ""
+            )
+
+        transport = FakeTransport({
+            ("POST", f"{tc.DISCORD_API}/channels/t1/messages"): tc.DiscordResponse(201, {"id": "555"}),
+        })
+        result = tc.run_cycle(db_path, runner=runner, token="tok", transport=transport)
+        assert result["pins_changed"] == 1
+        assert result["renames_applied"] == 1
+        assert result["errors"] == 0
+
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            assert thread["pin_message_id"] == "555"
+            assert thread["applied_name"] == "🔴 Experiment recompute · 🔴#1"
+        finally:
+            conn.close()
+
+    def test_dry_run_leaves_applied_name_and_pin_untouched(self, db_path, capsys, monkeypatch):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+        monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+
+        def runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return __import__("subprocess").CompletedProcess(cmd, 0, "token\n", "")
+            return __import__("subprocess").CompletedProcess(
+                cmd, 0, json.dumps(_graphql_payload(pr_1=_github_pr(ci="FAILURE"))), ""
+            )
+
+        transport = FakeTransport()
+        result = tc.run_cycle(db_path, runner=runner, token="tok", transport=transport, dry_run=True)
+        assert result["pins_changed"] == 0
+        assert result["renames_applied"] == 0
+        assert transport.calls == []
+
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            assert thread["desired_name"] == "🔴 Experiment recompute · 🔴#1"
+            assert thread["applied_name"] is None
+            assert thread["pin_message_id"] is None
+        finally:
+            conn.close()
+
+    def test_no_op_rename_is_skipped_across_full_cycle(self, db_path, capsys, monkeypatch):
+        _bind(db_path, capsys)
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE threads SET applied_name='🟢 Experiment recompute · 🟢#1', pin_message_id='555' "
+                    "WHERE thread_id='t1'"
+                )
+                tc._set_meta(conn, "pin_body:t1", "irrelevant")
+        finally:
+            conn.close()
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+        monkeypatch.setattr(tc, "_now_iso", lambda: "2026-07-28T12:00:00Z")
+
+        def runner(cmd, timeout):
+            if cmd[:2] == ["gh", "auth"]:
+                return __import__("subprocess").CompletedProcess(cmd, 0, "token\n", "")
+            return __import__("subprocess").CompletedProcess(
+                cmd, 0, json.dumps(_graphql_payload(pr_1=_github_pr(ci="NONE"))), ""
+            )
+
+        transport = FakeTransport()
+        result = tc.run_cycle(db_path, runner=runner, token="tok", transport=transport)
+        rename_calls = [c for c in transport.calls if c[0] == "PATCH" and c[1] == f"{tc.DISCORD_API}/channels/t1"]
+        assert rename_calls == []
+        assert result["renames_applied"] == 0

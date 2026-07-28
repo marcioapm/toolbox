@@ -59,8 +59,10 @@ import sqlite3
 import subprocess
 import sys
 import tomllib
+import urllib.error
+import urllib.request
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -370,6 +372,21 @@ def get_all_threads(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     return conn.execute("SELECT * FROM threads ORDER BY title ASC, thread_id ASC").fetchall()
 
 
+def _get_meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def _set_meta(conn: sqlite3.Connection, key: str, value: Optional[str]) -> None:
+    if value is None:
+        conn.execute("DELETE FROM meta WHERE key=?", (key,))
+    else:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+
 # ---------------------------------------------------------------------------
 # cycle: GitHub polling and desired-name recomputation
 # ---------------------------------------------------------------------------
@@ -597,41 +614,300 @@ def recompute_desired_names(conn: sqlite3.Connection, now: datetime, stale_after
     return count
 
 
+# ---------------------------------------------------------------------------
+# cycle: Discord writes (token resolution, pin reconciliation, rename)
+# ---------------------------------------------------------------------------
+
+DISCORD_API = "https://discord.com/api/v10"
+DISCORD_TIMEOUT_S = 15
+
+
+class DiscordResponse:
+    """A normalized Discord API response. The injectable `transport` seam
+    returns these instead of raw urllib objects, so tests fake one callable
+    instead of HTTP internals."""
+
+    def __init__(self, status: int, data: Optional[Dict[str, Any]] = None):
+        self.status = status
+        self.data = data
+
+
+def _discord_transport(
+    method: str, url: str, token: str, payload: Optional[Dict[str, Any]], timeout: int
+) -> DiscordResponse:
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            return DiscordResponse(resp.status, json.loads(body) if body else None)
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        try:
+            parsed = json.loads(body) if body else None
+        except json.JSONDecodeError:
+            parsed = None
+        return DiscordResponse(exc.code, parsed)
+
+
+def _resolve_discord_token(
+    config_path: Optional[Path] = None,
+    openclaw_path: Optional[Path] = None,
+) -> Optional[str]:
+    """Resolution order (spec section 4): $THREADCTL_DISCORD_TOKEN, then
+    ~/.config/threadctl/config.toml -> discord.token, then a fallback read of
+    .channels.discord.token from ~/.openclaw/openclaw.json."""
+    env = os.environ.get("THREADCTL_DISCORD_TOKEN")
+    if env:
+        return env
+
+    cfg_path = config_path or Path.home() / ".config" / "threadctl" / "config.toml"
+    if cfg_path.exists():
+        with cfg_path.open("rb") as f:
+            data = tomllib.load(f)
+        token = data.get("discord", {}).get("token")
+        if token:
+            return token
+
+    oc_path = openclaw_path or Path.home() / ".openclaw" / "openclaw.json"
+    if oc_path.exists():
+        try:
+            data = json.loads(oc_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        token = ((data.get("channels") or {}).get("discord") or {}).get("token")
+        if token:
+            return token
+
+    return None
+
+
+def _pr_repo_short(repo: str) -> str:
+    return repo.split("/", 1)[-1]
+
+
+def render_pin_body(thread: Dict[str, Any], prs: List[Dict[str, Any]]) -> str:
+    """The pinned status message body: every PR ever tracked (including
+    merged/closed — unlike the title, which only shows OPEN PRs), each
+    repo-qualified (never bare, unlike title rendering) so the list reads
+    unambiguously as PRs accumulate over a thread's life (spec section 9)."""
+    lines = [f"**{thread.get('title', '')}**"]
+    for p in sorted(prs, key=lambda p: (not p.get("primary"), p["number"])):
+        parts = [pr_icon(p), f"{_pr_repo_short(p['repo'])}#{p['number']}"]
+        if p.get("title"):
+            parts.append(p["title"])
+        if p.get("url"):
+            parts.append(p["url"])
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+def reconcile_pin(
+    conn: sqlite3.Connection,
+    thread: sqlite3.Row,
+    prs: List[Dict[str, Any]],
+    token: Optional[str],
+    transport,
+    dry_run: bool,
+) -> Tuple[bool, Optional[str]]:
+    """Cycle step 3: create/edit/unpin the pinned status message for one
+    thread. Returns (applied, error). DB fields (`pin_message_id`, the
+    cached pin body in `meta`) only ever change in lockstep with a confirmed
+    Discord write — a missing token or --dry-run leaves both untouched."""
+    thread_id = thread["thread_id"]
+    pin_message_id = thread["pin_message_id"]
+    meta_key = f"pin_body:{thread_id}"
+
+    if not prs:
+        if pin_message_id is None:
+            return False, None
+        if dry_run or not token:
+            return False, None
+        resp = transport(
+            "DELETE", f"{DISCORD_API}/channels/{thread_id}/pins/{pin_message_id}", token, None, DISCORD_TIMEOUT_S
+        )
+        if resp.status not in (200, 204):
+            return False, f"failed to unpin stale message: HTTP {resp.status}"
+        conn.execute("UPDATE threads SET pin_message_id=NULL WHERE thread_id=?", (thread_id,))
+        _set_meta(conn, meta_key, None)
+        _record_history(conn, thread_id, "pin", "unpinned (no PRs tracked)")
+        return True, None
+
+    body = render_pin_body(dict(thread), prs)
+    if dry_run or not token:
+        return False, None
+
+    if pin_message_id is None:
+        resp = transport("POST", f"{DISCORD_API}/channels/{thread_id}/messages", token, {"content": body}, DISCORD_TIMEOUT_S)
+        if resp.status not in (200, 201):
+            return False, f"failed to create pin message: HTTP {resp.status}"
+        message_id = str((resp.data or {}).get("id") or "")
+        if not message_id:
+            return False, "pin message created but response had no id"
+        pin_resp = transport(
+            "PUT", f"{DISCORD_API}/channels/{thread_id}/pins/{message_id}", token, None, DISCORD_TIMEOUT_S
+        )
+        if pin_resp.status not in (200, 204):
+            return False, f"created pin message {message_id} but failed to pin it: HTTP {pin_resp.status}"
+        conn.execute("UPDATE threads SET pin_message_id=? WHERE thread_id=?", (message_id, thread_id))
+        _set_meta(conn, meta_key, body)
+        _record_history(conn, thread_id, "pin", f"created and pinned message {message_id}")
+        return True, None
+
+    if _get_meta(conn, meta_key) == body:
+        return False, None
+    resp = transport(
+        "PATCH", f"{DISCORD_API}/channels/{thread_id}/messages/{pin_message_id}", token, {"content": body}, DISCORD_TIMEOUT_S
+    )
+    if resp.status != 200:
+        return False, f"failed to edit pin message: HTTP {resp.status}"
+    _set_meta(conn, meta_key, body)
+    _record_history(conn, thread_id, "pin", "edited pin message")
+    return True, None
+
+
+def reconcile_rename(
+    conn: sqlite3.Connection,
+    thread: sqlite3.Row,
+    now: datetime,
+    config: Dict[str, int],
+    token: Optional[str],
+    transport,
+    dry_run: bool,
+) -> Tuple[bool, Optional[str]]:
+    """Cycle step 4, the last step of the cycle: rename the Discord thread to
+    `desired_name`. Never burns a rename slot on a no-op (desired ==
+    applied — critical, see module docstring), honours the
+    rename_min_interval_s coalescing window, and backs off on 429 using the
+    server-provided retry_after (spec section 8)."""
+    thread_id = thread["thread_id"]
+    desired = thread["desired_name"]
+    if desired is None or desired == thread["applied_name"]:
+        return False, None
+
+    last_rename_at = thread["last_rename_at"]
+    if last_rename_at is not None:
+        elapsed = (now - _parse_iso(last_rename_at)).total_seconds()
+        if elapsed < config["rename_min_interval_s"]:
+            return False, None
+
+    backoff_until = thread["rename_backoff_until"]
+    if backoff_until is not None and _parse_iso(backoff_until) > now:
+        return False, None
+
+    if dry_run or not token:
+        return False, None
+
+    resp = transport("PATCH", f"{DISCORD_API}/channels/{thread_id}", token, {"name": desired}, DISCORD_TIMEOUT_S)
+    if resp.status == 429:
+        retry_after = (resp.data or {}).get("retry_after")
+        retry_after = float(retry_after) if retry_after is not None else 60.0
+        backoff_at = (now + timedelta(seconds=retry_after)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute("UPDATE threads SET rename_backoff_until=? WHERE thread_id=?", (backoff_at, thread_id))
+        _record_history(conn, thread_id, "rename", f"rate-limited, backing off {retry_after}s")
+        return False, None
+    if resp.status != 200:
+        _record_history(conn, thread_id, "error", f"rename failed: HTTP {resp.status}")
+        return False, f"rename failed: HTTP {resp.status}"
+
+    conn.execute(
+        "UPDATE threads SET applied_name=?, last_rename_at=? WHERE thread_id=?",
+        (desired, _now_iso(), thread_id),
+    )
+    _record_history(conn, thread_id, "rename", f"renamed to '{desired}'")
+    return True, None
+
+
+def reconcile_discord(
+    conn: sqlite3.Connection,
+    now: datetime,
+    config: Dict[str, int],
+    token: Optional[str],
+    transport,
+    dry_run: bool,
+) -> Tuple[int, int, int]:
+    """Cycle steps 3-4 for every thread: pin reconciliation, then rename
+    reconciliation (rename is always last, per spec). Returns
+    (pins_changed, renames_applied, errors)."""
+    pins_changed = renames_applied = errors = 0
+    for thread in get_all_threads(conn):
+        thread_id = thread["thread_id"]
+        prs = [_pr_to_dict(pr) for pr in get_prs(conn, thread_id)]
+
+        applied, error = reconcile_pin(conn, thread, prs, token, transport, dry_run)
+        if error:
+            errors += 1
+            _record_history(conn, thread_id, "error", f"pin reconcile: {error}")
+        elif applied:
+            pins_changed += 1
+
+        # Re-fetch: reconcile_pin may have just cleared pin_message_id.
+        thread = get_thread(conn, thread_id)
+        applied, error = reconcile_rename(conn, thread, now, config, token, transport, dry_run)
+        if error:
+            errors += 1
+        elif applied:
+            renames_applied += 1
+    return pins_changed, renames_applied, errors
+
+
 def run_cycle(
     db_path: Path,
     *,
     runner=_run_command,
     config: Optional[Dict[str, int]] = None,
     accounts: Optional[Dict[str, str]] = None,
+    token: Optional[str] = None,
+    transport=None,
+    dry_run: bool = False,
 ) -> Dict[str, int]:
-    """Poll due PRs and persist the DB-derived name for every thread.
-
-    Discord pin/name writes deliberately remain absent here until their
-    reconcilers are added; this chunk only implements cycle steps 1 and 2.
-    """
+    """Run the full cycle: poll due PRs, recompute every thread's desired
+    name, then reconcile the pinned message and thread rename against
+    Discord (the cycle is the only Discord writer in threadctl — see module
+    docstring). `--dry-run` still polls GitHub and recomputes DB state, but
+    `reconcile_pin`/`reconcile_rename` skip every Discord write."""
     config = {**_load_cycle_config(), **(config or {})}
     accounts = accounts or DEFAULT_ACCOUNTS
+    if token is None:
+        token = _resolve_discord_token()
+    transport = transport or _discord_transport
     conn = connect_db(db_path)
     try:
         now = _utcnow()
         with conn:
-            refreshed, errors = _poll_due_prs(conn, now, config, runner, accounts)
+            refreshed, poll_errors = _poll_due_prs(conn, now, config, runner, accounts)
             threads = recompute_desired_names(conn, now, config["stale_after_min"])
-        return {"refreshed": refreshed, "errors": errors, "threads": threads}
+            pins_changed, renames_applied, discord_errors = reconcile_discord(
+                conn, now, config, token, transport, dry_run
+            )
+        return {
+            "refreshed": refreshed,
+            "errors": poll_errors + discord_errors,
+            "threads": threads,
+            "pins_changed": pins_changed,
+            "renames_applied": renames_applied,
+        }
     finally:
         conn.close()
 
 
 def cmd_cycle(args: argparse.Namespace) -> int:
     try:
-        result = run_cycle(_resolve_db_path(args))
+        result = run_cycle(_resolve_db_path(args), dry_run=args.dry_run)
     except (OSError, tomllib.TOMLDecodeError, sqlite3.Error) as exc:
         _err(f"threadctl: cycle failed: {exc}")
         return 1
     mode = " (dry run)" if args.dry_run else ""
     print(
         f"threadctl: cycle{mode}: refreshed {result['refreshed']} PR(s), "
-        f"recomputed {result['threads']} thread(s), {result['errors']} error(s)"
+        f"recomputed {result['threads']} thread(s), "
+        f"{result['pins_changed']} pin(s) reconciled, {result['renames_applied']} rename(s) applied, "
+        f"{result['errors']} error(s)"
     )
     return 0
 
