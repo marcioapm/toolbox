@@ -1091,35 +1091,67 @@ def reconcile_discord(
     reverted to their old values and re-issue the POST/PUT/PATCH, creating
     a second pinned message and burning a second rename slot against the
     2-per-10-min-per-thread limit — exactly the failure this whole design
-    exists to prevent. Each thread's pin+rename work is now also wrapped in
-    try/except so a bug or unexpected exception for one thread can't take
-    down the rest of the cycle either; it's recorded to `history` and the
-    loop continues."""
+    exists to prevent.
+
+    R2-1 (regression of C2): committing once per *thread* was still not
+    enough. `reconcile_pin` and `reconcile_rename` are two SEPARATE Discord
+    interactions for the same thread; the old code ran both under one
+    try/except and committed only at the very end, so `reconcile_pin`'s
+    confirmed, already-applied write (`pin_message_id`) sat uncommitted
+    while `reconcile_rename` went and did its own network I/O. If the
+    rename call raised, the shared `except` rolled back — discarding the
+    pin write that had ALREADY succeeded on Discord, even though pinning
+    and renaming are independent Discord resources. The next cycle then
+    saw `pin_message_id` reverted to its old value and posted a SECOND
+    pinned message.
+
+    Fixed by giving each Discord interaction its own try/commit/rollback:
+    `reconcile_pin`'s result is committed (or, on an unexpected exception,
+    rolled back — there is nothing pin-related to lose since pin's own
+    write never happened) BEFORE `reconcile_rename` ever starts its
+    network I/O. A crash in the rename step can then only roll back
+    rename's own not-yet-committed write; the pin commit that already
+    landed is untouchable. Never roll back confirmed work — only ever roll
+    back the transaction for the interaction that actually crashed."""
     pins_changed = renames_applied = errors = 0
     for thread in get_all_threads(conn):
         thread_id = thread["thread_id"]
-        try:
-            prs = [_pr_to_dict(pr) for pr in get_prs(conn, thread_id)]
+        prs = [_pr_to_dict(pr) for pr in get_prs(conn, thread_id)]
 
+        try:
             applied, error = reconcile_pin(conn, thread, prs, token, transport, dry_run)
             if error:
                 errors += 1
                 _record_history(conn, thread_id, "error", f"pin reconcile: {error}")
             elif applied:
                 pins_changed += 1
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 - isolate one thread's failure from the rest of the cycle
+            conn.rollback()
+            errors += 1
+            _record_history(conn, thread_id, "error", f"pin reconcile crashed: {exc}")
+            conn.commit()
+            # The pin step is unconfirmed/unknown at this point; skip the
+            # rename step for this thread this cycle rather than risk
+            # renaming on top of a half-finished pin reconciliation. The
+            # next cycle will retry both from a clean, committed state.
+            continue
 
-            # Re-fetch: reconcile_pin may have just cleared pin_message_id.
-            thread = get_thread(conn, thread_id)
+        # Re-fetch: reconcile_pin may have just cleared pin_message_id, and
+        # its commit above is now durable regardless of what happens below.
+        thread = get_thread(conn, thread_id)
+        try:
             applied, error = reconcile_rename(conn, thread, now, config, token, transport, dry_run)
             if error:
                 errors += 1
             elif applied:
                 renames_applied += 1
+            conn.commit()
         except Exception as exc:  # noqa: BLE001 - isolate one thread's failure from the rest of the cycle
             conn.rollback()
             errors += 1
-            _record_history(conn, thread_id, "error", f"discord reconcile crashed: {exc}")
-        conn.commit()
+            _record_history(conn, thread_id, "error", f"rename reconcile crashed: {exc}")
+            conn.commit()
     return pins_changed, renames_applied, errors
 
 

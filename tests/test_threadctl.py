@@ -1365,6 +1365,77 @@ class TestReconcileDiscordCommitsPerThread:
             conn.close()
 
 
+class TestReconcileDiscordPinSurvivesRenameCrash:
+    """R2-1 (regression of C2, ROUND2-FINDINGS.md): `reconcile_pin` stages
+    `pin_message_id` but the old code did NOT commit it before
+    `reconcile_rename` went and did its own network PATCH for the SAME
+    thread. If the rename raised, the shared try/except rolled back the
+    whole transaction — discarding the pin write that had ALREADY
+    succeeded on Discord. DB ends with pin_message_id=None while Discord
+    has a real pinned message, so the next cycle posts a SECOND pinned
+    message. Fix: reconcile_pin's commit happens before reconcile_rename
+    starts its network I/O; only the interaction that actually crashes
+    gets rolled back."""
+
+    def test_pin_write_survives_same_threads_rename_crash(self, db_path, capsys):
+        _bind(db_path, capsys, thread_id="t1", title="Thread one")
+        run_cli(["add-pr", "t1", "1"], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            with conn:
+                conn.execute("UPDATE threads SET desired_name='🟢 t1 new' WHERE thread_id='t1'")
+        finally:
+            conn.close()
+
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+
+        class BoomOnRenameTransport:
+            """Pin creation succeeds; the rename PATCH for the SAME thread
+            raises an unexpected exception — exactly the reviewer's
+            reproduction of R2-1."""
+
+            def __call__(self, method, url, token, payload, timeout):
+                if method == "PATCH" and "/channels/t1" in url and "/messages/" not in url:
+                    raise RuntimeError("simulated unexpected crash mid-rename")
+                if method == "POST":
+                    return tc.DiscordResponse(201, {"id": "555"})
+                return tc.DiscordResponse(200, {"id": "555"})
+
+        conn = tc.connect_db(db_path)
+        try:
+            pins_changed, renames_applied, errors = tc.reconcile_discord(
+                conn, now, {"rename_min_interval_s": 330}, "tok", BoomOnRenameTransport(), dry_run=False
+            )
+            assert errors >= 1
+            assert renames_applied == 0
+            t1 = tc.get_thread(conn, "t1")
+            # The pin write ALREADY succeeded on Discord (POST + PUT both
+            # returned 2xx) before the rename crashed — it must be
+            # committed and visible, not rolled back.
+            assert t1["pin_message_id"] == "555"
+        finally:
+            conn.close()
+
+        # Re-run the cycle's pin step with a transport that would fail the
+        # test if a SECOND pin message gets created — proving the DB
+        # genuinely retained the first pin and won't re-create it.
+        conn = tc.connect_db(db_path)
+        try:
+
+            def forbid_second_create(method, url, token, payload, timeout):
+                if method == "POST":
+                    raise AssertionError("must not create a second pinned message")
+                return tc.DiscordResponse(200, {"id": "555"})
+
+            thread = tc.get_thread(conn, "t1")
+            prs = [tc._pr_to_dict(p) for p in tc.get_prs(conn, "t1")]
+            applied, error = tc.reconcile_pin(conn, thread, prs, "tok", forbid_second_create, dry_run=False)
+            conn.commit()
+            assert error is None
+        finally:
+            conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Discord: token resolution
 # ---------------------------------------------------------------------------
