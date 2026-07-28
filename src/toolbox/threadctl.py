@@ -186,6 +186,137 @@ def _enforce_title(title: str) -> Tuple[str, bool]:
 
 
 # ---------------------------------------------------------------------------
+# icon derivation (worst-wins), staleness, title rendering
+# ---------------------------------------------------------------------------
+
+# Worst-wins priority, most-severe first. Note ✅ ranks BELOW 🟢 — a PR that's
+# approved-and-mergeable is *less* urgent than a thread actively being worked
+# (🟢), since ✅ is waiting on nothing but a merge click. This is intentional,
+# not a bug.
+ICON_PRIORITY = ["❓", "🔴", "❗", "🟡", "🔵", "🟢", "✅", "🟣", "⚪"]
+
+# Icons that mean "waiting on a human", not "waiting on an agent" — these
+# never go stale regardless of last_touch_at age.
+STALE_EXEMPT_ICONS = frozenset({"❓", "🔵", "✅", "❗", "🟣", "⚪"})
+
+STATUS_ICON = {
+    "active": "🟢",
+    "paused": "⚪",
+    "closed": "⚪",
+    "merged": "🟣",
+}
+
+DEFAULT_STALE_AFTER_MIN = 30
+
+
+def worst_icon(icons: List[str]) -> str:
+    """Worst-wins across `icons`, per the fixed priority ladder
+    ❓ > 🔴 > ❗ > 🟡 > 🔵 > 🟢 > ✅ > 🟣 > ⚪."""
+    return min(icons, key=ICON_PRIORITY.index)
+
+
+def pr_icon(pr: Dict[str, Any]) -> str:
+    """Per-PR icon, per the fixed ladder in spec section 5. `pr` is a dict
+    with state/ci/review/mergeable keys. MERGED/CLOSED are checked first
+    since they're terminal; every other branch assumes state == OPEN."""
+    state = pr.get("state")
+    if state == "MERGED":
+        return "🟣"
+    if state == "CLOSED":
+        return "⚪"
+    ci = pr.get("ci")
+    review = pr.get("review")
+    mergeable = pr.get("mergeable")
+    if ci == "FAILURE":
+        return "🔴"
+    if ci == "PENDING":
+        return "🟡"
+    if review == "APPROVED" and mergeable == "CONFLICTING":
+        return "❗"
+    if review == "APPROVED" and mergeable == "MERGEABLE" and ci == "SUCCESS":
+        return "✅"
+    if ci == "SUCCESS" and review != "APPROVED":
+        return "🔵"
+    return "🟢"
+
+
+def effective_thread_icon(thread: Dict[str, Any], prs: List[Dict[str, Any]]) -> str:
+    """Thread icon = worst of {thread-level state, all OPEN PR states}. The
+    question flag contributes ❓, which always wins (it outranks everything
+    in ICON_PRIORITY) — it doesn't need to short-circuit the other icons."""
+    icons = [STATUS_ICON.get(thread.get("status"), "🟢")]
+    if thread.get("question"):
+        icons.append("❓")
+    icons.extend(pr_icon(p) for p in prs if p.get("state") == "OPEN")
+    return worst_icon(icons)
+
+
+def is_stale(
+    icon: str,
+    last_touch_at: str,
+    now: Optional[datetime] = None,
+    stale_after_min: int = DEFAULT_STALE_AFTER_MIN,
+) -> bool:
+    """Stale = now - last_touch_at > stale_after_min, except for icons that
+    are inherently "waiting on a human" (see STALE_EXEMPT_ICONS) — those
+    never go stale no matter how old last_touch_at is."""
+    if icon in STALE_EXEMPT_ICONS:
+        return False
+    now = now or _utcnow()
+    age_seconds = (now - _parse_iso(last_touch_at)).total_seconds()
+    return age_seconds > stale_after_min * 60
+
+
+def _pr_label(pr: Dict[str, Any], thread_repo: Optional[str]) -> str:
+    """`#4615` when the PR's repo matches the thread's bound repo, else
+    `abs#4615` — the repo's short name (no owner, since owner is always
+    shared between a thread and its PRs)."""
+    repo = pr.get("repo") or thread_repo
+    if repo == thread_repo:
+        return f"#{pr['number']}"
+    short = (repo or "").split("/", 1)[-1]
+    return f"{short}#{pr['number']}"
+
+
+def _sorted_open_prs(prs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """OPEN PRs only, primary first then ascending number."""
+    open_prs = [p for p in prs if p.get("state") == "OPEN"]
+    return sorted(open_prs, key=lambda p: (not p.get("primary"), p["number"]))
+
+
+def render_title(thread: Dict[str, Any], prs: List[Dict[str, Any]], stale: bool) -> str:
+    """The full desired Discord thread name:
+    `{threadIcon} {title} · {prIcon}#{num} {prIcon}#{num} …{💤}`
+    Only OPEN PRs appear (merged/closed live on in the pinned message only).
+    Discord's 100-char cap is enforced by truncating the PR list from the
+    right and appending `+N` — the icon and title are never truncated here
+    (title is already capped to 48 chars at write time)."""
+    icon = effective_thread_icon(thread, prs)
+    title = thread.get("title", "")
+    base = f"{icon} {title}"
+    suffix = " 💤" if stale else ""
+
+    open_prs = _sorted_open_prs(prs)
+    if not open_prs:
+        return base + suffix
+
+    parts = [f"{pr_icon(p)}{_pr_label(p, thread.get('repo'))}" for p in open_prs]
+    full = base + " · " + " ".join(parts) + suffix
+    if len(full) <= DISCORD_NAME_MAX:
+        return full
+
+    candidate = base + " · " + f"+{len(parts)}" + suffix
+    for keep in range(len(parts) - 1, -1, -1):
+        dropped = len(parts) - keep
+        shown = " ".join(parts[:keep])
+        tail = f"{shown} +{dropped}" if shown else f"+{dropped}"
+        candidate = base + " · " + tail + suffix
+        if len(candidate) <= DISCORD_NAME_MAX:
+            return candidate
+    return candidate  # pathological: even a bare "+N" barely fits; best effort
+
+
+# ---------------------------------------------------------------------------
 # database: connection, schema, history
 # ---------------------------------------------------------------------------
 

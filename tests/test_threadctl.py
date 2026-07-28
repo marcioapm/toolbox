@@ -469,3 +469,228 @@ class TestShowList:
         assert code == 0
         data = json.loads(out)
         assert {d["threadId"] for d in data} == {"t1", "t2"}
+
+
+# ---------------------------------------------------------------------------
+# per-PR icon derivation
+# ---------------------------------------------------------------------------
+
+def _pr(number=1, repo=None, primary=False, state="OPEN", ci=None, review=None, mergeable=None, draft=False):
+    return {
+        "repo": repo, "number": number, "primary": primary, "state": state,
+        "ci": ci, "review": review, "mergeable": mergeable, "draft": draft,
+    }
+
+
+class TestPrIcon:
+    def test_merged(self):
+        assert tc.pr_icon(_pr(state="MERGED")) == "🟣"
+
+    def test_closed_not_merged(self):
+        assert tc.pr_icon(_pr(state="CLOSED")) == "⚪"
+
+    def test_open_ci_failure(self):
+        assert tc.pr_icon(_pr(ci="FAILURE")) == "🔴"
+
+    def test_open_ci_pending(self):
+        assert tc.pr_icon(_pr(ci="PENDING")) == "🟡"
+
+    def test_approved_but_conflicting(self):
+        assert tc.pr_icon(_pr(ci="SUCCESS", review="APPROVED", mergeable="CONFLICTING")) == "❗"
+
+    def test_approved_and_mergeable_and_green(self):
+        assert tc.pr_icon(_pr(ci="SUCCESS", review="APPROVED", mergeable="MERGEABLE")) == "✅"
+
+    def test_green_ci_not_approved_is_in_review(self):
+        assert tc.pr_icon(_pr(ci="SUCCESS", review=None)) == "🔵"
+
+    def test_green_ci_changes_requested_is_in_review(self):
+        assert tc.pr_icon(_pr(ci="SUCCESS", review="CHANGES_REQUESTED")) == "🔵"
+
+    def test_draft_no_ci_is_active(self):
+        assert tc.pr_icon(_pr(ci=None, review=None, draft=True)) == "🟢"
+
+    def test_ci_failure_beats_approved_mergeable(self):
+        # CI failure is checked before the approved+mergeable branch.
+        assert tc.pr_icon(_pr(ci="FAILURE", review="APPROVED", mergeable="MERGEABLE")) == "🔴"
+
+
+# ---------------------------------------------------------------------------
+# worst-wins thread icon priority
+# ---------------------------------------------------------------------------
+
+class TestWorstIcon:
+    def test_priority_order_matches_spec(self):
+        # ❓ > 🔴 > ❗ > 🟡 > 🔵 > 🟢 > ✅ > 🟣 > ⚪
+        assert tc.ICON_PRIORITY == ["❓", "🔴", "❗", "🟡", "🔵", "🟢", "✅", "🟣", "⚪"]
+
+    @pytest.mark.parametrize("icons,expected", [
+        (["🔴", "🟢"], "🔴"),
+        (["✅", "🟢"], "🟢"),  # 🟢 outranks ✅ -- intentional, not a bug
+        (["⚪", "✅"], "✅"),
+        (["🟣", "⚪"], "🟣"),
+        (["❓", "🔴"], "❓"),
+        (["🟢"], "🟢"),
+    ])
+    def test_worst_of_set(self, icons, expected):
+        assert tc.worst_icon(icons) == expected
+
+    def test_question_flag_always_wins(self):
+        thread = {"status": "active", "question": True}
+        prs = [_pr(state="OPEN", ci="FAILURE")]
+        assert tc.effective_thread_icon(thread, prs) == "❓"
+
+    def test_thread_icon_is_worst_of_status_and_open_prs(self):
+        thread = {"status": "active", "question": False}
+        prs = [
+            _pr(number=1, state="OPEN", ci="SUCCESS", review="APPROVED", mergeable="MERGEABLE"),
+            _pr(number=2, state="OPEN", ci="FAILURE"),
+        ]
+        assert tc.effective_thread_icon(thread, prs) == "🔴"
+
+    def test_closed_prs_excluded_from_worst_wins(self):
+        thread = {"status": "active", "question": False}
+        prs = [_pr(number=1, state="CLOSED"), _pr(number=2, state="MERGED")]
+        # Only thread status (active -> 🟢) counts; closed/merged PRs are not OPEN.
+        assert tc.effective_thread_icon(thread, prs) == "🟢"
+
+    def test_no_prs_uses_status_icon(self):
+        assert tc.effective_thread_icon({"status": "paused", "question": False}, []) == "⚪"
+
+    def test_merged_status_icon(self):
+        assert tc.effective_thread_icon({"status": "merged", "question": False}, []) == "🟣"
+
+
+# ---------------------------------------------------------------------------
+# staleness + exemptions
+# ---------------------------------------------------------------------------
+
+class TestStaleness:
+    def test_old_touch_is_stale_for_non_exempt_icon(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+        old = (now - timedelta(minutes=31)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert tc.is_stale("🟢", old, now=now) is True
+
+    def test_recent_touch_not_stale(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+        recent = (now - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert tc.is_stale("🟢", recent, now=now) is False
+
+    def test_exactly_at_threshold_not_stale(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+        edge = (now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert tc.is_stale("🟢", edge, now=now) is False
+
+    @pytest.mark.parametrize("icon", sorted(tc.STALE_EXEMPT_ICONS))
+    def test_exempt_icons_never_stale(self, icon):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+        ancient = (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert tc.is_stale(icon, ancient, now=now) is False
+
+    @pytest.mark.parametrize("icon", ["🟢", "🔴", "🟡"])
+    def test_non_exempt_icons_can_go_stale(self, icon):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+        ancient = (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert tc.is_stale(icon, ancient, now=now) is True
+
+    def test_custom_stale_after_min(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+        old = (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert tc.is_stale("🟢", old, now=now, stale_after_min=5) is True
+        assert tc.is_stale("🟢", old, now=now, stale_after_min=15) is False
+
+
+# ---------------------------------------------------------------------------
+# title rendering
+# ---------------------------------------------------------------------------
+
+class TestRenderTitle:
+    def test_example_from_spec(self):
+        thread = {"title": "Experiment recompute", "status": "active", "question": False, "repo": "absmartly/abs"}
+        prs = [
+            _pr(number=4615, repo="absmartly/abs", primary=True, ci="FAILURE"),
+            _pr(number=4620, repo="absmartly/abs", ci="PENDING"),
+            _pr(number=4631, repo="absmartly/abs", ci="SUCCESS", review="APPROVED", mergeable="MERGEABLE"),
+        ]
+        title = tc.render_title(thread, prs, stale=False)
+        assert title == "🔴 Experiment recompute · 🔴#4615 🟡#4620 ✅#4631"
+
+    def test_no_open_prs_omits_pr_segment(self):
+        thread = {"title": "mSPRT", "status": "active", "question": False, "repo": "absmartly/abs"}
+        assert tc.render_title(thread, [], stale=False) == "🟢 mSPRT"
+
+    def test_stale_suffix_appended_last(self):
+        thread = {"title": "mSPRT", "status": "active", "question": False, "repo": "absmartly/abs"}
+        prs = [_pr(number=1, repo="absmartly/abs", ci="SUCCESS")]
+        title = tc.render_title(thread, prs, stale=True)
+        assert title.endswith("💤")
+        # 🔵 (in-review PR) worst-wins over 🟢 (active thread status)
+        assert title == "🔵 mSPRT · 🔵#1 💤"
+
+    def test_bare_pr_number_when_repo_matches_thread(self):
+        thread = {"title": "x", "status": "active", "question": False, "repo": "absmartly/abs"}
+        prs = [_pr(number=5, repo="absmartly/abs", ci="SUCCESS")]
+        title = tc.render_title(thread, prs, stale=False)
+        assert "#5" in title
+        assert "abs#5" not in title
+
+    def test_repo_qualified_pr_number_when_different_repo(self):
+        thread = {"title": "x", "status": "active", "question": False, "repo": "absmartly/abs"}
+        prs = [_pr(number=5, repo="absmartly/other", ci="SUCCESS")]
+        title = tc.render_title(thread, prs, stale=False)
+        assert "other#5" in title
+
+    def test_primary_pr_first_then_ascending(self):
+        thread = {"title": "x", "status": "active", "question": False, "repo": "absmartly/abs"}
+        prs = [
+            _pr(number=10, repo="absmartly/abs", ci="SUCCESS"),
+            _pr(number=3, repo="absmartly/abs", primary=True, ci="SUCCESS"),
+            _pr(number=7, repo="absmartly/abs", ci="SUCCESS"),
+        ]
+        title = tc.render_title(thread, prs, stale=False)
+        # primary (#3) first, then ascending: #7, #10
+        pr_part = title.split(" · ", 1)[1]
+        assert pr_part.index("#3") < pr_part.index("#7") < pr_part.index("#10")
+
+    def test_only_open_prs_shown(self):
+        thread = {"title": "x", "status": "active", "question": False, "repo": "absmartly/abs"}
+        prs = [
+            _pr(number=1, repo="absmartly/abs", state="MERGED"),
+            _pr(number=2, repo="absmartly/abs", state="OPEN", ci="SUCCESS"),
+        ]
+        title = tc.render_title(thread, prs, stale=False)
+        assert "#1" not in title
+        assert "#2" in title
+
+    def test_title_never_exceeds_100_chars_with_many_prs(self):
+        thread = {"title": "x" * 48, "status": "active", "question": False, "repo": "absmartly/abs"}
+        prs = [_pr(number=1000 + i, repo="absmartly/abs", ci="SUCCESS") for i in range(20)]
+        title = tc.render_title(thread, prs, stale=False)
+        assert len(title) <= 100
+
+    def test_overflow_truncates_from_right_and_appends_plus_n(self):
+        thread = {"title": "Experiment recompute pipeline", "status": "active", "question": False, "repo": "absmartly/abs"}
+        prs = [_pr(number=4000 + i, repo="absmartly/abs", ci="SUCCESS") for i in range(20)]
+        title = tc.render_title(thread, prs, stale=False)
+        assert len(title) <= 100
+        assert "+" in title
+
+    def test_icon_and_title_never_truncated_only_pr_list(self):
+        thread = {"title": "y" * 48, "status": "active", "question": False, "repo": "absmartly/abs"}
+        prs = [_pr(number=5000 + i, repo="absmartly/abs", ci="SUCCESS") for i in range(30)]
+        title = tc.render_title(thread, prs, stale=False)
+        assert title.startswith("🔵 " + "y" * 48)
+        assert len(title) <= 100
+
+    def test_stale_suffix_survives_overflow_truncation(self):
+        thread = {"title": "Experiment recompute pipeline", "status": "active", "question": False, "repo": "absmartly/abs"}
+        prs = [_pr(number=4000 + i, repo="absmartly/abs", ci="SUCCESS") for i in range(20)]
+        title = tc.render_title(thread, prs, stale=True)
+        assert title.endswith("💤")
+        assert len(title) <= 100
