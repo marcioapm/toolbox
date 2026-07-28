@@ -1030,7 +1030,21 @@ def reconcile_rename(
     `desired_name`. Never burns a rename slot on a no-op (desired ==
     applied — critical, see module docstring), honours the
     rename_min_interval_s coalescing window, and backs off on 429 using the
-    server-provided retry_after (spec section 8)."""
+    server-provided retry_after (spec section 8).
+
+    R2-2 (critical, ROUND2-FINDINGS.md): coalescing must be attempt-based,
+    not success-based. `last_rename_at` used to be written ONLY on the
+    success path (status 200); a 400/403/404/500 response — or `status=0`
+    from a network blip that hit AFTER Discord had already applied the
+    rename (see `_discord_transport`) — left `last_rename_at` untouched,
+    so the very next cycle (60s later) re-issued the identical PATCH
+    instead of waiting out the full 330s window. Discord counts 4xx
+    responses against the same rate-limit bucket as successful renames, so
+    a couple of those in a row burns the whole budget and locks the
+    thread out of renames entirely — precisely the failure this 330s
+    design exists to prevent. Every attempt that actually reaches the
+    network (i.e. every branch below, from the transport call onward) now
+    stamps `last_rename_at`, regardless of outcome."""
     thread_id = thread["thread_id"]
     desired = thread["desired_name"]
     if desired is None or desired == thread["applied_name"]:
@@ -1050,20 +1064,29 @@ def reconcile_rename(
         return False, None
 
     resp = transport("PATCH", f"{DISCORD_API}/channels/{thread_id}", token, {"name": desired}, DISCORD_TIMEOUT_S)
+    # Attempt-based coalescing (R2-2): stamp the attempt time once, then
+    # every branch below persists it alongside whatever else it needs to
+    # write, so no outcome — success, 429, 4xx/5xx, or a synthetic
+    # status=0 network blip — can leave last_rename_at untouched.
+    attempt_at = _now_iso()
     if resp.status == 429:
         retry_after = (resp.data or {}).get("retry_after")
         retry_after = float(retry_after) if retry_after is not None else 60.0
         backoff_at = (now + timedelta(seconds=retry_after)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        conn.execute("UPDATE threads SET rename_backoff_until=? WHERE thread_id=?", (backoff_at, thread_id))
+        conn.execute(
+            "UPDATE threads SET last_rename_at=?, rename_backoff_until=? WHERE thread_id=?",
+            (attempt_at, backoff_at, thread_id),
+        )
         _record_history(conn, thread_id, "rename", f"rate-limited, backing off {retry_after}s")
         return False, None
     if resp.status != 200:
+        conn.execute("UPDATE threads SET last_rename_at=? WHERE thread_id=?", (attempt_at, thread_id))
         _record_history(conn, thread_id, "error", f"rename failed: HTTP {resp.status}")
         return False, f"rename failed: HTTP {resp.status}"
 
     conn.execute(
         "UPDATE threads SET applied_name=?, last_rename_at=? WHERE thread_id=?",
-        (desired, _now_iso(), thread_id),
+        (desired, attempt_at, thread_id),
     )
     _record_history(conn, thread_id, "rename", f"renamed to '{desired}'")
     return True, None

@@ -1716,6 +1716,97 @@ class TestReconcileRename:
         assert applied is False
         assert transport.calls == []
 
+    def test_http_400_sets_last_rename_at(self, db_path, capsys):
+        """R2-2 (critical): a 400 (or any non-429, non-200) response must
+        still stamp last_rename_at so the coalescing window applies to the
+        NEXT attempt. Before the fix, only the success path wrote
+        last_rename_at, so a 400 left it NULL and the identical PATCH
+        re-fired 60s later instead of waiting the full 330s."""
+        thread = self._thread_row(db_path, capsys, desired_name="🟢 new", applied_name="🟢 old")
+        conn = tc.connect_db(db_path)
+        try:
+            transport = FakeTransport({
+                ("PATCH", f"{tc.DISCORD_API}/channels/t1"): tc.DiscordResponse(400, {"message": "bad request"}),
+            })
+            now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+            applied, error = tc.reconcile_rename(conn, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=False)
+            conn.commit()
+            assert applied is False
+            assert error is not None
+            updated = tc.get_thread(conn, "t1")
+            assert updated["last_rename_at"] is not None
+            assert updated["applied_name"] == "🟢 old"  # not confirmed, must not change
+        finally:
+            conn.close()
+
+    def test_status_zero_network_blip_sets_last_rename_at(self, db_path, capsys):
+        """R2-2: a synthetic status=0 response (a network blip that may
+        have hit AFTER Discord already applied the rename — see
+        `_discord_transport`) must also stamp last_rename_at. Otherwise a
+        read timeout right after a real rename triggers a second PATCH at
+        60s instead of waiting the full 330s — guaranteeing two renames
+        inside the rate-limit window."""
+        thread = self._thread_row(db_path, capsys, desired_name="🟢 new", applied_name="🟢 old")
+        conn = tc.connect_db(db_path)
+        try:
+            transport = FakeTransport({
+                ("PATCH", f"{tc.DISCORD_API}/channels/t1"): tc.DiscordResponse(0, {"error": "timed out"}),
+            })
+            now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+            applied, error = tc.reconcile_rename(conn, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=False)
+            conn.commit()
+            assert applied is False
+            assert error is not None
+            updated = tc.get_thread(conn, "t1")
+            assert updated["last_rename_at"] is not None
+        finally:
+            conn.close()
+
+    def test_500_response_sets_last_rename_at(self, db_path, capsys):
+        thread = self._thread_row(db_path, capsys, desired_name="🟢 new", applied_name="🟢 old")
+        conn = tc.connect_db(db_path)
+        try:
+            transport = FakeTransport({
+                ("PATCH", f"{tc.DISCORD_API}/channels/t1"): tc.DiscordResponse(500, None),
+            })
+            now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+            applied, error = tc.reconcile_rename(conn, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=False)
+            conn.commit()
+            updated = tc.get_thread(conn, "t1")
+            assert updated["last_rename_at"] is not None
+        finally:
+            conn.close()
+
+    def test_400_then_five_more_cycles_issues_only_one_patch_call(self, db_path, capsys):
+        """The regression that matters most (ROUND2-TASK.md testing bar):
+        after an HTTP 400, simulate N=5 more cycle passes at 60s
+        intervals (the old broken re-fire cadence) and assert the PATCH
+        call count. Before the fix this issued 6 PATCHes total (one per
+        cycle, every cycle, forever, because last_rename_at never got
+        set); after the fix, only the FIRST attempt reaches the network —
+        every subsequent cycle within the 330s coalescing window is
+        skipped because last_rename_at is now populated."""
+        thread = self._thread_row(db_path, capsys, desired_name="🟢 new", applied_name="🟢 old")
+        conn = tc.connect_db(db_path)
+        try:
+            transport = FakeTransport({
+                ("PATCH", f"{tc.DISCORD_API}/channels/t1"): tc.DiscordResponse(400, {"message": "bad request"}),
+            })
+            base = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+            # Cycle 0 (the initial failing attempt) plus 5 more cycles,
+            # each 60s apart — matching the old broken re-fire cadence
+            # described in ROUND2-FINDINGS.md ("5 cycles issued 6
+            # PATCHes").
+            for i in range(6):
+                now = base + timedelta(seconds=60 * i)
+                thread = tc.get_thread(conn, "t1")
+                tc.reconcile_rename(conn, thread, now, {"rename_min_interval_s": 330}, "tok", transport, dry_run=False)
+                conn.commit()
+            patch_calls = [c for c in transport.calls if c[0] == "PATCH" and c[1] == f"{tc.DISCORD_API}/channels/t1"]
+            assert len(patch_calls) == 1
+        finally:
+            conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Discord: full cycle wiring (reconcile_discord + run_cycle)
