@@ -1275,3 +1275,191 @@ class TestCycleDiscordWiring:
         rename_calls = [c for c in transport.calls if c[0] == "PATCH" and c[1] == f"{tc.DISCORD_API}/channels/t1"]
         assert rename_calls == []
         assert result["renames_applied"] == 0
+
+
+# ---------------------------------------------------------------------------
+# migrate: import from the old thread-state registry.json
+# ---------------------------------------------------------------------------
+
+def _registry(**threads):
+    return {"schemaVersion": 5, "accounts": {}, "threads": threads}
+
+
+def _old_thread(
+    thread_id="t1", title="Experiment recompute", repo="absmartly/abs", status="active",
+    prs=None, created_at="2026-07-01T00:00:00Z", updated_at="2026-07-27T09:00:00Z",
+    card_message_id=None, discord_name=None,
+):
+    return {
+        "threadId": thread_id,
+        "title": title,
+        "description": "",
+        "repo": repo,
+        "status": status,
+        "tags": [],
+        "links": [],
+        "notes": "",
+        "prs": prs or [],
+        "branches": [],
+        "runs": [],
+        "lastActivityAt": None,
+        "lastActivitySource": None,
+        "updates": [],
+        "cardMessageId": card_message_id,
+        "parentChannelId": None,
+        "discordName": discord_name,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    }
+
+
+def _old_pr(number=1, repo="absmartly/abs", primary=True, state="OPEN", ci="SUCCESS", title="Fix thing", url="https://github.com/absmartly/abs/pull/1"):
+    return {
+        "repo": repo,
+        "number": number,
+        "primary": primary,
+        "prState": {
+            "state": state, "ci": ci, "title": title, "url": url,
+            "mergedAt": None, "checkedAt": "2026-07-27T08:00:00Z", "stale": False, "error": None,
+        },
+    }
+
+
+class TestMigrate:
+    def test_imports_thread_with_pr_and_discord_identity(self, db_path, tmp_path, capsys):
+        registry = _registry(t1=_old_thread(
+            prs=[_old_pr()], card_message_id="555", discord_name="🟢 Experiment recompute · 🔵#1",
+        ))
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+
+        code, out, err = run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        assert code == 0
+        assert "migrated 1 thread" in out
+
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            assert thread["title"] == "Experiment recompute"
+            assert thread["owner"] == "absmartly"
+            assert thread["repo"] == "absmartly/abs"
+            assert thread["status"] == "active"
+            assert thread["last_touch_at"] == "2026-07-27T09:00:00Z"
+            assert thread["pin_message_id"] == "555"
+            assert thread["applied_name"] == "🟢 Experiment recompute · 🔵#1"
+
+            prs = tc.get_prs(conn, "t1")
+            assert len(prs) == 1
+            assert prs[0]["number"] == 1
+            assert prs[0]["is_primary"] == 1
+            assert prs[0]["state"] == "OPEN"
+            assert prs[0]["ci"] == "SUCCESS"
+        finally:
+            conn.close()
+
+    def test_title_over_48_chars_is_truncated(self, db_path, tmp_path, capsys):
+        long_title = "x" * 60
+        registry = _registry(t1=_old_thread(title=long_title))
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            assert len(tc.get_thread(conn, "t1")["title"]) <= tc.THREAD_TITLE_MAX
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize("old_status,new_status", [
+        ("active", "active"), ("blocked", "active"), ("review", "active"),
+        ("merged", "merged"), ("closed", "closed"), ("done", "closed"), ("paused", "paused"),
+    ])
+    def test_status_mapping(self, db_path, tmp_path, capsys, old_status, new_status):
+        registry = _registry(t1=_old_thread(status=old_status))
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        conn = tc.connect_db(db_path)
+        try:
+            assert tc.get_thread(conn, "t1")["status"] == new_status
+        finally:
+            conn.close()
+
+    def test_last_touch_at_comes_from_updated_at_so_idle_threads_show_stale(self, db_path, tmp_path, capsys, monkeypatch):
+        registry = _registry(t1=_old_thread(updated_at="2026-01-01T00:00:00Z"))
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        run_cli(["migrate", "--from", str(src)], db_path, capsys)
+
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(tc, "_utcnow", lambda: now)
+        conn = tc.connect_db(db_path)
+        try:
+            thread = dict(tc.get_thread(conn, "t1"))
+            icon = tc.effective_thread_icon(thread, [])
+            assert tc.is_stale(icon, thread["last_touch_at"], now, 30) is True
+        finally:
+            conn.close()
+
+    def test_registry_file_untouched_after_migration(self, db_path, tmp_path, capsys):
+        registry = _registry(t1=_old_thread())
+        src = tmp_path / "registry.json"
+        original = json.dumps(registry)
+        src.write_text(original)
+        run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        assert src.read_text() == original
+
+    def test_importing_all_25_threads_from_a_realistic_registry(self, db_path, tmp_path, capsys):
+        threads = {f"t{i}": _old_thread(thread_id=f"t{i}", title=f"Thread {i}") for i in range(25)}
+        registry = _registry(**threads)
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        code, out, err = run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        assert code == 0
+        assert "migrated 25 thread" in out
+        conn = tc.connect_db(db_path)
+        try:
+            assert len(tc.get_all_threads(conn)) == 25
+        finally:
+            conn.close()
+
+    def test_already_bound_thread_is_skipped_not_clobbered(self, db_path, tmp_path, capsys):
+        _bind(db_path, capsys, thread_id="t1", title="Existing live thread")
+        registry = _registry(t1=_old_thread(title="Old registry title"))
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        code, out, err = run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        assert code == 0
+        assert "migrated 0 thread" in out
+        assert "skipped 1" in err
+        conn = tc.connect_db(db_path)
+        try:
+            assert tc.get_thread(conn, "t1")["title"] == "Existing live thread"
+        finally:
+            conn.close()
+
+    def test_missing_registry_file_reports_error(self, db_path, tmp_path, capsys):
+        code, out, err = run_cli(["migrate", "--from", str(tmp_path / "nope.json")], db_path, capsys)
+        assert code != 0
+        assert "nope.json" in err
+
+    def test_invalid_json_reports_error(self, db_path, tmp_path, capsys):
+        src = tmp_path / "registry.json"
+        src.write_text("not json")
+        code, out, err = run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        assert code != 0
+        assert "not valid JSON" in err
+
+    def test_thread_with_no_prs_and_no_discord_identity_migrates_cleanly(self, db_path, tmp_path, capsys):
+        registry = _registry(t1=_old_thread(card_message_id=None, discord_name=None))
+        src = tmp_path / "registry.json"
+        src.write_text(json.dumps(registry))
+        code, out, err = run_cli(["migrate", "--from", str(src)], db_path, capsys)
+        assert code == 0
+        conn = tc.connect_db(db_path)
+        try:
+            thread = tc.get_thread(conn, "t1")
+            assert thread["pin_message_id"] is None
+            assert thread["applied_name"] is None
+            assert tc.get_prs(conn, "t1") == []
+        finally:
+            conn.close()

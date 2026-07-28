@@ -1285,6 +1285,110 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# migrate: one-shot import from the old thread-state registry.json
+# ---------------------------------------------------------------------------
+
+# Old thread-state statuses -> new threadctl statuses (spec section 11).
+# blocked/review were auto-derived from PR state in the old tool; the new
+# cycle re-derives the equivalent icon from PR state itself, so both simply
+# become "active" here.
+MIGRATE_STATUS_MAP = {
+    "active": "active",
+    "blocked": "active",
+    "review": "active",
+    "merged": "merged",
+    "closed": "closed",
+    "done": "closed",
+    "paused": "paused",
+}
+
+
+def _migrate_thread(conn: sqlite3.Connection, thread_id: str, entry: Dict[str, Any]) -> None:
+    repo = entry.get("repo") or ""
+    owner = repo.split("/", 1)[0] if repo else ""
+    title, _truncated = _enforce_title(entry.get("title") or thread_id)
+    old_status = entry.get("status") or "active"
+    status = MIGRATE_STATUS_MAP.get(old_status, "active")
+    now = _now_iso()
+    last_touch_at = entry.get("updatedAt") or now
+    created_at = entry.get("createdAt") or now
+
+    conn.execute(
+        "INSERT INTO threads (thread_id, title, owner, repo, status, question, bound_at, "
+        "last_touch_at, applied_name, pin_message_id, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+        (
+            thread_id, title, owner, repo, status,
+            created_at, last_touch_at, entry.get("discordName"), entry.get("cardMessageId"),
+            created_at, now,
+        ),
+    )
+    for pr in entry.get("prs") or []:
+        pr_repo = pr.get("repo") or repo
+        number = pr.get("number")
+        if number is None:
+            continue
+        pr_state = pr.get("prState") or {}
+        conn.execute(
+            "INSERT OR IGNORE INTO prs (thread_id, repo, number, is_primary, state, ci, "
+            "pr_title, url, checked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                thread_id, pr_repo, number, int(bool(pr.get("primary"))),
+                pr_state.get("state"), pr_state.get("ci"),
+                pr_state.get("title"), pr_state.get("url"), pr_state.get("checkedAt"),
+                now,
+            ),
+        )
+    _record_history(conn, thread_id, "bind", f"migrated from thread-state registry.json (status={old_status})")
+
+
+def migrate_registry(conn: sqlite3.Connection, registry: Dict[str, Any]) -> Tuple[int, List[str]]:
+    """Import every thread from an old thread-state registry dict. Returns
+    (imported_count, skipped_thread_ids) — a thread already present in the
+    DB is left untouched and reported as skipped, so migrate is safe to
+    re-run without clobbering live state."""
+    imported = 0
+    skipped = []
+    threads = registry.get("threads") or {}
+    for thread_id, entry in threads.items():
+        if get_thread(conn, thread_id) is not None:
+            skipped.append(thread_id)
+            continue
+        _migrate_thread(conn, thread_id, entry)
+        imported += 1
+    return imported, skipped
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    src = Path(args.from_path).expanduser()
+    try:
+        data = json.loads(src.read_text())
+    except OSError as exc:
+        _err(f"threadctl: could not read '{src}': {exc}")
+        return 1
+    except json.JSONDecodeError as exc:
+        _err(f"threadctl: '{src}' is not valid JSON: {exc}")
+        return 1
+
+    path = _resolve_db_path(args)
+    conn = connect_db(path)
+    try:
+        with conn:
+            imported, skipped = migrate_registry(conn, data)
+    except sqlite3.Error as exc:
+        _err(f"threadctl: migration failed: {exc}")
+        return 1
+    finally:
+        conn.close()
+
+    print(f"threadctl: migrated {imported} thread(s) from '{src}'")
+    if skipped:
+        _err(f"threadctl: skipped {len(skipped)} already-bound thread(s): {', '.join(sorted(skipped))}")
+    print(f"threadctl: '{src}' left untouched as a backup")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI dispatch
 # ---------------------------------------------------------------------------
 
@@ -1349,6 +1453,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_list = sub.add_parser("list", parents=[parent], help="list all threads")
     sp_list.add_argument("--json", action="store_true")
     sp_list.set_defaults(func=cmd_list)
+
+    sp_migrate = sub.add_parser("migrate", parents=[parent], help="one-shot import from the old thread-state registry.json")
+    sp_migrate.add_argument("--from", dest="from_path", required=True, metavar="PATH")
+    sp_migrate.set_defaults(func=cmd_migrate)
 
     return p
 
