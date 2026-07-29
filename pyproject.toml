@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "CLI toolkit: Gemini AI tools (image, TTS, video), Slack client, and more"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "Márcio Martins", email = "marcioapm@gmail.com" }
 ]
@@ -38,7 +38,7 @@ gemini-vision = "toolbox.gemini_vision:main"
 slackcli = "toolbox.slackcli:main"
 llm-usage = "toolbox.llm_usage:main"
 agent-run = "toolbox.agent_run:main"
-thread-state = "toolbox.thread_state:main"
+threadctl = "toolbox.threadctl:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
