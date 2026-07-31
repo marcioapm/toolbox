@@ -523,7 +523,12 @@ def _feed_pyte(stream, raw: bytes) -> None:
     def _worker() -> None:
         try:
             stream.feed(raw)
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+        except Exception as exc:
+            error.append(exc)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            # Cross the worker-thread boundary so process-control exceptions
+            # propagate on the caller's thread rather than being swallowed or
+            # merely reported as an unhandled thread exception.
             error.append(exc)
 
     old_limit = sys.getrecursionlimit()
@@ -574,7 +579,7 @@ def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 1
     stream = pyte.ByteStream(screen)
     try:
         _feed_pyte(stream, raw)
-    except BaseException:  # noqa: BLE001 - RecursionError/BaseException included; never let clean/--echo crash the run
+    except Exception:
         return _strip_ansi_fallback(raw)
 
     rows: List[str] = []

@@ -200,6 +200,18 @@ class TestEchoLoop:
 
 
 class TestRenderLogRecursionHardening:
+    @pytest.mark.parametrize("exception", [KeyboardInterrupt(), SystemExit(7)])
+    def test_process_control_exceptions_propagate(self, monkeypatch, exception):
+        import pyte
+
+        def _boom(self, data):
+            raise exception
+
+        monkeypatch.setattr(pyte.ByteStream, "feed", _boom)
+
+        with pytest.raises(type(exception)):
+            _render_log(b"control exception\r\n")
+
     def test_recursion_error_falls_back_to_plain_text(self, monkeypatch):
         import pyte
 
