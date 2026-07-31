@@ -434,6 +434,13 @@ def _require_positive_state_int(state_dir: Path, field: str, name: str) -> int:
 
 def _process_identity(pid: int) -> Optional[str]:
     """Return a stable platform-specific birth token for ``pid``, if readable."""
+    if os.environ.get("AGENT_RUN_TEST_SLOW_IDENTITY"):
+        # Test-only hook, inert unless this env var is explicitly set: widens
+        # the real window between a runner's fork and its state publication
+        # so tests exercising R3 (launcher-death-before-publication) can
+        # deterministically hit that race instead of relying on scheduling
+        # luck. Never set in normal operation.
+        time.sleep(1.5)
     system = platform.system()
     if system == "Linux":
         try:
