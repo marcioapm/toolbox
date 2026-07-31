@@ -121,6 +121,36 @@ def test_steer_raw_is_verbatim_even_for_opencode_and_esc(isolated_runs_root, mon
         os.close(reader)
 
 
+def test_launch_fails_when_runner_setup_cannot_open_log(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    log_path = isolated_log_root / "setup-failure" / "log"
+    real_open = agent_run.os.open
+
+    def fail_log_open(path, flags, mode=0o777):
+        if Path(path) == log_path and flags & os.O_TRUNC:
+            raise PermissionError("forced unwritable log")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(agent_run.os, "open", fail_log_open)
+    args = argparse.Namespace(
+        name="setup-failure",
+        command=[sys.executable, "-c", "pass"],
+        interactive=False,
+        prompt_file=None,
+        echo=False,
+        echo_interval=2.0,
+    )
+
+    with pytest.raises(SystemExit, match="forced unwritable log"):
+        agent_run.cmd_launch(args)
+
+    state = isolated_runs_root / "setup-failure"
+    assert (state / "status").read_text().strip() == "failed"
+    assert (state / "exit_code").read_text().strip() == "1"
+    assert (state / "ended_at").is_file()
+
+
 def _wait_until(predicate, timeout=5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

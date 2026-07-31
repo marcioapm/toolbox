@@ -833,12 +833,24 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         # Parent: wait for the grandchild to publish its pid, then return.
         os.close(w_ack)
         os.waitpid(child_pid, 0)  # reap the intermediate forker
-        # Read a single byte as the "child is ready" signal.
+        # Read the structured readiness result. EOF, malformed data, and an
+        # explicit setup error all mean launch failed.
         try:
-            os.read(r_ack, 1)
+            ack_raw = os.read(r_ack, 65536)
         except OSError:
-            pass
+            ack_raw = b""
         os.close(r_ack)
+        try:
+            ack = json.loads(ack_raw.decode()) if ack_raw else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            ack = {}
+        if ack.get("status") != "ok":
+            error = str(ack.get("error") or "runner exited before readiness")
+            if not (d / "exit_code").exists():
+                _write(d / "exit_code", "1\n")
+                _write(d / "ended_at", _now_iso() + "\n")
+                _write(d / "status", "failed\n")
+            sys.exit(f"agent-run: failed to start agent: {error}")
         bg_pid_raw = _read(d / "pid")
         if not bg_pid_raw:
             sys.exit("agent-run: failed to start agent (no pid recorded)")
@@ -973,26 +985,7 @@ def _runner(
     or forks a PTY child and shuttles FIFO <-> PTY master <-> log (interactive).
     """
     my_pid = os.getpid()
-    _write(state_dir / "pid", f"{my_pid}\n")
-    # After setsid(), pid == pgid (we're the session & group leader).
-    _write(state_dir / "pgid", f"{os.getpgid(my_pid)}\n")
-
-    # Signal parent we're ready so it can print the launch banner.
-    try:
-        os.write(ready_fd, b".")
-        os.close(ready_fd)
-    except OSError:
-        pass
-
-    # Redirect stdio to /dev/null to fully detach (we write the log ourselves).
-    devnull = os.open(os.devnull, os.O_RDWR)
-    os.dup2(devnull, 0)
-    os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
-    if devnull > 2:
-        os.close(devnull)
-
-    log_fd = os.open(str(log_dir / "log"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    log_fd = -1
 
     def _finalize(code: int) -> None:
         if not (state_dir / "exit_code").exists():
@@ -1015,22 +1008,70 @@ def _runner(
         _finalize(128 + signum)
         os._exit(128 + signum)
 
-    signal.signal(signal.SIGTERM, _on_signal)
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGHUP, _on_signal)
+    try:
+        _write(state_dir / "pid", f"{my_pid}\n")
+        # After setsid(), pid == pgid (we're the session & group leader).
+        _write(state_dir / "pgid", f"{os.getpgid(my_pid)}\n")
 
-    # If --echo was requested, fork a background renderer that periodically
-    # writes a cleaned transcript next to the raw log. Stays alive for the
-    # whole run; the signal handler tears it down on shutdown.
-    if echo:
-        echo_pid = os.fork()
-        if echo_pid == 0:
-            _reset_runner_signal_handlers()
+        # Redirect stdio to /dev/null to fully detach (we write the log ourselves).
+        devnull = os.open(os.devnull, os.O_RDWR)
+        try:
+            os.dup2(devnull, 0)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+        finally:
+            if devnull > 2:
+                os.close(devnull)
+
+        log_fd = os.open(
+            str(log_dir / "log"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644
+        )
+
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
+        signal.signal(signal.SIGHUP, _on_signal)
+
+        # If --echo was requested, fork a background renderer that periodically
+        # writes a cleaned transcript next to the raw log. Stays alive for the
+        # whole run; the signal handler tears it down on shutdown.
+        if echo:
+            echo_pid = os.fork()
+            if echo_pid == 0:
+                _reset_runner_signal_handlers()
+                try:
+                    _echo_loop(log_dir, echo_interval)
+                finally:
+                    os._exit(0)
+            _write(state_dir / "echo_pid", f"{echo_pid}\n")
+    except Exception as exc:  # setup failed before readiness
+        try:
+            payload = json.dumps({"status": "error", "error": str(exc)}).encode()
+            os.write(ready_fd, payload)
+        except OSError:
+            pass
+        finally:
             try:
-                _echo_loop(log_dir, echo_interval)
-            finally:
-                os._exit(0)
-        _write(state_dir / "echo_pid", f"{echo_pid}\n")
+                os.close(ready_fd)
+            except OSError:
+                pass
+        _teardown_children(state_dir)
+        try:
+            _finalize(1)
+        except OSError:
+            pass
+        os._exit(1)
+
+    # Acknowledge only after all required resources, handlers, and helpers are
+    # ready. The parent treats EOF or an error payload as launch failure.
+    try:
+        os.write(ready_fd, b'{"status":"ok"}')
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(ready_fd)
+        except OSError:
+            pass
 
     try:
         if interactive:
