@@ -63,6 +63,10 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     keeper_pid   FIFO-keeper pid (interactive only)
     prompt_pid   initial-prompt helper pid (when -f and interactive)
     echo_pid     transcript renderer pid (when --echo)
+    render_pid   final-transcript-render child pid (when --echo; present only
+                 while the bounded final render is in flight, so
+                 ``_force_kill`` can discover and reap it if the runner
+                 itself is wedged)
     command      pretty-printed launch command
     argv         JSON-encoded argv (authoritative form for replay)
     submit_mode  cr | crlf (selected from argv for interactive submission)
@@ -907,9 +911,11 @@ def _bounded_final_render(
 
     ``register(pid)`` is invoked with the child's pid right after fork (and
     with ``None`` once it no longer needs tracking) so a caller can fold this
-    untracked-by-state-files helper into its own signal-handler teardown —
-    without it, a signal delivered while rendering would find no pid file for
-    this child and leave it orphaned.
+    child into its own signal-handler teardown *and* publish it to a state
+    file (the ``_runner`` caller does both, via ``render_pid``) — without
+    that, a signal delivered while rendering would find no pid file for this
+    child and leave it orphaned, and a wedged runner's own SIGTERM handler
+    would never even get to run to find it via ``extra_pids``.
     """
     try:
         size = (log_dir / "log").stat().st_size
@@ -1561,7 +1567,7 @@ def _block_handled_runner_signals():
         pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
-_AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid")
+_AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid", "render_pid")
 
 
 def _publish_or_reap_child(state_dir: Path, field: str, pid: int) -> None:
@@ -1588,8 +1594,8 @@ def _teardown_children(
     state_dir: Path, grace: float = 2.0, extra_pids: Optional[Iterable[int]] = None
 ) -> None:
     """SIGTERM (then SIGKILL after `grace` seconds) every child pid this
-    runner recorded (agent_pid / pty_pid / keeper_pid / prompt_pid / echo_pid), reaping
-    each one.
+    runner recorded (agent_pid / pty_pid / keeper_pid / prompt_pid / echo_pid /
+    render_pid), reaping each one.
 
     ``extra_pids`` covers children forked but not yet (or never) published to
     a state file — e.g. the state-file write itself failed. Publication is
@@ -1841,7 +1847,22 @@ def _runner(
         # after stopping it.  The status is already terminal if this times out.
         def _track_render_pid(pid: Optional[int]) -> None:
             nonlocal render_pid
+            if pid is None:
+                render_pid = None
+                try:
+                    (state_dir / "render_pid").unlink()
+                except FileNotFoundError:
+                    pass
+                return
             render_pid = pid
+            try:
+                # Same publish-or-reap path used at every other fork site, so
+                # a state-file write failure for render_pid cannot orphan the
+                # render child either -- _publish_or_reap_child kills and
+                # reaps it itself before raising.
+                _publish_or_reap_child(state_dir, "render_pid", pid)
+            except OSError:
+                render_pid = None
 
         render_error = _bounded_final_render(log_dir, register=_track_render_pid)
         if render_error:
