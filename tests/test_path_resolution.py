@@ -80,6 +80,33 @@ class TestRunNameSafety:
             agent_run._safe_rmtree(candidate, root)
 
         assert root.is_dir()
+    def test_safe_rmtree_refuses_top_level_sibling_symlink(self, tmp_path):
+        root = tmp_path / "root"
+        target = root / "run-b"
+        target.mkdir(parents=True)
+        (target / "data").write_text("preserve")
+        link = root / "run-a"
+        link.symlink_to(target, target_is_directory=True)
+
+        with pytest.raises(SystemExit, match="not a real directory"):
+            agent_run._safe_rmtree(link, root)
+
+        assert link.is_symlink()
+        assert (target / "data").read_text() == "preserve"
+
+    def test_safe_rmtree_refuses_top_level_outside_symlink(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "data").write_text("preserve")
+        link = root / "run"
+        link.symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(SystemExit, match="not a real directory"):
+            agent_run._safe_rmtree(link, root)
+
+        assert (outside / "data").read_text() == "preserve"
 
 
 class TestStateAndLogDirs:
@@ -201,26 +228,55 @@ class TestPruneOldLogs:
         monkeypatch.setattr(agent_run, "LOG_ROOT", missing)
         agent_run._prune_old_logs()  # should not raise
 
-    def test_prunes_only_stale_unlocked_regular_locks(self, isolated_runs_root):
+    def test_skips_live_old_log_dir(self, isolated_runs_root):
+        old_dir = agent_run.LOG_ROOT / "live"
+        old_dir.mkdir(parents=True)
+        old_log = old_dir / "log"
+        old_log.write_text("quiet but live\n")
+        state = agent_run.STATE_ROOT / "live"
+        state.mkdir()
+        (state / "status").write_text("running\n")
+        old_time = time.time() - 30 * 86400
+        os.utime(old_log, (old_time, old_time))
+
+        agent_run._prune_old_logs(max_age_days=21)
+
+        assert old_dir.exists()
+
+    def test_skips_replaced_prune_candidate(self, isolated_runs_root, monkeypatch):
+        old_dir = agent_run.LOG_ROOT / "replace"
+        old_dir.mkdir(parents=True)
+        old_log = old_dir / "log"
+        old_log.write_text("old\n")
+        old_time = time.time() - 30 * 86400
+        os.utime(old_log, (old_time, old_time))
+        original_lock = agent_run._launch_lock
+
+        @agent_run.contextmanager
+        def replace_while_locked(name):
+            with original_lock(name) as fd:
+                old_dir.rename(agent_run.LOG_ROOT / "old-replaced")
+                replacement = agent_run.LOG_ROOT / "replace"
+                replacement.mkdir()
+                (replacement / "log").write_text("new\n")
+                yield fd
+
+        monkeypatch.setattr(agent_run, "_launch_lock", replace_while_locked)
+        agent_run._prune_old_logs(max_age_days=21)
+
+        assert (agent_run.LOG_ROOT / "replace" / "log").read_text() == "new\n"
+
+    def test_never_prunes_per_name_lock_files(self, isolated_runs_root):
         lock_dir = agent_run.STATE_ROOT / ".locks"
         lock_dir.mkdir()
         old_lock = lock_dir / "old.lock"
         old_lock.write_text("")
-        fresh_lock = lock_dir / "fresh.lock"
-        fresh_lock.write_text("")
-        target = lock_dir / "target"
-        target.write_text("keep")
-        symlink = lock_dir / "link.lock"
-        symlink.symlink_to(target)
         old_time = time.time() - 30 * 86400
         os.utime(old_lock, (old_time, old_time))
 
         agent_run._prune_old_locks(max_age_days=21)
 
-        assert not old_lock.exists()
-        assert fresh_lock.exists()
-        assert symlink.is_symlink()
-        assert target.exists()
+        assert old_lock.exists()
 
     def test_keeps_stale_lock_held_by_another_process(self, isolated_runs_root):
         lock_dir = agent_run.STATE_ROOT / ".locks"
