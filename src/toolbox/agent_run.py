@@ -69,6 +69,7 @@ from contextlib import contextmanager
 import errno
 import fcntl
 import json
+import math
 import os
 import pty
 import re
@@ -1431,6 +1432,36 @@ def _run_interactive(
 # CLI dispatch
 # ---------------------------------------------------------------------------
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed
+
+
+def _positive_finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than 0")
+    return parsed
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="agent-run",
@@ -1444,7 +1475,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp_logs = sub.add_parser("logs", help="print last N lines of the log")
     sp_logs.add_argument("name")
-    sp_logs.add_argument("n", nargs="?", type=int, default=50)
+    sp_logs.add_argument("n", nargs="?", type=_positive_int, default=50)
     sp_logs.set_defaults(func=cmd_logs)
 
     sp_tail = sub.add_parser("tail", help="follow log in real time (tail -f)")
@@ -1464,19 +1495,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_clean.add_argument(
         "--width",
-        type=int,
+        type=_positive_int,
         default=120,
         help="emulated terminal width in columns (default: 120)",
     )
     sp_clean.add_argument(
         "--height",
-        type=int,
+        type=_positive_int,
         default=60,
         help="emulated viewport height in rows (default: 60)",
     )
     sp_clean.add_argument(
         "--history",
-        type=int,
+        type=_nonnegative_int,
         default=100000,
         help="scrollback line budget for the emulator (default: 100000)",
     )
@@ -1555,10 +1586,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         if raw[0].startswith("--echo="):
             echo = True
+            value = raw[0].split("=", 1)[1]
             try:
-                echo_interval = float(raw[0].split("=", 1)[1])
-            except ValueError:
-                sys.exit("agent-run: --echo=<interval> needs a number (seconds)")
+                echo_interval = _positive_finite_float(value)
+            except argparse.ArgumentTypeError as exc:
+                sys.exit(f"agent-run: --echo interval {exc}")
             raw = raw[1:]
             continue
         if raw[0].startswith("--submit-mode="):

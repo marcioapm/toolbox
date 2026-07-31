@@ -54,6 +54,47 @@ def test_tail_prints_preserved_log_and_exits(
     assert stdout.getvalue() == b"preserved output\n"
 
 
+class TestCliNumericValidation:
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["logs", "run", "0"],
+            ["logs", "run", "-1"],
+            ["clean", "run", "--width", "0"],
+            ["clean", "run", "--height", "-1"],
+            ["clean", "run", "--history", "-1"],
+        ],
+    )
+    def test_argparse_rejects_out_of_range_integers(self, argv, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run._build_parser().parse_args(argv)
+
+        assert exc_info.value.code == 2
+        assert "must be at least" in capsys.readouterr().err
+
+    def test_history_zero_is_valid(self):
+        args = agent_run._build_parser().parse_args(
+            ["clean", "run", "--width", "1", "--height", "1", "--history", "0"]
+        )
+        assert (args.width, args.height, args.history) == (1, 1, 0)
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf"])
+    def test_echo_interval_must_be_finite_and_positive(self, value):
+        with pytest.raises(SystemExit, match="finite and greater than 0"):
+            agent_run.main([f"--echo={value}", "run", "true"])
+
+    def test_positive_echo_interval_is_accepted(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            agent_run,
+            "cmd_launch",
+            lambda args: captured.update(vars(args)) or 0,
+        )
+
+        assert agent_run.main(["--echo=0.25", "run", "true"]) == 0
+        assert captured["echo_interval"] == 0.25
+
+
 class TestCmdCleanStdout:
     def test_renders_real_moon_log_to_stdout(
         self, isolated_runs_root, moon_log_bytes, capsys
