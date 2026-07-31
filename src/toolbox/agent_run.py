@@ -426,9 +426,13 @@ def cmd_tail(args: argparse.Namespace) -> int:
                 except BrokenPipeError:
                     return 0
                 continue
-            # EOF. If agent dead, exit. Otherwise sleep and retry.
-            if pid is not None and not _pid_alive(pid):
-                # One more drain to catch final writes.
+            # EOF. A preserved-log-only or otherwise non-live run has nothing
+            # left to follow; after printing existing content, exit immediately.
+            if pid is None:
+                return 0
+            if not _pid_alive(pid):
+                # One more drain to catch final writes from a process that was
+                # live when tail started.
                 time.sleep(0.1)
                 remaining = f.read()
                 if remaining:

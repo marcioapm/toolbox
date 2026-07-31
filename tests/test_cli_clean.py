@@ -6,6 +6,7 @@ fixture log, then invoke `cmd_clean` directly to verify the CLI plumbing
 from __future__ import annotations
 
 import argparse
+import io
 import sys
 
 import pytest
@@ -33,6 +34,24 @@ def _make_run(runs_root, name: str, log_bytes: bytes, interactive: bool = True, 
         log_d.mkdir(parents=True, exist_ok=True)
         (log_d / "log").write_bytes(log_bytes)
     return d
+
+
+def test_tail_prints_preserved_log_and_exits(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    log_dir = isolated_log_root / "preserved"
+    log_dir.mkdir()
+    (log_dir / "log").write_bytes(b"preserved output\n")
+    stdout = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", type("Stdout", (), {"buffer": stdout})())
+    monkeypatch.setattr(
+        agent_run.time,
+        "sleep",
+        lambda _seconds: pytest.fail("tail slept despite no live PID"),
+    )
+
+    assert agent_run.cmd_tail(argparse.Namespace(name="preserved")) == 0
+    assert stdout.getvalue() == b"preserved output\n"
 
 
 class TestCmdCleanStdout:
