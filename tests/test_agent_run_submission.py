@@ -122,6 +122,31 @@ def test_steer_raw_is_verbatim_even_for_opencode_and_esc(isolated_runs_root, mon
         os.close(reader)
 
 
+def test_unexpected_interactive_select_error_marks_run_failed(
+    isolated_runs_root, monkeypatch
+):
+    def fail_select(*_args, **_kwargs):
+        raise OSError(errno.EBADF, "forced bad fd")
+
+    monkeypatch.setattr(agent_run.select, "select", fail_select)
+    args = argparse.Namespace(
+        name="relay-error",
+        command=[sys.executable, "-c", "import time; time.sleep(30)"],
+        interactive=True,
+        prompt_file=None,
+        echo=False,
+        echo_interval=2.0,
+    )
+
+    assert agent_run.cmd_launch(args) == 0
+
+    state = isolated_runs_root / "relay-error"
+    assert _wait_until(lambda: (state / "status").read_text().strip() == "failed")
+    assert (state / "exit_code").read_text().strip() == "1"
+    log = (agent_run.LOG_ROOT / "relay-error" / "log").read_text()
+    assert "forced bad fd" in log
+
+
 def test_drain_pty_input_retries_partial_write_and_eagain(monkeypatch):
     payload = b"prompt bytes" + agent_run._submit_bytes(agent_run.SUBMIT_MODE_CRLF)
     delivered = bytearray()
@@ -170,7 +195,7 @@ def test_launch_fails_when_runner_setup_cannot_open_log(
         agent_run.cmd_launch(args)
 
     state = isolated_runs_root / "setup-failure"
-    assert (state / "status").read_text().strip() == "failed"
+    assert _wait_until(lambda: (state / "status").read_text().strip() == "failed")
     assert (state / "exit_code").read_text().strip() == "1"
     assert (state / "ended_at").is_file()
 

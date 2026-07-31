@@ -1274,7 +1274,7 @@ def _run_interactive(
         except (OSError, select.error) as exc:
             if isinstance(exc, OSError) and exc.errno == errno.EINTR:
                 continue
-            break
+            raise
 
         if master_fd in r:
             try:
