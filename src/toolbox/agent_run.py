@@ -38,8 +38,11 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     pgid         process group id (kill target)
     pty_pid      PTY child pid (interactive only)
     keeper_pid   FIFO-keeper pid (interactive only)
+    prompt_pid   initial-prompt helper pid (when -f and interactive)
+    echo_pid     transcript renderer pid (when --echo)
     command      pretty-printed launch command
     argv         JSON-encoded argv (authoritative form for replay)
+    submit_mode  cr | crlf (selected from argv for interactive submission)
     started_at   ISO-8601 UTC
     ended_at     ISO-8601 UTC (after completion)
     interactive  "1" if launched with -i, else "0"
@@ -74,6 +77,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -82,6 +86,8 @@ from typing import List, Optional, Sequence
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
 LOG_ROOT = Path(os.environ.get("AGENT_RUN_LOG_DIR", "/var/tmp/agent-runs"))
 PRUNE_AFTER_DAYS = 21
+SUBMIT_MODE_CR = "cr"
+SUBMIT_MODE_CRLF = "crlf"
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +192,61 @@ def _pid_alive(pid: int) -> bool:
 
 def _pretty_command(argv: Sequence[str]) -> str:
     return " ".join(shlex.quote(a) for a in argv)
+
+
+def _submit_mode_for_argv(argv: Sequence[str]) -> str:
+    """Select the interactive Enter sequence from the launched argv.
+
+    Only inspect the executable position, optionally beneath wrappers whose
+    command structure is unambiguous. Never search arbitrary arguments: a
+    prompt mentioning "opencode" must not change how another agent is driven.
+    """
+    command = list(argv)
+    while command:
+        executable = Path(command[0]).name
+        if executable == "opencode":
+            return SUBMIT_MODE_CRLF
+        if executable in {"command", "exec"}:
+            command = command[1:]
+            continue
+        if executable == "env":
+            command = command[1:]
+            while command:
+                argument = command[0]
+                if argument == "--":
+                    command = command[1:]
+                    break
+                if argument in {"-i", "--ignore-environment"} or (
+                    not argument.startswith("-") and "=" in argument
+                ):
+                    command = command[1:]
+                    continue
+                break
+            continue
+        break
+    return SUBMIT_MODE_CR
+
+
+def _submit_bytes(mode: str) -> bytes:
+    """Return the selected Enter sequence; legacy/malformed state uses CR."""
+    return b"\r\n" if mode == SUBMIT_MODE_CRLF else b"\r"
+
+
+def _submit_mode_from_state(state_dir: Path) -> str:
+    return _read(state_dir / "submit_mode", SUBMIT_MODE_CR)
+
+
+def _persist_submit_mode(state_dir: Path, argv: Sequence[str]) -> str:
+    """Persist a symbolic submission mode selected from authoritative argv."""
+    mode = _submit_mode_for_argv(argv)
+    _write(state_dir / "submit_mode", mode + "\n")
+    return mode
+
+
+def _prompt_submission_writes(data: bytes, mode: str) -> tuple[bytes, bytes]:
+    """Return the two FIFO writes used to submit an initial prompt file."""
+    submit = _submit_bytes(mode)
+    return data + submit, submit
 
 
 # ---------------------------------------------------------------------------
@@ -519,20 +580,20 @@ def cmd_steer(args: argparse.Namespace) -> int:
     msg = " ".join(args.message)
     if args.raw:
         # Caller knows what they want — send bytes verbatim.
-        payload = msg
+        data = msg.encode()
         esc_payload: Optional[bytes] = None
-        send_separate_cr = False
+        submit = b""
     else:
-        # PTY + raw-mode TUIs (Claude Code, Codex REPL) treat \r as Enter,
-        # not \n. Send CR so the line is actually submitted.
-        payload = msg + "\r"
+        # Most PTY + raw-mode TUIs use CR for Enter. OpenCode's Bubble Tea
+        # TUI needs CRLF; the mode was selected from launch argv and persisted.
+        submit = _submit_bytes(_submit_mode_from_state(d))
+        data = msg.encode() + submit
         # --esc: send ESC first as its own write so the TUI has time to
-        # exit generation mode before the new prompt+CR arrive. Sending ESC
-        # + text in one chunk races the TUI's mode switch and the CR can
+        # exit generation mode before the new prompt + Enter arrive. Sending
+        # ESC + text in one chunk races the TUI's mode switch and Enter can
         # end up dropped while the input buffer is still being reset.
         esc_payload = b"\x1b" if args.esc else None
-        send_separate_cr = args.esc
-    data = payload.encode()
+    send_separate_submit = not args.raw and args.esc
     # Write with a timeout guard: a healthy run has the keeper holding the
     # FIFO open for reading, so this returns immediately.
     def _alarm(_sig, _frame):
@@ -550,18 +611,18 @@ def cmd_steer(args: argparse.Namespace) -> int:
                 time.sleep(0.6)
             f.write(data)
             f.flush()
-            if send_separate_cr:
-                # Belt-and-braces: send a final CR as its own write after a
-                # brief settle so the TUI is guaranteed to see Enter even if
-                # it briefly flushed input while exiting generation mode.
+            if send_separate_submit:
+                # Belt-and-braces: send a final Enter as its own write after a
+                # brief settle so the TUI is guaranteed to see it even if it
+                # briefly flushed input while exiting generation mode.
                 time.sleep(0.2)
-                f.write(b"\r")
+                f.write(submit)
                 f.flush()
     except TimeoutError:
         sys.exit("agent-run: steer timed out writing to FIFO — is the agent alive?")
     finally:
         signal.alarm(0)
-    sent = len(data) + (len(esc_payload) if esc_payload else 0) + (1 if send_separate_cr else 0)
+    sent = len(data) + (len(esc_payload) if esc_payload else 0) + (len(submit) if send_separate_submit else 0)
     print(f"agent-run: steered '{args.name}' ({sent} bytes)")
     return 0
 
@@ -664,6 +725,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
 
     _write(d / "command", _pretty_command(argv) + "\n")
     _write(d / "argv", json.dumps(argv))
+    submit_mode = _persist_submit_mode(d, argv)
     _write(d / "started_at", _now_iso() + "\n")
     _write(d / "status", "running\n")
     _write(d / "interactive", "1\n" if args.interactive else "0\n")
@@ -724,29 +786,64 @@ def cmd_launch(args: argparse.Namespace) -> int:
         os._exit(0)
 
     # Grandchild: actually run the agent.
-    _runner(d, log_d, argv, args.interactive, w_ack, prompt_file, echo, echo_interval)
+    _runner(
+        d,
+        log_d,
+        argv,
+        args.interactive,
+        w_ack,
+        prompt_file,
+        submit_mode,
+        echo,
+        echo_interval,
+    )
     return 0  # never reached
+
+
+def _reset_runner_signal_handlers() -> None:
+    """Remove signal handlers inherited from the runner after ``fork()``.
+
+    Helper children must never execute the runner's teardown handler: it reads
+    runner-owned pid files and may otherwise signal the helper itself. SIGTERM,
+    SIGINT, and SIGHUP use their normal process defaults in every child; the
+    exec'd agent can install its own handlers afterward.
+    """
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_DFL)
 
 
 def _teardown_children(state_dir: Path, grace: float = 2.0) -> None:
     """SIGTERM (then SIGKILL after `grace` seconds) every child pid this
-    runner recorded (pty_pid / keeper_pid / echo_pid), reaping each one.
+    runner recorded (pty_pid / keeper_pid / prompt_pid / echo_pid), reaping
+    each one.
 
     Called from both the runner's signal handler and its crash `except` so
-    a hard crash (e.g. an unhandled exception mid-render) can never leave
-    the launched agent — or the keeper/echo helpers — orphaned. All three
-    pids are always direct children of this process (forked or
-    pty.fork()'d in `_runner`/`_run_interactive`), so waitpid is valid here.
+    a hard crash can never leave the launched agent or its helpers orphaned.
+    Recorded pids are direct children of this process (forked or pty.fork()'d
+    in `_runner`/`_run_interactive`), so waitpid is valid here.
+    Stale or corrupt state is filtered so teardown never signals itself.
     """
+    own_pid = os.getpid()
     pids = []
-    for aux in ("pty_pid", "keeper_pid", "echo_pid"):
+    seen = set()
+    for aux in ("pty_pid", "keeper_pid", "prompt_pid", "echo_pid"):
         raw = _read(state_dir / aux)
         if not raw:
             continue
         try:
-            pids.append(int(raw))
+            pid = int(raw)
         except ValueError:
-            pass
+            continue
+        if pid <= 0 or pid == own_pid or pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            continue
+        if waited_pid == pid:
+            continue
+        pids.append(pid)
     if not pids:
         return
 
@@ -788,6 +885,7 @@ def _runner(
     interactive: bool,
     ready_fd: int,
     prompt_file: Optional[str] = None,
+    submit_mode: str = SUBMIT_MODE_CR,
     echo: bool = False,
     echo_interval: float = 2.0,
 ) -> None:
@@ -824,8 +922,17 @@ def _runner(
             _write(state_dir / "ended_at", _now_iso() + "\n")
             _write(state_dir / "status", "done\n" if code == 0 else "failed\n")
 
+    handling_signal = False
+
     def _on_signal(signum: int, _frame) -> None:
-        # Propagate to children, then finalize and exit.
+        nonlocal handling_signal
+        # Block recursive delivery before touching children. A second signal
+        # during teardown exits immediately instead of re-entering cleanup.
+        if handling_signal:
+            os._exit(128 + signum)
+        handling_signal = True
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
         _teardown_children(state_dir)
         _finalize(128 + signum)
         os._exit(128 + signum)
@@ -840,6 +947,7 @@ def _runner(
     if echo:
         echo_pid = os.fork()
         if echo_pid == 0:
+            _reset_runner_signal_handlers()
             try:
                 _echo_loop(log_dir, echo_interval)
             finally:
@@ -848,12 +956,18 @@ def _runner(
 
     try:
         if interactive:
-            exit_code = _run_interactive(state_dir, argv, log_fd, prompt_file)
+            exit_code = _run_interactive(
+                state_dir, argv, log_fd, prompt_file, submit_mode
+            )
         else:
             exit_code = _run_oneshot(state_dir, argv, log_fd, prompt_file)
     except Exception as exc:  # noqa: BLE001
         try:
-            os.write(log_fd, f"\nagent-run: runner crashed: {exc!r}\n".encode())
+            detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            os.write(
+                log_fd,
+                f"\nagent-run: runner crashed:\n{detail}".encode(errors="replace"),
+            )
         except OSError:
             pass
         # A crash mid-run may have skipped the normal cleanup path (e.g. an
@@ -863,6 +977,9 @@ def _runner(
         _teardown_children(state_dir)
         exit_code = 1
 
+    # Persistent helpers (notably --echo) outlive the agent by design, so reap
+    # them on successful completion as well as on crashes and external signals.
+    _teardown_children(state_dir)
     _finalize(exit_code)
     os._exit(exit_code)
 
@@ -875,6 +992,7 @@ def _run_oneshot(
 ) -> int:
     pid = os.fork()
     if pid == 0:
+        _reset_runner_signal_handlers()
         # Child: stdin from prompt file (if provided) or /dev/null;
         # stdout/stderr to log.
         if prompt_file:
@@ -908,6 +1026,7 @@ def _run_interactive(
     argv: Sequence[str],
     log_fd: int,
     prompt_file: Optional[str] = None,
+    submit_mode: str = SUBMIT_MODE_CR,
 ) -> int:
     fifo_path = state_dir / "stdin"
 
@@ -917,6 +1036,7 @@ def _run_interactive(
     keeper_r, keeper_w = os.pipe()
     keeper_pid = os.fork()
     if keeper_pid == 0:
+        _reset_runner_signal_handlers()
         os.close(keeper_r)
         # Open FIFO for writing (blocks until a reader appears, that's us below).
         # Use a background-safe open: O_RDWR avoids the reader-blocking behavior.
@@ -950,6 +1070,7 @@ def _run_interactive(
     # Fork + PTY for the agent.
     pty_pid, master_fd = pty.fork()
     if pty_pid == 0:
+        _reset_runner_signal_handlers()
         # Child: stdin/stdout/stderr are all the PTY slave. Exec.
         try:
             os.execvp(argv[0], list(argv))
@@ -959,12 +1080,13 @@ def _run_interactive(
     _write(state_dir / "pty_pid", f"{pty_pid}\n")
 
     # If a prompt file was provided, fork a helper that waits for the TUI to
-    # finish initializing (so the PTY is in raw mode and CR -> Enter), then
-    # writes the prompt + CR to the FIFO so the agent receives it as if a
+    # finish initializing (so the PTY is in raw mode and Enter is recognized),
+    # then writes the prompt + selected Enter sequence to the FIFO so the agent
     # human had typed it. Same pattern as `agent-run steer`.
     if prompt_file:
         helper = os.fork()
         if helper == 0:
+            _reset_runner_signal_handlers()
             # Detach from the parent's stdio. Errors are silent (no log to write to).
             try:
                 # Wait a few seconds for the TUI to enable raw mode. Earlier
@@ -974,28 +1096,29 @@ def _run_interactive(
                     data = Path(prompt_file).read_bytes()
                 except OSError:
                     os._exit(0)
-                # Submit with CR; trailing CR is unconditional so the agent
-                # treats the file as a single Enter-terminated message. Send
-                # a second separate CR after a brief settle so the TUI is
-                # guaranteed to see Enter even if the first one races the
-                # input-buffer being reset right after typing finishes.
+                # Submit with the launch-selected Enter sequence. Trailing
+                # Enter is unconditional so the agent treats the file as a
+                # single submitted message. Send a second separate Enter
+                # after a brief settle so the TUI is guaranteed to see it
+                # even if the first one races input-buffer reset.
+                submit_writes = _prompt_submission_writes(data, submit_mode)
                 try:
                     fd = os.open(str(fifo_path), os.O_WRONLY)
                     try:
-                        os.write(fd, data + b"\r")
+                        os.write(fd, submit_writes[0])
                     finally:
                         os.close(fd)
                     time.sleep(0.5)
                     fd = os.open(str(fifo_path), os.O_WRONLY)
                     try:
-                        os.write(fd, b"\r")
+                        os.write(fd, submit_writes[1])
                     finally:
                         os.close(fd)
                 except OSError:
                     pass
             finally:
                 os._exit(0)
-        # Parent (the runner) just continues; helper is detached.
+        _write(state_dir / "prompt_pid", f"{helper}\n")
 
     # Open FIFO read end (blocks until the keeper has opened for writing,
     # which it has by the time we got the ack).
@@ -1163,7 +1286,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp_steer = sub.add_parser(
         "steer",
-        help="send text to agent stdin (needs -i); auto-appends CR to submit",
+        help="send text to agent stdin (needs -i); auto-appends the run's submission sequence",
     )
     sp_steer.add_argument("name")
     sp_steer.add_argument("message", nargs="+")
