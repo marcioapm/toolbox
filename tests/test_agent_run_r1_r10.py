@@ -892,8 +892,11 @@ def test_bounded_final_render_child_resets_inherited_signal_handler(monkeypatch,
 
 def test_on_signal_tears_down_untracked_render_pid(tmp_path):
     """A signal arriving to the runner while the final renderer is running
-    must reap that renderer too, via _teardown_children's extra_pids -- the
-    renderer has no dedicated state-file field of its own."""
+    must reap that renderer too, via _teardown_children's extra_pids -- this
+    covers the normal (runner-alive) signal path, which must keep working
+    the same way even though render_pid is now also published to a state
+    file for the wedged-runner case (see
+    test_force_kill_reaps_wedged_echo_render_child)."""
     state_dir = tmp_path / "state"
     state_dir.mkdir()
 
@@ -911,6 +914,127 @@ def test_on_signal_tears_down_untracked_render_pid(tmp_path):
                 os.kill(pid, signal.SIGKILL)
                 os.waitpid(pid, 0)
             except (ProcessLookupError, ChildProcessError):
+                pass
+
+
+def test_force_kill_reaps_wedged_echo_render_child(tmp_path, monkeypatch):
+    """Real-process reproduction of N1 (final-independent-rereview #2): a
+    `--echo` final-render child must not survive as an unbounded orphan when
+    the runner itself is wedged and `agent-run kill <name> KILL` falls
+    through to `_force_kill`'s external escalation path.
+
+    Forks a real runner via a direct `_runner()` call (same pattern as the
+    other real-process tests in this file), lets it run a real one-shot
+    command to completion, then hangs `_render_log_to_clean` so the
+    final-render child is alive and its pid published (`render_pid` state
+    file) when the runner is `SIGSTOP`'d -- simulating exactly the
+    wedged-supervisor scenario `_force_kill`'s escalation path exists to
+    handle (the runner can no longer run its own SIGTERM handler to reap
+    the render child via `extra_pids`). `_force_kill` must discover the
+    render child through the published `render_pid` field, verify its
+    parentage, and SIGKILL it -- not leave it reparented to init.
+    """
+    state_dir = tmp_path / "state"
+    log_dir = tmp_path / "log"
+    state_dir.mkdir()
+    log_dir.mkdir()
+    (log_dir / "log").touch()
+
+    def hang_render(_log_dir):
+        time.sleep(30)
+
+    monkeypatch.setattr(agent_run, "_render_log_to_clean", hang_render)
+    monkeypatch.setattr(agent_run, "KILL_ESCALATION_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(agent_run, "KILL_CHILD_REAP_TIMEOUT_SECONDS", 2.0)
+
+    ready_read, ready_write = os.pipe()
+    runner_pid = os.fork()
+    if runner_pid == 0:
+        os.close(ready_read)
+        agent_run._runner(
+            state_dir,
+            log_dir,
+            [sys.executable, "-c", "print('hi')"],
+            False,
+            ready_write,
+            echo=True,
+            echo_interval=60.0,
+        )
+        os._exit(99)  # unreachable -- _runner always os._exit()s itself
+
+    os.close(ready_write)
+    render_pid = None
+    runner_reaped = False
+    try:
+        assert _wait_until(
+            lambda: (state_dir / "render_pid").exists(), timeout=10
+        ), "render child was never forked/registered via render_pid"
+        render_pid = int((state_dir / "render_pid").read_text().strip())
+        assert agent_run._pid_alive(render_pid)
+        assert agent_run._pid_parent_pid(render_pid) == runner_pid, (
+            "render child's live parent must be the runner before we rely "
+            "on _force_kill's own parentage re-verification"
+        )
+
+        # Wedge the runner mid-render: it can no longer run its own SIGTERM
+        # handler, exactly the scenario _force_kill's escalation exists for.
+        os.kill(runner_pid, signal.SIGSTOP)
+        expected_identity = (state_dir / "process_identity").read_text().strip()
+        agent_run._force_kill(
+            "render-wedge", state_dir, runner_pid, expected_identity
+        )
+        # Best-effort: if force_kill somehow left the runner merely stopped
+        # rather than dead, don't leave it permanently suspended.
+        try:
+            os.kill(runner_pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+
+        # We are runner_pid's real parent (a direct os.fork(), no
+        # setsid/double-fork detach), so a dead-but-unreaped runner is a
+        # zombie -- os.kill(pid, 0) would still succeed against a zombie's
+        # pid slot, so confirm death by reaping it rather than polling
+        # liveness.
+        reaped_pid, _status = os.waitpid(runner_pid, 0)
+        assert reaped_pid == runner_pid
+        runner_reaped = True
+
+        # render_pid's parent was the runner, not this test process, so the
+        # kernel reparents (and eventually reaps) it -- liveness polling is
+        # correct here.
+        assert _wait_until(
+            lambda: _process_gone(render_pid), timeout=5
+        ), "render child survived force_kill as an orphan"
+
+        # The agent itself (`print('hi')`) already finished and _finalize()
+        # published terminal state *before* the runner entered the final
+        # render step -- by design (a pathological renderer must never leave
+        # a dead agent reported as starting/running). So the pre-existing
+        # terminal state here is legitimately "done", not "failed"; what
+        # matters for N1 is that it stayed terminal (force_kill must never
+        # regress a terminal status back to a false "running") and that the
+        # render child, discovered only via the published render_pid field,
+        # did not survive as an orphan.
+        status = (state_dir / "status").read_text().strip()
+        assert status in {"done", "failed"}, f"expected terminal state, got {status!r}"
+        assert (state_dir / "exit_code").exists()
+        assert (state_dir / "ended_at").exists()
+    finally:
+        os.close(ready_read)
+        if not runner_reaped:
+            try:
+                os.kill(runner_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(runner_pid, 0)
+            except ChildProcessError:
+                pass
+        if render_pid is not None and not _process_gone(render_pid):
+            try:
+                os.kill(render_pid, signal.SIGKILL)
+            except ProcessLookupError:
                 pass
 
 
