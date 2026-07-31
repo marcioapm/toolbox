@@ -381,6 +381,8 @@ def test_sigterm_runner_reaps_one_shot_child(isolated_runs_root):
 
     state = isolated_runs_root / "one-shot-term"
     runner_pid = int((state / "pid").read_text())
+    identity = (state / "process_identity").read_text().strip()
+    assert identity == agent_run._process_identity(runner_pid)
     assert _wait_until(lambda: (state / "agent_pid").exists())
     child_pid = int((state / "agent_pid").read_text())
 

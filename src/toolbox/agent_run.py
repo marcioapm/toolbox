@@ -34,8 +34,9 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 
     status       running | done | failed
     exit_code    numeric exit code (after completion)
-    pid          launcher pid
+    pid          runner process id
     pgid         process group id (kill target)
+    process_identity  platform-specific runner birth token (kill verification)
     agent_pid   one-shot command child pid (non-interactive only)
     pty_pid      PTY child pid (interactive only)
     keeper_pid   FIFO-keeper pid (interactive only)
@@ -78,10 +79,12 @@ import shlex
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import threading
 import time
 import traceback
+import platform
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -104,7 +107,16 @@ def _now_iso() -> str:
 
 
 def _write(path: Path, text: str) -> None:
-    path.write_text(text)
+    """Atomically publish a state file so readers never see a partial value."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_text(text)
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _read(path: Path, default: str = "") -> str:
@@ -302,6 +314,64 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         # Process exists but we can't signal it — still "alive" for our purposes.
         return True
+
+
+def _require_positive_state_int(state_dir: Path, field: str, name: str) -> int:
+    """Read a positive integer control value or stop before process control."""
+    raw = _read(state_dir / field)
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if not raw or value <= 0:
+        sys.exit(
+            f"agent-run: invalid {field} state for '{name}'; "
+            "inspect status/logs and confirm the run is gone before removing stale state"
+        )
+    return value
+
+
+def _process_identity(pid: int) -> Optional[str]:
+    """Return a stable platform-specific birth token for ``pid``, if readable."""
+    system = platform.system()
+    if system == "Linux":
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text()
+            _before, after = stat_text.rsplit(")", 1)
+            fields = after.split()
+            starttime = fields[19]
+            if not starttime.isdigit():
+                return None
+        except (IndexError, OSError, ValueError):
+            return None
+        return f"linux:{starttime}"
+    if system == "Darwin":
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "lstart="],
+                capture_output=True,
+                check=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        start = result.stdout.strip()
+        return f"darwin:{start}" if start else None
+    return None
+
+
+def _read_process_identity(state_dir: Path, name: str) -> str:
+    token = _read(state_dir / "process_identity")
+    if not token:
+        sys.exit(
+            f"agent-run: refusing to kill '{name}': no process identity recorded "
+            "(legacy state); inspect status/logs and remove stale state only after confirming it is gone"
+        )
+    prefix, separator, value = token.partition(":")
+    if prefix not in {"linux", "darwin"} or not separator or not value:
+        sys.exit(f"agent-run: refusing to kill '{name}': corrupt process identity state")
+    return token
 
 
 def _pretty_command(argv: Sequence[str]) -> str:
@@ -766,12 +836,12 @@ def cmd_steer(args: argparse.Namespace) -> int:
             f"agent-run: '{name}' is not interactive. "
             f"Relaunch with: agent-run -i {name} <command...>"
         )
+    pid = _require_positive_state_int(d, "pid", name)
+    if not _pid_alive(pid):
+        sys.exit(f"agent-run: '{args.name}' is not running")
     fifo = d / "stdin"
     if not fifo.is_fifo():
         sys.exit(f"agent-run: no stdin FIFO at {fifo}")
-    pid_raw = _read(d / "pid")
-    if not pid_raw or not _pid_alive(int(pid_raw)):
-        sys.exit(f"agent-run: '{args.name}' is not running")
     msg = " ".join(args.message)
     if args.raw:
         # Caller knows what they want — send bytes verbatim.
@@ -838,39 +908,46 @@ def cmd_kill(args: argparse.Namespace) -> int:
         sig = _signal_by_name(args.signal)
     except AttributeError:
         sys.exit(f"agent-run: unknown signal '{args.signal}'")
-    pid_raw = _read(d / "pid")
-    if not pid_raw:
-        sys.exit(f"agent-run: no pid recorded for {args.name}")
-    pid = int(pid_raw)
+    if _read(d / "status") != "running":
+        sys.exit(f"agent-run: refusing to kill '{name}': run is not marked running")
+    pid = _require_positive_state_int(d, "pid", name)
+    pgid = _require_positive_state_int(d, "pgid", name)
+    expected_identity = _read_process_identity(d, name)
+    current_identity = _process_identity(pid)
+    if current_identity is None:
+        sys.exit(
+            f"agent-run: refusing to kill '{name}': cannot verify current process identity"
+        )
+    if current_identity != expected_identity:
+        sys.exit(
+            f"agent-run: refusing to kill '{name}': process identity does not match recorded runner"
+        )
     if not _pid_alive(pid):
         print(f"agent-run: {args.name} is not running (pid {pid})")
         return 0
-    pgid_raw = _read(d / "pgid")
     try:
-        pgid = int(pgid_raw) if pgid_raw else None
-    except ValueError:
-        pgid = None
-    # Prefer process-group kill (reaches agent + PTY wrapper + keeper).
-    sent = False
-    if pgid:
-        try:
-            os.killpg(pgid, sig)
-            sent = True
-        except (ProcessLookupError, PermissionError):
-            pass
-    if not sent:
-        try:
-            os.kill(pid, sig)
-            sent = True
-        except ProcessLookupError:
-            pass
+        if os.getpgid(pid) != pgid:
+            sys.exit(
+                f"agent-run: refusing to kill '{name}': runner process group does not match recorded state"
+            )
+    except ProcessLookupError:
+        print(f"agent-run: {args.name} is not running (pid {pid})")
+        return 0
+    # All destructive controls require a verified runner identity and group.
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        print(f"agent-run: {args.name} is not running (pgid {pgid})")
+        return 0
+    except PermissionError:
+        sys.exit(f"agent-run: permission denied signaling '{name}' (pgid {pgid})")
     # Belt-and-braces: also hit tracked aux pids.
     for aux in ("pty_pid", "keeper_pid"):
         raw = _read(d / aux)
         if raw:
             try:
                 aux_pid = int(raw)
-                if _pid_alive(aux_pid):
+                if aux_pid > 0 and _pid_alive(aux_pid):
                     try:
                         os.kill(aux_pid, sig)
                     except ProcessLookupError:
@@ -878,7 +955,7 @@ def cmd_kill(args: argparse.Namespace) -> int:
             except ValueError:
                 pass
     sig_name = signal.Signals(sig).name
-    print(f"agent-run: sent {sig_name} to {args.name} (pid={pid} pgid={pgid or '?'})")
+    print(f"agent-run: sent {sig_name} to {args.name} (pid={pid} pgid={pgid})")
     return 0
 
 
@@ -1138,9 +1215,14 @@ def _runner(
         os._exit(128 + signum)
 
     try:
+        runner_pgid = os.getpgid(my_pid)
+        identity = _process_identity(my_pid)
+        if identity is None:
+            raise RuntimeError("cannot record runner process identity")
         _write(state_dir / "pid", f"{my_pid}\n")
         # After setsid(), pid == pgid (we're the session & group leader).
-        _write(state_dir / "pgid", f"{os.getpgid(my_pid)}\n")
+        _write(state_dir / "pgid", f"{runner_pgid}\n")
+        _write(state_dir / "process_identity", identity + "\n")
 
         # Redirect stdio to /dev/null to fully detach (we write the log ourselves).
         devnull = os.open(os.devnull, os.O_RDWR)
