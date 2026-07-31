@@ -6,6 +6,7 @@ import re
 
 import pytest
 
+from toolbox import agent_run
 from toolbox.agent_run import _render_log
 
 
@@ -169,6 +170,34 @@ class TestRenderLogSizing:
 # in a portable unit test, so we simulate the failure at the seam
 # (ByteStream.feed) and assert the fallback kicks in and returns a string.
 # ---------------------------------------------------------------------------
+
+class TestEchoLoop:
+    def test_failed_render_is_retried_without_mtime_change(self, tmp_path, monkeypatch):
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(b"complete\r\n")
+        attempts = 0
+
+        def flaky_render(_log_dir):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("transient replace failure")
+            (log_dir / "log.clean").write_text("complete\n")
+
+        def stop_after_retry(_interval):
+            if attempts >= 2:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(agent_run, "_render_log_to_clean", flaky_render)
+        monkeypatch.setattr(agent_run.time, "sleep", stop_after_retry)
+
+        with pytest.raises(KeyboardInterrupt):
+            agent_run._echo_loop(log_dir, 1.0)
+
+        assert attempts == 2
+        assert (log_dir / "log.clean").read_text() == "complete\n"
+
 
 class TestRenderLogRecursionHardening:
     def test_recursion_error_falls_back_to_plain_text(self, monkeypatch):

@@ -568,6 +568,17 @@ def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 1
     return "\n".join(deduped) + "\n"
 
 
+def _render_log_to_clean(log_dir: Path) -> None:
+    """Atomically render ``log`` to ``log.clean`` in ``log_dir``."""
+    log = log_dir / "log"
+    clean = log_dir / "log.clean"
+    raw = log.read_bytes()
+    rendered = _render_log(raw)
+    tmp = clean.with_suffix(".clean.tmp")
+    tmp.write_text(rendered, encoding="utf-8")
+    tmp.replace(clean)
+
+
 def _echo_loop(log_dir: "Path", interval: float) -> None:
     """Periodically render log_dir/log into log_dir/log.clean.
 
@@ -577,7 +588,6 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
     doesn't burn CPU.
     """
     log = log_dir / "log"
-    clean = log_dir / "log.clean"
     last_mtime = -1.0
     # Soft cap: if pyte isn't installed, write a friendly stub and exit.
     try:
@@ -595,17 +605,16 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
             time.sleep(interval)
             continue
         if mtime != last_mtime:
-            last_mtime = mtime
             try:
-                raw = log.read_bytes()
-                rendered = _render_log(raw)
-                tmp = clean.with_suffix(".clean.tmp")
-                tmp.write_text(rendered, encoding="utf-8")
-                tmp.replace(clean)
+                _render_log_to_clean(log_dir)
             except Exception:
                 # Don't crash the helper on transient render errors;
                 # next tick may succeed.
                 pass
+            else:
+                # Failed renders must be retried even when the raw log's mtime
+                # remains unchanged.
+                last_mtime = mtime
         time.sleep(interval)
 
 
@@ -1100,6 +1109,22 @@ def _runner(
     # Persistent helpers (notably --echo) outlive the agent by design, so reap
     # them on successful completion as well as on crashes and external signals.
     _teardown_children(state_dir)
+    if echo:
+        # The periodic renderer may never tick on a short run, or may have run
+        # just before the agent's final output. Render once synchronously after
+        # stopping it and before publishing terminal state.
+        try:
+            _render_log_to_clean(log_dir)
+        except Exception as exc:  # transcript is a convenience artifact
+            try:
+                os.write(
+                    log_fd,
+                    f"\nagent-run: final echo render failed: {exc}\n".encode(
+                        errors="replace"
+                    ),
+                )
+            except OSError:
+                pass
     _finalize(exit_code)
     os._exit(exit_code)
 

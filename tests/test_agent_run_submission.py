@@ -122,6 +122,28 @@ def test_steer_raw_is_verbatim_even_for_opencode_and_esc(isolated_runs_root, mon
         os.close(reader)
 
 
+def test_short_echo_run_gets_final_transcript_with_last_output(
+    isolated_runs_root, isolated_log_root
+):
+    final_output = "final-output-immediately-before-exit"
+    args = argparse.Namespace(
+        name="short-echo",
+        command=[sys.executable, "-c", f"print({final_output!r})"],
+        interactive=False,
+        prompt_file=None,
+        echo=True,
+        echo_interval=60.0,
+    )
+
+    assert agent_run.cmd_launch(args) == 0
+
+    state = isolated_runs_root / "short-echo"
+    assert _wait_until(lambda: (state / "status").read_text().strip() == "done")
+    clean = isolated_log_root / "short-echo" / "log.clean"
+    assert clean.is_file()
+    assert final_output in clean.read_text()
+
+
 def test_unexpected_interactive_select_error_marks_run_failed(
     isolated_runs_root, monkeypatch
 ):
