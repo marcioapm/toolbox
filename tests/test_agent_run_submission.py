@@ -121,6 +121,54 @@ def test_steer_raw_is_verbatim_even_for_opencode_and_esc(isolated_runs_root, mon
         os.close(reader)
 
 
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _process_gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def test_sigterm_runner_reaps_one_shot_child(isolated_runs_root):
+    env = os.environ.copy()
+    launch = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "toolbox.agent_run",
+            "one-shot-term",
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+        ],
+        capture_output=True,
+        env=env,
+        timeout=10,
+    )
+    assert launch.returncode == 0, launch.stderr.decode()
+
+    state = isolated_runs_root / "one-shot-term"
+    runner_pid = int((state / "pid").read_text())
+    assert _wait_until(lambda: (state / "agent_pid").exists())
+    child_pid = int((state / "agent_pid").read_text())
+
+    os.kill(runner_pid, signal.SIGTERM)
+
+    assert _wait_until(lambda: (state / "status").read_text().strip() == "failed")
+    assert (state / "exit_code").read_text().strip() == str(128 + signal.SIGTERM)
+    assert _wait_until(lambda: _process_gone(child_pid))
+    assert _wait_until(lambda: _process_gone(runner_pid))
+
+
 def test_same_name_launches_are_serialized_without_state_clobber(
     isolated_runs_root, isolated_log_root
 ):

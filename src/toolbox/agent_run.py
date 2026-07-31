@@ -36,6 +36,7 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     exit_code    numeric exit code (after completion)
     pid          launcher pid
     pgid         process group id (kill target)
+    agent_pid   one-shot command child pid (non-interactive only)
     pty_pid      PTY child pid (interactive only)
     keeper_pid   FIFO-keeper pid (interactive only)
     prompt_pid   initial-prompt helper pid (when -f and interactive)
@@ -891,7 +892,7 @@ def _reset_runner_signal_handlers() -> None:
 
 def _teardown_children(state_dir: Path, grace: float = 2.0) -> None:
     """SIGTERM (then SIGKILL after `grace` seconds) every child pid this
-    runner recorded (pty_pid / keeper_pid / prompt_pid / echo_pid), reaping
+    runner recorded (agent_pid / pty_pid / keeper_pid / prompt_pid / echo_pid), reaping
     each one.
 
     Called from both the runner's signal handler and its crash `except` so
@@ -903,7 +904,7 @@ def _teardown_children(state_dir: Path, grace: float = 2.0) -> None:
     own_pid = os.getpid()
     pids = []
     seen = set()
-    for aux in ("pty_pid", "keeper_pid", "prompt_pid", "echo_pid"):
+    for aux in ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid"):
         raw = _read(state_dir / aux)
         if not raw:
             continue
@@ -1090,6 +1091,7 @@ def _run_oneshot(
         except OSError as exc:
             os.write(2, f"agent-run: exec failed: {exc}\n".encode())
             os._exit(127)
+    _write(state_dir / "agent_pid", f"{pid}\n")
     _, status = os.waitpid(pid, 0)
     if os.WIFEXITED(status):
         return os.WEXITSTATUS(status)
