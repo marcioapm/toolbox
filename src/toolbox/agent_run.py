@@ -90,6 +90,7 @@ LOG_ROOT = Path(os.environ.get("AGENT_RUN_LOG_DIR", "/var/tmp/agent-runs"))
 PRUNE_AFTER_DAYS = 21
 SUBMIT_MODE_CR = "cr"
 SUBMIT_MODE_CRLF = "crlf"
+MAX_PTY_INPUT_BUFFER = 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -1141,6 +1142,19 @@ def _run_oneshot(
     return 1
 
 
+def _drain_pty_input(master_fd: int, buffered: bytes) -> bytes:
+    """Write buffered FIFO input to the PTY until empty or backpressured."""
+    while buffered:
+        try:
+            written = os.write(master_fd, buffered)
+        except BlockingIOError:
+            break
+        if written <= 0:
+            break
+        buffered = buffered[written:]
+    return buffered
+
+
 def _run_interactive(
     state_dir: Path,
     argv: Sequence[str],
@@ -1255,7 +1269,8 @@ def _run_interactive(
     buf_in = b""
     while True:
         try:
-            r, _, _ = select.select([master_fd, fifo_fd], [], [], 0.5)
+            writable = [master_fd] if buf_in else []
+            r, w, _ = select.select([master_fd, fifo_fd], writable, [], 0.5)
         except (OSError, select.error) as exc:
             if isinstance(exc, OSError) and exc.errno == errno.EINTR:
                 continue
@@ -1298,12 +1313,14 @@ def _run_interactive(
             except OSError:
                 chunk = b""
             if chunk:
+                if len(buf_in) + len(chunk) > MAX_PTY_INPUT_BUFFER:
+                    raise BufferError(
+                        f"PTY input buffer exceeded {MAX_PTY_INPUT_BUFFER} bytes"
+                    )
                 buf_in += chunk
-                try:
-                    written = os.write(master_fd, buf_in)
-                    buf_in = buf_in[written:]
-                except OSError:
-                    pass
+
+        if master_fd in w and buf_in:
+            buf_in = _drain_pty_input(master_fd, buf_in)
 
         # Child may have exited without us seeing EOF (detached, etc.).
         try:

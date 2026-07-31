@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import signal
@@ -119,6 +120,29 @@ def test_steer_raw_is_verbatim_even_for_opencode_and_esc(isolated_runs_root, mon
         assert os.read(reader, 4096) == b"hello"
     finally:
         os.close(reader)
+
+
+def test_drain_pty_input_retries_partial_write_and_eagain(monkeypatch):
+    payload = b"prompt bytes" + agent_run._submit_bytes(agent_run.SUBMIT_MODE_CRLF)
+    delivered = bytearray()
+    actions = iter([3, BlockingIOError(errno.EAGAIN, "backpressure"), 4, 999])
+
+    def partial_write(_fd, data):
+        action = next(actions)
+        if isinstance(action, BaseException):
+            raise action
+        written = min(action, len(data))
+        delivered.extend(data[:written])
+        return written
+
+    monkeypatch.setattr(agent_run.os, "write", partial_write)
+
+    remaining = agent_run._drain_pty_input(42, payload)
+    assert remaining == payload[3:]
+    remaining = agent_run._drain_pty_input(42, remaining)
+
+    assert remaining == b""
+    assert bytes(delivered) == payload
 
 
 def test_launch_fails_when_runner_setup_cannot_open_log(
