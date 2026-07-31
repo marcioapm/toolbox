@@ -329,7 +329,7 @@ _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # Feeding pyte's coroutine-based FSM a pathological escape-sequence pattern
 # can recurse past this many frames; give it plenty of headroom (restored
 # immediately after) rather than tripping Python's conservative default.
-_PYTE_RECURSION_LIMIT = 10000
+_PYTE_RECURSION_LIMIT = 20000
 # The C stack backing that higher Python recursion limit needs room too —
 # run the feed in a worker thread with a generous stack so the process
 # hits Python's RecursionError before the OS ever SIGSEGVs the thread.
@@ -416,7 +416,7 @@ def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 1
     stream = pyte.ByteStream(screen)
     try:
         _feed_pyte(stream, raw)
-    except Exception:  # noqa: BLE001 - RecursionError included; never let clean/--echo crash the run
+    except BaseException:  # noqa: BLE001 - RecursionError/BaseException included; never let clean/--echo crash the run
         return _strip_ansi_fallback(raw)
 
     rows: List[str] = []
