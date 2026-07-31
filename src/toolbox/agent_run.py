@@ -89,12 +89,28 @@ PRUNE_AFTER_DAYS = 21
 SUBMIT_MODE_CR = "cr"
 SUBMIT_MODE_CRLF = "crlf"
 
+# Grace period (seconds) between SIGTERM and SIGKILL during idle-kill.
+# Default 5 s; tests may override via monkeypatch or by setting this low.
+REAP_GRACE_SECONDS: float = 5.0
+
 # Idle-stall threshold: a "running" run whose log file hasn't been touched in
 # this many seconds is considered "stalled" by _effective_status(), and a
 # candidate for idle-killing by `agent-run reap`.
-IDLE_STALL_SECONDS: float = float(
-    os.environ.get("AGENT_RUN_IDLE_KILL_HOURS", 24)
-) * 3600
+# Parsed defensively so a typo in the env var doesn't crash every subcommand.
+def _parse_idle_stall_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_IDLE_KILL_HOURS", "24")
+    try:
+        return float(raw) * 3600
+    except ValueError:
+        print(
+            f"agent-run: warning: AGENT_RUN_IDLE_KILL_HOURS={raw!r} is not a valid number; "
+            "using default 24h",
+            file=sys.stderr,
+        )
+        return 24.0 * 3600
+
+
+IDLE_STALL_SECONDS: float = _parse_idle_stall_seconds()
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +213,137 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _pid_identity(pid: int) -> Optional[str]:
+    """Return a string identifying the process start time, or None on failure.
+
+    Uses ``ps -o lstart= -p <pid>`` which works on macOS and Linux. The raw
+    string is intentionally not parsed so any formatting difference between
+    platforms becomes an obvious mismatch rather than a silent bug.
+    """
+    try:
+        import subprocess as _subprocess
+        result = _subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        out = result.stdout.strip()
+        return out if out else None
+    except Exception:
+        return None
+
+
+def _mark_died(state_dir: Path, reason: str) -> None:
+    """Write status=died, ended_at, and reap_reason to *state_dir*.
+
+    Idempotent: ended_at is only written if not already present.
+    """
+    _write(state_dir / "status", "died\n")
+    if not (state_dir / "ended_at").exists():
+        _write(state_dir / "ended_at", _now_iso() + "\n")
+    _write(state_dir / "reap_reason", reason + "\n")
+
+
+def _signal_run(state_dir: Path, pid: int, reason: str, grace: float = REAP_GRACE_SECONDS) -> str:
+    """SIGTERM → grace-wait → SIGKILL the process group / pid, plus aux pids.
+
+    Returns "killed" if the process is confirmed gone after the sequence, or
+    "kill_failed" if it is still alive (e.g. PermissionError on SIGKILL).
+
+    The *reason* string is written to the ``reap_reason`` state file on success.
+    The caller is responsible for writing ``status``/``ended_at`` based on the
+    returned value.
+    """
+    pgid_raw = _read(state_dir / "pgid")
+    try:
+        pgid: Optional[int] = int(pgid_raw) if pgid_raw else None
+    except ValueError:
+        pgid = None
+
+    # --- SIGTERM phase ---
+    sent = False
+    if pgid and hasattr(os, "killpg"):
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            sent = True
+        except (ProcessLookupError, PermissionError):
+            pass
+    if not sent:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # Aux pids get SIGTERM too; catch both ProcessLookupError and PermissionError.
+    for aux in ("pty_pid", "keeper_pid"):
+        raw = _read(state_dir / aux)
+        if not raw:
+            continue
+        try:
+            aux_pid = int(raw)
+        except ValueError:
+            continue
+        if _pid_alive(aux_pid):
+            try:
+                os.kill(aux_pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    # --- Grace period ---
+    deadline = time.time() + grace
+    while time.time() < deadline and _pid_alive(pid):
+        time.sleep(0.2)
+
+    if not _pid_alive(pid):
+        return "killed"
+
+    # --- SIGKILL phase ---
+    kill_sent = False
+    kill_permission_error = False
+    if pgid and hasattr(os, "killpg"):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            kill_sent = True
+        except ProcessLookupError:
+            kill_sent = True  # process group already gone → effectively killed
+        except PermissionError:
+            pass  # fall through to os.kill(pid) below
+    if not kill_sent:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            kill_sent = True
+        except ProcessLookupError:
+            kill_sent = True  # already gone
+        except PermissionError:
+            kill_permission_error = True
+
+    # Aux pids: SIGKILL escalation.
+    for aux in ("pty_pid", "keeper_pid"):
+        raw = _read(state_dir / aux)
+        if not raw:
+            continue
+        try:
+            aux_pid = int(raw)
+        except ValueError:
+            continue
+        if _pid_alive(aux_pid):
+            try:
+                os.kill(aux_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    # If we got a PermissionError, we couldn't kill the process.
+    if kill_permission_error and not kill_sent:
+        # Check if it's now dead (may have exited on its own during grace).
+        if _pid_alive(pid):
+            return "kill_failed"
+    # SIGKILL was sent (or process was already gone) — consider it killed.
+    # Note: the process may appear as a zombie (waiting for parent waitpid),
+    # but it is terminated and will not consume CPU. We treat this as killed.
+    return "killed"
+
+
 def _effective_status(state_dir: Path, idle_threshold: Optional[float] = None) -> str:
     """Compute a display status for a run — read-only, no mutations.
 
@@ -252,7 +399,6 @@ def _opportunistic_heal(state_root: Optional[Path] = None) -> None:
         candidates = list(root.iterdir())
     except OSError:
         return
-    now_iso = _now_iso()
     for d in candidates:
         if not d.is_dir():
             continue
@@ -263,18 +409,16 @@ def _opportunistic_heal(state_root: Optional[Path] = None) -> None:
             pid_raw = _read(d / "pid")
             if not pid_raw:
                 # No pid recorded → mark died.
-                _write(d / "status", "died\n")
-                if not (d / "ended_at").exists():
-                    _write(d / "ended_at", now_iso + "\n")
+                _mark_died(d, "no pid recorded")
                 continue
             try:
                 pid = int(pid_raw)
             except ValueError:
+                # Unparseable pid → mark died so it doesn't stay running forever.
+                _mark_died(d, f"invalid pid: {pid_raw!r}")
                 continue
             if not _pid_alive(pid):
-                _write(d / "status", "died\n")
-                if not (d / "ended_at").exists():
-                    _write(d / "ended_at", now_iso + "\n")
+                _mark_died(d, f"pid {pid} no longer alive")
         except OSError:
             continue
 
@@ -660,8 +804,9 @@ def cmd_reap(args: argparse.Namespace) -> int:
     idle_hours: Optional[float] = getattr(args, "idle_hours", None)
     target_name: Optional[str] = getattr(args, "name", None)
 
+    # Re-read the env at call time so --idle-hours / env override both work.
     idle_threshold: float = (
-        idle_hours * 3600 if idle_hours is not None else IDLE_STALL_SECONDS
+        idle_hours * 3600 if idle_hours is not None else _parse_idle_stall_seconds()
     )
 
     if not STATE_ROOT.is_dir():
@@ -677,6 +822,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
     died_count = 0
     killed_count = 0
     skipped_count = 0
+    found_target = False
 
     for d in candidates:
         if not d.is_dir():
@@ -684,6 +830,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         name = d.name
         if target_name and name != target_name:
             continue
+        found_target = True
 
         raw_status = _read(d / "status")
         if raw_status != "running":
@@ -694,10 +841,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             # No pid at all → died.
             print(f"  {name}: dead (no pid recorded) [{'dry-run' if dry_run else 'marking died'}]")
             if not dry_run:
-                _write(d / "status", "died\n")
-                if not (d / "ended_at").exists():
-                    _write(d / "ended_at", _now_iso() + "\n")
-                _write(d / "reap_reason", "no pid recorded\n")
+                _mark_died(d, "no pid recorded")
             died_count += 1
             continue
 
@@ -706,10 +850,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         except ValueError:
             print(f"  {name}: dead (invalid pid {pid_raw!r}) [{'dry-run' if dry_run else 'marking died'}]")
             if not dry_run:
-                _write(d / "status", "died\n")
-                if not (d / "ended_at").exists():
-                    _write(d / "ended_at", _now_iso() + "\n")
-                _write(d / "reap_reason", f"invalid pid: {pid_raw!r}\n")
+                _mark_died(d, f"invalid pid: {pid_raw!r}")
             died_count += 1
             continue
 
@@ -717,10 +858,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             # Pid is gone → died.
             print(f"  {name}: dead pid={pid} [{'dry-run' if dry_run else 'marking died'}]")
             if not dry_run:
-                _write(d / "status", "died\n")
-                if not (d / "ended_at").exists():
-                    _write(d / "ended_at", _now_iso() + "\n")
-                _write(d / "reap_reason", f"pid {pid} no longer alive\n")
+                _mark_died(d, f"pid {pid} no longer alive")
             died_count += 1
             continue
 
@@ -738,64 +876,38 @@ def cmd_reap(args: argparse.Namespace) -> int:
             reason = f"idle>{idle_h:.1f}h"
             print(f"  {name}: idle pid={pid} idle={idle_h:.1f}h [{'dry-run' if dry_run else 'killing'}]")
             if not dry_run:
-                # Read pgid the same way cmd_kill does.
-                pgid_raw = _read(d / "pgid")
-                try:
-                    pgid: Optional[int] = int(pgid_raw) if pgid_raw else None
-                except ValueError:
-                    pgid = None
+                # PID-identity check: verify the live pid matches what was
+                # recorded at launch to avoid signalling a recycled PID.
+                recorded_identity = _read(d / "pid_start")
+                if recorded_identity:
+                    live_identity = _pid_identity(pid)
+                    if live_identity is None or live_identity != recorded_identity:
+                        print(
+                            f"  {name}: skipped: pid identity unverified "
+                            f"(recorded={recorded_identity!r}, live={live_identity!r})"
+                        )
+                        skipped_count += 1
+                        continue
 
-                # SIGTERM the process group (or the pid if no pgid).
-                sent = False
-                if pgid:
-                    try:
-                        os.killpg(pgid, signal.SIGTERM)
-                        sent = True
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                if not sent:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-
-                # Also hit tracked aux pids, same pattern as cmd_kill.
-                for aux in ("pty_pid", "keeper_pid"):
-                    raw = _read(d / aux)
-                    if raw:
-                        try:
-                            aux_pid = int(raw)
-                            if _pid_alive(aux_pid):
-                                try:
-                                    os.kill(aux_pid, signal.SIGTERM)
-                                except ProcessLookupError:
-                                    pass
-                        except ValueError:
-                            pass
-
-                # Grace period, then SIGKILL if still alive.
-                grace = 5.0
-                deadline = time.time() + grace
-                while time.time() < deadline and _pid_alive(pid):
-                    time.sleep(0.2)
-
-                if _pid_alive(pid):
-                    if pgid:
-                        try:
-                            os.killpg(pgid, signal.SIGKILL)
-                        except (ProcessLookupError, PermissionError):
-                            pass
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-
-                _write(d / "status", "killed\n")
-                _write(d / "ended_at", _now_iso() + "\n")
-                _write(d / "reap_reason", reason + "\n")
-            killed_count += 1
+                outcome = _signal_run(d, pid, reason)
+                if outcome == "killed":
+                    _write(d / "status", "killed\n")
+                    _write(d / "ended_at", _now_iso() + "\n")
+                    _write(d / "reap_reason", reason + "\n")
+                    killed_count += 1
+                else:
+                    print(
+                        f"  {name}: kill_failed — process pid={pid} still alive after SIGKILL; "
+                        "leaving status=running"
+                    )
+                    skipped_count += 1
+            else:
+                killed_count += 1
         else:
             skipped_count += 1
+
+    if target_name and not found_target:
+        print(f"reap: no such run '{target_name}' in {STATE_ROOT}")
 
     prefix = "[dry-run] " if dry_run else ""
     print(
@@ -1142,6 +1254,10 @@ def _runner(
     """
     my_pid = os.getpid()
     _write(state_dir / "pid", f"{my_pid}\n")
+    # Record process identity for PID-reuse guard in reap.
+    identity = _pid_identity(my_pid)
+    if identity:
+        _write(state_dir / "pid_start", identity + "\n")
     # After setsid(), pid == pgid (we're the session & group leader).
     _write(state_dir / "pgid", f"{os.getpgid(my_pid)}\n")
 

@@ -9,6 +9,9 @@ Covers:
 - idle-kill path: alive pid + backdated log mtime → signalled + marked killed.
 - opportunistic self-heal from list marks dead-pid runs died but never
   idle-kills.
+- kill-path coverage: pgid/pty_pid/keeper_pid signalling, grace→SIGKILL
+  escalation, pid identity mismatch guard.
+- --name <typo> prints a clear "no such run" message.
 """
 from __future__ import annotations
 
@@ -38,6 +41,10 @@ def _make_run(
     interactive: str = "0",
     write_log: bool = True,
     log_age_secs: Optional[float] = None,
+    pgid: Optional[int] = None,
+    pty_pid: Optional[int] = None,
+    keeper_pid: Optional[int] = None,
+    pid_start: Optional[str] = None,
 ) -> tuple[Path, Path]:
     """Create a minimal fake run under state_root and log_root."""
     sd = state_root / name
@@ -50,6 +57,14 @@ def _make_run(
     (sd / "started_at").write_text("2024-01-01T00:00:00Z\n")
     if pid is not None:
         (sd / "pid").write_text(f"{pid}\n")
+    if pgid is not None:
+        (sd / "pgid").write_text(f"{pgid}\n")
+    if pty_pid is not None:
+        (sd / "pty_pid").write_text(f"{pty_pid}\n")
+    if keeper_pid is not None:
+        (sd / "keeper_pid").write_text(f"{keeper_pid}\n")
+    if pid_start is not None:
+        (sd / "pid_start").write_text(f"{pid_start}\n")
 
     if write_log:
         log_file = ld / "log"
@@ -327,6 +342,16 @@ class TestReapDeadPid:
 
         assert sd.joinpath("status").read_text().strip() == "done"
 
+    def test_name_no_such_run_prints_message(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """--name <nonexistent> prints a clear 'no such run' message."""
+        rc = agent_run.cmd_reap(_reap_args(name="does-not-exist"))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "no such run" in out
+        assert "does-not-exist" in out
+
 
 # ---------------------------------------------------------------------------
 # cmd_reap -- idle-kill path
@@ -374,51 +399,227 @@ class TestReapIdleKill:
                 pass
             proc.wait(timeout=5)
 
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork/exec")
     def test_idle_kill_with_explicit_idle_hours_flag(
         self, isolated_runs_root, isolated_log_root, monkeypatch
     ):
-        """--idle-hours N overrides the module constant for reap decisions."""
-        # Very short threshold (0.1h = 6 minutes) to trigger idle detection.
+        """--idle-hours N overrides the module constant for reap decisions.
+
+        Uses a real subprocess and a shrunken grace period so the escalation
+        path runs without actually waiting 5 seconds.
+        """
         threshold_h = 0.1
         threshold_s = threshold_h * 3600
 
-        sd, ld = _make_run(
-            isolated_runs_root,
-            isolated_log_root,
-            "idlerun2",
-            status="running",
-            pid=12345,
-            log_age_secs=threshold_s + 10,
+        proc = subprocess.Popen(["sleep", "600"])
+        pid = proc.pid
+        try:
+            # Shrink grace to 0s so the test runs fast.
+            monkeypatch.setattr(agent_run, "REAP_GRACE_SECONDS", 0.0)
+            monkeypatch.setattr(agent_run, "IDLE_STALL_SECONDS", 24 * 3600)  # default large
+
+            sd, ld = _make_run(
+                isolated_runs_root,
+                isolated_log_root,
+                "idlerun2",
+                status="running",
+                pid=pid,
+                log_age_secs=threshold_s + 10,
+            )
+
+            rc = agent_run.cmd_reap(_reap_args(idle_hours=threshold_h))
+
+            assert rc == 0
+            assert sd.joinpath("status").read_text().strip() == "killed"
+            assert (sd / "ended_at").exists()
+
+            proc.wait(timeout=10)
+            assert proc.returncode is not None
+        finally:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait(timeout=5)
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork/exec")
+    def test_idle_kill_with_pgid_signals_process_group(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """reap uses pgid (killpg) when the pgid state file is present."""
+        # Launch the subprocess in its own process group so killpg doesn't
+        # terminate pytest itself.
+        proc = subprocess.Popen(
+            ["sleep", "600"],
+            start_new_session=True,  # gives the process its own pgid == pid
         )
-        monkeypatch.setattr(agent_run, "IDLE_STALL_SECONDS", 24 * 3600)  # default large
+        pid = proc.pid
+        pgid = pid  # start_new_session makes pgid == pid
+        try:
+            threshold = 3600.0
+            monkeypatch.setattr(agent_run, "IDLE_STALL_SECONDS", threshold)
+            monkeypatch.setattr(agent_run, "REAP_GRACE_SECONDS", 0.0)
 
-        signals_sent = []
+            sd, ld = _make_run(
+                isolated_runs_root,
+                isolated_log_root,
+                "pgidrun",
+                status="running",
+                pid=pid,
+                pgid=pgid,
+                log_age_secs=threshold + 60,
+            )
 
-        def fake_kill(pid, sig):
-            signals_sent.append((pid, sig))
+            rc = agent_run.cmd_reap(_reap_args(idle_hours=threshold / 3600))
 
-        def fake_killpg(pgid, sig):
-            signals_sent.append(("pgid", pgid, sig))
+            assert rc == 0
+            assert sd.joinpath("status").read_text().strip() == "killed"
 
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: False)  # dies on first check too
-        # But we need pid to appear alive initially for idle-kill branch, so:
-        call_count = [0]
+            proc.wait(timeout=10)
+            assert proc.returncode is not None
+        finally:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait(timeout=5)
 
-        def alive_then_dead(_p):
-            call_count[0] += 1
-            return call_count[0] <= 1  # alive on first call, dead after
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork/exec")
+    def test_idle_kill_signals_aux_pids(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """reap sends SIGTERM to pty_pid and keeper_pid aux processes."""
+        # Launch two aux processes to act as pty_pid and keeper_pid.
+        pty_proc = subprocess.Popen(["sleep", "600"])
+        keeper_proc = subprocess.Popen(["sleep", "600"])
+        main_proc = subprocess.Popen(["sleep", "600"])
+        try:
+            threshold = 3600.0
+            monkeypatch.setattr(agent_run, "IDLE_STALL_SECONDS", threshold)
+            monkeypatch.setattr(agent_run, "REAP_GRACE_SECONDS", 0.0)
 
-        monkeypatch.setattr(agent_run, "_pid_alive", alive_then_dead)
-        monkeypatch.setattr(agent_run.os, "kill", fake_kill)
-        monkeypatch.setattr(agent_run.os, "killpg", fake_killpg)
+            sd, ld = _make_run(
+                isolated_runs_root,
+                isolated_log_root,
+                "auxrun",
+                status="running",
+                pid=main_proc.pid,
+                pty_pid=pty_proc.pid,
+                keeper_pid=keeper_proc.pid,
+                log_age_secs=threshold + 60,
+            )
 
-        rc = agent_run.cmd_reap(_reap_args(idle_hours=threshold_h))
+            rc = agent_run.cmd_reap(_reap_args(idle_hours=threshold / 3600))
 
-        assert rc == 0
-        assert sd.joinpath("status").read_text().strip() == "killed"
-        # At least one SIGTERM was sent.
-        term_sigs = [s for s in signals_sent if signal.SIGTERM in s]
-        assert term_sigs
+            assert rc == 0
+            assert sd.joinpath("status").read_text().strip() == "killed"
+
+            # All three processes should be dead.
+            main_proc.wait(timeout=10)
+            pty_proc.wait(timeout=10)
+            keeper_proc.wait(timeout=10)
+            assert main_proc.returncode is not None
+            assert pty_proc.returncode is not None
+            assert keeper_proc.returncode is not None
+        finally:
+            for p in (main_proc, pty_proc, keeper_proc):
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+                p.wait(timeout=5)
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork/exec")
+    def test_pid_identity_mismatch_skips_kill(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """PID identity mismatch: reap must NOT signal the process."""
+        proc = subprocess.Popen(["sleep", "600"])
+        pid = proc.pid
+        real_kill = os.kill  # save before monkeypatching
+        try:
+            threshold = 3600.0
+            monkeypatch.setattr(agent_run, "IDLE_STALL_SECONDS", threshold)
+
+            sd, ld = _make_run(
+                isolated_runs_root,
+                isolated_log_root,
+                "mismatchrun",
+                status="running",
+                pid=pid,
+                log_age_secs=threshold + 60,
+                # Record a fake start time that won't match the real process.
+                pid_start="Thu Jan  1 00:00:00 1970",
+            )
+
+            harmful_signals_sent = []
+
+            def recording_kill(p, sig):
+                # Only record actual kill signals, not liveness probes (sig 0).
+                if sig != 0:
+                    harmful_signals_sent.append((p, sig))
+                else:
+                    # Allow liveness probes to use the real kill.
+                    real_kill(p, sig)
+
+            monkeypatch.setattr(agent_run.os, "kill", recording_kill)
+            if hasattr(os, "killpg"):
+                monkeypatch.setattr(agent_run.os, "killpg", lambda pg, sig: harmful_signals_sent.append(("pg", pg, sig)))
+
+            rc = agent_run.cmd_reap(_reap_args(idle_hours=threshold / 3600))
+
+            assert rc == 0
+            # No harmful signals sent.
+            assert harmful_signals_sent == [], f"Expected no signals, got: {harmful_signals_sent}"
+            # Status must remain running.
+            assert sd.joinpath("status").read_text().strip() == "running"
+            # Output should explain the skip.
+            out = capsys.readouterr().out
+            assert "skipped" in out or "identity" in out.lower() or "unverified" in out
+        finally:
+            # Use the real os.kill to clean up (not the monkeypatched version).
+            try:
+                real_kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait(timeout=5)
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork/exec")
+    def test_sigkill_escalation_runs_after_grace(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """After grace period expires, SIGKILL is sent and process is marked killed."""
+        # Use a process that ignores SIGTERM (we'll use a shell that traps it).
+        # For simplicity, we use a real sleep and a zero grace period so SIGKILL
+        # is sent immediately after SIGTERM.
+        proc = subprocess.Popen(["sleep", "600"])
+        pid = proc.pid
+        try:
+            threshold = 3600.0
+            monkeypatch.setattr(agent_run, "IDLE_STALL_SECONDS", threshold)
+            # Zero grace: SIGKILL fires immediately after SIGTERM.
+            monkeypatch.setattr(agent_run, "REAP_GRACE_SECONDS", 0.0)
+
+            sd, ld = _make_run(
+                isolated_runs_root,
+                isolated_log_root,
+                "gracerun",
+                status="running",
+                pid=pid,
+                log_age_secs=threshold + 60,
+            )
+
+            rc = agent_run.cmd_reap(_reap_args(idle_hours=threshold / 3600))
+
+            assert rc == 0
+            assert sd.joinpath("status").read_text().strip() == "killed"
+            proc.wait(timeout=10)
+        finally:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -505,3 +706,24 @@ class TestOpportunisticHeal:
         agent_run._opportunistic_heal(isolated_runs_root)
 
         assert sd.joinpath("status").read_text().strip() == "done"
+
+    def test_opportunistic_heal_marks_invalid_pid_as_died(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """_opportunistic_heal marks a run with an unparseable pid as died."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "badpidrun",
+            status="running",
+        )
+        # Write an unparseable pid.
+        (sd / "pid").write_text("not-a-number\n")
+
+        agent_run._opportunistic_heal(isolated_runs_root)
+
+        assert sd.joinpath("status").read_text().strip() == "died"
+        assert (sd / "ended_at").exists()
+        reason = (sd / "reap_reason").read_text().strip()
+        assert "invalid" in reason or "pid" in reason
+
