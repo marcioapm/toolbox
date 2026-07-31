@@ -604,7 +604,7 @@ agent-run tail build                      # follow logs in real time
 agent-run status build                    # running | done | failed
 agent-run -i chat claude --permission-mode bypassPermissions
 agent-run steer chat 'Also add tests for edge cases.'
-agent-run kill chat                       # clean kill of the whole group
+agent-run kill chat                       # TERM the run; runner does its own cleanup
 
 # threadctl: DB-only agent updates; `cycle` (cron) is the sole Discord writer
 threadctl bind 1234567890 --title "Fix flaky upload test" --repo marcioapm/toolbox
@@ -652,8 +652,19 @@ agent-run status <name>                   # one-line status
 agent-run logs <name> [N]                 # last N lines (default 50)
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
-agent-run kill <name> [SIGNAL]            # default TERM; use 9 if stuck
+agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 ```
+
+`kill` sends TERM/INT/HUP straight to the identity-verified runner, which
+catches it and runs its own teardown (kill/reap the workload, publish
+terminal state). `agent-run kill <name> KILL` does not send a raw SIGKILL
+to the runner — an uncatchable signal would skip that teardown and orphan
+the running agent while state still said "running". Instead it TERMs the
+runner first and waits a bounded window for normal teardown; only if the
+runner is still alive after that does it re-verify identity and
+parentage, KILL the runner and its recorded children directly, and
+publish terminal state itself. Only TERM, INT, HUP, and KILL are accepted;
+other signals are rejected rather than forwarded.
 
 `status` reports `not running (log preserved)` when the process state is
 gone (e.g. after a reboot) but the log survived in `/var/tmp`. `list` shows
@@ -667,10 +678,10 @@ Ephemeral, under `$AGENT_RUN_STATE_DIR/<name>/` (default `/tmp/agent-runs`):
 
 | File | Contents |
 |------|----------|
-| `status` | `running` / `done` / `failed` |
+| `status` | `starting` / `running` / `done` / `failed` |
 | `exit_code` | numeric exit code (after completion) |
-| `pid`, `pgid` | agent session/group leader pid (== pgid under setsid) |
-| `process_identity` | platform-specific runner birth token, verified before `kill` signals the group |
+| `pid`, `pgid` | agent session/group leader pid (== pgid under setsid); `pgid` is informational only, not a kill target |
+| `process_identity` | platform-specific runner birth token, verified before `kill` signals the runner |
 | `command` | pretty-printed launch command |
 | `argv` | JSON-encoded argv (authoritative form for replay) |
 | `started_at`, `ended_at` | ISO-8601 UTC timestamps |
@@ -692,9 +703,19 @@ Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
 - Written in Python (`src/toolbox/agent_run.py`), installed as a
   `[project.scripts]` entry point alongside the rest of the toolbox.
 - Double-forks and `os.setsid()` on launch so the run becomes its own
-  session + process-group leader. Before `agent-run kill` calls `os.killpg`, it
-  verifies the recorded PID's platform-specific birth token and group; it
-  refuses legacy or unverifiable state rather than signaling a recycled PID.
+  session + process-group leader. `agent-run kill` signals the
+  identity-verified runner directly (never the whole process group); on
+  Linux the signal is bound to a pidfd opened before the final identity
+  check, closing the ordinary PID-recycling window. Darwin has no pidfd
+  equivalent, so a narrow TOCTOU gap remains between the last identity
+  re-check and the actual signal call — accepted as a residual risk, not
+  fully closed.
+- Each run name is serialized by a permanent per-name lock file under
+  `$AGENT_RUN_STATE_DIR/.locks/<name>.lock`; these are never pruned, so
+  concurrent launches/prunes of the same name always contend on the same
+  lock inode. The detached runner holds its own inherited copy of that
+  lock fd until it has published its identity and resolved readiness, so
+  a launcher dying mid-setup cannot release the lock early.
 - On interactive runs, a dedicated "keeper" child process holds the FIFO
   open for writing (`O_RDWR`) so readers never see EOF between steers.
 - The PTY is allocated via `pty.fork()`; the parent runs a `select()` loop
@@ -702,7 +723,12 @@ Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
   (agent output). Works identically on Linux and macOS without depending
   on the (different) `script(1)` flavors.
 - SIGTERM/INT/HUP handlers always finalize `status` + `exit_code` +
-  `ended_at`, even when the launcher is killed mid-run.
+  `ended_at`, even when the launcher is killed mid-run. `status` starts at
+  `starting` (published before the detached runner exists) and only moves
+  to `running` once the runner is actually controllable — child
+  spawned/exec'd for one-shot, or PTY/FIFO/keeper ready for interactive.
+  Any setup failure before that point still resolves synchronously to
+  `failed`, never leaving `starting` stranded with no process behind it.
 
 ## License
 

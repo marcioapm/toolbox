@@ -27,15 +27,36 @@ Usage::
     agent-run logs <name> [N]            # last N lines (default 50)
     agent-run status <name>              # one-line status
     agent-run steer <name> <msg...>      # send text to agent stdin (needs -i)
-    agent-run kill <name> [SIGNAL]       # TERM by default; 9/KILL if stuck
+    agent-run kill <name> [SIGNAL]       # TERM by default; see "kill" below
     agent-run list                       # list all runs
+
+`kill` sends TERM, INT, or HUP straight to the identity-verified runner
+process, which catches it and runs its own teardown (kill/reap the
+workload, publish terminal state). Signals the runner cannot catch —
+notably KILL — are never sent to it directly: an uncatchable signal would
+skip that teardown entirely and orphan the running agent while state kept
+reporting "running". Instead `agent-run kill <name> KILL` first sends the
+runner a regular TERM and waits a bounded window for its normal teardown;
+only if the runner is still alive after that does it re-verify the
+runner's identity and its recorded children's parentage, KILL each
+directly, and publish terminal state itself. Signals outside
+{TERM, INT, HUP, KILL} are rejected rather than forwarded, since an
+unhandled one could bypass cleanup the same way a raw KILL would.
+
+A run's `status` moves from `starting` (published before the detached
+runner exists) to `running` (published only once the runner has actually
+become controllable — child spawned/exec'd for one-shot, or PTY, FIFO, and
+keeper ready for interactive) to a terminal `done`/`failed`. Any failure
+before a status file exists, or before the detached runner takes over,
+still resolves synchronously to `failed` rather than leaving `starting`
+stranded with no process behind it.
 
 Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 
-    status       running | done | failed
+    status       starting | running | done | failed
     exit_code    numeric exit code (after completion)
     pid          runner process id
-    pgid         process group id (kill target)
+    pgid         process group id (informational only; not a kill target)
     process_identity  platform-specific runner birth token (kill verification)
     agent_pid   one-shot command child pid (non-interactive only)
     pty_pid      PTY child pid (interactive only)
@@ -61,6 +82,24 @@ but the log dir survived. `logs`/`tail`/`clean` always read from the log
 dir, falling back to the old single-directory layout for runs started
 before this split. Log dirs older than 21 days are pruned opportunistically
 on `list`/launch.
+
+Each run name is serialized by a permanent per-name lock file under
+$AGENT_RUN_STATE_DIR/.locks/<name>.lock; these lock files are never pruned
+(only the run's own state/log directories are), so the lock inode a launch
+acquires is always the same one a concurrent launch or prune of that name
+contends on. A launcher may die before its detached runner finishes
+publishing identity and readiness, but the runner holds its own inherited
+copy of the same lock fd until then, so the name stays serialized either
+way.
+
+Kill-time process identity verification (a platform-specific "birth
+token": /proc/<pid>/stat start time on Linux, `ps -o lstart=` on Darwin)
+closes the ordinary PID-recycling window, and Linux additionally binds the
+signal to a pidfd opened before the final check. Darwin has no pidfd
+equivalent: the gap between the last identity re-check and the actual
+`os.kill()` call is a real, if extremely narrow, TOCTOU window where a
+recycled PID could theoretically receive a signal meant for its prior
+occupant. This residual race is accepted, not fully closed, on Darwin.
 """
 
 from __future__ import annotations
@@ -87,7 +126,7 @@ import traceback
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
@@ -98,6 +137,8 @@ SUBMIT_MODE_CRLF = "crlf"
 MAX_PTY_INPUT_BUFFER = 1024 * 1024
 MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
 FINAL_RENDER_TIMEOUT_SECONDS = 10.0
+FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
+ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -165,31 +206,67 @@ def _log_dir(name: str) -> Path:
 
 
 def _safe_rmtree(candidate: Path, root: Path, expected: Optional[os.stat_result] = None) -> None:
-    """Remove ``candidate`` only when it is a real, non-symlink direct child of ``root``.
+    """Remove a direct-child directory without following a mutable pathname.
 
-    Uses ``lstat`` on the *original* pathname to refuse symlinks before any
-    resolution occurs.  When ``expected`` is provided, its device/inode must
-    still match immediately before deletion, preventing a prune inspection of
-    one run directory from deleting a same-name replacement.
+    The directory is opened relative to an opened root with ``O_NOFOLLOW`` and
+    recursively emptied through directory descriptors.  Consequently a rename
+    plus symlink replacement after inspection cannot redirect deletion to a
+    sibling (the final ``rmdir`` is also relative to the original root fd).
     """
+    # pathlib never resolves ".." lexically, so ``(root / "..").parent`` is
+    # ``root`` itself — the parent check below would accept it and then
+    # ``os.open("..", dir_fd=root_fd)`` would walk straight out of root.
+    # Reject any non-plain name before it ever reaches dir_fd-relative opens.
+    if candidate.name in ("", ".", "..") or candidate.parent != root:
+        sys.exit(f"agent-run: refusing to delete {candidate} — not a direct child of {root}")
+    root_fd = child_fd = -1
     try:
-        st = candidate.lstat()
-    except OSError:
-        return  # already gone — nothing to do
-    if not _stat_module.S_ISDIR(st.st_mode):
-        sys.exit(
-            f"agent-run: refusing to delete {candidate} — not a real directory "
-            f"(lstat mode {oct(st.st_mode)})"
-        )
-    if expected is not None and (st.st_dev, st.st_ino) != (expected.st_dev, expected.st_ino):
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            child_fd = os.open(candidate.name, flags, dir_fd=root_fd)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            sys.exit(f"agent-run: refusing to delete {candidate} — not a real directory ({exc})")
+        st = os.fstat(child_fd)
+        if not _stat_module.S_ISDIR(st.st_mode):
+            sys.exit(f"agent-run: refusing to delete {candidate} — not a real directory")
+        if expected is not None and (st.st_dev, st.st_ino) != (expected.st_dev, expected.st_ino):
+            return
+
+        def remove_tree(fd: int) -> None:
+            for entry in os.listdir(fd):
+                entry_st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+                if _stat_module.S_ISDIR(entry_st.st_mode):
+                    nested = os.open(entry, flags, dir_fd=fd)
+                    try:
+                        remove_tree(nested)
+                    finally:
+                        os.close(nested)
+                    os.rmdir(entry, dir_fd=fd)
+                else:
+                    os.unlink(entry, dir_fd=fd)
+
+        remove_tree(child_fd)
+        # Re-verify the pathname still names the inode we opened and emptied.
+        # A rename-then-replace between the open above and here would
+        # otherwise let a path-relative rmdir remove an unrelated directory
+        # that happens to share the name.
+        try:
+            final_st = os.stat(candidate.name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (final_st.st_dev, final_st.st_ino) != (st.st_dev, st.st_ino):
+            return  # candidate was replaced after inspection — do not touch it
+        os.rmdir(candidate.name, dir_fd=root_fd)
+    except FileNotFoundError:
         return
-    resolved_root = root.resolve()
-    resolved = candidate.resolve()
-    if resolved == resolved_root or resolved.parent != resolved_root:
-        sys.exit(
-            f"agent-run: refusing to delete {resolved} — not contained in {resolved_root}"
-        )
-    shutil.rmtree(resolved)
+    finally:
+        if child_fd >= 0:
+            os.close(child_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
 
 
 @contextmanager
@@ -403,21 +480,44 @@ def _pretty_command(argv: Sequence[str]) -> str:
 
 
 def _submit_mode_for_argv(argv: Sequence[str]) -> str:
-    """Select the interactive Enter sequence from the launched argv.
+    """Select CRLF only when the unambiguous wrapped executable is OpenCode.
 
-    Only inspect the executable position, optionally beneath wrappers whose
-    command structure is unambiguous. Never search arbitrary arguments: a
-    prompt mentioning "opencode" must not change how another agent is driven.
-
-    ``env -S``/``--split-string`` tokens are fed back through the same env
-    option/assignment parser so that split strings containing ``env``
-    assignments (``KEY=value``), ``-i``, ``-u TOKEN``, etc. before the
-    executable are handled correctly.  A nesting counter (``_ENV_SPLIT_DEPTH``)
-    caps recursion so a maliciously constructed or accidentally nested split
-    string cannot loop indefinitely.
+    ``env -S`` uses a small BSD/GNU-compatible lexer: whitespace separates
+    words, quotes group words, backslash quotes the next character, and ``\_``
+    represents a literal space.  Expansion has one budget for the complete
+    wrapper walk, including nested ``env`` invocations.
     """
-    _ENV_SPLIT_MAX_DEPTH = 8
+    def split_env_string(value: str) -> Optional[list[str]]:
+        words: list[str] = []
+        word: list[str] = []
+        quote: Optional[str] = None
+        escaped = False
+        for char in value:
+            if escaped:
+                word.append(" " if char == "_" else char)
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif quote:
+                if char == quote:
+                    quote = None
+                else:
+                    word.append(char)
+            elif char in {"'", '"'}:
+                quote = char
+            elif char.isspace():
+                if word:
+                    words.append("".join(word))
+                    word = []
+            else:
+                word.append(char)
+        if escaped or quote:
+            return None
+        if word:
+            words.append("".join(word))
+        return words
 
+    budget = 8
     command = list(argv)
     while command:
         executable = Path(command[0]).name
@@ -426,71 +526,48 @@ def _submit_mode_for_argv(argv: Sequence[str]) -> str:
         if executable in {"command", "exec"}:
             command = command[1:]
             continue
-        if executable == "env":
-            command = command[1:]
-            split_depth = 0
-            while command:
-                argument = command[0]
-                if argument == "--":
-                    command = command[1:]
-                    break
-                if argument in {"-i", "--ignore-environment"} or (
-                    not argument.startswith("-") and "=" in argument
-                ):
-                    command = command[1:]
-                    continue
-                # -S / --split-string / -S<arg>: split the value via shlex and
-                # prepend the tokens back into the current command list so that
-                # env options/assignments *within* the split string (e.g.
-                # ``-S 'KEY=val opencode'``) are consumed by the same inner loop
-                # rather than re-entered as the outer loop's executable.
-                if argument in {"-S", "--split-string"}:
-                    if len(command) < 2:
-                        return SUBMIT_MODE_CR
-                    try:
-                        split_tokens = shlex.split(command[1])
-                    except ValueError:
-                        return SUBMIT_MODE_CR
-                    split_depth += 1
-                    if split_depth > _ENV_SPLIT_MAX_DEPTH:
-                        return SUBMIT_MODE_CR
-                    command = split_tokens + command[2:]
-                    continue  # re-enter inner loop with expanded tokens
-                if argument.startswith("--split-string="):
-                    try:
-                        split_tokens = shlex.split(argument.split("=", 1)[1])
-                    except ValueError:
-                        return SUBMIT_MODE_CR
-                    split_depth += 1
-                    if split_depth > _ENV_SPLIT_MAX_DEPTH:
-                        return SUBMIT_MODE_CR
-                    command = split_tokens + command[1:]
-                    continue  # re-enter inner loop with expanded tokens
-                if len(argument) > 2 and argument.startswith("-S"):
-                    try:
-                        split_tokens = shlex.split(argument[2:])
-                    except ValueError:
-                        return SUBMIT_MODE_CR
-                    split_depth += 1
-                    if split_depth > _ENV_SPLIT_MAX_DEPTH:
-                        return SUBMIT_MODE_CR
-                    command = split_tokens + command[1:]
-                    continue  # re-enter inner loop with expanded tokens
-                if argument in {"-u", "--unset", "-C", "--chdir", "-P", "--argv0"}:
-                    # These options consume the following argument. If it is
-                    # absent, env itself will fail; there is no executable to
-                    # inspect, so leave the default as CR.
-                    command = command[2:] if len(command) >= 2 else []
-                    continue
-                if argument.startswith(("--unset=", "--chdir=", "--argv0=")):
-                    command = command[1:]
-                    continue
-                if len(argument) > 2 and argument[:2] in {"-u", "-C", "-P"}:
-                    command = command[1:]
-                    continue
+        if executable != "env":
+            break
+        command = command[1:]
+        while command:
+            argument = command[0]
+            if argument == "--":
+                command = command[1:]
                 break
-            continue
-        break
+            # BSD env accepts combined short flags (notably -iS).  -S consumes
+            # either its suffix or the next argv element as its split string.
+            if argument.startswith("-") and not argument.startswith("--") and len(argument) > 2 and "S" in argument[1:]:
+                before, split_value = argument[1:].split("S", 1)
+                if any(flag not in {"i", "v"} for flag in before):
+                    break
+                if split_value:
+                    command = ["-S", split_value] + command[1:]
+                else:
+                    command = ["-S"] + command[1:]
+                continue
+            if argument in {"-S", "--split-string"} or argument.startswith("--split-string="):
+                if argument.startswith("--split-string="):
+                    value, rest = argument.split("=", 1)[1], command[1:]
+                elif len(command) >= 2:
+                    value, rest = command[1], command[2:]
+                else:
+                    return SUBMIT_MODE_CR
+                budget -= 1
+                tokens = split_env_string(value)
+                if budget < 0 or tokens is None:
+                    return SUBMIT_MODE_CR
+                command = tokens + rest
+                continue
+            if argument in {"-i", "--ignore-environment"} or (not argument.startswith("-") and "=" in argument):
+                command = command[1:]
+                continue
+            if argument in {"-u", "--unset", "-C", "--chdir", "-P", "--argv0"}:
+                command = command[2:] if len(command) >= 2 else []
+                continue
+            if argument.startswith(("--unset=", "--chdir=", "--argv0=")) or (len(argument) > 2 and argument[:2] in {"-u", "-C", "-P"}):
+                command = command[1:]
+                continue
+            break
     return SUBMIT_MODE_CR
 
 
@@ -810,7 +887,9 @@ def _render_log_to_clean(log_dir: Path) -> None:
     tmp.replace(clean)
 
 
-def _bounded_final_render(log_dir: Path) -> Optional[str]:
+def _bounded_final_render(
+    log_dir: Path, register: Optional["callable"] = None
+) -> Optional[str]:
     """Best-effort final render with strict byte and wall-clock limits.
 
     Rendering occurs in a dedicated child so an uninterruptible or pathological
@@ -818,6 +897,12 @@ def _bounded_final_render(log_dir: Path) -> Optional[str]:
     ``log.clean`` atomically through ``_render_log_to_clean``; the parent waits
     only ``FINAL_RENDER_TIMEOUT_SECONDS`` before killing it.  Returns an error
     description suitable for the raw log, or ``None`` on success.
+
+    ``register(pid)`` is invoked with the child's pid right after fork (and
+    with ``None`` once it no longer needs tracking) so a caller can fold this
+    untracked-by-state-files helper into its own signal-handler teardown —
+    without it, a signal delivered while rendering would find no pid file for
+    this child and leave it orphaned.
     """
     try:
         size = (log_dir / "log").stat().st_size
@@ -826,7 +911,12 @@ def _bounded_final_render(log_dir: Path) -> Optional[str]:
     if size > MAX_FINAL_RENDER_BYTES:
         return f"log is {size} bytes; final render limit is {MAX_FINAL_RENDER_BYTES} bytes"
 
-    pid = os.fork()
+    with _block_handled_runner_signals():
+        pid = os.fork()
+        if pid == 0:
+            _reset_runner_signal_handlers()
+        elif register is not None:
+            register(pid)
     if pid == 0:
         try:
             _render_log_to_clean(log_dir)
@@ -834,25 +924,40 @@ def _bounded_final_render(log_dir: Path) -> Optional[str]:
             os._exit(1)
         os._exit(0)
 
-    deadline = time.monotonic() + FINAL_RENDER_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        try:
-            waited, status = os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            return "renderer child could not be reaped"
-        if waited == pid:
-            return None if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else "renderer failed"
-        time.sleep(0.05)
+    try:
+        deadline = time.monotonic() + FINAL_RENDER_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                waited, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return "renderer child could not be reaped"
+            if waited == pid:
+                return None if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else "renderer failed"
+            time.sleep(0.05)
 
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
-        os.waitpid(pid, 0)
-    except ChildProcessError:
-        pass
-    return f"renderer exceeded {FINAL_RENDER_TIMEOUT_SECONDS:g}-second deadline"
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        # Bounded WNOHANG poll rather than a blocking waitpid: a renderer
+        # stuck in uninterruptible filesystem I/O can survive SIGKILL for an
+        # unbounded time, and this helper must never hold the runner hostage
+        # waiting for it.
+        reap_deadline = time.monotonic() + FINAL_RENDER_REAP_TIMEOUT_SECONDS
+        while time.monotonic() < reap_deadline:
+            try:
+                waited, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if waited == pid:
+                break
+            time.sleep(0.05)
+        else:
+            return f"renderer exceeded {FINAL_RENDER_TIMEOUT_SECONDS:g}-second deadline; still unreaped after SIGKILL"
+        return f"renderer exceeded {FINAL_RENDER_TIMEOUT_SECONDS:g}-second deadline"
+    finally:
+        if register is not None:
+            register(None)
 
 
 def _echo_loop(log_dir: "Path", interval: float) -> None:
@@ -861,7 +966,10 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
     Runs in a detached child for the lifetime of the agent. The parent's
     signal handler kills us on shutdown so we don't outlive the run. We
     only re-render when the raw log's mtime has changed, so a quiet run
-    doesn't burn CPU.
+    doesn't burn CPU. Renders are skipped (not crashed) once the raw log
+    exceeds ECHO_LOOP_MAX_RENDER_BYTES, so an unbounded long-running log
+    cannot make each periodic tick progressively more expensive; the final
+    render at exit applies its own independent, stricter size cap.
     """
     log = log_dir / "log"
     clean = log_dir / "log.clean"
@@ -877,11 +985,16 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
         return
     while True:
         try:
-            mtime = log.stat().st_mtime
+            log_stat = log.stat()
         except FileNotFoundError:
             time.sleep(interval)
             continue
+        mtime = log_stat.st_mtime
         if mtime != last_mtime:
+            if log_stat.st_size > ECHO_LOOP_MAX_RENDER_BYTES:
+                last_mtime = mtime
+                time.sleep(interval)
+                continue
             try:
                 _render_log_to_clean(log_dir)
             except Exception:
@@ -1026,29 +1139,32 @@ def _send_signal_to_verified_pid(pid: int, sig: int, expected_identity: str) -> 
     system = platform.system()
 
     if system == "Linux":
-        # Try pidfd path first.
+        # Try pidfd path first.  Only an unavailable pidfd implementation falls
+        # back; permission/resource failures are real operational errors.
         pidfd_open = getattr(os, "pidfd_open", None)
         pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
         if pidfd_open is not None and pidfd_send_signal is not None:
             try:
                 pfd = pidfd_open(pid, 0)
-            except (ProcessLookupError, OSError):
-                raise ProcessLookupError(pid)
-            try:
-                # Re-verify identity *with the pidfd open*: the pidfd keeps the
-                # process table slot alive (kernel ref-counts it), so the PID
-                # cannot be recycled underneath us.  Identity mismatch after a
-                # successful pidfd_open is only possible if we opened the wrong
-                # PID in a race — fail closed.
-                current = _process_identity(pid)
-                if current is None or current != expected_identity:
-                    raise RuntimeError(
-                        "process identity changed between verification and signal; refusing"
-                    )
-                pidfd_send_signal(pfd, sig, None, 0)
-            finally:
-                os.close(pfd)
-            return
+            except ProcessLookupError:
+                raise
+            except OSError as exc:
+                if exc.errno not in {errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL}:
+                    raise
+            else:
+                try:
+                    current = _process_identity(pid)
+                    if current is None or current != expected_identity:
+                        raise RuntimeError("process identity changed between verification and signal; refusing")
+                    try:
+                        pidfd_send_signal(pfd, sig, None, 0)
+                    except OSError as exc:
+                        if exc.errno == errno.ESRCH:
+                            raise ProcessLookupError(pid) from exc
+                        raise
+                finally:
+                    os.close(pfd)
+                return
         # Fall through to the re-verified numeric path on old kernels.
 
     # Darwin and Linux without pidfd: re-verify identity as close as possible
@@ -1061,6 +1177,129 @@ def _send_signal_to_verified_pid(pid: int, sig: int, expected_identity: str) -> 
             "process identity changed between verification and signal; refusing"
         )
     os.kill(pid, sig)
+
+
+def _pid_parent_pid(pid: int) -> Optional[int]:
+    """Best-effort parent-pid lookup for ``pid``, used only to confirm that a
+    recorded child pid is still the runner's actual child immediately before
+    force-killing it (see ``_force_kill``)."""
+    system = platform.system()
+    if system == "Linux":
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text()
+            _before, after = stat_text.rsplit(")", 1)
+            fields = after.split()
+            ppid = fields[1]
+            return int(ppid) if ppid.lstrip("-").isdigit() else None
+        except (IndexError, OSError, ValueError):
+            return None
+    if system == "Darwin":
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "ppid="],
+                capture_output=True,
+                check=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        raw = result.stdout.strip()
+        return int(raw) if raw.lstrip("-").isdigit() else None
+    return None
+
+
+def _run_is_terminal(state_dir: Path) -> bool:
+    return _read(state_dir / "status") in {"done", "failed"}
+
+
+KILL_ESCALATION_TIMEOUT_SECONDS = 8.0
+KILL_POLL_INTERVAL_SECONDS = 0.2
+KILL_CHILD_REAP_TIMEOUT_SECONDS = 3.0
+
+
+def _force_kill(name: str, state_dir: Path, pid: int, expected_identity: str) -> None:
+    """Force-terminate a run without orphaning its workload or leaving a
+    false ``running`` state.
+
+    SIGKILL cannot be delivered straight to the runner: it cannot be caught,
+    so the runner's own teardown handler -- which kills/reaps the workload
+    and publishes terminal state -- would never run, orphaning the agent
+    process tree while state still claims the run is active. Instead this
+    first sends the runner an authenticated, handled SIGTERM (the same
+    request a plain ``kill`` sends) and gives it a bounded window to run its
+    normal teardown. Only if the runner is still alive after that window --
+    a wedged supervisor, not merely a slow one -- does this escalate to
+    directly terminating the runner and any workload pids it had recorded,
+    and it then publishes terminal state itself so a forced kill can never
+    leave the run reporting ``running``.
+    """
+    try:
+        _send_signal_to_verified_pid(pid, signal.SIGTERM, expected_identity)
+    except ProcessLookupError:
+        pass
+    except (PermissionError, RuntimeError) as exc:
+        sys.exit(f"agent-run: refusing to force-kill '{name}': {exc}")
+
+    deadline = time.time() + KILL_ESCALATION_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if not _pid_alive(pid) and _run_is_terminal(state_dir):
+            print(f"agent-run: {name} terminated cleanly (pid={pid})")
+            return
+        time.sleep(KILL_POLL_INTERVAL_SECONDS)
+
+    # The runner did not finish its own teardown in time. While it is still
+    # the live, verified owner of its recorded children, a recorded pid
+    # cannot have been recycled out from under it -- a live, non-reaping
+    # parent keeps its dead children as zombies, never reusable -- so
+    # re-confirm parentage one more time and kill each directly, then
+    # force-kill the runner itself, mirroring what its own teardown handler
+    # would have done had SIGTERM reached it in time.
+    verified_children = []
+    for field in _AUX_PID_FIELDS:
+        raw = _read(state_dir / field)
+        if not raw:
+            continue
+        try:
+            child_pid = int(raw)
+        except ValueError:
+            continue
+        if child_pid <= 0 or not _pid_alive(child_pid):
+            continue
+        if _pid_parent_pid(child_pid) != pid:
+            continue
+        verified_children.append(child_pid)
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    current_identity = _process_identity(pid)
+    if current_identity is not None and current_identity == expected_identity:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    reap_deadline = time.time() + KILL_CHILD_REAP_TIMEOUT_SECONDS
+    survivors = [p for p in verified_children if _pid_alive(p)]
+    while survivors and time.time() < reap_deadline:
+        time.sleep(KILL_POLL_INTERVAL_SECONDS)
+        survivors = [p for p in survivors if _pid_alive(p)]
+
+    if not _run_is_terminal(state_dir):
+        _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
+        _write(state_dir / "ended_at", _now_iso() + "\n")
+        _write(state_dir / "status", "failed\n")
+
+    if survivors:
+        print(
+            f"agent-run: force-killed '{name}' (pid={pid}); "
+            f"{len(survivors)} descendant process(es) did not exit "
+            "(likely blocked in uninterruptible I/O)"
+        )
+    else:
+        print(f"agent-run: force-killed unresponsive '{name}' (pid={pid})")
 
 
 def cmd_kill(args: argparse.Namespace) -> int:
@@ -1086,11 +1325,17 @@ def cmd_kill(args: argparse.Namespace) -> int:
     if not _pid_alive(pid):
         print(f"agent-run: {args.name} is not running (pid {pid})")
         return 0
-    # Signal the verified runner PID directly.  The runner's own _on_signal
-    # handler tears down its direct children (agent_pid, pty_pid, keeper_pid,
-    # echo_pid) using waitpid-ownership checks, so we do not need to signal
-    # aux PIDs externally.  killpg is not used: it is numeric and cannot be
-    # made atomic with the group identity check.
+    # Cleanup is implemented by the runner's catchable handlers. Only signals
+    # it can catch (TERM/INT/HUP) are sent straight to it; anything else
+    # could bypass cleanup entirely and is rejected up front. KILL is
+    # special-cased below to a bounded escalation instead of a raw signal,
+    # since it cannot be caught and would otherwise orphan the workload.
+    supported = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGKILL}
+    if sig not in supported:
+        sys.exit("agent-run: only TERM, INT, HUP, or KILL are supported; arbitrary signals can bypass cleanup")
+    if sig == signal.SIGKILL:
+        _force_kill(name, d, pid, expected_identity)
+        return 0
     try:
         _send_signal_to_verified_pid(pid, sig, expected_identity)
     except ProcessLookupError:
@@ -1104,7 +1349,7 @@ def cmd_kill(args: argparse.Namespace) -> int:
         sig_name = signal.Signals(sig).name
     except ValueError:
         sig_name = str(sig)
-    print(f"agent-run: sent {sig_name} to {args.name} (pid={pid})")
+    print(f"agent-run: sent {sig_name} cleanup request to {args.name} (pid={pid})")
     return 0
 
 
@@ -1153,6 +1398,28 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     d.mkdir(parents=True, exist_ok=True)
     log_d.mkdir(parents=True, exist_ok=True)
 
+    # Create resources that can fail (fifo, pipe) before publishing
+    # "starting" wherever possible: a failure here means the run never
+    # appeared active, so there is no stranded state to clean up.
+    fifo_path: Optional[Path] = None
+    if args.interactive:
+        fifo_path = d / "stdin"
+        if fifo_path.exists():
+            fifo_path.unlink()
+        try:
+            os.mkfifo(str(fifo_path))
+        except OSError as exc:
+            sys.exit(f"agent-run: failed to create control fifo: {exc}")
+    try:
+        r_ack, w_ack = os.pipe()
+    except OSError as exc:
+        if fifo_path is not None:
+            try:
+                fifo_path.unlink()
+            except OSError:
+                pass
+        sys.exit(f"agent-run: failed to create readiness pipe: {exc}")
+
     _write(d / "command", _pretty_command(argv) + "\n")
     _write(d / "argv", json.dumps(argv))
     submit_mode = _persist_submit_mode(
@@ -1175,17 +1442,21 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     if echo:
         _write(d / "echo", f"{echo_interval}\n")
 
-    if args.interactive:
-        fifo = d / "stdin"
-        if fifo.exists():
-            fifo.unlink()
-        os.mkfifo(str(fifo))
-
     # Double-fork to detach from the terminal and become our own session
     # leader. The grandchild runs the actual agent.
     parent_pid = os.getpid()
-    r_ack, w_ack = os.pipe()
-    child_pid = os.fork()
+    try:
+        child_pid = os.fork()
+    except OSError as exc:
+        # "starting" is already published with no runner behind it: unlike
+        # the fifo/pipe failures above, this must explicitly resolve to a
+        # terminal state rather than leaving a phantom active run.
+        os.close(r_ack)
+        os.close(w_ack)
+        _write(d / "exit_code", "1\n")
+        _write(d / "ended_at", _now_iso() + "\n")
+        _write(d / "status", "failed\n")
+        sys.exit(f"agent-run: failed to start agent: {exc}")
     if child_pid != 0:
         # Parent: wait for the grandchild to publish its pid, then return.
         os.close(w_ack)
@@ -1221,10 +1492,9 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         print(f"agent-run: logs:   agent-run tail {name}")
         return 0
 
-    # Intermediate child: become session leader and fork once more. The launch
-    # parent keeps the lock through readiness; detached descendants must not
-    # inherit a reference that would hold it for the full run lifetime.
-    os.close(lock_fd)
+    # Intermediate child: become session leader and fork once more.  Keep the
+    # inherited lock descriptor: flock ownership survives launcher death until
+    # the runner has published identity and resolved readiness.
     os.close(r_ack)
     os.setsid()
     grand = os.fork()
@@ -1239,6 +1509,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         argv,
         args.interactive,
         w_ack,
+        lock_fd,
         prompt_file,
         submit_mode,
         echo,
@@ -1283,10 +1554,41 @@ def _block_handled_runner_signals():
         pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
-def _teardown_children(state_dir: Path, grace: float = 2.0) -> None:
+_AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid")
+
+
+def _publish_or_reap_child(state_dir: Path, field: str, pid: int) -> None:
+    """Persist a forked child's pid to ``field``; if that write fails, the
+    child is untrackable by ``_teardown_children`` (which only reads state
+    files), so terminate and reap it immediately here instead of letting it
+    survive unaccounted for after the runner reports setup failure.
+    """
+    try:
+        _write(state_dir / field, f"{pid}\n")
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        raise
+
+
+def _teardown_children(
+    state_dir: Path, grace: float = 2.0, extra_pids: Optional[Iterable[int]] = None
+) -> None:
     """SIGTERM (then SIGKILL after `grace` seconds) every child pid this
     runner recorded (agent_pid / pty_pid / keeper_pid / prompt_pid / echo_pid), reaping
     each one.
+
+    ``extra_pids`` covers children forked but not yet (or never) published to
+    a state file — e.g. the state-file write itself failed. Publication is
+    not atomic with the fork, so relying solely on state files would orphan
+    a child whose write failed; callers pass their locally tracked pid set
+    here so teardown can still find and reap it.
 
     Called from both the runner's signal handler and its crash `except` so
     a hard crash can never leave the launched agent or its helpers orphaned.
@@ -1297,14 +1599,18 @@ def _teardown_children(state_dir: Path, grace: float = 2.0) -> None:
     own_pid = os.getpid()
     pids = []
     seen = set()
-    for aux in ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid"):
+    candidates: List[int] = []
+    for aux in _AUX_PID_FIELDS:
         raw = _read(state_dir / aux)
         if not raw:
             continue
         try:
-            pid = int(raw)
+            candidates.append(int(raw))
         except ValueError:
             continue
+    if extra_pids:
+        candidates.extend(extra_pids)
+    for pid in candidates:
         if pid <= 0 or pid == own_pid or pid in seen:
             continue
         seen.add(pid)
@@ -1355,6 +1661,7 @@ def _runner(
     argv: Sequence[str],
     interactive: bool,
     ready_fd: int,
+    lock_fd: int = -1,
     prompt_file: Optional[str] = None,
     submit_mode: str = SUBMIT_MODE_CR,
     echo: bool = False,
@@ -1375,6 +1682,7 @@ def _runner(
             _write(state_dir / "status", "done\n" if code == 0 else "failed\n")
 
     handling_signal = False
+    render_pid: Optional[int] = None
 
     def _on_signal(signum: int, _frame) -> None:
         nonlocal handling_signal
@@ -1385,7 +1693,7 @@ def _runner(
         handling_signal = True
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)
-        _teardown_children(state_dir)
+        _teardown_children(state_dir, extra_pids=[render_pid] if render_pid else None)
         _finalize(128 + signum)
         os._exit(128 + signum)
 
@@ -1424,7 +1732,9 @@ def _runner(
             with _block_handled_runner_signals():
                 echo_pid = os.fork()
                 if echo_pid != 0:
-                    _write(state_dir / "echo_pid", f"{echo_pid}\n")
+                    _publish_or_reap_child(state_dir, "echo_pid", echo_pid)
+                else:
+                    _reset_runner_signal_handlers()
             if echo_pid == 0:
                 _reset_runner_signal_handlers()
                 try:
@@ -1453,25 +1763,24 @@ def _runner(
             pass
         os._exit(1)
 
-    # Acknowledge only after all required resources, handlers, and helpers are
-    # ready. The parent treats EOF or an error payload as launch failure.
-    try:
+    ready_sent = False
+
+    def _ready() -> None:
+        nonlocal ready_sent
+        if ready_sent:
+            return
         os.write(ready_fd, b'{"status":"ok"}')
-    except OSError:
-        pass
-    finally:
-        try:
-            os.close(ready_fd)
-        except OSError:
-            pass
+        os.close(ready_fd)
+        if lock_fd >= 0:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        ready_sent = True
 
     try:
         if interactive:
-            exit_code = _run_interactive(
-                state_dir, argv, log_fd, prompt_file, submit_mode
-            )
+            exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
         else:
-            exit_code = _run_oneshot(state_dir, argv, log_fd, prompt_file)
+            exit_code = _run_oneshot(state_dir, argv, log_fd, _ready, prompt_file)
     except Exception as exc:  # noqa: BLE001
         try:
             detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -1486,6 +1795,30 @@ def _runner(
         # its own "kill keeper_pid" tail), leaving the launched agent (and
         # keeper/echo helpers) orphaned. Never exit without reaping them.
         _teardown_children(state_dir)
+        if not ready_sent:
+            # Setup failed before the run became controllable (e.g. FIFO
+            # open, PTY fork, or fcntl raised): the launcher is still
+            # blocked reading ready_fd expecting a structured result, not a
+            # closed pipe it must interpret as an ambiguous EOF. Tell it
+            # explicitly so it reports failure instead of racing a false
+            # "started" success.
+            try:
+                payload = json.dumps({"status": "error", "error": str(exc)}).encode()
+                os.write(ready_fd, payload)
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(ready_fd)
+                except OSError:
+                    pass
+                if lock_fd >= 0:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                        os.close(lock_fd)
+                    except OSError:
+                        pass
+            ready_sent = True
         exit_code = 1
 
     # Persistent helpers (notably --echo) outlive the agent by design, so reap
@@ -1499,7 +1832,11 @@ def _runner(
         # The periodic renderer may never tick on a short run, or may have run
         # just before the agent's final output.  Render once in a bounded child
         # after stopping it.  The status is already terminal if this times out.
-        render_error = _bounded_final_render(log_dir)
+        def _track_render_pid(pid: Optional[int]) -> None:
+            nonlocal render_pid
+            render_pid = pid
+
+        render_error = _bounded_final_render(log_dir, register=_track_render_pid)
         if render_error:
             try:
                 os.write(
@@ -1517,14 +1854,17 @@ def _run_oneshot(
     state_dir: Path,
     argv: Sequence[str],
     log_fd: int,
+    ready: callable,
     prompt_file: Optional[str] = None,
 ) -> int:
     with _block_handled_runner_signals():
         pid = os.fork()
         if pid != 0:
-            _write(state_dir / "agent_pid", f"{pid}\n")
-            # Agent child exists: publish running now that it is controllable.
+            _publish_or_reap_child(state_dir, "agent_pid", pid)
             _write(state_dir / "status", "running\n")
+            ready()
+        else:
+            _reset_runner_signal_handlers()
     if pid == 0:
         _reset_runner_signal_handlers()
         # Child: stdin from prompt file (if provided) or /dev/null;
@@ -1576,6 +1916,7 @@ def _run_interactive(
     state_dir: Path,
     argv: Sequence[str],
     log_fd: int,
+    ready: callable,
     prompt_file: Optional[str] = None,
     submit_mode: str = SUBMIT_MODE_CR,
 ) -> int:
@@ -1588,7 +1929,9 @@ def _run_interactive(
     with _block_handled_runner_signals():
         keeper_pid = os.fork()
         if keeper_pid != 0:
-            _write(state_dir / "keeper_pid", f"{keeper_pid}\n")
+            _publish_or_reap_child(state_dir, "keeper_pid", keeper_pid)
+        else:
+            _reset_runner_signal_handlers()
     if keeper_pid == 0:
         _reset_runner_signal_handlers()
         os.close(keeper_r)
@@ -1624,7 +1967,9 @@ def _run_interactive(
     with _block_handled_runner_signals():
         pty_pid, master_fd = pty.fork()
         if pty_pid != 0:
-            _write(state_dir / "pty_pid", f"{pty_pid}\n")
+            _publish_or_reap_child(state_dir, "pty_pid", pty_pid)
+        else:
+            _reset_runner_signal_handlers()
     if pty_pid == 0:
         _reset_runner_signal_handlers()
         # Child: stdin/stdout/stderr are all the PTY slave. Exec.
@@ -1633,10 +1978,8 @@ def _run_interactive(
         except OSError as exc:
             sys.stderr.write(f"agent-run: exec failed: {exc}\n")
             os._exit(127)
-    # Full interactive relay is now established: PTY forked, keeper holds FIFO
-    # open, FIFO ready.  Publish running only now that the run is controllable.
-    _write(state_dir / "status", "running\n")
-
+    # Full interactive relay is now established: PTY forked and keeper holds
+    # FIFO open.  Finish the descriptor setup before declaring readiness.
     # If a prompt file was provided, fork a helper that waits for the TUI to
     # finish initializing (so the PTY is in raw mode and Enter is recognized),
     # then writes the prompt + selected Enter sequence to the FIFO so the agent
@@ -1645,7 +1988,9 @@ def _run_interactive(
         with _block_handled_runner_signals():
             helper = os.fork()
             if helper != 0:
-                _write(state_dir / "prompt_pid", f"{helper}\n")
+                _publish_or_reap_child(state_dir, "prompt_pid", helper)
+            else:
+                _reset_runner_signal_handlers()
         if helper == 0:
             _reset_runner_signal_handlers()
             # Detach from the parent's stdio. Errors are silent (no log to write to).
@@ -1690,6 +2035,8 @@ def _run_interactive(
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
     flags = fcntl.fcntl(fifo_fd, fcntl.F_GETFL)
     fcntl.fcntl(fifo_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    _write(state_dir / "status", "running\n")
+    ready()
 
     exit_code: Optional[int] = None
     buf_in = b""
