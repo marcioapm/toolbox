@@ -4,6 +4,7 @@ old-layout fallback, and the age-based log prune."""
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import time
 
@@ -94,6 +95,27 @@ class TestStateAndLogDirs:
         assert agent_run.STATE_ROOT != agent_run.LOG_ROOT
 
 
+class TestCmdList:
+    def test_ignores_internal_lock_directory(self, isolated_runs_root, capsys):
+        (isolated_runs_root / ".locks").mkdir()
+        run = isolated_runs_root / "actual-run"
+        run.mkdir()
+        (run / "status").write_text("running\n")
+
+        assert agent_run.cmd_list(argparse.Namespace()) == 0
+
+        output = capsys.readouterr().out
+        assert "actual-run: status=running" in output
+        assert ".locks" not in output
+
+    def test_only_internal_lock_directory_is_not_a_run(self, isolated_runs_root, capsys):
+        (isolated_runs_root / ".locks").mkdir()
+
+        assert agent_run.cmd_list(argparse.Namespace()) == 0
+
+        assert "  (none)" in capsys.readouterr().out
+
+
 class TestLogFileFor:
     def test_prefers_new_layout(self, isolated_runs_root):
         name = "run1"
@@ -178,3 +200,43 @@ class TestPruneOldLogs:
         missing = tmp_path / "does-not-exist"
         monkeypatch.setattr(agent_run, "LOG_ROOT", missing)
         agent_run._prune_old_logs()  # should not raise
+
+    def test_prunes_only_stale_unlocked_regular_locks(self, isolated_runs_root):
+        lock_dir = agent_run.STATE_ROOT / ".locks"
+        lock_dir.mkdir()
+        old_lock = lock_dir / "old.lock"
+        old_lock.write_text("")
+        fresh_lock = lock_dir / "fresh.lock"
+        fresh_lock.write_text("")
+        target = lock_dir / "target"
+        target.write_text("keep")
+        symlink = lock_dir / "link.lock"
+        symlink.symlink_to(target)
+        old_time = time.time() - 30 * 86400
+        os.utime(old_lock, (old_time, old_time))
+
+        agent_run._prune_old_locks(max_age_days=21)
+
+        assert not old_lock.exists()
+        assert fresh_lock.exists()
+        assert symlink.is_symlink()
+        assert target.exists()
+
+    def test_keeps_stale_lock_held_by_another_process(self, isolated_runs_root):
+        lock_dir = agent_run.STATE_ROOT / ".locks"
+        lock_dir.mkdir()
+        lock = lock_dir / "active.lock"
+        lock.write_text("")
+        old_time = time.time() - 30 * 86400
+        os.utime(lock, (old_time, old_time))
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            agent_run._prune_old_locks(max_age_days=21)
+            assert lock.exists()
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def test_prune_locks_noop_when_directory_missing(self, isolated_runs_root):
+        agent_run._prune_old_locks()

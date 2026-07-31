@@ -77,6 +77,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import sys
 import threading
 import time
@@ -222,11 +223,56 @@ def _known(name: str) -> bool:
     return _state_dir(name).is_dir() or _log_dir(name).is_dir()
 
 
+def _prune_old_locks(max_age_days: int = PRUNE_AFTER_DAYS) -> None:
+    """Best-effort removal of stale, unlocked per-name lock files.
+
+    A lock is unlinked only after this process acquired its inode's nonblocking
+    lock, so an active launch cannot lose its serialization lock.
+    """
+    lock_dir = STATE_ROOT / ".locks"
+    if not lock_dir.is_dir():
+        return
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        candidates = list(lock_dir.iterdir())
+    except OSError:
+        return
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    for path in candidates:
+        if not path.name.endswith(".lock"):
+            continue
+        try:
+            fd = os.open(path, os.O_RDONLY | nofollow)
+        except OSError:
+            continue
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_mtime >= cutoff:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            try:
+                # Refuse a path that was replaced after it was opened.
+                current = path.stat(follow_symlinks=False)
+                if current.st_ino == info.st_ino and current.st_dev == info.st_dev:
+                    path.unlink()
+            except OSError:
+                pass
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _prune_old_logs(max_age_days: int = PRUNE_AFTER_DAYS) -> None:
     """Remove log dirs whose newest file is older than max_age_days.
 
     Best-effort and silent: called opportunistically from `list` and launch
-    so stale crash-survivor logs don't accumulate forever in /var/tmp."""
+    so stale crash-survivor logs don't accumulate forever in /var/tmp.
+    """
+    _prune_old_locks(max_age_days)
     if not LOG_ROOT.is_dir():
         return
     cutoff = time.time() - max_age_days * 86400
@@ -289,16 +335,39 @@ def _submit_mode_for_argv(argv: Sequence[str]) -> str:
                 ):
                     command = command[1:]
                     continue
-                if argument in {"-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-P", "--argv0"}:
+                if argument in {"-S", "--split-string"}:
+                    if len(command) < 2:
+                        return SUBMIT_MODE_CR
+                    try:
+                        split_command = shlex.split(command[1])
+                    except ValueError:
+                        return SUBMIT_MODE_CR
+                    command = split_command + command[2:]
+                    break
+                if argument.startswith("--split-string="):
+                    try:
+                        split_command = shlex.split(argument.split("=", 1)[1])
+                    except ValueError:
+                        return SUBMIT_MODE_CR
+                    command = split_command + command[1:]
+                    break
+                if len(argument) > 2 and argument.startswith("-S"):
+                    try:
+                        split_command = shlex.split(argument[2:])
+                    except ValueError:
+                        return SUBMIT_MODE_CR
+                    command = split_command + command[1:]
+                    break
+                if argument in {"-u", "--unset", "-C", "--chdir", "-P", "--argv0"}:
                     # These options consume the following argument. If it is
                     # absent, env itself will fail; there is no executable to
                     # inspect, so leave the default as CR.
                     command = command[2:] if len(command) >= 2 else []
                     continue
-                if argument.startswith(("--unset=", "--chdir=", "--split-string=", "--argv0=")):
+                if argument.startswith(("--unset=", "--chdir=", "--argv0=")):
                     command = command[1:]
                     continue
-                if len(argument) > 2 and argument[:2] in {"-u", "-C", "-S", "-P"}:
+                if len(argument) > 2 and argument[:2] in {"-u", "-C", "-P"}:
                     command = command[1:]
                     continue
                 break
@@ -361,7 +430,9 @@ def cmd_list(_args: argparse.Namespace) -> int:
     state_names = set()
     print(f"Live runs ({STATE_ROOT}):")
     if STATE_ROOT.is_dir():
-        state_names = {p.name for p in STATE_ROOT.iterdir() if p.is_dir()}
+        state_names = {
+            p.name for p in STATE_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")
+        }
     if not state_names:
         print("  (none)")
     else:
@@ -554,6 +625,16 @@ def _feed_pyte(stream, raw: bytes) -> None:
         raise error[0]
 
 
+class RenderDependencyError(RuntimeError):
+    """The optional terminal renderer is unavailable."""
+
+
+_RENDER_DEPENDENCY_MESSAGE = (
+    "agent-run: `pyte` is required for `clean` / --echo. "
+    "Install with: pipx inject mmartins-toolbox pyte  (or uv tool install --with pyte ...)"
+)
+
+
 def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 100000) -> str:
     """Render a raw PTY-captured log (with ANSI/Ink redraw artifacts) into a
     plain-text transcript by replaying the byte stream through a VT100
@@ -570,11 +651,8 @@ def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 1
     """
     try:
         import pyte  # type: ignore
-    except ImportError:
-        sys.exit(
-            "agent-run: `pyte` is required for `clean` / --echo. "
-            "Install with: pipx inject mmartins-toolbox pyte  (or uv tool install --with pyte ...)"
-        )
+    except ImportError as exc:
+        raise RenderDependencyError(_RENDER_DEPENDENCY_MESSAGE) from exc
 
     screen = pyte.HistoryScreen(width, height, history=history, ratio=0.5)
     stream = pyte.ByteStream(screen)
@@ -623,6 +701,7 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
     doesn't burn CPU.
     """
     log = log_dir / "log"
+    clean = log_dir / "log.clean"
     last_mtime = -1.0
     # Soft cap: if pyte isn't installed, write a friendly stub and exit.
     try:
@@ -656,12 +735,15 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
 def cmd_clean(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
     raw = log.read_bytes()
-    rendered = _render_log(
-        raw,
-        width=args.width,
-        height=args.height,
-        history=args.history,
-    )
+    try:
+        rendered = _render_log(
+            raw,
+            width=args.width,
+            height=args.height,
+            history=args.history,
+        )
+    except RenderDependencyError as exc:
+        sys.exit(str(exc))
     out_path = getattr(args, "out", None)
     if out_path:
         Path(out_path).write_text(rendered, encoding="utf-8")
@@ -1086,6 +1168,10 @@ def _runner(
             if echo_pid == 0:
                 _reset_runner_signal_handlers()
                 try:
+                    os.close(ready_fd)
+                except OSError:
+                    pass
+                try:
                     _echo_loop(log_dir, echo_interval)
                 finally:
                     os._exit(0)
@@ -1152,7 +1238,7 @@ def _runner(
         # stopping it and before publishing terminal state.
         try:
             _render_log_to_clean(log_dir)
-        except Exception as exc:  # transcript is a convenience artifact
+        except (Exception, SystemExit) as exc:  # transcript is a convenience artifact
             try:
                 os.write(
                     log_fd,
@@ -1211,6 +1297,10 @@ def _drain_pty_input(master_fd: int, buffered: bytes) -> bytes:
             written = os.write(master_fd, buffered)
         except BlockingIOError:
             break
+        except OSError as exc:
+            if exc.errno in {errno.EIO, errno.EBADF, errno.EINVAL}:
+                return b""
+            raise
         if written <= 0:
             break
         buffered = buffered[written:]

@@ -33,8 +33,13 @@ from toolbox import agent_run
         (["env", "-C/tmp", "opencode"], agent_run.SUBMIT_MODE_CRLF),
         (["env", "-u", "TOKEN", "opencode"], agent_run.SUBMIT_MODE_CRLF),
         (["env", "--unset=TOKEN", "opencode"], agent_run.SUBMIT_MODE_CRLF),
-        (["env", "-S", "ignored", "opencode"], agent_run.SUBMIT_MODE_CRLF),
-        (["env", "--split-string=ignored", "opencode"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-S", "opencode --foo"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "--split-string", "opencode --foo"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "--split-string=opencode --foo"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-Sopencode --foo"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-S", "'opencode' --foo"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-S", "claude opencode"], agent_run.SUBMIT_MODE_CR),
+        (["env", "-S", "'unterminated"], agent_run.SUBMIT_MODE_CR),
         (["env", "-P", "name", "opencode"], agent_run.SUBMIT_MODE_CRLF),
         (["env", "--argv0=name", "opencode"], agent_run.SUBMIT_MODE_CRLF),
     ],
@@ -186,6 +191,72 @@ def test_short_echo_run_gets_final_transcript_with_last_output(
     assert final_output in clean.read_text()
 
 
+def test_echo_run_finalizes_when_pyte_is_unavailable(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    def missing_renderer(_log_dir):
+        raise SystemExit("forced missing pyte")
+
+    monkeypatch.setattr(agent_run, "_render_log_to_clean", missing_renderer)
+    args = argparse.Namespace(
+        name="echo-without-pyte",
+        command=[sys.executable, "-c", "pass"],
+        interactive=False,
+        prompt_file=None,
+        echo=True,
+        echo_interval=60.0,
+    )
+
+    assert agent_run.cmd_launch(args) == 0
+
+    state = isolated_runs_root / "echo-without-pyte"
+    assert _wait_until(lambda: (state / "status").read_text().strip() == "done")
+    assert (state / "exit_code").read_text().strip() == "0"
+    assert (state / "ended_at").is_file()
+
+
+def test_echo_child_closes_readiness_fd_before_rendering(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    log_dir = tmp_path / "log"
+    state_dir.mkdir()
+    log_dir.mkdir()
+    (log_dir / "log").touch()
+    marker = tmp_path / "ready-fd-state"
+    ready_read, ready_write = os.pipe()
+
+    def verify_ready_fd_closed(_log_dir, _interval):
+        try:
+            os.fstat(ready_write)
+        except OSError:
+            marker.write_text("closed")
+        else:
+            marker.write_text("open")
+
+    monkeypatch.setattr(agent_run, "_echo_loop", verify_ready_fd_closed)
+    pid = os.fork()
+    if pid == 0:
+        os.close(ready_read)
+        agent_run._runner(
+            state_dir,
+            log_dir,
+            [sys.executable, "-c", "pass"],
+            False,
+            ready_write,
+            echo=True,
+        )
+        os._exit(99)
+
+    os.close(ready_write)
+    try:
+        assert os.read(ready_read, 128) == b'{"status":"ok"}'
+        _waited_pid, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status)
+        assert os.WEXITSTATUS(status) == 0
+        assert marker.read_text() == "closed"
+    finally:
+        os.close(ready_read)
+
+
 def test_unexpected_interactive_select_error_marks_run_failed(
     isolated_runs_root, monkeypatch
 ):
@@ -229,9 +300,18 @@ def test_drain_pty_input_retries_partial_write_and_eagain(monkeypatch):
     remaining = agent_run._drain_pty_input(42, payload)
     assert remaining == payload[3:]
     remaining = agent_run._drain_pty_input(42, remaining)
-
     assert remaining == b""
     assert bytes(delivered) == payload
+
+
+@pytest.mark.parametrize("error", [errno.EIO, errno.EBADF, errno.EINVAL])
+def test_drain_pty_input_drops_undeliverable_input(monkeypatch, error):
+    def closed_pty(_fd, _data):
+        raise OSError(error, "closed PTY")
+
+    monkeypatch.setattr(agent_run.os, "write", closed_pty)
+
+    assert agent_run._drain_pty_input(42, b"prompt bytes") == b""
 
 
 def test_launch_fails_when_runner_setup_cannot_open_log(

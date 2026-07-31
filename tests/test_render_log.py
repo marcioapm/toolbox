@@ -2,6 +2,7 @@
 renderer used by `agent-run clean` and `--echo`)."""
 from __future__ import annotations
 
+import builtins
 import re
 
 import pytest
@@ -197,6 +198,25 @@ class TestEchoLoop:
 
         assert attempts == 2
         assert (log_dir / "log.clean").read_text() == "complete\n"
+
+    def test_missing_pyte_writes_diagnostic_stub(self, tmp_path, monkeypatch):
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(b"complete\r\n")
+        real_import = builtins.__import__
+
+        def no_pyte(name, *args, **kwargs):
+            if name == "pyte":
+                raise ImportError("forced missing pyte")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_pyte)
+
+        agent_run._echo_loop(log_dir, 1.0)
+
+        stub = (log_dir / "log.clean").read_text()
+        assert "--echo requested" in stub
+        assert "pyte" in stub
 
 
 class TestRenderLogRecursionHardening:

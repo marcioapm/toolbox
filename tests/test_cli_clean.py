@@ -6,6 +6,7 @@ fixture log, then invoke `cmd_clean` directly to verify the CLI plumbing
 from __future__ import annotations
 
 import argparse
+import builtins
 import io
 import sys
 
@@ -148,7 +149,6 @@ class TestCmdCleanErrors:
         )
         with pytest.raises(SystemExit):
             agent_run.cmd_clean(args)
-
     def test_run_without_log_exits(self, isolated_runs_root):
         # Create the dir but no log file.
         (isolated_runs_root / "no-log").mkdir()
@@ -157,6 +157,25 @@ class TestCmdCleanErrors:
             name="no-log", out=None, width=120, height=60, history=100000
         )
         with pytest.raises(SystemExit):
+            agent_run.cmd_clean(args)
+
+    def test_missing_pyte_exits_with_dependency_diagnostic(
+        self, isolated_runs_root, monkeypatch
+    ):
+        _make_run(isolated_runs_root, "missing-pyte", b"output\n")
+        real_import = builtins.__import__
+
+        def no_pyte(name, *args, **kwargs):
+            if name == "pyte":
+                raise ImportError("forced missing pyte")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_pyte)
+        args = argparse.Namespace(
+            name="missing-pyte", out=None, width=120, height=60, history=100000
+        )
+
+        with pytest.raises(SystemExit, match="pyte.*required"):
             agent_run.cmd_clean(args)
 
 
