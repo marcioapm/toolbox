@@ -109,12 +109,56 @@ def _read(path: Path, default: str = "") -> str:
         return default
 
 
+_RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_run_name(name: str) -> str:
+    """Validate a run name before it is ever used to build a filesystem path.
+
+    Rejects empty, ``.``/``..``, path separators, NUL/control characters, and
+    anything outside ``^[A-Za-z0-9][A-Za-z0-9._-]*$``. Returning the name
+    unchanged lets callers write ``name = _validate_run_name(name)`` inline.
+
+    This is the single choke point that keeps ``_state_dir``/``_log_dir`` (and
+    the ``shutil.rmtree`` calls that consume them) from resolving to a root or
+    parent directory and wiping unrelated state/logs.
+    """
+    if not name or name in (".", ".."):
+        sys.exit(f"agent-run: invalid run name {name!r}")
+    if "/" in name or "\\" in name:
+        sys.exit(f"agent-run: invalid run name {name!r} (path separators not allowed)")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        sys.exit(f"agent-run: invalid run name {name!r} (control characters not allowed)")
+    if not _RUN_NAME_RE.match(name):
+        sys.exit(
+            f"agent-run: invalid run name {name!r} "
+            f"(allowed: letters, digits, '.', '_', '-'; must start alnum)"
+        )
+    return name
+
+
 def _state_dir(name: str) -> Path:
     return STATE_ROOT / name
 
 
 def _log_dir(name: str) -> Path:
     return LOG_ROOT / name
+
+
+def _safe_rmtree(candidate: Path, root: Path) -> None:
+    """Remove ``candidate`` only when it is a direct child of ``root``.
+
+    Resolves both paths and asserts ``candidate.parent == root`` and
+    ``candidate != root`` before calling ``shutil.rmtree``, so a name that
+    somehow escaped validation can never delete a root or parent directory.
+    """
+    resolved = candidate.resolve()
+    resolved_root = root.resolve()
+    if resolved == resolved_root or resolved.parent != resolved_root:
+        sys.exit(
+            f"agent-run: refusing to delete {resolved} — not contained in {resolved_root}"
+        )
+    shutil.rmtree(resolved)
 
 
 def _log_file_for(name: str) -> Optional[Path]:
@@ -176,7 +220,7 @@ def _prune_old_logs(max_age_days: int = PRUNE_AFTER_DAYS) -> None:
         except OSError:
             continue
         if mtime < cutoff:
-            shutil.rmtree(d, ignore_errors=True)
+            _safe_rmtree(d, LOG_ROOT)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -293,7 +337,7 @@ def cmd_list(_args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    name = args.name
+    name = _validate_run_name(args.name)
     state_dir = _state_dir(name)
     log_dir = _log_dir(name)
     if not state_dir.is_dir() and not log_dir.is_dir():
@@ -317,7 +361,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
-    log = _require_log(args.name)
+    log = _require_log(_validate_run_name(args.name))
     n = max(1, args.n)
     # Read tail-n efficiently for large logs.
     with log.open("rb") as f:
@@ -341,8 +385,9 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 
 def cmd_tail(args: argparse.Namespace) -> int:
-    log = _require_log(args.name)
-    pid_raw = _read(_state_dir(args.name) / "pid")
+    name = _validate_run_name(args.name)
+    log = _require_log(name)
+    pid_raw = _read(_state_dir(name) / "pid")
     try:
         pid = int(pid_raw) if pid_raw else None
     except ValueError:
@@ -542,7 +587,7 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
-    log = _require_log(args.name)
+    log = _require_log(_validate_run_name(args.name))
     raw = log.read_bytes()
     rendered = _render_log(
         raw,
@@ -565,11 +610,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_steer(args: argparse.Namespace) -> int:
-    d = _require_state(args.name)
+    name = _validate_run_name(args.name)
+    d = _require_state(name)
     if _read(d / "interactive") != "1":
         sys.exit(
-            f"agent-run: '{args.name}' is not interactive. "
-            f"Relaunch with: agent-run -i {args.name} <command...>"
+            f"agent-run: '{name}' is not interactive. "
+            f"Relaunch with: agent-run -i {name} <command...>"
         )
     fifo = d / "stdin"
     if not fifo.is_fifo():
@@ -637,7 +683,8 @@ def _signal_by_name(name: str) -> int:
 
 
 def cmd_kill(args: argparse.Namespace) -> int:
-    d = _require_state(args.name)
+    name = _validate_run_name(args.name)
+    d = _require_state(name)
     try:
         sig = _signal_by_name(args.signal)
     except AttributeError:
@@ -691,7 +738,7 @@ def cmd_kill(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_launch(args: argparse.Namespace) -> int:
-    name: str = args.name
+    name: str = _validate_run_name(args.name)
     argv: List[str] = list(args.command)
     if not argv:
         sys.exit("agent-run: missing command")
@@ -717,9 +764,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
                     )
             except ValueError:
                 pass
-        shutil.rmtree(d)
+        _safe_rmtree(d, STATE_ROOT)
     if log_d.is_dir():
-        shutil.rmtree(log_d)
+        _safe_rmtree(log_d, LOG_ROOT)
     d.mkdir(parents=True, exist_ok=True)
     log_d.mkdir(parents=True, exist_ok=True)
 

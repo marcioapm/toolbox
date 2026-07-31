@@ -3,10 +3,82 @@ state dir (ephemeral, /tmp) vs. log dir (persistent, /var/tmp), the
 old-layout fallback, and the age-based log prune."""
 from __future__ import annotations
 
+import argparse
 import os
 import time
 
+import pytest
+
 from toolbox import agent_run
+
+
+class TestRunNameSafety:
+    @pytest.mark.parametrize(
+        "name",
+        ["", ".", "..", "../escape", "nested/run", r"nested\\run", "/tmp/escape", "-flag", "bad\x00name", "bad\nname"],
+    )
+    def test_validate_run_name_rejects_unsafe_names(self, name):
+        with pytest.raises(SystemExit, match="invalid run name"):
+            agent_run._validate_run_name(name)
+
+    @pytest.mark.parametrize("name", ["run", "run.v2", "Run_2-test", "1.2.3"])
+    def test_validate_run_name_accepts_safe_dotted_names(self, name):
+        assert agent_run._validate_run_name(name) == name
+
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
+            (agent_run.cmd_status, argparse.Namespace(name="..")),
+            (agent_run.cmd_logs, argparse.Namespace(name="..", n=1)),
+            (agent_run.cmd_tail, argparse.Namespace(name="..")),
+            (
+                agent_run.cmd_clean,
+                argparse.Namespace(name="..", out=None, width=80, height=24, history=0),
+            ),
+            (
+                agent_run.cmd_steer,
+                argparse.Namespace(name="..", message=["x"], raw=False, esc=False),
+            ),
+            (agent_run.cmd_kill, argparse.Namespace(name="..", signal="TERM")),
+            (
+                agent_run.cmd_launch,
+                argparse.Namespace(
+                    name="..",
+                    command=["true"],
+                    interactive=False,
+                    prompt_file=None,
+                    echo=False,
+                    echo_interval=2.0,
+                ),
+            ),
+        ],
+    )
+    def test_every_named_command_validates_before_path_use(self, command, args):
+        with pytest.raises(SystemExit, match="invalid run name"):
+            command(args)
+
+    def test_safe_rmtree_removes_direct_child_only(self, tmp_path):
+        root = tmp_path / "root"
+        child = root / "run"
+        child.mkdir(parents=True)
+
+        agent_run._safe_rmtree(child, root)
+
+        assert root.is_dir()
+        assert not child.exists()
+
+    @pytest.mark.parametrize("relative", [".", "..", "nested/run"])
+    def test_safe_rmtree_refuses_root_parent_and_nested_paths(self, tmp_path, relative):
+        root = tmp_path / "root"
+        root.mkdir()
+        candidate = root / relative
+        if relative == "nested/run":
+            candidate.mkdir(parents=True)
+
+        with pytest.raises(SystemExit, match="refusing to delete"):
+            agent_run._safe_rmtree(candidate, root)
+
+        assert root.is_dir()
 
 
 class TestStateAndLogDirs:
