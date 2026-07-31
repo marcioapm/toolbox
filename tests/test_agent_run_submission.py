@@ -34,6 +34,10 @@ from toolbox import agent_run
         (["env", "-u", "TOKEN", "opencode"], agent_run.SUBMIT_MODE_CRLF),
         (["env", "--unset=TOKEN", "opencode"], agent_run.SUBMIT_MODE_CRLF),
         (["env", "-S", "opencode --foo"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-S", "KEY=value opencode --foo"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-S", "-i opencode --foo"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-S", "-u TOKEN opencode --foo"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-S", "env -S 'KEY=value opencode --foo'"], agent_run.SUBMIT_MODE_CRLF),
         (["env", "--split-string", "opencode --foo"], agent_run.SUBMIT_MODE_CRLF),
         (["env", "--split-string=opencode --foo"], agent_run.SUBMIT_MODE_CRLF),
         (["env", "-Sopencode --foo"], agent_run.SUBMIT_MODE_CRLF),
@@ -187,8 +191,7 @@ def test_short_echo_run_gets_final_transcript_with_last_output(
     state = isolated_runs_root / "short-echo"
     assert _wait_until(lambda: (state / "status").read_text().strip() == "done")
     clean = isolated_log_root / "short-echo" / "log.clean"
-    assert clean.is_file()
-    assert final_output in clean.read_text()
+    assert _wait_until(lambda: clean.is_file() and final_output in clean.read_text())
 
 
 def test_echo_run_finalizes_when_pyte_is_unavailable(
@@ -470,6 +473,24 @@ def test_forked_helper_resets_inherited_runner_signal_handler():
         os.close(read_fd)
         if write_fd >= 0:
             os.close(write_fd)
+
+
+def test_block_handled_runner_signals_restores_exact_mask(monkeypatch):
+    calls = []
+    previous = {signal.SIGUSR1}
+    monkeypatch.setattr(
+        agent_run.signal,
+        "pthread_sigmask",
+        lambda how, mask: calls.append((how, set(mask))) or previous,
+    )
+
+    with agent_run._block_handled_runner_signals():
+        pass
+
+    assert calls == [
+        (signal.SIG_BLOCK, set(agent_run._HANDLED_RUNNER_SIGNALS)),
+        (signal.SIG_SETMASK, previous),
+    ]
 
 
 def test_teardown_never_signals_or_waits_for_self(tmp_path, monkeypatch):
