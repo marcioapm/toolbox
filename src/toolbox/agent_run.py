@@ -89,6 +89,13 @@ PRUNE_AFTER_DAYS = 21
 SUBMIT_MODE_CR = "cr"
 SUBMIT_MODE_CRLF = "crlf"
 
+# Idle-stall threshold: a "running" run whose log file hasn't been touched in
+# this many seconds is considered "stalled" by _effective_status(), and a
+# candidate for idle-killing by `agent-run reap`.
+IDLE_STALL_SECONDS: float = float(
+    os.environ.get("AGENT_RUN_IDLE_KILL_HOURS", 24)
+) * 3600
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -190,6 +197,88 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _effective_status(state_dir: Path, idle_threshold: Optional[float] = None) -> str:
+    """Compute a display status for a run — read-only, no mutations.
+
+    Rules (applied only when the raw status is "running"):
+    - pid missing or dead           → "died"
+    - pid alive but log idle > threshold → "stalled"
+    - otherwise                     → "running"
+
+    ``idle_threshold`` defaults to the module-level ``IDLE_STALL_SECONDS``
+    (which is itself overridable via ``AGENT_RUN_IDLE_KILL_HOURS``).
+    """
+    raw = _read(state_dir / "status", "unknown")
+    if raw != "running":
+        return raw
+
+    # Check pid liveness.
+    pid_raw = _read(state_dir / "pid")
+    if not pid_raw:
+        return "died"
+    try:
+        pid = int(pid_raw)
+    except ValueError:
+        return "died"
+    if not _pid_alive(pid):
+        return "died"
+
+    # Pid is alive — check log freshness.
+    if idle_threshold is None:
+        idle_threshold = IDLE_STALL_SECONDS
+    log = _log_file_for(state_dir.name)
+    if log is not None:
+        try:
+            mtime = log.stat().st_mtime
+            if time.time() - mtime > idle_threshold:
+                return "stalled"
+        except OSError:
+            pass
+
+    return "running"
+
+
+def _opportunistic_heal(state_root: Optional[Path] = None) -> None:
+    """Mark clearly-dead (pid gone) "running" runs as "died".
+
+    Deliberately NEVER idle-kills — that is only done by ``cmd_reap``.
+    Called from read commands (``cmd_list``) and launch so stale state
+    from crashed runs gets cleaned up passively, just like ``_prune_old_logs``.
+    """
+    root = state_root if state_root is not None else STATE_ROOT
+    if not root.is_dir():
+        return
+    try:
+        candidates = list(root.iterdir())
+    except OSError:
+        return
+    now_iso = _now_iso()
+    for d in candidates:
+        if not d.is_dir():
+            continue
+        try:
+            raw = _read(d / "status")
+            if raw != "running":
+                continue
+            pid_raw = _read(d / "pid")
+            if not pid_raw:
+                # No pid recorded → mark died.
+                _write(d / "status", "died\n")
+                if not (d / "ended_at").exists():
+                    _write(d / "ended_at", now_iso + "\n")
+                continue
+            try:
+                pid = int(pid_raw)
+            except ValueError:
+                continue
+            if not _pid_alive(pid):
+                _write(d / "status", "died\n")
+                if not (d / "ended_at").exists():
+                    _write(d / "ended_at", now_iso + "\n")
+        except OSError:
+            continue
+
+
 def _pretty_command(argv: Sequence[str]) -> str:
     return " ".join(shlex.quote(a) for a in argv)
 
@@ -265,6 +354,7 @@ def _log_line_count(log: Optional[Path]) -> int:
 
 def cmd_list(_args: argparse.Namespace) -> int:
     _prune_old_logs()
+    _opportunistic_heal()
     state_names = set()
     print(f"Live runs ({STATE_ROOT}):")
     if STATE_ROOT.is_dir():
@@ -273,7 +363,7 @@ def cmd_list(_args: argparse.Namespace) -> int:
         print("  (none)")
     else:
         for d in sorted(_state_dir(n) for n in state_names):
-            status = _read(d / "status", "unknown")
+            status = _effective_status(d)
             pid = _read(d / "pid", "?")
             started = _read(d / "started_at", "?")
             lines = _log_line_count(_log_file_for(d.name))
@@ -303,7 +393,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"name={name} status=not running (log preserved) lines={lines}")
         return 0
     d = state_dir
-    status = _read(d / "status", "unknown")
+    status = _effective_status(d)
     pid = _read(d / "pid", "?")
     started = _read(d / "started_at", "?")
     ended = _read(d / "ended_at", "-")
@@ -560,6 +650,161 @@ def cmd_clean(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reap(args: argparse.Namespace) -> int:
+    """Reconcile stale "running" state and idle-kill lingering processes.
+
+    Dead-pid runs → status=died.
+    Alive but log-idle runs → SIGTERM → SIGKILL → status=killed.
+    """
+    dry_run: bool = args.dry_run
+    idle_hours: Optional[float] = getattr(args, "idle_hours", None)
+    target_name: Optional[str] = getattr(args, "name", None)
+
+    idle_threshold: float = (
+        idle_hours * 3600 if idle_hours is not None else IDLE_STALL_SECONDS
+    )
+
+    if not STATE_ROOT.is_dir():
+        print("reap: no state root, nothing to do.")
+        return 0
+
+    try:
+        candidates = sorted(STATE_ROOT.iterdir())
+    except OSError as exc:
+        print(f"reap: cannot read state root: {exc}")
+        return 1
+
+    died_count = 0
+    killed_count = 0
+    skipped_count = 0
+
+    for d in candidates:
+        if not d.is_dir():
+            continue
+        name = d.name
+        if target_name and name != target_name:
+            continue
+
+        raw_status = _read(d / "status")
+        if raw_status != "running":
+            continue
+
+        pid_raw = _read(d / "pid")
+        if not pid_raw:
+            # No pid at all → died.
+            print(f"  {name}: dead (no pid recorded) [{'dry-run' if dry_run else 'marking died'}]")
+            if not dry_run:
+                _write(d / "status", "died\n")
+                if not (d / "ended_at").exists():
+                    _write(d / "ended_at", _now_iso() + "\n")
+                _write(d / "reap_reason", "no pid recorded\n")
+            died_count += 1
+            continue
+
+        try:
+            pid = int(pid_raw)
+        except ValueError:
+            print(f"  {name}: dead (invalid pid {pid_raw!r}) [{'dry-run' if dry_run else 'marking died'}]")
+            if not dry_run:
+                _write(d / "status", "died\n")
+                if not (d / "ended_at").exists():
+                    _write(d / "ended_at", _now_iso() + "\n")
+                _write(d / "reap_reason", f"invalid pid: {pid_raw!r}\n")
+            died_count += 1
+            continue
+
+        if not _pid_alive(pid):
+            # Pid is gone → died.
+            print(f"  {name}: dead pid={pid} [{'dry-run' if dry_run else 'marking died'}]")
+            if not dry_run:
+                _write(d / "status", "died\n")
+                if not (d / "ended_at").exists():
+                    _write(d / "ended_at", _now_iso() + "\n")
+                _write(d / "reap_reason", f"pid {pid} no longer alive\n")
+            died_count += 1
+            continue
+
+        # Pid alive — check log idle time.
+        log = _log_file_for(name)
+        idle_secs: Optional[float] = None
+        if log is not None:
+            try:
+                idle_secs = time.time() - log.stat().st_mtime
+            except OSError:
+                pass
+
+        if idle_secs is not None and idle_secs > idle_threshold:
+            idle_h = idle_secs / 3600
+            reason = f"idle>{idle_h:.1f}h"
+            print(f"  {name}: idle pid={pid} idle={idle_h:.1f}h [{'dry-run' if dry_run else 'killing'}]")
+            if not dry_run:
+                # Read pgid the same way cmd_kill does.
+                pgid_raw = _read(d / "pgid")
+                try:
+                    pgid: Optional[int] = int(pgid_raw) if pgid_raw else None
+                except ValueError:
+                    pgid = None
+
+                # SIGTERM the process group (or the pid if no pgid).
+                sent = False
+                if pgid:
+                    try:
+                        os.killpg(pgid, signal.SIGTERM)
+                        sent = True
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                if not sent:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+
+                # Also hit tracked aux pids, same pattern as cmd_kill.
+                for aux in ("pty_pid", "keeper_pid"):
+                    raw = _read(d / aux)
+                    if raw:
+                        try:
+                            aux_pid = int(raw)
+                            if _pid_alive(aux_pid):
+                                try:
+                                    os.kill(aux_pid, signal.SIGTERM)
+                                except ProcessLookupError:
+                                    pass
+                        except ValueError:
+                            pass
+
+                # Grace period, then SIGKILL if still alive.
+                grace = 5.0
+                deadline = time.time() + grace
+                while time.time() < deadline and _pid_alive(pid):
+                    time.sleep(0.2)
+
+                if _pid_alive(pid):
+                    if pgid:
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+
+                _write(d / "status", "killed\n")
+                _write(d / "ended_at", _now_iso() + "\n")
+                _write(d / "reap_reason", reason + "\n")
+            killed_count += 1
+        else:
+            skipped_count += 1
+
+    prefix = "[dry-run] " if dry_run else ""
+    print(
+        f"{prefix}reap done: {died_count} marked died, "
+        f"{killed_count} killed (idle), {skipped_count} skipped."
+    )
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # steer / kill
 # ---------------------------------------------------------------------------
@@ -701,6 +946,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
     echo: bool = bool(getattr(args, "echo", False))
     echo_interval: float = float(getattr(args, "echo_interval", 2.0))
     _prune_old_logs()
+    _opportunistic_heal()
     d = _state_dir(name)
     log_d = _log_dir(name)
     # Reject if a previous run with the same name is still active.
@@ -1310,6 +1556,31 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_list = sub.add_parser("list", help="list all runs")
     sp_list.set_defaults(func=cmd_list)
 
+    sp_reap = sub.add_parser(
+        "reap",
+        help="reconcile stale status and idle-kill lingering runs",
+    )
+    sp_reap.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="report actions without mutating any state",
+    )
+    sp_reap.add_argument(
+        "--idle-hours",
+        type=float,
+        default=None,
+        metavar="N",
+        help="override idle threshold (hours, float); default from AGENT_RUN_IDLE_KILL_HOURS or 24h",
+    )
+    sp_reap.add_argument(
+        "--name",
+        default=None,
+        metavar="NAME",
+        help="reap only this specific run",
+    )
+    sp_reap.set_defaults(func=cmd_reap)
+
     sp_help = sub.add_parser("help", help="show this help")
     sp_help.set_defaults(func=lambda _a: (p.print_help() or 0))
 
@@ -1365,7 +1636,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         break
 
     # Try to dispatch a known subcommand; otherwise treat as launch.
-    known_subcommands = {"status", "logs", "tail", "clean", "steer", "kill", "list", "help"}
+    known_subcommands = {"status", "logs", "tail", "clean", "steer", "kill", "list", "reap", "help"}
     if raw and raw[0] in known_subcommands and not interactive and not prompt_file and not echo:
         # argparse handles these, including their own -h/--help.
         parser = _build_parser()
