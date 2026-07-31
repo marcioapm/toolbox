@@ -28,7 +28,15 @@ from toolbox import agent_run
         (["claude", "fix opencode integration"], agent_run.SUBMIT_MODE_CR),
         (["codex", "opencode"], agent_run.SUBMIT_MODE_CR),
         (["python", "opencode"], agent_run.SUBMIT_MODE_CR),
-        (["env", "--chdir=/tmp", "opencode"], agent_run.SUBMIT_MODE_CR),
+        (["env", "--chdir=/tmp", "opencode"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "--chdir", "/tmp", "opencode"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-C/tmp", "opencode"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-u", "TOKEN", "opencode"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "--unset=TOKEN", "opencode"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-S", "ignored", "opencode"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "--split-string=ignored", "opencode"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "-P", "name", "opencode"], agent_run.SUBMIT_MODE_CRLF),
+        (["env", "--argv0=name", "opencode"], agent_run.SUBMIT_MODE_CRLF),
     ],
 )
 def test_submit_mode_for_argv_only_inspects_unambiguous_executable(argv, expected):
@@ -40,6 +48,40 @@ def test_persist_submit_mode_is_symbolic_and_uses_authoritative_argv(tmp_path):
 
     assert mode == agent_run.SUBMIT_MODE_CRLF
     assert (tmp_path / "submit_mode").read_text() == "crlf\n"
+
+
+def test_persist_submit_mode_honors_explicit_override(tmp_path):
+    mode = agent_run._persist_submit_mode(
+        tmp_path, ["opencode"], override=agent_run.SUBMIT_MODE_CR
+    )
+
+    assert mode == agent_run.SUBMIT_MODE_CR
+    assert (tmp_path / "submit_mode").read_text() == "cr\n"
+
+
+def test_missing_submit_mode_derives_legacy_default_from_argv(tmp_path):
+    (tmp_path / "argv").write_text(json.dumps(["env", "--chdir=/tmp", "opencode"]))
+
+    assert agent_run._submit_mode_from_state(tmp_path) == agent_run.SUBMIT_MODE_CRLF
+
+
+def test_main_accepts_explicit_submit_mode_override(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        agent_run,
+        "cmd_launch",
+        lambda args: captured.update(vars(args)) or 0,
+    )
+
+    assert agent_run.main(["--submit-mode=cr", "run", "opencode"]) == 0
+    assert captured["submit_mode"] == agent_run.SUBMIT_MODE_CR
+    assert captured["command"] == ["opencode"]
+
+
+@pytest.mark.parametrize("mode", ["", "lf", "auto"])
+def test_main_rejects_invalid_submit_mode(mode):
+    with pytest.raises(SystemExit, match="must be cr or crlf"):
+        agent_run.main([f"--submit-mode={mode}", "run", "opencode"])
 
 
 def test_prompt_submission_writes_use_selected_sequence():

@@ -288,6 +288,18 @@ def _submit_mode_for_argv(argv: Sequence[str]) -> str:
                 ):
                     command = command[1:]
                     continue
+                if argument in {"-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-P", "--argv0"}:
+                    # These options consume the following argument. If it is
+                    # absent, env itself will fail; there is no executable to
+                    # inspect, so leave the default as CR.
+                    command = command[2:] if len(command) >= 2 else []
+                    continue
+                if argument.startswith(("--unset=", "--chdir=", "--split-string=", "--argv0=")):
+                    command = command[1:]
+                    continue
+                if len(argument) > 2 and argument[:2] in {"-u", "-C", "-S", "-P"}:
+                    command = command[1:]
+                    continue
                 break
             continue
         break
@@ -300,12 +312,25 @@ def _submit_bytes(mode: str) -> bytes:
 
 
 def _submit_mode_from_state(state_dir: Path) -> str:
-    return _read(state_dir / "submit_mode", SUBMIT_MODE_CR)
+    mode = _read(state_dir / "submit_mode")
+    if mode in {SUBMIT_MODE_CR, SUBMIT_MODE_CRLF}:
+        return mode
+    # Upgrade path for runs created before submit_mode was persisted: recover
+    # the authoritative argv JSON and apply current executable detection.
+    try:
+        argv = json.loads((state_dir / "argv").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return SUBMIT_MODE_CR
+    if isinstance(argv, list) and all(isinstance(arg, str) for arg in argv):
+        return _submit_mode_for_argv(argv)
+    return SUBMIT_MODE_CR
 
 
-def _persist_submit_mode(state_dir: Path, argv: Sequence[str]) -> str:
-    """Persist a symbolic submission mode selected from authoritative argv."""
-    mode = _submit_mode_for_argv(argv)
+def _persist_submit_mode(
+    state_dir: Path, argv: Sequence[str], override: Optional[str] = None
+) -> str:
+    """Persist a symbolic submission mode selected from override or argv."""
+    mode = override or _submit_mode_for_argv(argv)
     _write(state_dir / "submit_mode", mode + "\n")
     return mode
 
@@ -814,7 +839,9 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
 
     _write(d / "command", _pretty_command(argv) + "\n")
     _write(d / "argv", json.dumps(argv))
-    submit_mode = _persist_submit_mode(d, argv)
+    submit_mode = _persist_submit_mode(
+        d, argv, getattr(args, "submit_mode", None)
+    )
     _write(d / "started_at", _now_iso() + "\n")
     _write(d / "status", "running\n")
     _write(d / "interactive", "1\n" if args.interactive else "0\n")
@@ -1499,8 +1526,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     prompt_file: Optional[str] = None
     echo: bool = False
     echo_interval: float = 2.0
-    # Consume top-level flags (`-i`, `-f <path>`, `--echo[=interval]`) in
-    # any order before the name.
+    submit_mode: Optional[str] = None
+    # Consume top-level flags (`-i`, `-f <path>`, `--echo[=interval]`,
+    # `--submit-mode=cr|crlf`) in any order before the name.
     while raw:
         if raw[0] in ("-i", "--interactive"):
             interactive = True
@@ -1528,11 +1556,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 sys.exit("agent-run: --echo=<interval> needs a number (seconds)")
             raw = raw[1:]
             continue
+        if raw[0].startswith("--submit-mode="):
+            submit_mode = raw[0].split("=", 1)[1]
+            if submit_mode not in {SUBMIT_MODE_CR, SUBMIT_MODE_CRLF}:
+                sys.exit("agent-run: --submit-mode must be cr or crlf")
+            raw = raw[1:]
+            continue
         break
 
     # Try to dispatch a known subcommand; otherwise treat as launch.
     known_subcommands = {"status", "logs", "tail", "clean", "steer", "kill", "list", "help"}
-    if raw and raw[0] in known_subcommands and not interactive and not prompt_file and not echo:
+    if (
+        raw
+        and raw[0] in known_subcommands
+        and not interactive
+        and not prompt_file
+        and not echo
+        and submit_mode is None
+    ):
         # argparse handles these, including their own -h/--help.
         parser = _build_parser()
         args = parser.parse_args(raw)
@@ -1552,6 +1593,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         prompt_file=prompt_file,
         echo=echo,
         echo_interval=echo_interval,
+        submit_mode=submit_mode,
     )
     return cmd_launch(ns)
 
