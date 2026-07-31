@@ -40,12 +40,11 @@ def test_steer_rejects_invalid_pid_before_liveness_or_fifo_write(isolated_runs_r
         agent_run.cmd_steer(argparse.Namespace(name="run", message=["hello"], esc=False, raw=False))
 
 
-@pytest.mark.parametrize("field,value", [("pid", ""), ("pid", "junk"), ("pid", "0"), ("pid", "-1"), ("pgid", ""), ("pgid", "junk"), ("pgid", "0"), ("pgid", "-1")])
+@pytest.mark.parametrize("field,value", [("pid", ""), ("pid", "junk"), ("pid", "0"), ("pid", "-1")])
 def test_kill_rejects_invalid_control_state_without_signaling(isolated_runs_root, monkeypatch, field, value):
     state = _seed_kill_state(isolated_runs_root)
     (state / field).write_text(value)
     calls = []
-    monkeypatch.setattr(agent_run.os, "killpg", lambda *args: calls.append(args))
     monkeypatch.setattr(agent_run.os, "kill", lambda *args: calls.append(args))
 
     with pytest.raises(SystemExit, match=f"invalid {field} state"):
@@ -60,13 +59,28 @@ def _make_verified_kill_state(isolated_runs_root, monkeypatch, *, stored="linux:
     monkeypatch.setattr(agent_run.os, "getpgid", lambda _pid: 123)
 
 
-def test_kill_matching_identity_signals_verified_group(isolated_runs_root, monkeypatch):
+def test_kill_matching_identity_signals_verified_runner_only(isolated_runs_root, monkeypatch):
     _make_verified_kill_state(isolated_runs_root, monkeypatch)
-    groups = []
-    monkeypatch.setattr(agent_run.os, "killpg", lambda pgid, sig: groups.append((pgid, sig)))
+    kills = []
+    monkeypatch.setattr(agent_run.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(agent_run.os, "kill", lambda pid, sig: kills.append((pid, sig)))
 
     assert agent_run.cmd_kill(_kill_args()) == 0
-    assert groups == [(123, signal.SIGTERM)]
+    assert kills == [(123, signal.SIGTERM)]
+
+
+def test_kill_never_signals_auxiliary_pids(isolated_runs_root, monkeypatch):
+    state = _seed_kill_state(isolated_runs_root)
+    (state / "pty_pid").write_text("456\n")
+    (state / "keeper_pid").write_text("789\n")
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:456")
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run.platform, "system", lambda: "Darwin")
+    kills = []
+    monkeypatch.setattr(agent_run.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    assert agent_run.cmd_kill(_kill_args()) == 0
+    assert kills == [(123, signal.SIGTERM)]
 
 
 @pytest.mark.parametrize("stored,current,error", [("linux:old", "linux:new", "does not match"), (None, "linux:old", "no process identity"), ("bad-token", "linux:old", "corrupt process identity"), ("linux:old", None, "cannot verify")])
@@ -81,18 +95,42 @@ def test_kill_refuses_unverifiable_identity_without_signaling(isolated_runs_root
     assert groups == []
 
 
-def test_kill_refuses_pgid_mismatch_without_signaling(isolated_runs_root, monkeypatch):
+def test_kill_refuses_identity_change_immediately_before_signal(isolated_runs_root, monkeypatch):
     _make_verified_kill_state(isolated_runs_root, monkeypatch)
-    groups = []
-    monkeypatch.setattr(agent_run.os, "getpgid", lambda _pid: 456)
-    monkeypatch.setattr(agent_run.os, "killpg", lambda *args: groups.append(args))
+    calls = iter(["linux:old", "linux:new"])
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: next(calls))
+    monkeypatch.setattr(agent_run.platform, "system", lambda: "Darwin")
+    kills = []
+    monkeypatch.setattr(agent_run.os, "kill", lambda *args: kills.append(args))
 
-    with pytest.raises(SystemExit, match="process group does not match"):
+    with pytest.raises(SystemExit, match="changed between verification"):
         agent_run.cmd_kill(_kill_args())
-    assert groups == []
+    assert kills == []
 
 
-def test_linux_process_identity_extracts_starttime(monkeypatch):
+def test_linux_pidfd_signal_path_rechecks_identity_and_closes_fd(monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent_run.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:verified")
+    monkeypatch.setattr(agent_run.os, "pidfd_open", lambda pid, flags: calls.append(("open", pid, flags)) or 77, raising=False)
+    monkeypatch.setattr(agent_run.signal, "pidfd_send_signal", lambda fd, sig, info, flags: calls.append(("send", fd, sig, info, flags)), raising=False)
+    monkeypatch.setattr(agent_run.os, "close", lambda fd: calls.append(("close", fd)))
+
+    agent_run._send_signal_to_verified_pid(123, signal.SIGTERM, "linux:verified")
+
+    assert calls == [("open", 123, 0), ("send", 77, signal.SIGTERM, None, 0), ("close", 77)]
+
+
+@pytest.mark.parametrize("raw", ["0", "999999"])
+def test_kill_rejects_invalid_numeric_signal_before_process_control(isolated_runs_root, monkeypatch, raw):
+    _seed_kill_state(isolated_runs_root)
+    calls = []
+    monkeypatch.setattr(agent_run.os, "kill", lambda *args: calls.append(args))
+
+    with pytest.raises(SystemExit, match="invalid signal number"):
+        agent_run.cmd_kill(argparse.Namespace(name="run", signal=raw))
+    assert calls == []
+
     monkeypatch.setattr(agent_run.platform, "system", lambda: "Linux")
     monkeypatch.setattr(
         agent_run.Path,
