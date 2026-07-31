@@ -64,6 +64,7 @@ on `list`/launch.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import errno
 import fcntl
 import json
@@ -159,6 +160,26 @@ def _safe_rmtree(candidate: Path, root: Path) -> None:
             f"agent-run: refusing to delete {resolved} — not contained in {resolved_root}"
         )
     shutil.rmtree(resolved)
+
+
+@contextmanager
+def _launch_lock(name: str):
+    """Serialize launch setup for one run name across processes.
+
+    The lock lives under ``STATE_ROOT/.locks`` rather than inside the run
+    directory, which launch may replace. It is held until runner readiness so
+    a competing launch cannot pass the liveness check against partial state.
+    """
+    lock_dir = STATE_ROOT / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{name}.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield fd
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _log_file_for(name: str) -> Optional[Path]:
@@ -738,7 +759,13 @@ def cmd_kill(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_launch(args: argparse.Namespace) -> int:
-    name: str = _validate_run_name(args.name)
+    name = _validate_run_name(args.name)
+    with _launch_lock(name) as lock_fd:
+        return _cmd_launch_locked(args, name, lock_fd)
+
+
+def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int:
+    """Perform launch setup while ``lock_fd`` serializes this run name."""
     argv: List[str] = list(args.command)
     if not argv:
         sys.exit("agent-run: missing command")
@@ -824,7 +851,10 @@ def cmd_launch(args: argparse.Namespace) -> int:
         print(f"agent-run: logs:   agent-run tail {name}")
         return 0
 
-    # Intermediate child: become session leader and fork once more.
+    # Intermediate child: become session leader and fork once more. The launch
+    # parent keeps the lock through readiness; detached descendants must not
+    # inherit a reference that would hold it for the full run lifetime.
+    os.close(lock_fd)
     os.close(r_ack)
     os.setsid()
     grand = os.fork()

@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -116,6 +119,48 @@ def test_steer_raw_is_verbatim_even_for_opencode_and_esc(isolated_runs_root, mon
         assert os.read(reader, 4096) == b"hello"
     finally:
         os.close(reader)
+
+
+def test_same_name_launches_are_serialized_without_state_clobber(
+    isolated_runs_root, isolated_log_root
+):
+    """Two rapid launchers must not both replace the same run directory."""
+    env = os.environ.copy()
+    command = [
+        sys.executable,
+        "-m",
+        "toolbox.agent_run",
+        "same-name",
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+    ]
+    launches = [
+        subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        for _ in range(2)
+    ]
+    results = [process.communicate(timeout=10) + (process.returncode,) for process in launches]
+
+    try:
+        return_codes = sorted(result[2] for result in results)
+        assert return_codes == [0, 1]
+        loser_output = b"".join(
+            stdout + stderr for stdout, stderr, code in results if code != 0
+        )
+        assert b"still active" in loser_output
+
+        state = isolated_runs_root / "same-name"
+        assert (state / "status").read_text().strip() == "running"
+        assert json.loads((state / "argv").read_text()) == command[4:]
+        assert (isolated_runs_root / ".locks" / "same-name.lock").is_file()
+        assert (isolated_log_root / "same-name" / "log").is_file()
+    finally:
+        pid_path = isolated_runs_root / "same-name" / "pid"
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork signal inheritance")
