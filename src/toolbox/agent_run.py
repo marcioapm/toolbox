@@ -1276,6 +1276,17 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     print(f"  {name}: skipped: {exc}")
                     skipped_count += 1
                     continue
+                # If the force-killed pid is our own child (e.g. a run whose
+                # runner was spawned in-process, or under tests), it can linger
+                # as a zombie until reaped, which _pid_alive() -- os.kill(pid, 0)
+                # -- would still report as alive. Reap it opportunistically so a
+                # successful termination is recognised. Harmless when pid is not
+                # our child: detached runners reparent to init, which reaps them,
+                # so waitpid() raises ChildProcessError and we fall through.
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except (ChildProcessError, OSError):
+                    pass
                 if not _pid_alive(pid):
                     _write(d / "status", "killed\n")
                     if not (d / "ended_at").exists():

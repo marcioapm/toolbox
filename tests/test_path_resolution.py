@@ -128,6 +128,10 @@ class TestCmdList:
         run = isolated_runs_root / "actual-run"
         run.mkdir()
         (run / "status").write_text("running\n")
+        # Seed a live pid so _opportunistic_heal (which reconciles a running
+        # run whose pid is dead/missing to "died") leaves this run as running;
+        # this test is about ignoring the internal .locks dir, not status.
+        (run / "pid").write_text(f"{os.getpid()}\n")
 
         assert agent_run.cmd_list(argparse.Namespace()) == 0
 
