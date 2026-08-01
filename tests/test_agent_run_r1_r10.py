@@ -369,15 +369,34 @@ def test_launcher_death_before_publication_keeps_lock_and_replacement_waits(
         stderr=subprocess.PIPE,
         env=env,
     )
-    # Give the launcher a brief moment to acquire the lock and fork, then
-    # send it SIGKILL -- the detached runner (already forked) keeps running
-    # and keeps its inherited copy of the lock fd.
-    time.sleep(0.05)
+    # We must kill the launcher only AFTER the double-fork has produced the
+    # detached runner grandchild, otherwise a blind fixed sleep occasionally
+    # (~1 in 4, independent of load) SIGKILLs the launcher before it finishes
+    # forking, so no detached runner survives and the run never publishes a
+    # pid. Wait for the grandchild runner to be reparented to init (ppid==1) --
+    # at that point it holds the inherited lock fd and is still inside the
+    # 1.5s AGENT_RUN_TEST_SLOW_IDENTITY window, before it publishes its pid,
+    # which is exactly the launcher-death-before-publication state R3 targets.
+    def _detached_runner_exists() -> bool:
+        ps = subprocess.run(
+            ["ps", "-eo", "pid,ppid,command"],
+            capture_output=True,
+            text=True,
+        ).stdout
+        for line in ps.splitlines():
+            if "toolbox.agent_run" not in line or name not in line:
+                continue
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[1] == "1":
+                return True
+        return False
+
+    assert _wait_until(_detached_runner_exists, timeout=10)
     proc.kill()
     proc.wait(timeout=5)
 
     state = isolated_runs_root / name
-    assert _wait_until(lambda: (state / "pid").exists(), timeout=5)
+    assert _wait_until(lambda: (state / "pid").exists(), timeout=10)
     runner_pid = int((state / "pid").read_text())
 
     # A concurrent launch of the same name must serialize behind the lock
