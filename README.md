@@ -653,9 +653,10 @@ tens of GB of RAM. Routing each run's `TMPDIR` into its own directory means
 reaping the run also reaps whatever it leaked.
 
 The scratch dir is **not** deleted when the run ends — postmortem
-artifacts matter for debugging a crashed or misbehaving agent — only
-`agent-run reap` removes it, once the run has been in a terminal status
-long enough (see below).
+artifacts matter for debugging a crashed or misbehaving agent. `agent-run
+reap` removes it when terminal state is old enough (and independently removes
+aged orphaned scratch after a reboot loses state). Relaunching the same run
+name intentionally replaces the prior log directory, including its scratch.
 
 ### Launch
 
@@ -671,14 +672,15 @@ agent-run -i chat claude --permission-mode bypassPermissions
 
 ```bash
 agent-run list                            # non-terminal runs only (default)
-agent-run list --all                      # every run, including done/failed/died/killed
+AGENT_RUN_LIST_DEFAULT=all agent-run list # restore the pre-filter default for a caller
+agent-run list --all                      # every recognized run, including done/failed/died/killed
 agent-run list --status died,killed       # only runs whose status is in this set
 agent-run status <name>                   # one-line status
 agent-run logs <name> [N]                 # last N lines (default 50)
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
-agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--name NAME]
+agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
 ```
 
 `kill` sends TERM/INT/HUP straight to the identity-verified runner, which
@@ -696,37 +698,45 @@ other signals are rejected rather than forwarded.
 gone (e.g. after a reboot) but the log survived in `/var/tmp`. `list`
 defaults to showing only non-terminal runs (`starting`/`running`/`stalled`)
 from `/tmp` — pass `--all` or `--status <list>` to include conclusively
-terminal ones (`done`/`failed`/`died`/`killed`) — plus, separately, any
-preserved-log-only runs (state dir already gone). `logs`/`tail`/`clean`
-always read the persistent log, falling back to the old single-directory
-layout for runs launched before the state/log split.
+terminal ones (`done`/`failed`/`died`/`killed`), or set
+`AGENT_RUN_LIST_DEFAULT=all` to restore the prior default without changing
+call sites. Unrecognized/legacy/corrupt statuses are always shown under an
+explicit `Unrecognized / needs attention` heading rather than as live runs;
+use `reap --force-unknown` only after operator review. Preserved-log-only runs
+(state dir already gone) appear separately. `logs`/`tail`/`clean` always read
+the persistent log, falling back to the old single-directory layout for runs
+launched before the state/log split.
 
 ### Reaping
 
 `agent-run reap` reconciles stale state and cleans up old runs in one pass:
 
 1. **Stale-running reconciliation** (unchanged from before): a `running`
-   run whose pid is gone is marked `died`; a `running` run whose pid is
-   alive but whose log has been idle longer than `--idle-hours` (or
-   `AGENT_RUN_IDLE_KILL_HOURS`, default 24h) is idle-killed through the
-   same identity-verified escalation `agent-run kill <name> KILL` uses, and
-   marked `killed`.
-2. **Terminal-state garbage collection**: runs whose status is
-   conclusively terminal (`done`, `failed`, `died`, `killed`) and whose
-   `ended_at` is older than `--min-age-hours` (or
-   `AGENT_RUN_REAP_MIN_AGE_HOURS`, default 168h/7 days) have their
-   ephemeral state dir *and* their scratch dir (`tmp/`, the `TMPDIR`)
-   removed. The persistent `log`/`log.clean`/`prompt` are never touched
-   here — they have their own, independent 21-day prune. A run that just
-   got reconciled to `died`/`killed` in the same invocation is too young
-   (its `ended_at` is "now") to be collected in that same pass.
+    run whose pid is missing, malformed, or gone is marked `died`; a
+    `running` run whose pid is alive but whose log has been idle longer than
+    `--idle-hours` (or `AGENT_RUN_IDLE_KILL_HOURS`, default 24h) is
+    idle-killed through the same identity-verified escalation
+    `agent-run kill <name> KILL` uses, and marked `killed`.
+2. **Terminal-state and orphan-scratch garbage collection**: runs whose
+    status is conclusively terminal (`done`, `failed`, `died`, `killed`) and
+    whose `ended_at` is older than `--min-age-hours` (or preferred
+    `AGENT_RUN_MIN_AGE_HOURS`; compatible alias `AGENT_RUN_REAP_MIN_AGE_HOURS`,
+    default 168h/7 days) have their ephemeral state dir *and* scratch dir
+    (`tmp/`, the `TMPDIR`) removed. Persistent `log`/`log.clean`/`prompt`
+    survive reap. A state-less `tmp/` left after a reboot is independently
+    collected once its contents have aged past the same threshold. A run
+    reconciled to `died`/`killed` in this invocation is never collected in
+    the same invocation. Unknown/legacy/corrupt statuses are left intact by
+    default and require `--force-unknown` to collect after review.
 
-Both steps only ever act after re-verifying a live pid is really gone
-(`_pid_alive`/`_process_identity`) or an inode hasn't been swapped out
-from under the scan (`_safe_rmtree`'s root-contained, inode-reverified
-deletion, plus the same per-name launch lock used to serialize relaunches)
-— `--dry-run` runs the full scan and prints every action it would take
-without mutating or deleting anything.
+Both steps only ever act after re-verifying a live pid belongs to the
+recorded runner (`_pid_alive`/`_process_identity`) or an inode hasn't been
+swapped out from under the scan (`_safe_rmtree`'s root-contained,
+inode-reverified deletion, plus the same per-name launch lock used to
+serialize relaunches). State GC first atomically renames a directory to a
+reserved sentinel so an interrupted deletion is resumed by the next reap;
+`--dry-run` runs the same read-only eligibility checks and prints only actions
+a real reap would take, without mutating or deleting anything.
 
 ### Files
 

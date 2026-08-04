@@ -136,9 +136,14 @@ def _reap_args(
     idle_hours: Optional[float] = None,
     min_age_hours: Optional[float] = None,
     name: Optional[str] = None,
+    force_unknown: bool = False,
 ) -> argparse.Namespace:
     return argparse.Namespace(
-        dry_run=dry_run, idle_hours=idle_hours, min_age_hours=min_age_hours, name=name
+        dry_run=dry_run,
+        idle_hours=idle_hours,
+        min_age_hours=min_age_hours,
+        name=name,
+        force_unknown=force_unknown,
     )
 
 
@@ -1193,7 +1198,7 @@ class TestReapTerminalStateGC:
         out = capsys.readouterr().out
         assert "olddone" in out
         assert "terminal" in out
-        assert "1 terminal state(s) collected" in out
+        assert "collected=1" in out
 
     def test_min_age_hours_flag_overrides_default(
         self, isolated_runs_root, isolated_log_root
@@ -1548,3 +1553,189 @@ class TestListFiltering:
         assert rc == 0
         out = capsys.readouterr().out
         assert "bareinvoke" in out
+
+
+# ---------------------------------------------------------------------------
+# reviewer regression coverage
+# ---------------------------------------------------------------------------
+
+class TestReapReviewerRegressions:
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "-1", "0"])
+    def test_invalid_hour_env_values_fall_back_to_safe_defaults(self, monkeypatch, capsys, raw):
+        monkeypatch.setenv("AGENT_RUN_IDLE_KILL_HOURS", raw)
+        assert agent_run._parse_idle_stall_seconds() == 24 * 3600
+        assert "not a finite, positive" in capsys.readouterr().err
+
+        monkeypatch.setenv("AGENT_RUN_REAP_MIN_AGE_HOURS", raw)
+        assert agent_run._parse_reap_min_age_seconds() == 168 * 3600
+        assert "not a finite, positive" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("flag", ["--idle-hours", "--min-age-hours"])
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "-1", "0"])
+    def test_reap_cli_rejects_invalid_hour_flags(self, flag, raw, capsys):
+        option = f"{flag}={raw}" if raw == "-inf" else flag
+        argv = ["reap", option] if raw == "-inf" else ["reap", flag, raw]
+        with pytest.raises(SystemExit) as exc:
+            agent_run._build_parser().parse_args(argv)
+        assert exc.value.code == 2
+        assert "must be finite and greater than 0" in capsys.readouterr().err
+
+    def test_symlinked_log_dir_never_deletes_outside_log_root(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        sd, _ = _make_run(
+            isolated_runs_root, isolated_log_root, "linked-log", status="done",
+            ended_at_age_secs=200 * 3600,
+        )
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        protected = outside / "protected"
+        protected.write_text("must survive")
+        log_dir = isolated_log_root / "linked-log"
+        (log_dir / "log").unlink()
+        log_dir.rmdir()
+        log_dir.symlink_to(outside, target_is_directory=True)
+
+        agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert sd.exists()
+        assert protected.read_text() == "must survive"
+        assert "log path is not a real directory" in capsys.readouterr().out
+
+    def test_bad_scratch_does_not_abort_later_gc(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        bad_state, bad_log = _make_run(
+            isolated_runs_root, isolated_log_root, "bad-scratch", status="done",
+            ended_at_age_secs=200 * 3600,
+        )
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        protected = outside / "protected"
+        protected.write_text("must survive")
+        (bad_log / "tmp").symlink_to(outside, target_is_directory=True)
+        good_state, good_log = _make_run(
+            isolated_runs_root, isolated_log_root, "good-scratch", status="done",
+            ended_at_age_secs=200 * 3600, make_scratch=True,
+        )
+
+        agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert bad_state.exists()
+        assert protected.read_text() == "must survive"
+        assert not good_state.exists()
+        assert not (good_log / "tmp").exists()
+        assert "scratch path is not a real directory" in capsys.readouterr().out
+
+    def test_reconciled_old_ended_at_is_not_collected_in_same_pass(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "old-reconciled", status="running",
+            pid=99999, ended_at_age_secs=200 * 3600, make_scratch=True,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: False)
+
+        agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert sd.exists()
+        assert _read_status(sd) == "died"
+        assert (ld / "tmp").exists()
+
+    def test_orphan_scratch_is_collected_without_state(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        scratch = isolated_log_root / "orphan" / "tmp"
+        nested = scratch / "nested"
+        nested.mkdir(parents=True)
+        artifact = nested / "artifact"
+        artifact.write_text("old")
+        old = time.time() - 200 * 3600
+        os.utime(artifact, (old, old))
+        os.utime(nested, (old, old))
+        os.utime(scratch, (old, old))
+
+        agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert not scratch.exists()
+        assert (isolated_log_root / "orphan").is_dir()
+
+    def test_dry_run_does_not_predict_gc_for_live_recorded_runner(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        identity = agent_run._process_identity(os.getpid())
+        assert identity is not None
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "live-dry-run", status="done",
+            pid=os.getpid(), process_identity=identity,
+            ended_at_age_secs=200 * 3600, make_scratch=True,
+        )
+
+        agent_run.cmd_reap(_reap_args(dry_run=True, min_age_hours=168))
+
+        assert sd.exists()
+        assert (ld / "tmp").exists()
+        out = capsys.readouterr().out
+        assert "recorded live runner" in out
+        assert "collected=0" in out
+
+    def test_recycled_pid_identity_mismatch_allows_gc(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "recycled", status="done",
+            pid=os.getpid(), process_identity="different-birth-token",
+            ended_at_age_secs=200 * 3600, make_scratch=True,
+        )
+
+        agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert not sd.exists()
+        assert not (ld / "tmp").exists()
+
+    @pytest.mark.parametrize("ended_at, warning", [
+        ("not-a-timestamp", "is malformed"),
+        ("2999-01-01T00:00:00Z", "is in the future"),
+    ])
+    def test_malformed_or_future_ended_at_warns_and_preserves_state(
+        self, isolated_runs_root, isolated_log_root, capsys, ended_at, warning
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "bad-ended-at", status="done",
+            make_scratch=True,
+        )
+        (sd / "ended_at").write_text(ended_at + "\n")
+
+        agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert sd.exists()
+        assert (ld / "tmp").exists()
+        assert warning in capsys.readouterr().err
+
+    def test_list_buckets_unknown_and_force_unknown_gc_requires_opt_in(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "legacy", status="frobnicated",
+            ended_at_age_secs=200 * 3600, make_scratch=True,
+        )
+
+        agent_run.cmd_list(argparse.Namespace(all=False, status=None))
+        assert "Unrecognized / needs attention" in capsys.readouterr().out
+        assert sd.exists()
+
+        agent_run.cmd_reap(_reap_args(min_age_hours=168))
+        assert sd.exists()
+
+        agent_run.cmd_reap(_reap_args(min_age_hours=168, force_unknown=True))
+        assert not sd.exists()
+        assert not (ld / "tmp").exists()
+
+    def test_reap_cleans_crash_deletion_sentinel(self, isolated_runs_root, isolated_log_root):
+        sentinel = isolated_runs_root / ".reaping-interrupted.1"
+        sentinel.mkdir()
+        (sentinel / "partial").write_text("left by interrupted deletion")
+
+        agent_run.cmd_reap(_reap_args())
+
+        assert not sentinel.exists()
