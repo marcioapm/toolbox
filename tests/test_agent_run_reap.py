@@ -13,6 +13,13 @@ Covers:
 - kill-path coverage: process-identity verification, grace→SIGKILL
   escalation via _force_kill, identity mismatch guard (no signal sent).
 - --name <typo> prints a clear "no such run" message.
+- terminal-state GC: reap removes state dir + scratch dir (TMPDIR) for
+  old done/failed/died/killed runs, honours --min-age-hours/env override,
+  never touches persistent log/log.clean/prompt, never collects a live or
+  unverifiable run, and is fully inert under --dry-run.
+- launch creates and exports a per-run scratch dir as TMPDIR, inherited by
+  the launched command and its descendants.
+- list defaults to hiding terminal runs; --all / --status override that.
 
 Reconciled against the R1-R10+N1+N2 kill/identity hardening: reap never
 does a raw, unverified killpg/os.kill sweep on an alive run. It reuses the
@@ -27,6 +34,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -46,6 +54,13 @@ def _wait_until(predicate, timeout=10.0):
             return True
         time.sleep(0.05)
     return False
+
+
+def _read_status(state_dir: Path) -> str:
+    try:
+        return (state_dir / "status").read_text().strip()
+    except FileNotFoundError:
+        return ""
 
 
 def _process_gone(pid: int) -> bool:
@@ -69,6 +84,8 @@ def _make_run(
     pty_pid: Optional[int] = None,
     keeper_pid: Optional[int] = None,
     process_identity: Optional[str] = None,
+    ended_at_age_secs: Optional[float] = None,
+    make_scratch: bool = False,
 ) -> tuple[Path, Path]:
     """Create a minimal fake run under state_root and log_root."""
     sd = state_root / name
@@ -89,6 +106,11 @@ def _make_run(
         (sd / "keeper_pid").write_text(f"{keeper_pid}\n")
     if process_identity is not None:
         (sd / "process_identity").write_text(f"{process_identity}\n")
+    if ended_at_age_secs is not None:
+        ended = datetime.fromtimestamp(
+            time.time() - ended_at_age_secs, tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (sd / "ended_at").write_text(ended + "\n")
 
     if write_log:
         log_file = ld / "log"
@@ -98,6 +120,13 @@ def _make_run(
             old_mtime = time.time() - log_age_secs
             os.utime(log_file, (old_mtime, old_mtime))
 
+    if make_scratch:
+        scratch = ld / "tmp"
+        scratch.mkdir(parents=True, exist_ok=True)
+        os.chmod(scratch, 0o700)
+        (scratch / "leaked-workspace").mkdir(exist_ok=True)
+        (sd / "tmp_dir").write_text(str(scratch) + "\n")
+
     return sd, ld
 
 
@@ -105,9 +134,12 @@ def _reap_args(
     *,
     dry_run: bool = False,
     idle_hours: Optional[float] = None,
+    min_age_hours: Optional[float] = None,
     name: Optional[str] = None,
 ) -> argparse.Namespace:
-    return argparse.Namespace(dry_run=dry_run, idle_hours=idle_hours, name=name)
+    return argparse.Namespace(
+        dry_run=dry_run, idle_hours=idle_hours, min_age_hours=min_age_hours, name=name
+    )
 
 
 def _shrink_escalation(monkeypatch, escalation=0.2, poll=0.05, reap_timeout=2.0):
@@ -970,3 +1002,549 @@ class TestOpportunisticHeal:
 
         assert sd.joinpath("status").read_text().strip() == "died"
         assert (sd / "ended_at").exists()
+
+
+# ---------------------------------------------------------------------------
+# per-run scratch dir (TMPDIR)
+# ---------------------------------------------------------------------------
+
+class TestScratchDir:
+    def test_launch_creates_scratch_dir_mode_0700(self, isolated_runs_root, isolated_log_root):
+        name = "scratchrun"
+        args = argparse.Namespace(
+            name=name,
+            command=[sys.executable, "-c", "pass"],
+            interactive=False,
+            prompt_file=None,
+            echo=False,
+            echo_interval=2.0,
+            submit_mode=None,
+        )
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+
+        scratch = isolated_log_root / name / "tmp"
+        assert scratch.is_dir()
+        mode = scratch.stat().st_mode & 0o777
+        assert mode == 0o700, f"expected 0700, got {oct(mode)}"
+
+    def test_launch_records_tmp_dir_in_state(self, isolated_runs_root, isolated_log_root):
+        name = "scratchrun2"
+        args = argparse.Namespace(
+            name=name,
+            command=[sys.executable, "-c", "pass"],
+            interactive=False,
+            prompt_file=None,
+            echo=False,
+            echo_interval=2.0,
+            submit_mode=None,
+        )
+        agent_run.cmd_launch(args)
+
+        recorded = (isolated_runs_root / name / "tmp_dir").read_text().strip()
+        assert recorded == str(isolated_log_root / name / "tmp")
+
+    def test_tmpdir_exported_and_inherited_by_child(self, isolated_runs_root, isolated_log_root):
+        """The launched command (and therefore its descendants) must see
+        TMPDIR pointing at this run's own scratch dir, not the ambient
+        system TMPDIR."""
+        name = "scratchrun3"
+        args = argparse.Namespace(
+            name=name,
+            command=[sys.executable, "-c", "import os, sys; sys.stdout.write(os.environ.get('TMPDIR', '<unset>'))"],
+            interactive=False,
+            prompt_file=None,
+            echo=False,
+            echo_interval=2.0,
+            submit_mode=None,
+        )
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+
+        state_dir = isolated_runs_root / name
+        assert _wait_until(lambda: _read_status(state_dir) in {"done", "failed"}, timeout=10)
+
+        log_path = isolated_log_root / name / "log"
+        assert _wait_until(lambda: log_path.exists() and log_path.read_text() != "", timeout=10)
+        content = log_path.read_text()
+        expected = str(isolated_log_root / name / "tmp")
+        assert content.strip() == expected, f"child saw TMPDIR={content!r}, expected {expected!r}"
+
+    def test_scratch_dir_not_deleted_on_normal_exit(self, isolated_runs_root, isolated_log_root):
+        """Scratch is postmortem material — it must survive the run ending,
+        only reap removes it."""
+        name = "scratchrun4"
+        args = argparse.Namespace(
+            name=name,
+            command=[
+                sys.executable,
+                "-c",
+                "import os; open(os.path.join(os.environ['TMPDIR'], 'leftover'), 'w').close()",
+            ],
+            interactive=False,
+            prompt_file=None,
+            echo=False,
+            echo_interval=2.0,
+            submit_mode=None,
+        )
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+
+        state_dir = isolated_runs_root / name
+        scratch = isolated_log_root / name / "tmp"
+        assert _wait_until(lambda: _read_status(state_dir) in {"done", "failed"}, timeout=10)
+        assert (scratch / "leftover").exists(), "child could not write into its own TMPDIR"
+        # Still there after the run has finished — nothing deletes it on exit.
+        assert scratch.is_dir()
+        assert (scratch / "leftover").exists()
+
+    def test_argv_not_touched_by_scratch_dir(self, isolated_runs_root, isolated_log_root):
+        """Only the environment carries TMPDIR — argv/command must be
+        recorded and exec'd unmodified."""
+        name = "scratchrun5"
+        argv = [sys.executable, "-c", "pass"]
+        args = argparse.Namespace(
+            name=name,
+            command=list(argv),
+            interactive=False,
+            prompt_file=None,
+            echo=False,
+            echo_interval=2.0,
+            submit_mode=None,
+        )
+        agent_run.cmd_launch(args)
+        import json as _json
+        recorded_argv = _json.loads((isolated_runs_root / name / "argv").read_text())
+        assert recorded_argv == argv
+
+
+# ---------------------------------------------------------------------------
+# reap -- terminal-state garbage collection
+# ---------------------------------------------------------------------------
+
+class TestReapTerminalStateGC:
+    @pytest.mark.parametrize("status", ["done", "failed", "died", "killed"])
+    def test_old_terminal_run_is_collected(
+        self, isolated_runs_root, isolated_log_root, status
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            f"old-{status}",
+            status=status,
+            pid=None,
+            ended_at_age_secs=200 * 3600,  # well past default 168h
+            make_scratch=True,
+        )
+        scratch = ld / "tmp"
+        assert scratch.is_dir()
+
+        rc = agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert rc == 0
+        assert not sd.exists(), "state dir must be removed"
+        assert not scratch.exists(), "scratch dir must be removed"
+        # Persistent log must survive.
+        assert (ld / "log").exists()
+
+    def test_young_terminal_run_is_not_collected(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """A done run younger than the min-age threshold must be left alone
+        entirely — this is what closed issue #2 in the task (reap only
+        reconciling "running" and never GC'ing anything) but conservatively:
+        a *fresh* terminal run's state/scratch must not vanish."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "freshdone",
+            status="done",
+            pid=None,
+            ended_at_age_secs=1 * 3600,  # 1 hour old
+            make_scratch=True,
+        )
+        scratch = ld / "tmp"
+
+        rc = agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert rc == 0
+        assert sd.exists()
+        assert scratch.exists()
+
+    def test_dry_run_does_not_delete_anything(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "olddone",
+            status="done",
+            pid=None,
+            ended_at_age_secs=200 * 3600,
+            make_scratch=True,
+        )
+        scratch = ld / "tmp"
+
+        rc = agent_run.cmd_reap(_reap_args(dry_run=True, min_age_hours=168))
+
+        assert rc == 0
+        assert sd.exists()
+        assert scratch.exists()
+        out = capsys.readouterr().out
+        assert "olddone" in out
+        assert "terminal" in out
+        assert "1 terminal state(s) collected" in out
+
+    def test_min_age_hours_flag_overrides_default(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """--min-age-hours lets a shorter threshold collect a run that the
+        168h default would still preserve."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "shortthreshold",
+            status="failed",
+            pid=None,
+            ended_at_age_secs=2 * 3600,  # 2 hours old
+            make_scratch=True,
+        )
+        scratch = ld / "tmp"
+
+        # Default threshold: not old enough.
+        agent_run.cmd_reap(_reap_args())
+        assert sd.exists()
+        assert scratch.exists()
+
+        # Explicit 1-hour threshold: now old enough.
+        rc = agent_run.cmd_reap(_reap_args(min_age_hours=1))
+        assert rc == 0
+        assert not sd.exists()
+        assert not scratch.exists()
+
+    def test_env_override_changes_min_age_threshold(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """AGENT_RUN_REAP_MIN_AGE_HOURS is re-read at call time by cmd_reap
+        (same pattern as AGENT_RUN_IDLE_KILL_HOURS), so setting the env var
+        — not the module constant — is what --min-age-hours falls back to."""
+        monkeypatch.setenv("AGENT_RUN_REAP_MIN_AGE_HOURS", "1")
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "envthreshold",
+            status="done",
+            pid=None,
+            ended_at_age_secs=2 * 3600,
+            make_scratch=True,
+        )
+
+        rc = agent_run.cmd_reap(_reap_args())
+
+        assert rc == 0
+        assert not sd.exists()
+
+    def test_live_pid_is_never_collected_even_if_status_says_terminal(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """A "terminal" status with a live pid recorded is a contradiction
+        (should never happen in practice — the runner only writes done/
+        failed after it is genuinely finished) but reap's GC pass must
+        refuse to act on it rather than trust the stale status label."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "contradictrun",
+            status="done",
+            pid=os.getpid(),  # definitely alive (this test process)
+            ended_at_age_secs=200 * 3600,
+            make_scratch=True,
+        )
+        scratch = ld / "tmp"
+
+        rc = agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert rc == 0
+        assert sd.exists(), "must not remove state for a live pid"
+        assert scratch.exists()
+
+    def test_stalled_run_is_never_collected(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """"stalled" (a live pid, idle log) is not in TERMINAL_STATUSES and
+        must never be GC'd, no matter how old — only reconciliation (which
+        requires raw status=="running") can eventually move it to killed."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "stalledrun",
+            status="stalled",
+            pid=None,
+            ended_at_age_secs=500 * 3600,
+            make_scratch=True,
+        )
+        scratch = ld / "tmp"
+
+        rc = agent_run.cmd_reap(_reap_args(min_age_hours=1))
+
+        assert rc == 0
+        assert sd.exists()
+        assert scratch.exists()
+
+    def test_running_run_is_never_collected(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """A "running" status is never in TERMINAL_STATUSES regardless of
+        age — GC must leave it alone entirely. Uses a genuinely live pid so
+        the reconciliation pass earlier in the same cmd_reap call doesn't
+        first turn it into "died" (which is itself covered by the
+        dead-pid-then-too-young-to-GC case elsewhere)."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "runningrun",
+            status="running",
+            pid=os.getpid(),
+            ended_at_age_secs=500 * 3600,
+            make_scratch=True,
+        )
+        scratch = ld / "tmp"
+
+        rc = agent_run.cmd_reap(_reap_args(min_age_hours=1))
+
+        assert rc == 0
+        assert sd.exists()
+        assert scratch.exists()
+
+    def test_unknown_legacy_status_is_skipped(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """A status outside the recognized set (legacy/corrupt/unknown)
+        must be left alone by GC — never treated as an implicit terminal."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "weirdrun",
+            status="frobnicated",
+            pid=None,
+            ended_at_age_secs=500 * 3600,
+            make_scratch=True,
+        )
+        scratch = ld / "tmp"
+
+        rc = agent_run.cmd_reap(_reap_args(min_age_hours=1))
+
+        assert rc == 0
+        assert sd.exists()
+        assert scratch.exists()
+
+    def test_logs_survive_reap_gc(self, isolated_runs_root, isolated_log_root):
+        """log / log.clean / prompt must never be touched by the
+        terminal-state GC pass — only the ephemeral state dir and the
+        scratch dir are removed."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "logsurvive",
+            status="done",
+            pid=None,
+            ended_at_age_secs=200 * 3600,
+            make_scratch=True,
+        )
+        (ld / "log.clean").write_text("cleaned transcript\n")
+        (ld / "prompt").write_text("original prompt\n")
+
+        rc = agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert rc == 0
+        assert not sd.exists()
+        assert (ld / "log").exists()
+        assert (ld / "log.clean").read_text() == "cleaned transcript\n"
+        assert (ld / "prompt").read_text() == "original prompt\n"
+
+    def test_gc_skips_when_no_scratch_dir_present(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """A run launched before this feature existed (or one whose scratch
+        was already removed) has no tmp/ dir at all — GC must still remove
+        the state dir cleanly without erroring on the missing scratch."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "noscratch",
+            status="done",
+            pid=None,
+            ended_at_age_secs=200 * 3600,
+            make_scratch=False,
+        )
+        assert not (ld / "tmp").exists()
+
+        rc = agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert rc == 0
+        assert not sd.exists()
+        assert (ld / "log").exists()
+
+    def test_gc_respects_name_filter(self, isolated_runs_root, isolated_log_root):
+        sd1, ld1 = _make_run(
+            isolated_runs_root, isolated_log_root, "gc-a",
+            status="done", pid=None, ended_at_age_secs=200 * 3600, make_scratch=True,
+        )
+        sd2, ld2 = _make_run(
+            isolated_runs_root, isolated_log_root, "gc-b",
+            status="done", pid=None, ended_at_age_secs=200 * 3600, make_scratch=True,
+        )
+
+        agent_run.cmd_reap(_reap_args(min_age_hours=168, name="gc-a"))
+
+        assert not sd1.exists()
+        assert sd2.exists(), "gc-b must be untouched by --name gc-a"
+
+    def test_gc_inode_swap_race_rejected(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """If the state dir is replaced (same name, new inode) between
+        reap's scan and its deletion under the per-name lock, the
+        replacement must survive untouched — the same inode-reverification
+        guarantee _safe_rmtree and _prune_old_logs already provide."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "raceswap",
+            status="done",
+            pid=None,
+            ended_at_age_secs=200 * 3600,
+            make_scratch=True,
+        )
+        original_lock = agent_run._launch_lock
+
+        @agent_run.contextmanager
+        def swap_while_locked(name):
+            with original_lock(name) as fd:
+                if name == "raceswap":
+                    import shutil as _shutil
+                    _shutil.rmtree(sd)
+                    sd.mkdir()
+                    (sd / "status").write_text("running\n")
+                    (sd / "marker").write_text("new run, do not touch\n")
+                yield fd
+
+        monkeypatch.setattr(agent_run, "_launch_lock", swap_while_locked)
+
+        rc = agent_run.cmd_reap(_reap_args(min_age_hours=168))
+
+        assert rc == 0
+        # The replacement (now "running") must survive intact.
+        assert sd.exists()
+        assert (sd / "marker").read_text() == "new run, do not touch\n"
+        assert (sd / "status").read_text().strip() == "running"
+
+    def test_existing_reap_reconciliation_paths_unchanged(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """Sanity check that adding the GC pass didn't disturb the existing
+        dead-pid reconciliation behavior in the same invocation."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "stilldeadpid",
+            status="running",
+            pid=99999,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: False)
+
+        rc = agent_run.cmd_reap(_reap_args())
+
+        assert rc == 0
+        assert sd.joinpath("status").read_text().strip() == "died"
+        assert (sd / "ended_at").exists()
+        # Freshly died — must NOT be GC'd in the same pass (too young).
+        assert sd.exists()
+
+
+# ---------------------------------------------------------------------------
+# list -- filtering
+# ---------------------------------------------------------------------------
+
+class TestListFiltering:
+    def test_default_hides_terminal_statuses(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd1, ld1 = _make_run(
+            isolated_runs_root, isolated_log_root, "livevrun",
+            status="running", pid=os.getpid(),
+        )
+        sd2, ld2 = _make_run(
+            isolated_runs_root, isolated_log_root, "donerun",
+            status="done", pid=None,
+        )
+
+        rc = agent_run.cmd_list(argparse.Namespace(all=False, status=None))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "livevrun" in out
+        assert "donerun" not in out
+
+    def test_all_flag_shows_terminal_statuses(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd1, ld1 = _make_run(
+            isolated_runs_root, isolated_log_root, "livevrun2",
+            status="running", pid=os.getpid(),
+        )
+        sd2, ld2 = _make_run(
+            isolated_runs_root, isolated_log_root, "donerun2",
+            status="done", pid=None,
+        )
+
+        rc = agent_run.cmd_list(argparse.Namespace(all=True, status=None))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "livevrun2" in out
+        assert "donerun2" in out
+
+    def test_status_filter_selects_only_matching(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd1, ld1 = _make_run(
+            isolated_runs_root, isolated_log_root, "died-run",
+            status="died", pid=None,
+        )
+        sd2, ld2 = _make_run(
+            isolated_runs_root, isolated_log_root, "killed-run",
+            status="killed", pid=None,
+        )
+        sd3, ld3 = _make_run(
+            isolated_runs_root, isolated_log_root, "done-run",
+            status="done", pid=None,
+        )
+
+        rc = agent_run.cmd_list(argparse.Namespace(all=False, status="died,killed"))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "died-run" in out
+        assert "killed-run" in out
+        assert "done-run" not in out
+
+    def test_status_and_all_mutually_exclusive(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        with pytest.raises(SystemExit):
+            agent_run.cmd_list(argparse.Namespace(all=True, status="done"))
+
+    def test_default_namespace_without_all_or_status_attrs_still_works(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """`agent-run` with no args (bare cmd_list(argparse.Namespace()))
+        must keep working — getattr-based defaults, not required attrs."""
+        _make_run(
+            isolated_runs_root, isolated_log_root, "bareinvoke",
+            status="running", pid=os.getpid(),
+        )
+        rc = agent_run.cmd_list(argparse.Namespace())
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "bareinvoke" in out

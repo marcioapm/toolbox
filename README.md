@@ -601,10 +601,11 @@ llm-usage -p anthropic
 # Agent-run: background coding agents with steering + live logs
 agent-run build claude --permission-mode bypassPermissions --print 'Refactor X'
 agent-run tail build                      # follow logs in real time
-agent-run status build                    # running | done | failed
+agent-run status build                    # running | done | failed | died | killed
 agent-run -i chat claude --permission-mode bypassPermissions
 agent-run steer chat 'Also add tests for edge cases.'
 agent-run kill chat                       # TERM the run; runner does its own cleanup
+agent-run reap --dry-run                  # preview idle-kills + terminal-state cleanup
 
 # threadctl: DB-only agent updates; `cycle` (cron) is the sole Discord writer
 threadctl bind 1234567890 --title "Fix flaky upload test" --repo marcioapm/toolbox
@@ -629,10 +630,32 @@ log even though the ephemeral process state is gone:
 - `/tmp/agent-runs/<name>/` — ephemeral process state (pid, status,
   exit_code, FIFO). tmpfs on Linux, wiped on reboot — a missing entry here
   unambiguously means "not running". Override with `AGENT_RUN_STATE_DIR`.
-- `/var/tmp/agent-runs/<name>/` — persistent log, cleaned transcript, and a
-  copy of the prompt file. Survives reboot/crash; the log fd is opened here
-  from the start, so there's no copy-on-exit step a crash could lose.
-  Override with `AGENT_RUN_LOG_DIR`. Pruned automatically after 21 days.
+- `/var/tmp/agent-runs/<name>/` — persistent log, cleaned transcript, a
+  copy of the prompt file, and a per-run scratch dir (`tmp/`, mode 0700)
+  exported as `TMPDIR` into the launched command's environment. Survives
+  reboot/crash; the log fd is opened here from the start, so there's no
+  copy-on-exit step a crash could lose. Override with `AGENT_RUN_LOG_DIR`.
+  `log`/`log.clean`/`prompt` are pruned automatically after 21 days; the
+  `tmp/` scratch dir is instead cleaned up by `agent-run reap` (see below).
+
+### Scratch dir (`TMPDIR`)
+
+Every launch gets its own disk-backed scratch dir at
+`$AGENT_RUN_LOG_DIR/<name>/tmp/`, exported as `TMPDIR` into the launched
+command's environment (and therefore every descendant it forks/execs). The
+agent's argv is never modified — only the environment carries this. This
+exists to contain tools that dump large, un-cleaned scratch data into
+`$TMPDIR`: OpenCode's bundled JDTLS, for example, creates
+`mkdtemp()`-based Eclipse workspaces (routinely hundreds of MB for a large
+Java repo) and never removes them. Left to land in the system `/tmp` —
+which is tmpfs (RAM) on most Linux hosts — enough leaked runs can consume
+tens of GB of RAM. Routing each run's `TMPDIR` into its own directory means
+reaping the run also reaps whatever it leaked.
+
+The scratch dir is **not** deleted when the run ends — postmortem
+artifacts matter for debugging a crashed or misbehaving agent — only
+`agent-run reap` removes it, once the run has been in a terminal status
+long enough (see below).
 
 ### Launch
 
@@ -647,12 +670,15 @@ agent-run -i chat claude --permission-mode bypassPermissions
 ### Inspect / control
 
 ```bash
-agent-run list                            # show all runs
+agent-run list                            # non-terminal runs only (default)
+agent-run list --all                      # every run, including done/failed/died/killed
+agent-run list --status died,killed       # only runs whose status is in this set
 agent-run status <name>                   # one-line status
 agent-run logs <name> [N]                 # last N lines (default 50)
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
+agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--name NAME]
 ```
 
 `kill` sends TERM/INT/HUP straight to the identity-verified runner, which
@@ -667,10 +693,40 @@ publish terminal state itself. Only TERM, INT, HUP, and KILL are accepted;
 other signals are rejected rather than forwarded.
 
 `status` reports `not running (log preserved)` when the process state is
-gone (e.g. after a reboot) but the log survived in `/var/tmp`. `list` shows
-live runs from `/tmp` and, separately, any preserved-log-only runs.
-`logs`/`tail`/`clean` always read the persistent log, falling back to the
-old single-directory layout for runs launched before this split.
+gone (e.g. after a reboot) but the log survived in `/var/tmp`. `list`
+defaults to showing only non-terminal runs (`starting`/`running`/`stalled`)
+from `/tmp` — pass `--all` or `--status <list>` to include conclusively
+terminal ones (`done`/`failed`/`died`/`killed`) — plus, separately, any
+preserved-log-only runs (state dir already gone). `logs`/`tail`/`clean`
+always read the persistent log, falling back to the old single-directory
+layout for runs launched before the state/log split.
+
+### Reaping
+
+`agent-run reap` reconciles stale state and cleans up old runs in one pass:
+
+1. **Stale-running reconciliation** (unchanged from before): a `running`
+   run whose pid is gone is marked `died`; a `running` run whose pid is
+   alive but whose log has been idle longer than `--idle-hours` (or
+   `AGENT_RUN_IDLE_KILL_HOURS`, default 24h) is idle-killed through the
+   same identity-verified escalation `agent-run kill <name> KILL` uses, and
+   marked `killed`.
+2. **Terminal-state garbage collection**: runs whose status is
+   conclusively terminal (`done`, `failed`, `died`, `killed`) and whose
+   `ended_at` is older than `--min-age-hours` (or
+   `AGENT_RUN_REAP_MIN_AGE_HOURS`, default 168h/7 days) have their
+   ephemeral state dir *and* their scratch dir (`tmp/`, the `TMPDIR`)
+   removed. The persistent `log`/`log.clean`/`prompt` are never touched
+   here — they have their own, independent 21-day prune. A run that just
+   got reconciled to `died`/`killed` in the same invocation is too young
+   (its `ended_at` is "now") to be collected in that same pass.
+
+Both steps only ever act after re-verifying a live pid is really gone
+(`_pid_alive`/`_process_identity`) or an inode hasn't been swapped out
+from under the scan (`_safe_rmtree`'s root-contained, inode-reverified
+deletion, plus the same per-name launch lock used to serialize relaunches)
+— `--dry-run` runs the full scan and prints every action it would take
+without mutating or deleting anything.
 
 ### Files
 
@@ -678,7 +734,7 @@ Ephemeral, under `$AGENT_RUN_STATE_DIR/<name>/` (default `/tmp/agent-runs`):
 
 | File | Contents |
 |------|----------|
-| `status` | `starting` / `running` / `done` / `failed` |
+| `status` | `starting` / `running` / `done` / `failed` / `died` / `killed` |
 | `exit_code` | numeric exit code (after completion) |
 | `pid`, `pgid` | agent session/group leader pid (== pgid under setsid); `pgid` is informational only, not a kill target |
 | `process_identity` | platform-specific runner birth token, verified before `kill` signals the runner |
@@ -689,6 +745,8 @@ Ephemeral, under `$AGENT_RUN_STATE_DIR/<name>/` (default `/tmp/agent-runs`):
 | `pty_pid` | PID of the PTY child (interactive only) |
 | `keeper_pid` | PID of the FIFO keeper (interactive only) |
 | `interactive` | `1` if launched with `-i`, else `0` |
+| `reap_reason` | set by `agent-run reap` when it changes status (died/killed) |
+| `tmp_dir` | absolute path to this run's scratch dir |
 
 Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
 
@@ -697,6 +755,7 @@ Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
 | `log` | combined stdout+stderr (PTY-captured in interactive mode) |
 | `log.clean` | rendered transcript (only when launched with `--echo`) |
 | `prompt` | copy of the `-f`/`--prompt-file` input, if one was given |
+| `tmp/` | per-run scratch dir exported as `TMPDIR`; removed only by `agent-run reap`, never on normal run exit |
 
 ### Design notes
 
@@ -729,6 +788,20 @@ Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
   spawned/exec'd for one-shot, or PTY/FIFO/keeper ready for interactive.
   Any setup failure before that point still resolves synchronously to
   `failed`, never leaving `starting` stranded with no process behind it.
+- `TMPDIR` is exported into `os.environ` inside the detached runner before
+  any child is forked/exec'd, so the launched agent — and anything it in
+  turn forks or execs — inherits it automatically; the launch argv itself
+  is never touched. This is deliberately environment-only rather than
+  argv-injected `env TMPDIR=...`, since some agents' own argument parsers
+  would otherwise need to understand and pass through an unrecognized
+  wrapper prefix.
+- `agent-run list`'s default view and `agent-run reap`'s garbage-collection
+  eligibility share one definition of "terminal" (`done`/`failed`/`died`/
+  `killed`) so they never disagree about which runs are "done with". A
+  script that previously scraped every line under `list`'s "Live runs"
+  heading and relied on terminal runs appearing there needs `--all` now —
+  this is the one deliberate behavior break in this feature; the heading
+  text also changes to describe the filter actually in effect.
 
 ## License
 

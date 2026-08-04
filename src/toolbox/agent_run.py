@@ -18,6 +18,24 @@ log even though the ephemeral process state is gone:
                                    AGENT_RUN_LOG_DIR. The log fd is opened
                                    here from the start — no copy-on-exit step
                                    that a crash could lose.
+    /var/tmp/agent-runs/<name>/tmp/  per-run scratch dir (mode 0700), on the
+                                   same persistent disk as the log. Exported
+                                   as TMPDIR into the launched command's
+                                   environment (and therefore all of its
+                                   descendants), so agents/tools that dump
+                                   large scratch data into $TMPDIR — e.g.
+                                   OpenCode's bundled JDTLS, which leaks
+                                   multi-hundred-MB Eclipse workspaces under
+                                   mkdtemp() and never cleans them up — land
+                                   on disk under this run's own directory
+                                   instead of silently filling up a shared,
+                                   possibly RAM-backed /tmp. The scratch dir
+                                   is NOT deleted when the run ends —
+                                   postmortem artifacts matter — only `agent-run
+                                   reap` removes it, alongside the run's
+                                   ephemeral state dir, once the run has been
+                                   in a terminal status for longer than the
+                                   reap age threshold (see `reap` below).
 
 Usage::
 
@@ -28,7 +46,8 @@ Usage::
     agent-run status <name>              # one-line status
     agent-run steer <name> <msg...>      # send text to agent stdin (needs -i)
     agent-run kill <name> [SIGNAL]       # TERM by default; see "kill" below
-    agent-run list                       # list all runs
+    agent-run list [--all] [--status S]  # list runs; defaults to non-terminal only
+    agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--name NAME]
 
 `kill` sends TERM, INT, or HUP straight to the identity-verified runner
 process, which catches it and runs its own teardown (kill/reap the
@@ -49,11 +68,14 @@ become controllable — child spawned/exec'd for one-shot, or PTY, FIFO, and
 keeper ready for interactive) to a terminal `done`/`failed`. Any failure
 before a status file exists, or before the detached runner takes over,
 still resolves synchronously to `failed` rather than leaving `starting`
-stranded with no process behind it.
+stranded with no process behind it. `agent-run reap` can additionally move
+a stale `running` run to `died` (pid gone) or `killed` (idle-killed); both
+are conclusively terminal, exactly like `done`/`failed`, and become
+eligible for garbage collection once old enough (see `reap` below).
 
 Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 
-    status       starting | running | done | failed
+    status       starting | running | done | failed | died | killed
     exit_code    numeric exit code (after completion)
     pid          runner process id
     pgid         process group id (informational only; not a kill target)
@@ -74,18 +96,24 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     ended_at     ISO-8601 UTC (after completion)
     interactive  "1" if launched with -i, else "0"
     stdin        FIFO for steering (interactive only)
+    reap_reason  set by `agent-run reap` when it changes status (died/killed)
+    tmp_dir      absolute path to this run's scratch dir (see below)
 
 Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs)::
 
     log          captured stdout+stderr (PTY-captured when interactive)
     log.clean    rendered transcript (only when launched with --echo)
     prompt       copy of the -f/--prompt-file input, if one was given
+    tmp/         per-run scratch dir exported as TMPDIR (see above); removed
+                 only by `agent-run reap`, never on normal run exit
 
 `status` reports "not running (log preserved)" when the state dir is gone
 but the log dir survived. `logs`/`tail`/`clean` always read from the log
 dir, falling back to the old single-directory layout for runs started
 before this split. Log dirs older than 21 days are pruned opportunistically
-on `list`/launch.
+on `list`/launch — but a `tmp/` scratch dir has already been removed by
+`reap` long before then (see `reap` below); the 21-day prune only ever
+finds `log`/`log.clean`/`prompt` left to remove.
 
 Each run name is serialized by a permanent per-name lock file under
 $AGENT_RUN_STATE_DIR/.locks/<name>.lock; these lock files are never pruned
@@ -104,6 +132,45 @@ equivalent: the gap between the last identity re-check and the actual
 `os.kill()` call is a real, if extremely narrow, TOCTOU window where a
 recycled PID could theoretically receive a signal meant for its prior
 occupant. This residual race is accepted, not fully closed, on Darwin.
+
+`agent-run reap` does three things, all reported (and, without --dry-run,
+performed) in one pass over $AGENT_RUN_STATE_DIR:
+
+  1. Stale-"running" reconciliation: a "running" run whose pid is gone is
+     marked `died`; a "running" run whose pid is alive but whose log has
+     been idle longer than the idle threshold (--idle-hours, or
+     AGENT_RUN_IDLE_KILL_HOURS, default 24h) is idle-killed and marked
+     `killed`, via the same identity-verified `_force_kill` escalation
+     `agent-run kill <name> KILL` uses.
+  2. Terminal-state garbage collection: runs whose status is conclusively
+     terminal — `done`, `failed`, `died`, or `killed` — and whose state dir
+     has not been modified in longer than a separate, more conservative age
+     threshold (--min-age-hours, or AGENT_RUN_REAP_MIN_AGE_HOURS, default
+     168h/7 days) have their ephemeral state dir *and* their persistent
+     scratch dir ($AGENT_RUN_LOG_DIR/<name>/tmp) removed. The persistent
+     `log`, `log.clean`, and `prompt` files are never touched here — they
+     have their own existing, independent 21-day prune. A `stalled` run
+     (alive pid, idle log — see `_effective_status`) is not terminal and is
+     never garbage-collected by this pass; only reconciliation in step 1
+     can eventually turn it into `killed`, which becomes GC-eligible on a
+     later reap once it, too, has aged past the threshold. Any status not
+     in the recognized set (unknown/legacy/corrupt) is left alone.
+  3. Both steps re-verify identity/inode state immediately before mutating
+     anything (per-name `_launch_lock`, `_safe_rmtree`'s root-contained,
+     inode-reverified deletion, `_pid_alive`/`_process_identity`), so a
+     run that raced into life or was replaced between listing and action is
+     never touched. --dry-run performs the full scan and prints every
+     action it would take without writing or deleting anything.
+
+`agent-run list` defaults to showing only runs whose effective status is
+*not* conclusively terminal (`starting`, `running`, `stalled`; a `died` or
+`killed` run is terminal and hidden by default, matching reap's own
+definition of terminal). Pass `--status done,failed,died,killed,...` (or
+any comma-separated subset of statuses) or `--all` to see terminal runs
+too. Scripts that previously scraped every line under "Live runs" should
+add `--all` if they relied on terminal runs being listed there; the
+heading text also now reflects the actual filter in effect rather than
+unconditionally claiming everything shown is live.
 """
 
 from __future__ import annotations
@@ -144,6 +211,16 @@ FINAL_RENDER_TIMEOUT_SECONDS = 10.0
 FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
 ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
 
+# Statuses that are conclusively terminal: the run will never transition
+# again on its own. "done"/"failed" are published by the runner itself;
+# "died"/"killed" are published only by reap/heal reconciliation (a dead
+# pid, or a completed idle-kill escalation) — never by the runner, since a
+# runner that can still write state files is by definition not dead. This
+# set is deliberately narrow: any other status (including "stalled", which
+# still has a live, signal-verified pid) is treated as non-terminal and is
+# never a target for `agent-run reap`'s terminal-state garbage collection.
+TERMINAL_STATUSES = frozenset({"done", "failed", "died", "killed"})
+
 # Idle-stall threshold: a "running" run whose log file hasn't been touched in
 # this many seconds is considered "stalled" by _effective_status(), and a
 # candidate for idle-killing by `agent-run reap`.
@@ -162,6 +239,29 @@ def _parse_idle_stall_seconds() -> float:
 
 
 IDLE_STALL_SECONDS: float = _parse_idle_stall_seconds()
+
+# Terminal-state garbage-collection age threshold: how long a run must have
+# been sitting in a conclusively terminal status (see TERMINAL_STATUSES)
+# before `agent-run reap` removes its ephemeral state dir and persistent
+# scratch dir. Deliberately much more conservative than the idle-kill
+# threshold above — that one decides when to stop a *live* run; this one
+# decides when it's safe to delete the last record of a run that already
+# stopped, so it defaults to a full week rather than a day. Parsed
+# defensively for the same reason as AGENT_RUN_IDLE_KILL_HOURS.
+def _parse_reap_min_age_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_REAP_MIN_AGE_HOURS", "168")
+    try:
+        return float(raw) * 3600
+    except ValueError:
+        print(
+            f"agent-run: warning: AGENT_RUN_REAP_MIN_AGE_HOURS={raw!r} is not a valid number; "
+            "using default 168h (7 days)",
+            file=sys.stderr,
+        )
+        return 168.0 * 3600
+
+
+REAP_MIN_AGE_SECONDS: float = _parse_reap_min_age_seconds()
 
 
 # ---------------------------------------------------------------------------
@@ -415,8 +515,12 @@ def _prune_old_logs(max_age_days: int = PRUNE_AFTER_DAYS) -> None:
             if state_dir.exists():
                 # A state directory that is not conclusively terminal is live
                 # or unverifiable; preserve its persistent log conservatively.
+                # Uses the same TERMINAL_STATUSES set reap's own GC pass
+                # uses, so this 21-day log prune and reap's (much shorter,
+                # by default) terminal-state GC never disagree about which
+                # runs are "done with".
                 status = _read(state_dir / "status")
-                if status not in {"done", "failed"}:
+                if status not in TERMINAL_STATUSES:
                     continue
             try:
                 mtime = max(
@@ -514,6 +618,38 @@ def _mark_died(state_dir: Path, reason: str) -> None:
     if not (state_dir / "ended_at").exists():
         _write(state_dir / "ended_at", _now_iso() + "\n")
     _write(state_dir / "reap_reason", reason + "\n")
+
+
+def _terminal_state_age_seconds(state_dir: Path) -> Optional[float]:
+    """How long a conclusively-terminal run has been sitting idle, for the
+    reap min-age GC threshold.
+
+    Prefers the parsed ``ended_at`` timestamp (the moment the run actually
+    became terminal) over the state dir's mtime, since the dir's mtime can
+    be bumped by unrelated later writes (e.g. a subsequent ``reap_reason``
+    write) that must not reset the GC clock. Falls back to the newest mtime
+    across the state dir's own files if ``ended_at`` is missing or
+    unparsable (legacy/corrupt state), and finally to the directory's own
+    mtime if the dir is empty. Returns ``None`` only if the dir cannot be
+    stat'd at all (e.g. removed concurrently).
+    """
+    ended_raw = _read(state_dir / "ended_at")
+    if ended_raw:
+        try:
+            parsed = datetime.strptime(ended_raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+            return time.time() - parsed.timestamp()
+        except ValueError:
+            pass
+    try:
+        mtime = max(
+            (f.stat().st_mtime for f in state_dir.iterdir()),
+            default=state_dir.stat().st_mtime,
+        )
+    except OSError:
+        return None
+    return time.time() - mtime
 
 
 def _effective_status(state_dir: Path, idle_threshold: Optional[float] = None) -> str:
@@ -751,31 +887,69 @@ def _log_line_count(log: Optional[Path]) -> int:
         return 0
 
 
-def cmd_list(_args: argparse.Namespace) -> int:
+def cmd_list(args: argparse.Namespace) -> int:
     _prune_old_logs()
     _opportunistic_heal()
+
+    show_all: bool = bool(getattr(args, "all", False))
+    status_filter_raw: Optional[str] = getattr(args, "status", None)
+    status_filter: Optional[set] = None
+    if status_filter_raw:
+        if show_all:
+            sys.exit("agent-run: --status and --all are mutually exclusive")
+        status_filter = {s.strip() for s in status_filter_raw.split(",") if s.strip()}
+        if not status_filter:
+            sys.exit("agent-run: --status requires at least one status")
+
+    def _visible(status: str) -> bool:
+        if status_filter is not None:
+            return status in status_filter
+        if show_all:
+            return True
+        # Default: hide conclusively terminal runs — "Live runs" should
+        # actually mean live. TERMINAL_STATUSES is exactly reap's own
+        # definition of terminal, so this filter and reap's GC eligibility
+        # agree on what "done with this run" means.
+        return status not in TERMINAL_STATUSES
+
+    if status_filter is not None:
+        heading = f"Runs (status in {sorted(status_filter)}) ({STATE_ROOT}):"
+    elif show_all:
+        heading = f"All runs ({STATE_ROOT}):"
+    else:
+        heading = f"Live runs, non-terminal only — pass --all to include done/failed/died/killed ({STATE_ROOT}):"
+
     state_names = set()
-    print(f"Live runs ({STATE_ROOT}):")
+    print(heading)
     if STATE_ROOT.is_dir():
         state_names = {
             p.name for p in STATE_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")
         }
-    if not state_names:
-        print("  (none)")
-    else:
+    shown = 0
+    if state_names:
         for d in sorted(_state_dir(n) for n in state_names):
             status = _effective_status(d)
+            if not _visible(status):
+                continue
+            shown += 1
             pid = _read(d / "pid", "?")
             started = _read(d / "started_at", "?")
             lines = _log_line_count(_log_file_for(d.name))
             interactive = _read(d / "interactive", "0")
             flag = " [interactive]" if interactive == "1" else ""
             print(f"  {d.name}: status={status} pid={pid} started={started} lines={lines}{flag}")
+    if shown == 0:
+        print("  (none)")
 
     log_only_names = set()
     if LOG_ROOT.is_dir():
         log_only_names = {p.name for p in LOG_ROOT.iterdir() if p.is_dir()} - state_names
     if log_only_names:
+        # Preserved-log-only runs (state dir already gone) are already
+        # unambiguously and correctly labeled as "not running" under their
+        # own heading — unlike the "Live runs" section above, this was
+        # never the misleading part, so it is always shown regardless of
+        # --status/--all.
         print(f"Preserved logs, not running ({LOG_ROOT}):")
         for name in sorted(log_only_names):
             lines = _log_line_count(_log_file_for(name))
@@ -1165,18 +1339,27 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 
 def cmd_reap(args: argparse.Namespace) -> int:
-    """Reconcile stale "running" state and idle-kill lingering processes.
+    """Reconcile stale "running" state, idle-kill lingering processes, and
+    garbage-collect old terminal-state runs.
 
     Dead-pid runs → status=died.
     Alive but log-idle runs → SIGTERM → SIGKILL → status=killed.
+    Conclusively terminal runs (done/failed/died/killed) older than the
+    min-age threshold → ephemeral state dir AND persistent scratch dir
+    (TMPDIR) removed. Persistent log/log.clean/prompt are never touched
+    here — they have their own existing 21-day prune.
     """
     dry_run: bool = args.dry_run
     idle_hours: Optional[float] = getattr(args, "idle_hours", None)
+    min_age_hours: Optional[float] = getattr(args, "min_age_hours", None)
     target_name: Optional[str] = getattr(args, "name", None)
 
     # Re-read the env at call time so --idle-hours / env override both work.
     idle_threshold: float = (
         idle_hours * 3600 if idle_hours is not None else _parse_idle_stall_seconds()
+    )
+    min_age_threshold: float = (
+        min_age_hours * 3600 if min_age_hours is not None else _parse_reap_min_age_seconds()
     )
 
     if not STATE_ROOT.is_dir():
@@ -1192,10 +1375,12 @@ def cmd_reap(args: argparse.Namespace) -> int:
     died_count = 0
     killed_count = 0
     skipped_count = 0
+    gc_count = 0
+    gc_skipped_count = 0
     found_target = False
 
     for d in candidates:
-        if not d.is_dir():
+        if not d.is_dir() or d.name.startswith("."):
             continue
         name = d.name
         if target_name and name != target_name:
@@ -1304,13 +1489,98 @@ def cmd_reap(args: argparse.Namespace) -> int:
         else:
             skipped_count += 1
 
+    # Second pass: garbage-collect conclusively terminal runs (done/failed/
+    # died/killed) whose state dir has been sitting untouched for longer
+    # than min_age_threshold. Deliberately separate from the reconciliation
+    # loop above: a run that reconciliation *just* transitioned to died/
+    # killed in this same invocation has an ended_at of "now" and will not
+    # be old enough to be collected until a later reap, which is exactly
+    # the conservative behavior we want (no same-pass double-action).
+    for d in candidates:
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        name = d.name
+        if target_name and name != target_name:
+            continue
+
+        try:
+            before = d.lstat()
+        except OSError:
+            continue
+        if not _stat_module.S_ISDIR(before.st_mode):
+            continue
+
+        raw_status = _read(d / "status")
+        if raw_status not in TERMINAL_STATUSES:
+            continue
+
+        age_secs = _terminal_state_age_seconds(d)
+        if age_secs is None or age_secs < min_age_threshold:
+            continue
+        age_h = age_secs / 3600
+
+        print(
+            f"  {name}: terminal (status={raw_status}, age={age_h:.1f}h) "
+            f"[{'dry-run' if dry_run else 'removing state+scratch'}]"
+        )
+        if dry_run:
+            gc_count += 1
+            continue
+
+        # Re-verify under the per-name lock: serializes with a concurrent
+        # relaunch of this same name, and the inode re-check after
+        # acquiring it rejects a directory that was replaced between the
+        # scan above and this point (matches _prune_old_logs's pattern).
+        with _launch_lock(name):
+            try:
+                current = d.lstat()
+            except OSError:
+                gc_skipped_count += 1
+                continue
+            if not _stat_module.S_ISDIR(current.st_mode):
+                gc_skipped_count += 1
+                continue
+            if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+                # Replaced (e.g. a relaunch) since the scan — do not touch.
+                gc_skipped_count += 1
+                continue
+            status_now = _read(d / "status")
+            if status_now not in TERMINAL_STATUSES:
+                # Raced back to a live state since the scan — never collect.
+                gc_skipped_count += 1
+                continue
+            pid_now_raw = _read(d / "pid")
+            if pid_now_raw:
+                try:
+                    pid_now = int(pid_now_raw)
+                except ValueError:
+                    pid_now = None
+                if pid_now is not None and _pid_alive(pid_now):
+                    # A live pid recorded against a "terminal" status is a
+                    # contradiction reap must never act on — skip rather
+                    # than risk removing state out from under a live run.
+                    print(
+                        f"  {name}: skipped: status={status_now} but pid={pid_now} "
+                        "is alive — refusing to remove"
+                    )
+                    gc_skipped_count += 1
+                    continue
+
+            log_d = _log_dir(name)
+            scratch_dir = log_d / "tmp"
+            if log_d.is_dir() and scratch_dir.is_dir():
+                _safe_rmtree(scratch_dir, log_d)
+            _safe_rmtree(d, STATE_ROOT, expected=current)
+            gc_count += 1
+
     if target_name and not found_target:
         print(f"reap: no such run '{target_name}' in {STATE_ROOT}")
 
     prefix = "[dry-run] " if dry_run else ""
     print(
         f"{prefix}reap done: {died_count} marked died, "
-        f"{killed_count} killed (idle), {skipped_count} skipped."
+        f"{killed_count} killed (idle), {skipped_count} skipped, "
+        f"{gc_count} terminal state(s) collected, {gc_skipped_count} gc skipped."
     )
     return 0
 
@@ -1684,6 +1954,19 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     d.mkdir(parents=True, exist_ok=True)
     log_d.mkdir(parents=True, exist_ok=True)
 
+    # Per-run scratch dir, on the same persistent disk as the log (not the
+    # possibly-tmpfs/RAM-backed STATE_ROOT). Created eagerly, before the
+    # fork, so a launch that fails before the runner even starts still
+    # leaves no half-created scratch dir with nothing to point at it — and
+    # so its path can be recorded in state up front for tooling to find.
+    # Mode 0700: the launched command's own temp files, potentially
+    # containing sensitive scratch data, should not be world/group
+    # readable. mkdir()'s mode is masked by umask, so chmod explicitly.
+    scratch_dir = log_d / "tmp"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(scratch_dir, 0o700)
+    _write(d / "tmp_dir", str(scratch_dir) + "\n")
+
     # Create resources that can fail (fifo, pipe) before publishing
     # "starting" wherever possible: a failure here means the run never
     # appeared active, so there is no stranded state to clean up.
@@ -1774,6 +2057,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             print(f"agent-run: interactive — steer with: agent-run steer {name} '<message>'")
         print(f"agent-run: state_dir={d}")
         print(f"agent-run: log_dir={log_d}")
+        print(f"agent-run: tmp_dir={scratch_dir}")
         print(f"agent-run: poll:   agent-run status {name}")
         print(f"agent-run: logs:   agent-run tail {name}")
         return 0
@@ -1800,6 +2084,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         submit_mode,
         echo,
         echo_interval,
+        tmp_dir=scratch_dir,
     )
     return 0  # never reached
 
@@ -1952,6 +2237,7 @@ def _runner(
     submit_mode: str = SUBMIT_MODE_CR,
     echo: bool = False,
     echo_interval: float = 2.0,
+    tmp_dir: Optional[Path] = None,
 ) -> None:
     """Execute in the detached session-leader process.
 
@@ -1992,6 +2278,16 @@ def _runner(
         # After setsid(), pid == pgid (we're the session & group leader).
         _write(state_dir / "pgid", f"{runner_pgid}\n")
         _write(state_dir / "process_identity", identity + "\n")
+
+        if tmp_dir is not None:
+            # Export before any child is forked/exec'd below: os.environ is
+            # process-wide, so every subsequent os.fork()+os.execvp() in this
+            # runner (the agent itself, and any helper that in turn execs
+            # something) inherits TMPDIR pointing at this run's own
+            # disk-backed scratch dir rather than the shared, possibly
+            # tmpfs-backed system /tmp. Argv is intentionally left untouched
+            # — only the environment carries this.
+            os.environ["TMPDIR"] = str(tmp_dir)
 
         # Redirect stdio to /dev/null to fully detach (we write the log ourselves).
         devnull = os.open(os.devnull, os.O_RDWR)
@@ -2548,12 +2844,31 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_kill.add_argument("signal", nargs="?", default="TERM")
     sp_kill.set_defaults(func=cmd_kill)
 
-    sp_list = sub.add_parser("list", help="list all runs")
+    sp_list = sub.add_parser(
+        "list",
+        help="list runs (defaults to non-terminal only; see --all/--status)",
+    )
+    sp_list.add_argument(
+        "--all",
+        action="store_true",
+        default=False,
+        help="show every run, including conclusively terminal ones "
+        "(done/failed/died/killed) that are hidden by default",
+    )
+    sp_list.add_argument(
+        "--status",
+        default=None,
+        metavar="STATUS[,STATUS...]",
+        help="show only runs whose effective status is in this comma-separated "
+        "list (e.g. --status running,stalled); overrides the default filter "
+        "and is mutually exclusive with --all",
+    )
     sp_list.set_defaults(func=cmd_list)
 
     sp_reap = sub.add_parser(
         "reap",
-        help="reconcile stale status and idle-kill lingering runs",
+        help="reconcile stale status, idle-kill lingering runs, and garbage-"
+        "collect old terminal-state run dirs",
     )
     sp_reap.add_argument(
         "--dry-run",
@@ -2567,6 +2882,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="override idle threshold (hours, float); default from AGENT_RUN_IDLE_KILL_HOURS or 24h",
+    )
+    sp_reap.add_argument(
+        "--min-age-hours",
+        type=float,
+        default=None,
+        metavar="N",
+        help="override the terminal-state GC age threshold (hours, float); "
+        "a done/failed/died/killed run must be at least this old before its "
+        "state dir and scratch dir are removed; default from "
+        "AGENT_RUN_REAP_MIN_AGE_HOURS or 168h (7 days)",
     )
     sp_reap.add_argument(
         "--name",
