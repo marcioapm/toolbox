@@ -38,7 +38,6 @@ gemini-vision = "toolbox.gemini_vision:main"
 slackcli = "toolbox.slackcli:main"
 llm-usage = "toolbox.llm_usage:main"
 agent-run = "toolbox.agent_run:main"
-threadctl = "toolbox.threadctl:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
