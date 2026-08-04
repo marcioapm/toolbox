@@ -1602,6 +1602,29 @@ class TestReapReviewerRegressions:
         assert protected.read_text() == "must survive"
         assert "log path is not a real directory" in capsys.readouterr().out
 
+    def test_safe_rmtree_refuses_root_replaced_by_symlink(
+        self, isolated_log_root, tmp_path
+    ):
+        """A root swap immediately before deletion cannot redirect its child."""
+        log_dir = isolated_log_root / "raced-log"
+        scratch = log_dir / "tmp"
+        scratch.mkdir(parents=True)
+        (scratch / "safe-artifact").write_text("remove only this")
+        outside = tmp_path / "outside"
+        victim_scratch = outside / "tmp"
+        victim_scratch.mkdir(parents=True)
+        protected = victim_scratch / "protected"
+        protected.write_text("must survive")
+        moved = isolated_log_root / "raced-log-old"
+        log_dir.rename(moved)
+        log_dir.symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(SystemExit):
+            agent_run._safe_rmtree(log_dir / "tmp", log_dir)
+
+        assert protected.read_text() == "must survive"
+        assert (moved / "tmp" / "safe-artifact").exists()
+
     def test_bad_scratch_does_not_abort_later_gc(
         self, isolated_runs_root, isolated_log_root, tmp_path, capsys
     ):

@@ -373,6 +373,17 @@ def _log_dir(name: str) -> Path:
     return LOG_ROOT / name
 
 
+def _open_real_directory(path: Path) -> int:
+    """Open a directory without following its final path component."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        sys.exit(f"agent-run: refusing to use {path} — not a real directory ({exc})")
+
+
 def _safe_rmtree(candidate: Path, root: Path, expected: Optional[os.stat_result] = None) -> None:
     """Remove a direct-child directory without following a mutable pathname.
 
@@ -389,7 +400,7 @@ def _safe_rmtree(candidate: Path, root: Path, expected: Optional[os.stat_result]
         sys.exit(f"agent-run: refusing to delete {candidate} — not a direct child of {root}")
     root_fd = child_fd = -1
     try:
-        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        root_fd = _open_real_directory(root)
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
         try:
             child_fd = os.open(candidate.name, flags, dir_fd=root_fd)
@@ -481,7 +492,7 @@ def _crash_safe_rmtree(candidate: Path, root: Path, expected: os.stat_result) ->
         # child containment rule even if the textual root pathname is swapped
         # after our caller's inspection, and expected= still makes the final
         # descriptor-relative delete refuse a replaced candidate.
-        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        root_fd = _open_real_directory(root)
         os.rename(candidate.name, sentinel.name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
     except FileNotFoundError:
         return
@@ -893,6 +904,25 @@ def _gc_pid_is_live_runner(state_dir: Path, pid: int) -> bool:
     if live is None:
         return True  # can't verify — stay conservative
     return live == recorded
+
+
+def _gc_status_eligible(status: str, *, force_unknown: bool) -> bool:
+    """Whether a persisted status is eligible for terminal-state GC."""
+    return status in TERMINAL_STATUSES or (
+        force_unknown and _status_bucket(status) == "unrecognized"
+    )
+
+
+def _gc_live_runner_pid(state_dir: Path) -> Optional[int]:
+    """Return the verified live recorded runner PID, if one blocks GC."""
+    raw = _read(state_dir / "pid")
+    try:
+        pid = int(raw) if raw else None
+    except ValueError:
+        return None
+    if pid is not None and _pid_alive(pid) and _gc_pid_is_live_runner(state_dir, pid):
+        return pid
+    return None
 
 
 def _effective_status(state_dir: Path, idle_threshold: Optional[float] = None) -> str:
@@ -1824,9 +1854,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             continue
 
         raw_status = _read(d / "status")
-        status_is_terminal = raw_status in TERMINAL_STATUSES
-        status_is_unrecognized = _status_bucket(raw_status) == "unrecognized"
-        if not status_is_terminal and not (force_unknown and status_is_unrecognized):
+        if not _gc_status_eligible(raw_status, force_unknown=force_unknown):
             continue
 
         age_secs = _terminal_state_age_seconds(d)
@@ -1839,24 +1867,17 @@ def cmd_reap(args: argparse.Namespace) -> int:
         # would refuse (quality C1). The normal path repeats them under the
         # per-name lock to close the actual scan-to-delete race.
         status_now = _read(d / "status")
-        if status_now not in TERMINAL_STATUSES and not (
-            force_unknown and _status_bucket(status_now) == "unrecognized"
-        ):
+        if not _gc_status_eligible(status_now, force_unknown=force_unknown):
             gc_skipped_count += 1
             continue
-        pid_now_raw = _read(d / "pid")
-        if pid_now_raw:
-            try:
-                pid_now = int(pid_now_raw)
-            except ValueError:
-                pid_now = None
-            if pid_now is not None and _pid_alive(pid_now) and _gc_pid_is_live_runner(d, pid_now):
-                print(
-                    f"  {name}: skipped: status={status_now or 'unknown'} but pid={pid_now} "
-                    "is the recorded live runner — refusing to remove"
-                )
-                gc_skipped_count += 1
-                continue
+        live_pid = _gc_live_runner_pid(d)
+        if live_pid is not None:
+            print(
+                f"  {name}: skipped: status={status_now or 'unknown'} but pid={live_pid} "
+                "is the recorded live runner — refusing to remove"
+            )
+            gc_skipped_count += 1
+            continue
 
         # Validate both log path components using lstat (never is_dir(),
         # which follows symlinks) before touching scratch. A malformed/symlink
@@ -1864,7 +1885,6 @@ def cmd_reap(args: argparse.Namespace) -> int:
         # actionable warning, and continue with later candidates (C2/H2/D1).
         log_d = _log_dir(name)
         scratch_dir = log_d / "tmp"
-        scratch_st: Optional[os.stat_result] = None
         try:
             log_st = log_d.lstat()
         except FileNotFoundError:
@@ -1891,7 +1911,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 gc_skipped_count += 1
                 continue
 
-        action = "force-unknown" if not status_is_terminal else "terminal"
+        action = "force-unknown" if raw_status not in TERMINAL_STATUSES else "terminal"
         print(
             f"  {name}: {action} (status={raw_status or 'unknown'}, age={age_h:.1f}h) "
             f"[{'dry-run' if dry_run else 'removing state+scratch'}]"
@@ -1915,23 +1935,13 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 gc_skipped_count += 1
                 continue
             status_current = _read(d / "status")
-            if status_current not in TERMINAL_STATUSES and not (
-                force_unknown and _status_bucket(status_current) == "unrecognized"
-            ):
+            if not _gc_status_eligible(status_current, force_unknown=force_unknown):
                 gc_skipped_count += 1
                 continue
-            pid_current_raw = _read(d / "pid")
-            try:
-                pid_current = int(pid_current_raw) if pid_current_raw else None
-            except ValueError:
-                pid_current = None
-            if (
-                pid_current is not None
-                and _pid_alive(pid_current)
-                and _gc_pid_is_live_runner(d, pid_current)
-            ):
+            live_pid = _gc_live_runner_pid(d)
+            if live_pid is not None:
                 print(
-                    f"  {name}: skipped: status={status_current or 'unknown'} but pid={pid_current} "
+                    f"  {name}: skipped: status={status_current or 'unknown'} but pid={live_pid} "
                     "is the recorded live runner — refusing to remove"
                 )
                 gc_skipped_count += 1
