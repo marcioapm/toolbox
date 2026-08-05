@@ -378,8 +378,25 @@ def test_launcher_death_before_publication_keeps_lock_and_replacement_waits(
     # 1.5s AGENT_RUN_TEST_SLOW_IDENTITY window, before it publishes its pid,
     # which is exactly the launcher-death-before-publication state R3 targets.
     def _detached_runner_exists() -> bool:
+        # ``ps`` truncates the COMMAND column to the terminal width when its
+        # output isn't a tty (default 80 columns on both GNU procps and BSD
+        # ps -- this subprocess call, piped via capture_output, always hits
+        # that default). This run's full argv easily exceeds 80 characters
+        # (interpreter path + "-m toolbox.agent_run" + name + wrapped
+        # command), so without an explicit unlimited-width flag the run
+        # ``name`` this loop greps for is frequently chopped off entirely,
+        # making the match silently and permanently fail regardless of how
+        # long we poll -- this, not a bad ppid==1 reparent assumption or a
+        # closed timing window, was the actual cause of this test's flake
+        # (reproduced deterministically in a minimal-PID-1 Linux container
+        # matching GitHub's runner; ppid==1 reparenting itself was reliable
+        # every time). ``-ww`` requests unlimited width on both GNU procps
+        # and BSD/macOS ps; note the leading dash is required on BSD ps --
+        # unlike GNU, a bare ``ww`` (no dash) there is parsed as a
+        # ``keyword=keyword`` -o-style column spec, not the width flag, and
+        # silently narrows process selection instead of widening output.
         ps = subprocess.run(
-            ["ps", "-eo", "pid,ppid,command"],
+            ["ps", "-ww", "-eo", "pid,ppid,command"],
             capture_output=True,
             text=True,
         ).stdout
