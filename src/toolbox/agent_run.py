@@ -1317,27 +1317,55 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# Logs are raw PTY captures of the wrapped TUI agent, which routinely enable
+# terminal modes (mouse tracking, focus reporting, bracketed paste, hidden
+# cursor) that only the live TUI's own shutdown sequence turns back off.
+# Replaying those bytes onto the real terminal via `logs`/`tail` leaves the
+# mode enabled after we're done printing, so e.g. mouse movement afterward
+# shows up as garbage escape sequences. Force every such mode off (best
+# effort; harmless if the mode was never on) once we stop writing to stdout.
+_TERMINAL_MODE_RESET = (
+    b"\x1b[0m\x1b[r\x1b[?7h"
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l"
+    b"\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?25h"
+    b"\x1b[?1049l\x1b[?1047l\x1b[?47l"
+)
+
+
+def _reset_terminal_modes() -> None:
+    try:
+        if not sys.stdout.isatty():
+            return
+        sys.stdout.buffer.write(_TERMINAL_MODE_RESET)
+        sys.stdout.buffer.flush()
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
     n = max(1, args.n)
-    # Read tail-n efficiently for large logs.
-    with log.open("rb") as f:
-        f.seek(0, os.SEEK_END)
-        end = f.tell()
-        block = 8192
-        data = b""
-        pos = end
-        while pos > 0 and data.count(b"\n") <= n:
-            read_size = min(block, pos)
-            pos -= read_size
-            f.seek(pos)
-            data = f.read(read_size) + data
-    lines = data.splitlines()
-    for line in lines[-n:]:
-        try:
-            sys.stdout.buffer.write(line + b"\n")
-        except BrokenPipeError:
-            break
+    try:
+        # Read tail-n efficiently for large logs.
+        with log.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            block = 8192
+            data = b""
+            pos = end
+            while pos > 0 and data.count(b"\n") <= n:
+                read_size = min(block, pos)
+                pos -= read_size
+                f.seek(pos)
+                data = f.read(read_size) + data
+        lines = data.splitlines()
+        for line in lines[-n:]:
+            try:
+                sys.stdout.buffer.write(line + b"\n")
+            except BrokenPipeError:
+                break
+    finally:
+        _reset_terminal_modes()
     return 0
 
 
@@ -1350,33 +1378,42 @@ def cmd_tail(args: argparse.Namespace) -> int:
     except ValueError:
         pid = None
     # Stream the whole file then tail until the agent dies or log stops growing.
-    with log.open("rb") as f:
-        while True:
-            chunk = f.read(8192)
-            if chunk:
-                try:
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.buffer.flush()
-                except BrokenPipeError:
-                    return 0
-                continue
-            # EOF. A preserved-log-only or otherwise non-live run has nothing
-            # left to follow; after printing existing content, exit immediately.
-            if pid is None:
-                return 0
-            if not _pid_alive(pid):
-                # One more drain to catch final writes from a process that was
-                # live when tail started.
-                time.sleep(0.1)
-                remaining = f.read()
-                if remaining:
+    # Ctrl-C is the normal way to stop following (same as `tail -f`): catch it
+    # here so it exits quietly with the conventional 128+SIGINT status instead
+    # of dumping a traceback, while still running the terminal-mode reset.
+    try:
+        with log.open("rb") as f:
+            while True:
+                chunk = f.read(8192)
+                if chunk:
                     try:
-                        sys.stdout.buffer.write(remaining)
+                        sys.stdout.buffer.write(chunk)
                         sys.stdout.buffer.flush()
                     except BrokenPipeError:
-                        pass
-                return 0
-            time.sleep(0.2)
+                        return 0
+                    continue
+                # EOF. A preserved-log-only or otherwise non-live run has
+                # nothing left to follow; after printing existing content,
+                # exit immediately.
+                if pid is None:
+                    return 0
+                if not _pid_alive(pid):
+                    # One more drain to catch final writes from a process
+                    # that was live when tail started.
+                    time.sleep(0.1)
+                    remaining = f.read()
+                    if remaining:
+                        try:
+                            sys.stdout.buffer.write(remaining)
+                            sys.stdout.buffer.flush()
+                        except BrokenPipeError:
+                            pass
+                    return 0
+                time.sleep(0.2)
+    except KeyboardInterrupt:
+        return 128 + signal.SIGINT
+    finally:
+        _reset_terminal_modes()
 
 
 # ---------------------------------------------------------------------------
