@@ -2436,8 +2436,16 @@ def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
     runner killed outright will never publish it.
     """
     pgid = _recorded_pgid(state_dir)
+    if pgid is not None and pgid == os.getpgrp():
+        sys.exit(
+            f"agent-run: refusing to force-kill '{name}': caller shares the "
+            f"run's process group ({pgid}) and would signal itself"
+        )
     try:
-        if pgid is not None:
+        # Only the uncatchable SIGKILL targets the group: a catchable signal
+        # sent group-wide reaches the runner's children directly, racing the
+        # runner's own handler and producing non-deterministic terminal state.
+        if sig == signal.SIGKILL and pgid is not None:
             os.killpg(pgid, sig)
         else:
             os.kill(pid, sig)
@@ -2763,35 +2771,125 @@ _AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid
 IDLE_TIMEOUT_MARKER = "idle_timeout_fired"
 
 
+def _parse_watchdog_startup_grace_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "300")
+    return _positive_finite_seconds(
+        raw, "AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", 300.0
+    )
+
+
+def _idle_timeout_reason(state_dir: Path) -> str:
+    """Human-readable `reap_reason` for a watchdog kill, using the idle seconds
+    the watchdog recorded in its marker."""
+    recorded = _read(state_dir / IDLE_TIMEOUT_MARKER).strip()
+    measured = f"idle>{recorded}s" if recorded else "idle"
+    return f"{measured} (idle-timeout watchdog)"
+
+
+def _watchdog_escalate(state_dir: Path, runner_pid: int) -> None:
+    """SIGKILL the runner and its recorded children after SIGTERM was ignored.
+
+    The watchdog is a sibling of those processes rather than their parent, so
+    it can signal but never reap them. Terminal state is published here because
+    a runner killed outright never publishes its own.
+    """
+    own_pid = os.getpid()
+    for field in _AUX_PID_FIELDS:
+        raw = _read(state_dir / field)
+        if not raw:
+            continue
+        try:
+            pid = int(raw)
+        except ValueError:
+            continue
+        if pid <= 0 or pid == own_pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.kill(runner_pid, signal.SIGKILL)
+    except OSError:
+        pass
+    if not _run_is_terminal(state_dir):
+        if not (state_dir / "exit_code").exists():
+            _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
+        _mark_terminal(state_dir, "killed", _idle_timeout_reason(state_dir))
+
+
 def _idle_watchdog_loop(
     state_dir: Path, log_dir: Path, runner_pid: int, idle_timeout: float
 ) -> None:
-    """Signal ``runner_pid`` once the run log has been untouched for
+    """Terminate ``runner_pid`` once the run log has stopped growing for
     ``idle_timeout`` seconds.
 
     An agent that stops producing output but never exits would otherwise hold
-    the run at "running" indefinitely. Termination is delegated to the runner's
-    own SIGTERM handler rather than killing the workload here, so teardown and
-    status publication follow the single existing path.
+    the run at "running" indefinitely. Idleness must hold on both the wall
+    clock and a monotonic clock, so an NTP step or a suspend/resume cannot
+    manufacture or mask it. Enforcement is suppressed until the agent's first
+    output, bounded by ``AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS``: before that
+    first byte the log still carries the launcher's own ``touch`` timestamp, so
+    measuring against it would kill an agent that is merely slow to start.
+
+    Termination is delegated to the runner's SIGTERM handler so teardown and
+    status publication follow the single existing path; SIGKILL escalation
+    covers a runner that cannot service the signal.
     """
     log_path = log_dir / "log"
     poll = max(1.0, min(idle_timeout / 4.0, 30.0))
+    startup_grace = _parse_watchdog_startup_grace_seconds()
+    started_monotonic = time.monotonic()
+    last_change_monotonic = started_monotonic
+    last_mtime: Optional[float] = None
+    saw_output = False
+
     while True:
         time.sleep(poll)
         if not _pid_alive(runner_pid):
             return
+        now_monotonic = time.monotonic()
         try:
-            idle = time.time() - log_path.stat().st_mtime
+            mtime: Optional[float] = log_path.stat().st_mtime
         except OSError:
-            continue
-        if idle < idle_timeout:
-            continue
-        try:
-            _write(state_dir / IDLE_TIMEOUT_MARKER, f"{idle:.0f}\n")
-            os.kill(runner_pid, signal.SIGTERM)
-        except OSError:
-            pass
+            # A log that cannot be stat'd is not producing output. Keep the run
+            # guarded rather than looping inertly, but only once enough time has
+            # passed that a transient failure cannot trigger a kill.
+            mtime = None
+            if now_monotonic - last_change_monotonic < max(idle_timeout, startup_grace):
+                continue
+        if mtime is not None:
+            if last_mtime is None:
+                last_mtime = mtime
+            elif mtime != last_mtime:
+                last_mtime = mtime
+                last_change_monotonic = now_monotonic
+                saw_output = True
+            idle_wall = time.time() - mtime
+            idle_monotonic = now_monotonic - last_change_monotonic
+            if min(idle_wall, idle_monotonic) < idle_timeout:
+                continue
+            if not saw_output and now_monotonic - started_monotonic < startup_grace:
+                continue
+        idle_seconds = now_monotonic - last_change_monotonic
+        break
+
+    # The marker only labels the kill; a failed write must never stop it, or a
+    # full state dir would silently disable the watchdog entirely.
+    try:
+        _write(state_dir / IDLE_TIMEOUT_MARKER, f"{idle_seconds:.0f}\n")
+    except OSError:
+        pass
+    try:
+        os.kill(runner_pid, signal.SIGTERM)
+    except OSError:
         return
+    deadline = time.monotonic() + KILL_ESCALATION_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not _pid_alive(runner_pid):
+            return
+        time.sleep(KILL_POLL_INTERVAL_SECONDS)
+    _watchdog_escalate(state_dir, runner_pid)
 
 
 def _publish_or_reap_child(state_dir: Path, field: str, pid: int) -> None:
@@ -2950,9 +3048,11 @@ def _runner(
             _write(state_dir / "exit_code", f"{code}\n")
             _write(state_dir / "ended_at", _now_iso() + "\n")
             status = "done" if code == 0 else "failed"
-            # A watchdog kill is a deliberate termination, not a crash.
+            # A watchdog kill is a deliberate termination, not a crash, and
+            # carries the same reap_reason every other `killed` producer writes.
             if code != 0 and (state_dir / IDLE_TIMEOUT_MARKER).exists():
                 status = "killed"
+                _write(state_dir / "reap_reason", _idle_timeout_reason(state_dir) + "\n")
             # A non-zero exit within the grace window is argv validation or a
             # missing binary, not work that ran; an unsubmitted prompt means the
             # agent never received its task. Both are launch failures. Codes at
