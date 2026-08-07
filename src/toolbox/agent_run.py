@@ -43,6 +43,8 @@ Usage::
 
     agent-run <name> <cmd...>            # non-interactive (one-shot)
     agent-run -i <name> <cmd...>         # interactive (PTY-wrapped, steerable)
+    agent-run --echo <name> <cmd...>     # also render a cleaned live transcript
+    agent-run --idle-timeout N <name> <cmd...>  # self-terminate after N idle seconds
     agent-run tail <name>                # follow log in real time
     agent-run logs <name> [N]            # last N lines (default 50)
     agent-run status <name>              # one-line status
@@ -77,10 +79,14 @@ eligible for garbage collection once old enough (see `reap` below).
 
 Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 
-    status       starting | running | done | failed | died | killed
+    status       starting | running | done | failed | launch_failed | died | killed
     exit_code    numeric exit code (after completion)
     pid          runner process id
-    pgid         process group id (informational only; not a kill target)
+    pgid         process group id (also the `kill --force` fallback target)
+    launch_error first output line of a run that failed at launch
+    prompt_submitted  written once an interactive prompt file was delivered
+    idle_timeout      idle-timeout seconds this run was launched with
+    idle_timeout_fired  idle seconds measured when the watchdog fired
     process_identity  platform-specific runner birth token (kill verification)
     agent_pid   one-shot command child pid (non-interactive only)
     pty_pid      PTY child pid (interactive only)
@@ -145,7 +151,7 @@ performed) in one invocation:
       and marked `killed`, via the same identity-verified `_force_kill`
       escalation `agent-run kill <name> KILL` uses.
    2. Terminal-state garbage collection: runs whose status is conclusively
-      terminal — `done`, `failed`, `died`, or `killed` — and whose state dir
+      terminal — `done`, `failed`, `launch_failed`, `died`, or `killed` — and whose state dir
       has not been modified in longer than a separate, more conservative age
       threshold (--min-age-hours, or AGENT_RUN_MIN_AGE_HOURS (preferred) /
       AGENT_RUN_REAP_MIN_AGE_HOURS (compatible alias), default 168h/7 days)
@@ -222,14 +228,15 @@ FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
 ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
 
 # Statuses that are conclusively terminal: the run will never transition
-# again on its own. "done"/"failed" are published by the runner itself;
-# "died"/"killed" are published only by reap/heal reconciliation (a dead
-# pid, or a completed idle-kill escalation) — never by the runner, since a
-# runner that can still write state files is by definition not dead. This
-# set is deliberately narrow: any other status (including "stalled", which
-# still has a live, signal-verified pid) is treated as non-terminal and is
-# never a target for `agent-run reap`'s terminal-state garbage collection.
-TERMINAL_STATUSES = frozenset({"done", "failed", "died", "killed"})
+# again on its own. "done"/"failed"/"launch_failed" are published by the
+# runner itself; "died"/"killed" are published only by reap/heal
+# reconciliation (a dead pid, or a completed idle-kill escalation) — never
+# by the runner, since a runner that can still write state files is by
+# definition not dead. This set is deliberately narrow: any other status
+# (including "stalled", which still has a live, signal-verified pid) is
+# treated as non-terminal and is never a target for `agent-run reap`'s
+# terminal-state garbage collection.
+TERMINAL_STATUSES = frozenset({"done", "failed", "launch_failed", "died", "killed"})
 
 # Recognized non-terminal statuses: "starting"/"running" are raw states the
 # runner itself writes; "stalled" is a *computed* status from
@@ -307,6 +314,71 @@ def _parse_reap_min_age_seconds() -> float:
     )
     raw = os.environ.get(env_name, "168")
     return _positive_finite_hours(raw, env_name, 168.0)
+
+
+# Launch-grace window: how many seconds after exec a non-zero exit still reads
+# as argv validation or a missing binary rather than work that ran and failed.
+def _positive_finite_seconds(raw: str, label: str, default_seconds: float) -> float:
+    try:
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(raw)
+    except ValueError:
+        print(
+            f"agent-run: warning: {label}={raw!r} is not a finite, positive "
+            f"number of seconds; using default {default_seconds:g}s",
+            file=sys.stderr,
+        )
+        return default_seconds
+    return value
+
+
+def _parse_launch_grace_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_LAUNCH_GRACE_SECS", "10")
+    return _positive_finite_seconds(raw, "AGENT_RUN_LAUNCH_GRACE_SECS", 10.0)
+
+
+LAUNCH_GRACE_SECONDS: float = _parse_launch_grace_seconds()
+
+# How much of the log to scan for the diagnostic first line, and how much of
+# that line to keep.
+LAUNCH_ERROR_SCAN_BYTES = 65536
+LAUNCH_ERROR_MAX_CHARS = 500
+
+PROMPT_UNSUBMITTED_ERROR = "agent exited before its prompt file was submitted"
+
+# The interactive prompt helper waits this long for the TUI to enter raw mode
+# before submitting; it also bounds how late an unsubmitted prompt still counts
+# as a launch failure.
+PROMPT_SUBMISSION_DELAY_SECONDS = 4.0
+
+
+# Off by default, unlike the thresholds above. An invalid flag value is a hard
+# launch-time error: a launcher that believes idle-timeout is active must not
+# silently run without it.
+def _parse_idle_timeout_flag(raw: str) -> float:
+    return _positive_finite_float(raw)
+
+
+def _idle_timeout_env_seconds() -> Optional[float]:
+    """Parse AGENT_RUN_IDLE_TIMEOUT_SECS, defaulting to off (None) — both when
+    unset and when the value fails validation, since idle-timeout being
+    disabled is this feature's fail-safe direction."""
+    raw = os.environ.get("AGENT_RUN_IDLE_TIMEOUT_SECS")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(raw)
+    except ValueError:
+        print(
+            f"agent-run: warning: AGENT_RUN_IDLE_TIMEOUT_SECS={raw!r} is not a "
+            "finite, positive number of seconds; idle-timeout stays off",
+            file=sys.stderr,
+        )
+        return None
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -1227,7 +1299,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         # was completely empty. Keeping status tokens out of stdout headings
         # entirely keeps scripted greps honest.
         print(
-            "agent-run: pass --all to include done/failed/died/killed",
+            "agent-run: pass --all to include done/failed/launch_failed/died/killed",
             file=sys.stderr,
         )
 
@@ -1301,7 +1373,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
     lines = _log_line_count(_log_file_for(name))
     if not state_dir.is_dir():
-        print(f"name={name} status=not running (log preserved) lines={lines}")
+        # The state dir is volatile; a launch failure recorded alongside the
+        # log outlives it and is exactly what a post-reboot status needs.
+        launch_error = _read(_log_dir(name) / "launch_error")
+        suffix = f" launch_error={launch_error!r}" if launch_error else ""
+        print(f"name={name} status=not running (log preserved) lines={lines}{suffix}")
         return 0
     d = state_dir
     status = _effective_status(d)
@@ -1310,9 +1386,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     ended = _read(d / "ended_at", "-")
     exit_code = _read(d / "exit_code", "-")
     interactive = _read(d / "interactive", "0")
+    launch_error = _read(d / "launch_error") or _read(_log_dir(name) / "launch_error")
+    suffix = f" launch_error={launch_error!r}" if launch_error else ""
     print(
         f"name={name} status={status} pid={pid} exit={exit_code} "
         f"started={started} ended={ended} lines={lines} interactive={interactive}"
+        f"{suffix}"
     )
     return 0
 
@@ -2273,7 +2352,7 @@ def _pid_parent_pid(pid: int) -> Optional[int]:
 
 
 def _run_is_terminal(state_dir: Path) -> bool:
-    return _read(state_dir / "status") in {"done", "failed"}
+    return _read(state_dir / "status") in TERMINAL_STATUSES
 
 
 KILL_ESCALATION_TIMEOUT_SECONDS = 8.0
@@ -2365,6 +2444,86 @@ def _force_kill(name: str, state_dir: Path, pid: int, expected_identity: str) ->
         print(f"agent-run: force-killed unresponsive '{name}' (pid={pid})")
 
 
+def _publish_forced_kill(state_dir: Path, reason: str) -> None:
+    """Record a SIGKILL-terminated run as ``killed``: an uncatchable signal
+    leaves the runner unable to publish its own terminal state."""
+    if _run_is_terminal(state_dir):
+        return
+    if not (state_dir / "exit_code").exists():
+        _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
+    _mark_terminal(state_dir, "killed", reason)
+
+
+# `kill --force` cannot rule out PID reuse: this path has no birth token.
+_FORCED_UNVERIFIED_NOTE = "forced — no recorded process identity to verify"
+
+
+def _recorded_pgid(state_dir: Path) -> Optional[int]:
+    """The recorded process group id, if present and a plausible positive
+    group id — used only by the ``--force`` legacy-identity kill fallback."""
+    raw = _read(state_dir / "pgid")
+    try:
+        pgid = int(raw) if raw else None
+    except ValueError:
+        return None
+    return pgid if pgid is not None and pgid > 0 else None
+
+
+def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
+    """``kill --force`` fallback for state dirs with no recorded
+    ``process_identity`` (pre-dates identity tracking, or it failed to
+    read at launch time).
+
+    There is no birth token to verify, so this cannot close the PID-reuse
+    TOCTOU window the identity-verified paths do — the caller's liveness
+    check immediately before this call, and confinement to the run's own
+    recorded process group, are the only remaining safeguards. Targets the
+    recorded pgid (matching the documented manual workaround, ``kill
+    -TERM -- -<pgid>``) so descendants are reached the same way normal
+    teardown would reach them; falls back to the bare pid if no pgid was
+    recorded. TERM/INT/HUP are single unverified signals, trusting a
+    still-alive runner's own handler exactly like the verified path does. KILL
+    cannot be caught, so — mirroring ``_force_kill`` — this also publishes
+    terminal state itself after a bounded wait, since an unverifiable
+    runner killed outright will never publish it.
+    """
+    pgid = _recorded_pgid(state_dir)
+    if pgid is not None and pgid == os.getpgrp():
+        sys.exit(
+            f"agent-run: refusing to force-kill '{name}': caller shares the "
+            f"run's process group ({pgid}) and would signal itself"
+        )
+    try:
+        # Only the uncatchable SIGKILL targets the group: a catchable signal
+        # sent group-wide reaches the runner's children directly, racing the
+        # runner's own handler and producing non-deterministic terminal state.
+        if sig == signal.SIGKILL and pgid is not None:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+    except ProcessLookupError:
+        print(f"agent-run: {name} is not running (pid {pid})")
+        return
+    except PermissionError:
+        sys.exit(f"agent-run: permission denied signaling '{name}' (pid {pid})")
+
+    if sig != signal.SIGKILL:
+        sig_name = signal.Signals(sig).name
+        print(
+            f"agent-run: sent {sig_name} cleanup request to {name} (pid={pid}, "
+            f"{_FORCED_UNVERIFIED_NOTE})"
+        )
+        return
+
+    deadline = time.time() + KILL_ESCALATION_TIMEOUT_SECONDS
+    while time.time() < deadline and _pid_alive(pid):
+        time.sleep(KILL_POLL_INTERVAL_SECONDS)
+    _publish_forced_kill(state_dir, f"kill --force ({_FORCED_UNVERIFIED_NOTE})")
+    print(
+        f"agent-run: force-killed '{name}' (pid={pid}, {_FORCED_UNVERIFIED_NOTE})"
+    )
+
+
 def cmd_kill(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     d = _require_state(name)
@@ -2375,16 +2534,31 @@ def cmd_kill(args: argparse.Namespace) -> int:
     if _read(d / "status") not in {"running", "starting"}:
         sys.exit(f"agent-run: refusing to kill '{name}': run is not marked running")
     pid = _require_positive_state_int(d, "pid", name)
-    expected_identity = _read_process_identity(d, name)
-    current_identity = _process_identity(pid)
-    if current_identity is None:
-        sys.exit(
-            f"agent-run: refusing to kill '{name}': cannot verify current process identity"
-        )
-    if current_identity != expected_identity:
-        sys.exit(
-            f"agent-run: refusing to kill '{name}': process identity does not match recorded runner"
-        )
+    force = bool(getattr(args, "force", False))
+    recorded_identity = _read(d / "process_identity")
+    # --force overrides every unconfirmable case: no birth token, an unreadable
+    # one, or a mismatch. It previously applied only to the first.
+    legacy_force = force and not recorded_identity
+    if force and recorded_identity:
+        current_identity = _process_identity(pid)
+        if current_identity is None or current_identity != recorded_identity.strip():
+            print(
+                f"agent-run: '{name}' identity does not verify; proceeding because "
+                "--force was given",
+                file=sys.stderr,
+            )
+            legacy_force = True
+    if not legacy_force:
+        expected_identity = _read_process_identity(d, name)
+        current_identity = _process_identity(pid)
+        if current_identity is None:
+            sys.exit(
+                f"agent-run: refusing to kill '{name}': cannot verify current process identity"
+            )
+        if current_identity != expected_identity:
+            sys.exit(
+                f"agent-run: refusing to kill '{name}': process identity does not match recorded runner"
+            )
     if not _pid_alive(pid):
         print(f"agent-run: {args.name} is not running (pid {pid})")
         return 0
@@ -2396,6 +2570,9 @@ def cmd_kill(args: argparse.Namespace) -> int:
     supported = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGKILL}
     if sig not in supported:
         sys.exit("agent-run: only TERM, INT, HUP, or KILL are supported; arbitrary signals can bypass cleanup")
+    if legacy_force:
+        _force_kill_legacy(name, d, pid, sig)
+        return 0
     if sig == signal.SIGKILL:
         _force_kill(name, d, pid, expected_identity)
         return 0
@@ -2532,6 +2709,11 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             pass
     if echo:
         _write(d / "echo", f"{echo_interval}\n")
+    idle_timeout: Optional[float] = getattr(args, "idle_timeout", None)
+    if idle_timeout is not None:
+        # Persisted so introspection can tell whether a running run is guarded
+        # by a watchdog at all, and post-mortem can reconstruct the launch.
+        _write(d / "idle_timeout", f"{idle_timeout}\n")
 
     # Double-fork to detach from the terminal and become our own session
     # leader. The grandchild runs the actual agent.
@@ -2607,6 +2789,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         echo,
         echo_interval,
         tmp_dir=scratch_dir,
+        idle_timeout=getattr(args, "idle_timeout", None),
     )
     return 0  # never reached
 
@@ -2647,7 +2830,129 @@ def _block_handled_runner_signals():
         pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
-_AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid", "render_pid")
+_AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid", "render_pid", "watchdog_pid")
+
+
+# Distinguishes a watchdog kill from an ordinary SIGTERM in `_finalize`.
+IDLE_TIMEOUT_MARKER = "idle_timeout_fired"
+
+
+def _parse_watchdog_startup_grace_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "300")
+    return _positive_finite_seconds(
+        raw, "AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", 300.0
+    )
+
+
+def _idle_timeout_reason(state_dir: Path) -> str:
+    """Human-readable `reap_reason` for a watchdog kill, using the idle seconds
+    the watchdog recorded in its marker."""
+    recorded = _read(state_dir / IDLE_TIMEOUT_MARKER).strip()
+    measured = f"idle>{recorded}s" if recorded else "idle"
+    return f"{measured} (idle-timeout watchdog)"
+
+
+def _watchdog_escalate(state_dir: Path, runner_pid: int) -> None:
+    """SIGKILL the runner and its recorded children after SIGTERM was ignored.
+
+    The watchdog is a sibling of those processes rather than their parent, so
+    it can signal but never reap them. Terminal state is published here because
+    a runner killed outright never publishes its own.
+    """
+    own_pid = os.getpid()
+    for field in _AUX_PID_FIELDS:
+        raw = _read(state_dir / field)
+        if not raw:
+            continue
+        try:
+            pid = int(raw)
+        except ValueError:
+            continue
+        if pid <= 0 or pid == own_pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.kill(runner_pid, signal.SIGKILL)
+    except OSError:
+        pass
+    _publish_forced_kill(state_dir, _idle_timeout_reason(state_dir))
+
+
+def _idle_watchdog_loop(
+    state_dir: Path, log_dir: Path, runner_pid: int, idle_timeout: float
+) -> None:
+    """Terminate ``runner_pid`` once the run log has stopped growing for
+    ``idle_timeout`` seconds.
+
+    An agent that stops producing output but never exits would otherwise hold
+    the run at "running" indefinitely. Idleness must hold on both the wall
+    clock and a monotonic clock, so an NTP step or a suspend/resume cannot
+    manufacture or mask it. Enforcement is suppressed until the agent's first
+    output, bounded by ``AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS``: before that
+    first byte the log still carries the launcher's own ``touch`` timestamp, so
+    measuring against it would kill an agent that is merely slow to start.
+
+    Termination is delegated to the runner's SIGTERM handler so teardown and
+    status publication follow the single existing path; SIGKILL escalation
+    covers a runner that cannot service the signal.
+    """
+    log_path = log_dir / "log"
+    poll = max(1.0, min(idle_timeout / 4.0, 30.0))
+    startup_grace = _parse_watchdog_startup_grace_seconds()
+    started_monotonic = time.monotonic()
+    last_change_monotonic = started_monotonic
+    last_mtime: Optional[float] = None
+    saw_output = False
+
+    while True:
+        time.sleep(poll)
+        if not _pid_alive(runner_pid):
+            return
+        now_monotonic = time.monotonic()
+        try:
+            mtime: Optional[float] = log_path.stat().st_mtime
+        except OSError:
+            # A log that cannot be stat'd is not producing output. Keep the run
+            # guarded rather than looping inertly, but only once enough time has
+            # passed that a transient failure cannot trigger a kill.
+            mtime = None
+            if now_monotonic - last_change_monotonic < max(idle_timeout, startup_grace):
+                continue
+        if mtime is not None:
+            if last_mtime is None:
+                last_mtime = mtime
+            elif mtime != last_mtime:
+                last_mtime = mtime
+                last_change_monotonic = now_monotonic
+                saw_output = True
+            idle_wall = time.time() - mtime
+            idle_monotonic = now_monotonic - last_change_monotonic
+            if min(idle_wall, idle_monotonic) < idle_timeout:
+                continue
+            if not saw_output and now_monotonic - started_monotonic < startup_grace:
+                continue
+        idle_seconds = now_monotonic - last_change_monotonic
+        break
+
+    # The marker only labels the kill; a failed write must never stop it, or a
+    # full state dir would silently disable the watchdog entirely.
+    try:
+        _write(state_dir / IDLE_TIMEOUT_MARKER, f"{idle_seconds:.0f}\n")
+    except OSError:
+        pass
+    try:
+        os.kill(runner_pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + KILL_ESCALATION_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not _pid_alive(runner_pid):
+            return
+        time.sleep(KILL_POLL_INTERVAL_SECONDS)
+    _watchdog_escalate(state_dir, runner_pid)
 
 
 def _publish_or_reap_child(state_dir: Path, field: str, pid: int) -> None:
@@ -2760,6 +3065,7 @@ def _runner(
     echo: bool = False,
     echo_interval: float = 2.0,
     tmp_dir: Optional[Path] = None,
+    idle_timeout: Optional[float] = None,
 ) -> None:
     """Execute in the detached session-leader process.
 
@@ -2768,12 +3074,78 @@ def _runner(
     """
     my_pid = os.getpid()
     log_fd = -1
+    # Set immediately before the agent is exec'd, so `_finalize` can measure how
+    # long it survived. None until then: a failure during runner setup is not a
+    # launch failure of the agent itself.
+    agent_started_monotonic: Optional[float] = None
+    # True only once the agent process returned its own exit status. Signal
+    # teardown and runner crashes finalize through other paths and must stay
+    # plain `failed`, however early they happen.
+    agent_exited_naturally = False
+
+    def _record_launch_error(message: str) -> None:
+        """Persist a launch diagnostic to both the volatile state dir and the
+        durable log dir, so it survives state-dir GC and reboots."""
+        payload = message[:LAUNCH_ERROR_MAX_CHARS] + "\n"
+        for target in (state_dir / "launch_error", log_dir / "launch_error"):
+            try:
+                _write(target, payload)
+            except OSError:
+                pass
+
+    def _capture_launch_error() -> None:
+        """Persist the agent's first non-empty output line so `status` can state
+        why the launch failed without the operator opening the log."""
+        try:
+            with (log_dir / "log").open("rb") as handle:
+                raw = handle.read(LAUNCH_ERROR_SCAN_BYTES)
+        except OSError:
+            return
+        for line in _strip_ansi_fallback(raw).splitlines():
+            stripped = line.strip()
+            if stripped:
+                _record_launch_error(stripped)
+                return
+
+    def _prompt_was_required_but_unsubmitted() -> bool:
+        """True when an interactive prompt file never reached the agent. The
+        submission helper publishes its marker only after both FIFO writes.
+
+        Bounded by the helper's own delay plus the launch grace: past that, the
+        run may have been steered manually and done real work, which must not
+        be recorded as a launch failure.
+        """
+        if not (interactive and prompt_file is not None):
+            return False
+        if (state_dir / "prompt_submitted").exists():
+            return False
+        if agent_started_monotonic is None:
+            return False
+        elapsed = time.monotonic() - agent_started_monotonic
+        return elapsed <= LAUNCH_GRACE_SECONDS + PROMPT_SUBMISSION_DELAY_SECONDS
 
     def _finalize(code: int) -> None:
         if not (state_dir / "exit_code").exists():
             _write(state_dir / "exit_code", f"{code}\n")
             _write(state_dir / "ended_at", _now_iso() + "\n")
-            _write(state_dir / "status", "done\n" if code == 0 else "failed\n")
+            status = "done" if code == 0 else "failed"
+            # A watchdog kill is a deliberate termination, not a crash, and
+            # carries the same reap_reason every other `killed` producer writes.
+            if code != 0 and (state_dir / IDLE_TIMEOUT_MARKER).exists():
+                status = "killed"
+                _write(state_dir / "reap_reason", _idle_timeout_reason(state_dir) + "\n")
+            # A non-zero exit within the grace window is argv validation or a
+            # missing binary, not work that ran; an unsubmitted prompt means the
+            # agent never received its task. Both are launch failures. Codes at
+            # or above 128 encode a terminating signal, which is a kill.
+            elif code != 0 and code < 128 and agent_exited_naturally and agent_started_monotonic is not None:
+                if time.monotonic() - agent_started_monotonic <= LAUNCH_GRACE_SECONDS:
+                    status = "launch_failed"
+                    _capture_launch_error()
+                elif _prompt_was_required_but_unsubmitted():
+                    status = "launch_failed"
+                    _record_launch_error(PROMPT_UNSUBMITTED_ERROR)
+            _write(state_dir / "status", status + "\n")
 
     handling_signal = False
     render_pid: Optional[int] = None
@@ -2847,6 +3219,26 @@ def _runner(
                     _echo_loop(log_dir, echo_interval)
                 finally:
                     os._exit(0)
+
+        # Opt-in stall guard: a sibling child watching log mtime, so a wedged
+        # agent reaches a terminal status instead of running forever.
+        if idle_timeout is not None:
+            with _block_handled_runner_signals():
+                watchdog_pid = os.fork()
+                if watchdog_pid != 0:
+                    _publish_or_reap_child(state_dir, "watchdog_pid", watchdog_pid)
+                else:
+                    _reset_runner_signal_handlers()
+            if watchdog_pid == 0:
+                _reset_runner_signal_handlers()
+                try:
+                    os.close(ready_fd)
+                except OSError:
+                    pass
+                try:
+                    _idle_watchdog_loop(state_dir, log_dir, my_pid, idle_timeout)
+                finally:
+                    os._exit(0)
     except Exception as exc:  # setup failed before readiness
         try:
             payload = json.dumps({"status": "error", "error": str(exc)}).encode()
@@ -2879,10 +3271,12 @@ def _runner(
         ready_sent = True
 
     try:
+        agent_started_monotonic = time.monotonic()
         if interactive:
             exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
         else:
             exit_code = _run_oneshot(state_dir, argv, log_fd, _ready, prompt_file)
+        agent_exited_naturally = True
     except Exception as exc:  # noqa: BLE001
         try:
             detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -3093,7 +3487,9 @@ def _run_interactive(
         try:
             os.execvp(argv[0], list(argv))
         except OSError as exc:
-            sys.stderr.write(f"agent-run: exec failed: {exc}\n")
+            # Unbuffered, matching the one-shot path: os._exit does not flush, and
+            # this is the line _capture_launch_error reports for a failed exec.
+            os.write(2, f"agent-run: exec failed: {exc}\n".encode())
             os._exit(127)
     # Full interactive relay is now established: PTY forked and keeper holds
     # FIFO open.  Finish the descriptor setup before declaring readiness.
@@ -3114,7 +3510,7 @@ def _run_interactive(
             try:
                 # Wait a few seconds for the TUI to enable raw mode. Earlier
                 # tests showed sub-3s delivery races ICRNL CR->LF translation.
-                time.sleep(4)
+                time.sleep(PROMPT_SUBMISSION_DELAY_SECONDS)
                 try:
                     data = Path(prompt_file).read_bytes()
                 except OSError:
@@ -3137,6 +3533,9 @@ def _run_interactive(
                         os.write(fd, submit_writes[1])
                     finally:
                         os.close(fd)
+                    # Marks delivery for `_finalize`; absence means the agent
+                    # died before its task ever reached it.
+                    _write(state_dir / "prompt_submitted", _now_iso() + "\n")
                 except OSError:
                     pass
             finally:
@@ -3362,6 +3761,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_kill = sub.add_parser("kill", help="kill the agent (default SIGTERM)")
     sp_kill.add_argument("name")
     sp_kill.add_argument("signal", nargs="?", default="TERM")
+    sp_kill.add_argument(
+        "--force",
+        action="store_true",
+        help="kill a run whose state dir records no process identity, using its "
+        "recorded process group; cannot verify PID reuse",
+    )
     sp_kill.set_defaults(func=cmd_kill)
 
     sp_list = sub.add_parser(
@@ -3454,8 +3859,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     echo: bool = False
     echo_interval: float = 2.0
     submit_mode: Optional[str] = None
+    idle_timeout: Optional[float] = None
     # Consume top-level flags (`-i`, `-f <path>`, `--echo[=interval]`,
-    # `--submit-mode=cr|crlf`) in any order before the name.
+    # `--submit-mode=cr|crlf`, `--idle-timeout <seconds>`) in any order
+    # before the name.
     while raw:
         if raw[0] in ("-i", "--interactive"):
             interactive = True
@@ -3490,6 +3897,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 sys.exit("agent-run: --submit-mode must be cr or crlf")
             raw = raw[1:]
             continue
+        if raw[0] == "--idle-timeout":
+            if len(raw) < 2:
+                sys.exit("agent-run: --idle-timeout requires a value in seconds")
+            try:
+                idle_timeout = _parse_idle_timeout_flag(raw[1])
+            except argparse.ArgumentTypeError as exc:
+                sys.exit(f"agent-run: --idle-timeout {exc}")
+            raw = raw[2:]
+            continue
+        if raw[0].startswith("--idle-timeout="):
+            try:
+                idle_timeout = _parse_idle_timeout_flag(raw[0].split("=", 1)[1])
+            except argparse.ArgumentTypeError as exc:
+                sys.exit(f"agent-run: --idle-timeout {exc}")
+            raw = raw[1:]
+            continue
         break
 
     # Try to dispatch a known subcommand; otherwise treat as launch.
@@ -3501,6 +3924,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         and not prompt_file
         and not echo
         and submit_mode is None
+        and idle_timeout is None
     ):
         # argparse handles these, including their own -h/--help.
         parser = _build_parser()
@@ -3514,6 +3938,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Basic validation of the name.
     if "/" in name or name.startswith("-"):
         sys.exit(f"agent-run: invalid name '{name}'")
+    if command and command[0].startswith("-"):
+        # A flag typed after the run name is never part of the launch
+        # command — it silently becomes argv[0] and exec fails with an
+        # opaque ENOENT. Reject it here with the actual offending token
+        # instead of letting the fork/exec path produce that confusion.
+        sys.exit(
+            f"agent-run: {command[0]!r} looks like an agent-run flag, not part "
+            "of the launch command; agent-run flags (-i, -f, --echo, "
+            "--submit-mode, --idle-timeout) must precede the run name"
+        )
     ns = argparse.Namespace(
         name=name,
         command=command,
@@ -3522,6 +3956,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         echo=echo,
         echo_interval=echo_interval,
         submit_mode=submit_mode,
+        idle_timeout=idle_timeout if idle_timeout is not None else _idle_timeout_env_seconds(),
     )
     return cmd_launch(ns)
 
