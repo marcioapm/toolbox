@@ -222,14 +222,15 @@ FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
 ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
 
 # Statuses that are conclusively terminal: the run will never transition
-# again on its own. "done"/"failed" are published by the runner itself;
-# "died"/"killed" are published only by reap/heal reconciliation (a dead
-# pid, or a completed idle-kill escalation) — never by the runner, since a
-# runner that can still write state files is by definition not dead. This
-# set is deliberately narrow: any other status (including "stalled", which
-# still has a live, signal-verified pid) is treated as non-terminal and is
-# never a target for `agent-run reap`'s terminal-state garbage collection.
-TERMINAL_STATUSES = frozenset({"done", "failed", "died", "killed"})
+# again on its own. "done"/"failed"/"launch_failed" are published by the
+# runner itself; "died"/"killed" are published only by reap/heal
+# reconciliation (a dead pid, or a completed idle-kill escalation) — never
+# by the runner, since a runner that can still write state files is by
+# definition not dead. This set is deliberately narrow: any other status
+# (including "stalled", which still has a live, signal-verified pid) is
+# treated as non-terminal and is never a target for `agent-run reap`'s
+# terminal-state garbage collection.
+TERMINAL_STATUSES = frozenset({"done", "failed", "launch_failed", "died", "killed"})
 
 # Recognized non-terminal statuses: "starting"/"running" are raw states the
 # runner itself writes; "stalled" is a *computed* status from
@@ -307,6 +308,70 @@ def _parse_reap_min_age_seconds() -> float:
     )
     raw = os.environ.get(env_name, "168")
     return _positive_finite_hours(raw, env_name, 168.0)
+
+
+# Launch-grace window: how many seconds after exec a non-zero exit is still
+# almost certainly an argv-validation/missing-binary failure rather than
+# real work having run and failed (see `launch_failed` in `_finalize`).
+# Same nan/inf/negative/zero rejection as the hour-granularity thresholds
+# above, just seconds-scaled since this operates on a much shorter horizon.
+def _positive_finite_seconds(raw: str, label: str, default_seconds: float) -> float:
+    try:
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(raw)
+    except ValueError:
+        print(
+            f"agent-run: warning: {label}={raw!r} is not a finite, positive "
+            f"number of seconds; using default {default_seconds:g}s",
+            file=sys.stderr,
+        )
+        return default_seconds
+    return value
+
+
+def _parse_launch_grace_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_LAUNCH_GRACE_SECS", "10")
+    return _positive_finite_seconds(raw, "AGENT_RUN_LAUNCH_GRACE_SECS", 10.0)
+
+
+LAUNCH_GRACE_SECONDS: float = _parse_launch_grace_seconds()
+
+
+# Per-run idle-timeout: off by default (None), unlike the two thresholds
+# above. Opted into per launch via --idle-timeout or AGENT_RUN_IDLE_TIMEOUT_SECS
+# (flag takes precedence); an invalid override is a hard launch-time error,
+# not a silent fallback, since a launcher that thinks idle-timeout is active
+# must not silently run without it.
+def _parse_idle_timeout_flag(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than 0")
+    return value
+
+
+def _idle_timeout_env_seconds() -> Optional[float]:
+    """Parse AGENT_RUN_IDLE_TIMEOUT_SECS, defaulting to off (None) — both when
+    unset and when the value fails validation, since idle-timeout being
+    disabled is this feature's fail-safe direction."""
+    raw = os.environ.get("AGENT_RUN_IDLE_TIMEOUT_SECS")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(raw)
+    except ValueError:
+        print(
+            f"agent-run: warning: AGENT_RUN_IDLE_TIMEOUT_SECS={raw!r} is not a "
+            "finite, positive number of seconds; idle-timeout stays off",
+            file=sys.stderr,
+        )
+        return None
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -2236,7 +2301,7 @@ def _pid_parent_pid(pid: int) -> Optional[int]:
 
 
 def _run_is_terminal(state_dir: Path) -> bool:
-    return _read(state_dir / "status") in {"done", "failed"}
+    return _read(state_dir / "status") in {"done", "failed", "launch_failed"}
 
 
 KILL_ESCALATION_TIMEOUT_SECONDS = 8.0
@@ -2328,6 +2393,65 @@ def _force_kill(name: str, state_dir: Path, pid: int, expected_identity: str) ->
         print(f"agent-run: force-killed unresponsive '{name}' (pid={pid})")
 
 
+def _recorded_pgid(state_dir: Path) -> Optional[int]:
+    """The recorded process group id, if present and a plausible positive
+    group id — used only by the ``--force`` legacy-identity kill fallback."""
+    raw = _read(state_dir / "pgid")
+    try:
+        pgid = int(raw) if raw else None
+    except ValueError:
+        return None
+    return pgid if pgid is not None and pgid > 0 else None
+
+
+def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
+    """``kill --force`` fallback for state dirs with no recorded
+    ``process_identity`` (pre-dates identity tracking, or it failed to
+    read at launch time).
+
+    There is no birth token to verify, so this cannot close the PID-reuse
+    TOCTOU window the identity-verified paths do — the caller's liveness
+    check immediately before this call, and confinement to the run's own
+    recorded process group, are the only remaining safeguards. Targets the
+    recorded pgid (matching the documented manual workaround, ``kill
+    -TERM -- -<pgid>``) so descendants are reached the same way normal
+    teardown would reach them; falls back to the bare pid if no pgid was
+    recorded. TERM/INT/HUP are single unverified signals, trusting a still
+    -alive runner's own handler exactly like the verified path does. KILL
+    cannot be caught, so — mirroring ``_force_kill`` — this also publishes
+    terminal state itself after a bounded wait, since an unverifiable
+    runner killed outright will never publish it.
+    """
+    pgid = _recorded_pgid(state_dir)
+    try:
+        if pgid is not None:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+    except ProcessLookupError:
+        print(f"agent-run: {name} is not running (pid {pid})")
+        return
+    except PermissionError:
+        sys.exit(f"agent-run: permission denied signaling '{name}' (pid {pid})")
+
+    if sig != signal.SIGKILL:
+        sig_name = signal.Signals(sig).name
+        print(
+            f"agent-run: sent {sig_name} cleanup request to {name} (pid={pid}, "
+            "forced — no recorded process identity to verify)"
+        )
+        return
+
+    deadline = time.time() + KILL_ESCALATION_TIMEOUT_SECONDS
+    while time.time() < deadline and _pid_alive(pid):
+        time.sleep(KILL_POLL_INTERVAL_SECONDS)
+    if not _run_is_terminal(state_dir):
+        _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
+        _write(state_dir / "ended_at", _now_iso() + "\n")
+        _write(state_dir / "status", "failed\n")
+    print(f"agent-run: force-killed '{name}' (pid={pid}, forced — no recorded process identity to verify)")
+
+
 def cmd_kill(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     d = _require_state(name)
@@ -2338,16 +2462,20 @@ def cmd_kill(args: argparse.Namespace) -> int:
     if _read(d / "status") not in {"running", "starting"}:
         sys.exit(f"agent-run: refusing to kill '{name}': run is not marked running")
     pid = _require_positive_state_int(d, "pid", name)
-    expected_identity = _read_process_identity(d, name)
-    current_identity = _process_identity(pid)
-    if current_identity is None:
-        sys.exit(
-            f"agent-run: refusing to kill '{name}': cannot verify current process identity"
-        )
-    if current_identity != expected_identity:
-        sys.exit(
-            f"agent-run: refusing to kill '{name}': process identity does not match recorded runner"
-        )
+    force = bool(getattr(args, "force", False))
+    recorded_identity = _read(d / "process_identity")
+    legacy_force = force and not recorded_identity
+    if not legacy_force:
+        expected_identity = _read_process_identity(d, name)
+        current_identity = _process_identity(pid)
+        if current_identity is None:
+            sys.exit(
+                f"agent-run: refusing to kill '{name}': cannot verify current process identity"
+            )
+        if current_identity != expected_identity:
+            sys.exit(
+                f"agent-run: refusing to kill '{name}': process identity does not match recorded runner"
+            )
     if not _pid_alive(pid):
         print(f"agent-run: {args.name} is not running (pid {pid})")
         return 0
@@ -2359,6 +2487,9 @@ def cmd_kill(args: argparse.Namespace) -> int:
     supported = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGKILL}
     if sig not in supported:
         sys.exit("agent-run: only TERM, INT, HUP, or KILL are supported; arbitrary signals can bypass cleanup")
+    if legacy_force:
+        _force_kill_legacy(name, d, pid, sig)
+        return 0
     if sig == signal.SIGKILL:
         _force_kill(name, d, pid, expected_identity)
         return 0
@@ -3417,8 +3548,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     echo: bool = False
     echo_interval: float = 2.0
     submit_mode: Optional[str] = None
+    idle_timeout: Optional[float] = None
     # Consume top-level flags (`-i`, `-f <path>`, `--echo[=interval]`,
-    # `--submit-mode=cr|crlf`) in any order before the name.
+    # `--submit-mode=cr|crlf`, `--idle-timeout <seconds>`) in any order
+    # before the name.
     while raw:
         if raw[0] in ("-i", "--interactive"):
             interactive = True
@@ -3453,6 +3586,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 sys.exit("agent-run: --submit-mode must be cr or crlf")
             raw = raw[1:]
             continue
+        if raw[0] == "--idle-timeout":
+            if len(raw) < 2:
+                sys.exit("agent-run: --idle-timeout requires a value in seconds")
+            try:
+                idle_timeout = _parse_idle_timeout_flag(raw[1])
+            except argparse.ArgumentTypeError as exc:
+                sys.exit(f"agent-run: --idle-timeout {exc}")
+            raw = raw[2:]
+            continue
+        if raw[0].startswith("--idle-timeout="):
+            try:
+                idle_timeout = _parse_idle_timeout_flag(raw[0].split("=", 1)[1])
+            except argparse.ArgumentTypeError as exc:
+                sys.exit(f"agent-run: --idle-timeout {exc}")
+            raw = raw[1:]
+            continue
         break
 
     # Try to dispatch a known subcommand; otherwise treat as launch.
@@ -3464,6 +3613,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         and not prompt_file
         and not echo
         and submit_mode is None
+        and idle_timeout is None
     ):
         # argparse handles these, including their own -h/--help.
         parser = _build_parser()
@@ -3477,6 +3627,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Basic validation of the name.
     if "/" in name or name.startswith("-"):
         sys.exit(f"agent-run: invalid name '{name}'")
+    if command and command[0].startswith("-"):
+        # A flag typed after the run name is never part of the launch
+        # command — it silently becomes argv[0] and exec fails with an
+        # opaque ENOENT. Reject it here with the actual offending token
+        # instead of letting the fork/exec path produce that confusion.
+        sys.exit(
+            f"agent-run: {command[0]!r} looks like an agent-run flag, not part "
+            "of the launch command; agent-run flags (-i, -f, --echo, "
+            "--submit-mode, --idle-timeout) must precede the run name"
+        )
     ns = argparse.Namespace(
         name=name,
         command=command,
@@ -3485,6 +3645,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         echo=echo,
         echo_interval=echo_interval,
         submit_mode=submit_mode,
+        idle_timeout=idle_timeout if idle_timeout is not None else _idle_timeout_env_seconds(),
     )
     return cmd_launch(ns)
 
