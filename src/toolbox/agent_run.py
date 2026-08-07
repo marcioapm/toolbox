@@ -2408,6 +2408,11 @@ def _force_kill(name: str, state_dir: Path, pid: int, expected_identity: str) ->
         print(f"agent-run: force-killed unresponsive '{name}' (pid={pid})")
 
 
+# Appended to `kill --force` messages: this path has no birth token to check,
+# so it cannot rule out PID reuse the way the identity-verified path does.
+_FORCED_UNVERIFIED_NOTE = "forced — no recorded process identity to verify"
+
+
 def _recorded_pgid(state_dir: Path) -> Optional[int]:
     """The recorded process group id, if present and a plausible positive
     group id — used only by the ``--force`` legacy-identity kill fallback."""
@@ -2431,8 +2436,8 @@ def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
     recorded pgid (matching the documented manual workaround, ``kill
     -TERM -- -<pgid>``) so descendants are reached the same way normal
     teardown would reach them; falls back to the bare pid if no pgid was
-    recorded. TERM/INT/HUP are single unverified signals, trusting a still
-    -alive runner's own handler exactly like the verified path does. KILL
+    recorded. TERM/INT/HUP are single unverified signals, trusting a
+    still-alive runner's own handler exactly like the verified path does. KILL
     cannot be caught, so — mirroring ``_force_kill`` — this also publishes
     terminal state itself after a bounded wait, since an unverifiable
     runner killed outright will never publish it.
@@ -2461,7 +2466,7 @@ def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
         sig_name = signal.Signals(sig).name
         print(
             f"agent-run: sent {sig_name} cleanup request to {name} (pid={pid}, "
-            "forced — no recorded process identity to verify)"
+            f"{_FORCED_UNVERIFIED_NOTE})"
         )
         return
 
@@ -2472,7 +2477,9 @@ def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
         _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
         _write(state_dir / "ended_at", _now_iso() + "\n")
         _write(state_dir / "status", "failed\n")
-    print(f"agent-run: force-killed '{name}' (pid={pid}, forced — no recorded process identity to verify)")
+    print(
+        f"agent-run: force-killed '{name}' (pid={pid}, {_FORCED_UNVERIFIED_NOTE})"
+    )
 
 
 def cmd_kill(args: argparse.Namespace) -> int:
@@ -3423,7 +3430,9 @@ def _run_interactive(
         try:
             os.execvp(argv[0], list(argv))
         except OSError as exc:
-            sys.stderr.write(f"agent-run: exec failed: {exc}\n")
+            # Unbuffered, matching the one-shot path: os._exit does not flush, and
+            # this is the line _capture_launch_error reports for a failed exec.
+            os.write(2, f"agent-run: exec failed: {exc}\n".encode())
             os._exit(127)
     # Full interactive relay is now established: PTY forked and keeper holds
     # FIFO open.  Finish the descriptor setup before declaring readiness.
