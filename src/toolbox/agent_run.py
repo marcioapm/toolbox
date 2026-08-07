@@ -2407,6 +2407,16 @@ def _force_kill(name: str, state_dir: Path, pid: int, expected_identity: str) ->
         print(f"agent-run: force-killed unresponsive '{name}' (pid={pid})")
 
 
+def _publish_forced_kill(state_dir: Path, reason: str) -> None:
+    """Record a SIGKILL-terminated run as ``killed``: an uncatchable signal
+    leaves the runner unable to publish its own terminal state."""
+    if _run_is_terminal(state_dir):
+        return
+    if not (state_dir / "exit_code").exists():
+        _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
+    _mark_terminal(state_dir, "killed", reason)
+
+
 # `kill --force` cannot rule out PID reuse: this path has no birth token.
 _FORCED_UNVERIFIED_NOTE = "forced — no recorded process identity to verify"
 
@@ -2471,11 +2481,7 @@ def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
     deadline = time.time() + KILL_ESCALATION_TIMEOUT_SECONDS
     while time.time() < deadline and _pid_alive(pid):
         time.sleep(KILL_POLL_INTERVAL_SECONDS)
-    if not _run_is_terminal(state_dir):
-        _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
-        # An operator kill is deliberate, so it records `killed` with a reason
-        # like every other producer of that status.
-        _mark_terminal(state_dir, "killed", f"kill --force ({_FORCED_UNVERIFIED_NOTE})")
+    _publish_forced_kill(state_dir, f"kill --force ({_FORCED_UNVERIFIED_NOTE})")
     print(
         f"agent-run: force-killed '{name}' (pid={pid}, {_FORCED_UNVERIFIED_NOTE})"
     )
@@ -2835,10 +2841,7 @@ def _watchdog_escalate(state_dir: Path, runner_pid: int) -> None:
         os.kill(runner_pid, signal.SIGKILL)
     except OSError:
         pass
-    if not _run_is_terminal(state_dir):
-        if not (state_dir / "exit_code").exists():
-            _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
-        _mark_terminal(state_dir, "killed", _idle_timeout_reason(state_dir))
+    _publish_forced_kill(state_dir, _idle_timeout_reason(state_dir))
 
 
 def _idle_watchdog_loop(
