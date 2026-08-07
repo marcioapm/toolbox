@@ -43,6 +43,8 @@ Usage::
 
     agent-run <name> <cmd...>            # non-interactive (one-shot)
     agent-run -i <name> <cmd...>         # interactive (PTY-wrapped, steerable)
+    agent-run --echo <name> <cmd...>     # also render a cleaned live transcript
+    agent-run --idle-timeout N <name> <cmd...>  # self-terminate after N idle seconds
     agent-run tail <name>                # follow log in real time
     agent-run logs <name> [N]            # last N lines (default 50)
     agent-run status <name>              # one-line status
@@ -350,6 +352,11 @@ LAUNCH_ERROR_MAX_CHARS = 500
 # it that case is indistinguishable from an agent that received its prompt and
 # then failed on its own.
 PROMPT_UNSUBMITTED_ERROR = "agent exited before its prompt file was submitted"
+
+# How long the interactive prompt helper waits for the TUI to enter raw mode
+# before submitting. Bounds how late an unsubmitted prompt can still be read as
+# a launch failure rather than as work that ran.
+PROMPT_SUBMISSION_DELAY_SECONDS = 4.0
 
 
 # Per-run idle-timeout: off by default (None), unlike the two thresholds
@@ -3075,12 +3082,20 @@ def _runner(
 
     def _prompt_was_required_but_unsubmitted() -> bool:
         """True when an interactive prompt file never reached the agent. The
-        submission helper publishes its marker only after both FIFO writes."""
-        return (
-            interactive
-            and prompt_file is not None
-            and not (state_dir / "prompt_submitted").exists()
-        )
+        submission helper publishes its marker only after both FIFO writes.
+
+        Bounded by the helper's own delay plus the launch grace: past that, the
+        run may have been steered manually and done real work, which must not
+        be recorded as a launch failure.
+        """
+        if not (interactive and prompt_file is not None):
+            return False
+        if (state_dir / "prompt_submitted").exists():
+            return False
+        if agent_started_monotonic is None:
+            return False
+        elapsed = time.monotonic() - agent_started_monotonic
+        return elapsed <= LAUNCH_GRACE_SECONDS + PROMPT_SUBMISSION_DELAY_SECONDS
 
     def _finalize(code: int) -> None:
         if not (state_dir / "exit_code").exists():
@@ -3468,7 +3483,7 @@ def _run_interactive(
             try:
                 # Wait a few seconds for the TUI to enable raw mode. Earlier
                 # tests showed sub-3s delivery races ICRNL CR->LF translation.
-                time.sleep(4)
+                time.sleep(PROMPT_SUBMISSION_DELAY_SECONDS)
                 try:
                     data = Path(prompt_file).read_bytes()
                 except OSError:
