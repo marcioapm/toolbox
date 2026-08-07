@@ -316,11 +316,8 @@ def _parse_reap_min_age_seconds() -> float:
     return _positive_finite_hours(raw, env_name, 168.0)
 
 
-# Launch-grace window: how many seconds after exec a non-zero exit is still
-# almost certainly an argv-validation/missing-binary failure rather than
-# real work having run and failed (see `launch_failed` in `_finalize`).
-# Same nan/inf/negative/zero rejection as the hour-granularity thresholds
-# above, just seconds-scaled since this operates on a much shorter horizon.
+# Launch-grace window: how many seconds after exec a non-zero exit still reads
+# as argv validation or a missing binary rather than work that ran and failed.
 def _positive_finite_seconds(raw: str, label: str, default_seconds: float) -> float:
     try:
         value = float(raw)
@@ -343,27 +340,22 @@ def _parse_launch_grace_seconds() -> float:
 
 LAUNCH_GRACE_SECONDS: float = _parse_launch_grace_seconds()
 
-# Bounds for the diagnostic first-output line recorded next to a
-# `launch_failed` status: how much log to scan, and how much of it to keep.
+# How much of the log to scan for the diagnostic first line, and how much of
+# that line to keep.
 LAUNCH_ERROR_SCAN_BYTES = 65536
 LAUNCH_ERROR_MAX_CHARS = 500
 
-# Recorded when an interactive run's prompt file was never delivered. Without
-# it that case is indistinguishable from an agent that received its prompt and
-# then failed on its own.
 PROMPT_UNSUBMITTED_ERROR = "agent exited before its prompt file was submitted"
 
-# How long the interactive prompt helper waits for the TUI to enter raw mode
-# before submitting. Bounds how late an unsubmitted prompt can still be read as
-# a launch failure rather than as work that ran.
+# The interactive prompt helper waits this long for the TUI to enter raw mode
+# before submitting; it also bounds how late an unsubmitted prompt still counts
+# as a launch failure.
 PROMPT_SUBMISSION_DELAY_SECONDS = 4.0
 
 
-# Per-run idle-timeout: off by default (None), unlike the two thresholds
-# above. Opted into per launch via --idle-timeout or AGENT_RUN_IDLE_TIMEOUT_SECS
-# (flag takes precedence); an invalid override is a hard launch-time error,
-# not a silent fallback, since a launcher that thinks idle-timeout is active
-# must not silently run without it.
+# Off by default, unlike the thresholds above. An invalid flag value is a hard
+# launch-time error: a launcher that believes idle-timeout is active must not
+# silently run without it.
 def _parse_idle_timeout_flag(raw: str) -> float:
     return _positive_finite_float(raw)
 
@@ -2415,8 +2407,7 @@ def _force_kill(name: str, state_dir: Path, pid: int, expected_identity: str) ->
         print(f"agent-run: force-killed unresponsive '{name}' (pid={pid})")
 
 
-# Appended to `kill --force` messages: this path has no birth token to check,
-# so it cannot rule out PID reuse the way the identity-verified path does.
+# `kill --force` cannot rule out PID reuse: this path has no birth token.
 _FORCED_UNVERIFIED_NOTE = "forced — no recorded process identity to verify"
 
 
@@ -2482,9 +2473,8 @@ def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
         time.sleep(KILL_POLL_INTERVAL_SECONDS)
     if not _run_is_terminal(state_dir):
         _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
-        # An operator kill is a deliberate termination, so it records `killed`
-        # with a reason like every other producer of that status, rather than
-        # the `failed` a work failure would leave behind.
+        # An operator kill is deliberate, so it records `killed` with a reason
+        # like every other producer of that status.
         _mark_terminal(state_dir, "killed", f"kill --force ({_FORCED_UNVERIFIED_NOTE})")
     print(
         f"agent-run: force-killed '{name}' (pid={pid}, {_FORCED_UNVERIFIED_NOTE})"
@@ -2503,10 +2493,8 @@ def cmd_kill(args: argparse.Namespace) -> int:
     pid = _require_positive_state_int(d, "pid", name)
     force = bool(getattr(args, "force", False))
     recorded_identity = _read(d / "process_identity")
-    # --force covers every case where the recorded runner cannot be confirmed:
-    # no birth token at all, an unreadable one, or one that no longer matches.
-    # Without this it silently did nothing in the mismatch cases operators
-    # actually reach for it in.
+    # --force overrides every unconfirmable case: no birth token, an unreadable
+    # one, or a mismatch. It previously applied only to the first.
     legacy_force = force and not recorded_identity
     if force and recorded_identity:
         current_identity = _process_identity(pid)
@@ -2802,8 +2790,7 @@ def _block_handled_runner_signals():
 _AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid", "render_pid", "watchdog_pid")
 
 
-# Marker written by the idle watchdog before it signals the runner, so
-# `_finalize` can distinguish a watchdog kill from an ordinary SIGTERM.
+# Distinguishes a watchdog kill from an ordinary SIGTERM in `_finalize`.
 IDLE_TIMEOUT_MARKER = "idle_timeout_fired"
 
 
