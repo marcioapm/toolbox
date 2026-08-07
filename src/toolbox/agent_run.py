@@ -1325,8 +1325,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 # shows up as garbage escape sequences. Force every such mode off (best
 # effort; harmless if the mode was never on) once we stop writing to stdout.
 _TERMINAL_MODE_RESET = (
+    b"\x1b[0m\x1b[r\x1b[?7h"
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l"
-    b"\x1b[?1004l\x1b[?2004l\x1b[?25h"
+    b"\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?25h"
+    b"\x1b[?1049l\x1b[?1047l\x1b[?47l"
 )
 
 
@@ -1336,7 +1338,7 @@ def _reset_terminal_modes() -> None:
             return
         sys.stdout.buffer.write(_TERMINAL_MODE_RESET)
         sys.stdout.buffer.flush()
-    except (AttributeError, BrokenPipeError, OSError):
+    except (AttributeError, OSError, ValueError):
         pass
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import builtins
 import io
+import signal
 import sys
 
 import pytest
@@ -37,14 +38,38 @@ def _make_run(runs_root, name: str, log_bytes: bytes, interactive: bool = True, 
     return d
 
 
+class _FakeStdout:
+    def __init__(self, tty: bool):
+        self.buffer = io.BytesIO()
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+class _BrokenPipeBuffer:
+    def write(self, _data: bytes) -> int:
+        raise BrokenPipeError
+
+    def flush(self) -> None:
+        raise BrokenPipeError
+
+
+class _BrokenPipeStdout:
+    buffer = _BrokenPipeBuffer()
+
+    def isatty(self) -> bool:
+        return True
+
+
 def test_tail_prints_preserved_log_and_exits(
     isolated_runs_root, isolated_log_root, monkeypatch
 ):
     log_dir = isolated_log_root / "preserved"
     log_dir.mkdir()
     (log_dir / "log").write_bytes(b"preserved output\n")
-    stdout = io.BytesIO()
-    monkeypatch.setattr(sys, "stdout", type("Stdout", (), {"buffer": stdout})())
+    stdout = _FakeStdout(tty=True)
+    monkeypatch.setattr(sys, "stdout", stdout)
     monkeypatch.setattr(
         agent_run.time,
         "sleep",
@@ -52,7 +77,58 @@ def test_tail_prints_preserved_log_and_exits(
     )
 
     assert agent_run.cmd_tail(argparse.Namespace(name="preserved")) == 0
-    assert stdout.getvalue() == b"preserved output\n"
+    assert stdout.buffer.getvalue() == b"preserved output\n" + agent_run._TERMINAL_MODE_RESET
+
+
+def test_logs_resets_terminal_modes_on_tty(isolated_runs_root, monkeypatch):
+    _make_run(isolated_runs_root, "tty", b"captured output\n")
+    stdout = _FakeStdout(tty=True)
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    assert agent_run.cmd_logs(argparse.Namespace(name="tty", n=1)) == 0
+    assert stdout.buffer.getvalue() == b"captured output\n" + agent_run._TERMINAL_MODE_RESET
+
+
+def test_logs_does_not_reset_terminal_modes_when_not_a_tty(
+    isolated_runs_root, monkeypatch
+):
+    _make_run(isolated_runs_root, "pipe", b"captured output\n")
+    stdout = _FakeStdout(tty=False)
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    assert agent_run.cmd_logs(argparse.Namespace(name="pipe", n=1)) == 0
+    assert stdout.buffer.getvalue() == b"captured output\n"
+
+
+def test_tail_resets_terminal_modes_after_ctrl_c(isolated_runs_root, monkeypatch):
+    run = _make_run(isolated_runs_root, "following", b"")
+    (run / "pid").write_text("123\n")
+    stdout = _FakeStdout(tty=True)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        agent_run.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+
+    assert agent_run.cmd_tail(argparse.Namespace(name="following")) == 128 + signal.SIGINT
+    assert stdout.buffer.getvalue() == agent_run._TERMINAL_MODE_RESET
+
+
+def test_logs_survives_broken_stdout(isolated_runs_root, monkeypatch):
+    _make_run(isolated_runs_root, "broken", b"captured output\n")
+    monkeypatch.setattr(sys, "stdout", _BrokenPipeStdout())
+
+    assert agent_run.cmd_logs(argparse.Namespace(name="broken", n=1)) == 0
+
+
+def test_reset_survives_closed_stdout(monkeypatch):
+    stdout = _FakeStdout(tty=True)
+    stdout.buffer.close()
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    agent_run._reset_terminal_modes()
 
 
 class TestCliNumericValidation:
