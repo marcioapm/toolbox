@@ -2475,8 +2475,10 @@ def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
         time.sleep(KILL_POLL_INTERVAL_SECONDS)
     if not _run_is_terminal(state_dir):
         _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
-        _write(state_dir / "ended_at", _now_iso() + "\n")
-        _write(state_dir / "status", "failed\n")
+        # An operator kill is a deliberate termination, so it records `killed`
+        # with a reason like every other producer of that status, rather than
+        # the `failed` a work failure would leave behind.
+        _mark_terminal(state_dir, "killed", f"kill --force ({_FORCED_UNVERIFIED_NOTE})")
     print(
         f"agent-run: force-killed '{name}' (pid={pid}, {_FORCED_UNVERIFIED_NOTE})"
     )
@@ -2494,7 +2496,20 @@ def cmd_kill(args: argparse.Namespace) -> int:
     pid = _require_positive_state_int(d, "pid", name)
     force = bool(getattr(args, "force", False))
     recorded_identity = _read(d / "process_identity")
+    # --force covers every case where the recorded runner cannot be confirmed:
+    # no birth token at all, an unreadable one, or one that no longer matches.
+    # Without this it silently did nothing in the mismatch cases operators
+    # actually reach for it in.
     legacy_force = force and not recorded_identity
+    if force and recorded_identity:
+        current_identity = _process_identity(pid)
+        if current_identity is None or current_identity != recorded_identity.strip():
+            print(
+                f"agent-run: '{name}' identity does not verify; proceeding because "
+                "--force was given",
+                file=sys.stderr,
+            )
+            legacy_force = True
     if not legacy_force:
         expected_identity = _read_process_identity(d, name)
         current_identity = _process_identity(pid)
