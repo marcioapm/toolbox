@@ -2714,6 +2714,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         echo,
         echo_interval,
         tmp_dir=scratch_dir,
+        idle_timeout=getattr(args, "idle_timeout", None),
     )
     return 0  # never reached
 
@@ -2754,7 +2755,43 @@ def _block_handled_runner_signals():
         pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
-_AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid", "render_pid")
+_AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid", "render_pid", "watchdog_pid")
+
+
+# Marker written by the idle watchdog before it signals the runner, so
+# `_finalize` can distinguish a watchdog kill from an ordinary SIGTERM.
+IDLE_TIMEOUT_MARKER = "idle_timeout_fired"
+
+
+def _idle_watchdog_loop(
+    state_dir: Path, log_dir: Path, runner_pid: int, idle_timeout: float
+) -> None:
+    """Signal ``runner_pid`` once the run log has been untouched for
+    ``idle_timeout`` seconds.
+
+    An agent that stops producing output but never exits would otherwise hold
+    the run at "running" indefinitely. Termination is delegated to the runner's
+    own SIGTERM handler rather than killing the workload here, so teardown and
+    status publication follow the single existing path.
+    """
+    log_path = log_dir / "log"
+    poll = max(1.0, min(idle_timeout / 4.0, 30.0))
+    while True:
+        time.sleep(poll)
+        if not _pid_alive(runner_pid):
+            return
+        try:
+            idle = time.time() - log_path.stat().st_mtime
+        except OSError:
+            continue
+        if idle < idle_timeout:
+            continue
+        try:
+            _write(state_dir / IDLE_TIMEOUT_MARKER, f"{idle:.0f}\n")
+            os.kill(runner_pid, signal.SIGTERM)
+        except OSError:
+            pass
+        return
 
 
 def _publish_or_reap_child(state_dir: Path, field: str, pid: int) -> None:
@@ -2867,6 +2904,7 @@ def _runner(
     echo: bool = False,
     echo_interval: float = 2.0,
     tmp_dir: Optional[Path] = None,
+    idle_timeout: Optional[float] = None,
 ) -> None:
     """Execute in the detached session-leader process.
 
@@ -2912,11 +2950,14 @@ def _runner(
             _write(state_dir / "exit_code", f"{code}\n")
             _write(state_dir / "ended_at", _now_iso() + "\n")
             status = "done" if code == 0 else "failed"
+            # A watchdog kill is a deliberate termination, not a crash.
+            if code != 0 and (state_dir / IDLE_TIMEOUT_MARKER).exists():
+                status = "killed"
             # A non-zero exit within the grace window is argv validation or a
             # missing binary, not work that ran; an unsubmitted prompt means the
             # agent never received its task. Both are launch failures. Codes at
             # or above 128 encode a terminating signal, which is a kill.
-            if code != 0 and code < 128 and agent_exited_naturally and agent_started_monotonic is not None:
+            elif code != 0 and code < 128 and agent_exited_naturally and agent_started_monotonic is not None:
                 if time.monotonic() - agent_started_monotonic <= LAUNCH_GRACE_SECONDS:
                     status = "launch_failed"
                     _capture_launch_error()
@@ -2995,6 +3036,26 @@ def _runner(
                     pass
                 try:
                     _echo_loop(log_dir, echo_interval)
+                finally:
+                    os._exit(0)
+
+        # Opt-in stall guard: a sibling child watching log mtime, so a wedged
+        # agent reaches a terminal status instead of running forever.
+        if idle_timeout is not None:
+            with _block_handled_runner_signals():
+                watchdog_pid = os.fork()
+                if watchdog_pid != 0:
+                    _publish_or_reap_child(state_dir, "watchdog_pid", watchdog_pid)
+                else:
+                    _reset_runner_signal_handlers()
+            if watchdog_pid == 0:
+                _reset_runner_signal_handlers()
+                try:
+                    os.close(ready_fd)
+                except OSError:
+                    pass
+                try:
+                    _idle_watchdog_loop(state_dir, log_dir, my_pid, idle_timeout)
                 finally:
                     os._exit(0)
     except Exception as exc:  # setup failed before readiness
