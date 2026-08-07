@@ -77,10 +77,14 @@ eligible for garbage collection once old enough (see `reap` below).
 
 Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 
-    status       starting | running | done | failed | died | killed
+    status       starting | running | done | failed | launch_failed | died | killed
     exit_code    numeric exit code (after completion)
     pid          runner process id
-    pgid         process group id (informational only; not a kill target)
+    pgid         process group id (also the `kill --force` fallback target)
+    launch_error first output line of a run that failed at launch
+    prompt_submitted  written once an interactive prompt file was delivered
+    idle_timeout      idle-timeout seconds this run was launched with
+    idle_timeout_fired  idle seconds measured when the watchdog fired
     process_identity  platform-specific runner birth token (kill verification)
     agent_pid   one-shot command child pid (non-interactive only)
     pty_pid      PTY child pid (interactive only)
@@ -145,7 +149,7 @@ performed) in one invocation:
       and marked `killed`, via the same identity-verified `_force_kill`
       escalation `agent-run kill <name> KILL` uses.
    2. Terminal-state garbage collection: runs whose status is conclusively
-      terminal — `done`, `failed`, `died`, or `killed` — and whose state dir
+      terminal — `done`, `failed`, `launch_failed`, `died`, or `killed` — and whose state dir
       has not been modified in longer than a separate, more conservative age
       threshold (--min-age-hours, or AGENT_RUN_MIN_AGE_HOURS (preferred) /
       AGENT_RUN_REAP_MIN_AGE_HOURS (compatible alias), default 168h/7 days)
@@ -354,13 +358,7 @@ PROMPT_UNSUBMITTED_ERROR = "agent exited before its prompt file was submitted"
 # not a silent fallback, since a launcher that thinks idle-timeout is active
 # must not silently run without it.
 def _parse_idle_timeout_flag(raw: str) -> float:
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a number") from exc
-    if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError("must be finite and greater than 0")
-    return value
+    return _positive_finite_float(raw)
 
 
 def _idle_timeout_env_seconds() -> Optional[float]:
@@ -1302,7 +1300,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         # was completely empty. Keeping status tokens out of stdout headings
         # entirely keeps scripted greps honest.
         print(
-            "agent-run: pass --all to include done/failed/died/killed",
+            "agent-run: pass --all to include done/failed/launch_failed/died/killed",
             file=sys.stderr,
         )
 
@@ -1376,7 +1374,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
     lines = _log_line_count(_log_file_for(name))
     if not state_dir.is_dir():
-        print(f"name={name} status=not running (log preserved) lines={lines}")
+        # The state dir is volatile; a launch failure recorded alongside the
+        # log outlives it and is exactly what a post-reboot status needs.
+        launch_error = _read(_log_dir(name) / "launch_error")
+        suffix = f" launch_error={launch_error!r}" if launch_error else ""
+        print(f"name={name} status=not running (log preserved) lines={lines}{suffix}")
         return 0
     d = state_dir
     status = _effective_status(d)
@@ -1385,7 +1387,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     ended = _read(d / "ended_at", "-")
     exit_code = _read(d / "exit_code", "-")
     interactive = _read(d / "interactive", "0")
-    launch_error = _read(d / "launch_error")
+    launch_error = _read(d / "launch_error") or _read(_log_dir(name) / "launch_error")
     suffix = f" launch_error={launch_error!r}" if launch_error else ""
     print(
         f"name={name} status={status} pid={pid} exit={exit_code} "
@@ -2314,7 +2316,7 @@ def _pid_parent_pid(pid: int) -> Optional[int]:
 
 
 def _run_is_terminal(state_dir: Path) -> bool:
-    return _read(state_dir / "status") in {"done", "failed", "launch_failed"}
+    return _read(state_dir / "status") in TERMINAL_STATUSES
 
 
 KILL_ESCALATION_TIMEOUT_SECONDS = 8.0
@@ -2647,6 +2649,11 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             pass
     if echo:
         _write(d / "echo", f"{echo_interval}\n")
+    idle_timeout: Optional[float] = getattr(args, "idle_timeout", None)
+    if idle_timeout is not None:
+        # Persisted so introspection can tell whether a running run is guarded
+        # by a watchdog at all, and post-mortem can reconstruct the launch.
+        _write(d / "idle_timeout", f"{idle_timeout}\n")
 
     # Double-fork to detach from the terminal and become our own session
     # leader. The grandchild runs the actual agent.
@@ -3020,6 +3027,16 @@ def _runner(
     # plain `failed`, however early they happen.
     agent_exited_naturally = False
 
+    def _record_launch_error(message: str) -> None:
+        """Persist a launch diagnostic to both the volatile state dir and the
+        durable log dir, so it survives state-dir GC and reboots."""
+        payload = message[:LAUNCH_ERROR_MAX_CHARS] + "\n"
+        for target in (state_dir / "launch_error", log_dir / "launch_error"):
+            try:
+                _write(target, payload)
+            except OSError:
+                pass
+
     def _capture_launch_error() -> None:
         """Persist the agent's first non-empty output line so `status` can state
         why the launch failed without the operator opening the log."""
@@ -3031,7 +3048,7 @@ def _runner(
         for line in _strip_ansi_fallback(raw).splitlines():
             stripped = line.strip()
             if stripped:
-                _write(state_dir / "launch_error", stripped[:LAUNCH_ERROR_MAX_CHARS] + "\n")
+                _record_launch_error(stripped)
                 return
 
     def _prompt_was_required_but_unsubmitted() -> bool:
@@ -3063,7 +3080,7 @@ def _runner(
                     _capture_launch_error()
                 elif _prompt_was_required_but_unsubmitted():
                     status = "launch_failed"
-                    _write(state_dir / "launch_error", PROMPT_UNSUBMITTED_ERROR + "\n")
+                    _record_launch_error(PROMPT_UNSUBMITTED_ERROR)
             _write(state_dir / "status", status + "\n")
 
     handling_signal = False
