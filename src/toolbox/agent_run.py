@@ -337,6 +337,16 @@ def _parse_launch_grace_seconds() -> float:
 
 LAUNCH_GRACE_SECONDS: float = _parse_launch_grace_seconds()
 
+# Bounds for the diagnostic first-output line recorded next to a
+# `launch_failed` status: how much log to scan, and how much of it to keep.
+LAUNCH_ERROR_SCAN_BYTES = 65536
+LAUNCH_ERROR_MAX_CHARS = 500
+
+# Recorded when an interactive run's prompt file was never delivered. Without
+# it that case is indistinguishable from an agent that received its prompt and
+# then failed on its own.
+PROMPT_UNSUBMITTED_ERROR = "agent exited before its prompt file was submitted"
+
 
 # Per-run idle-timeout: off by default (None), unlike the two thresholds
 # above. Opted into per launch via --idle-timeout or AGENT_RUN_IDLE_TIMEOUT_SECS
@@ -1375,9 +1385,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     ended = _read(d / "ended_at", "-")
     exit_code = _read(d / "exit_code", "-")
     interactive = _read(d / "interactive", "0")
+    launch_error = _read(d / "launch_error")
+    suffix = f" launch_error={launch_error!r}" if launch_error else ""
     print(
         f"name={name} status={status} pid={pid} exit={exit_code} "
         f"started={started} ended={ended} lines={lines} interactive={interactive}"
+        f"{suffix}"
     )
     return 0
 
@@ -2862,12 +2875,55 @@ def _runner(
     """
     my_pid = os.getpid()
     log_fd = -1
+    # Set immediately before the agent is exec'd, so `_finalize` can measure how
+    # long it survived. None until then: a failure during runner setup is not a
+    # launch failure of the agent itself.
+    agent_started_monotonic: Optional[float] = None
+    # True only once the agent process returned its own exit status. Signal
+    # teardown and runner crashes finalize through other paths and must stay
+    # plain `failed`, however early they happen.
+    agent_exited_naturally = False
+
+    def _capture_launch_error() -> None:
+        """Persist the agent's first non-empty output line so `status` can state
+        why the launch failed without the operator opening the log."""
+        try:
+            with (log_dir / "log").open("rb") as handle:
+                raw = handle.read(LAUNCH_ERROR_SCAN_BYTES)
+        except OSError:
+            return
+        for line in _strip_ansi_fallback(raw).splitlines():
+            stripped = line.strip()
+            if stripped:
+                _write(state_dir / "launch_error", stripped[:LAUNCH_ERROR_MAX_CHARS] + "\n")
+                return
+
+    def _prompt_was_required_but_unsubmitted() -> bool:
+        """True when an interactive prompt file never reached the agent. The
+        submission helper publishes its marker only after both FIFO writes."""
+        return (
+            interactive
+            and prompt_file is not None
+            and not (state_dir / "prompt_submitted").exists()
+        )
 
     def _finalize(code: int) -> None:
         if not (state_dir / "exit_code").exists():
             _write(state_dir / "exit_code", f"{code}\n")
             _write(state_dir / "ended_at", _now_iso() + "\n")
-            _write(state_dir / "status", "done\n" if code == 0 else "failed\n")
+            status = "done" if code == 0 else "failed"
+            # A non-zero exit within the grace window is argv validation or a
+            # missing binary, not work that ran; an unsubmitted prompt means the
+            # agent never received its task. Both are launch failures. Codes at
+            # or above 128 encode a terminating signal, which is a kill.
+            if code != 0 and code < 128 and agent_exited_naturally and agent_started_monotonic is not None:
+                if time.monotonic() - agent_started_monotonic <= LAUNCH_GRACE_SECONDS:
+                    status = "launch_failed"
+                    _capture_launch_error()
+                elif _prompt_was_required_but_unsubmitted():
+                    status = "launch_failed"
+                    _write(state_dir / "launch_error", PROMPT_UNSUBMITTED_ERROR + "\n")
+            _write(state_dir / "status", status + "\n")
 
     handling_signal = False
     render_pid: Optional[int] = None
@@ -2973,10 +3029,12 @@ def _runner(
         ready_sent = True
 
     try:
+        agent_started_monotonic = time.monotonic()
         if interactive:
             exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
         else:
             exit_code = _run_oneshot(state_dir, argv, log_fd, _ready, prompt_file)
+        agent_exited_naturally = True
     except Exception as exc:  # noqa: BLE001
         try:
             detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -3231,6 +3289,9 @@ def _run_interactive(
                         os.write(fd, submit_writes[1])
                     finally:
                         os.close(fd)
+                    # Marks delivery for `_finalize`; absence means the agent
+                    # died before its task ever reached it.
+                    _write(state_dir / "prompt_submitted", _now_iso() + "\n")
                 except OSError:
                     pass
             finally:
@@ -3456,6 +3517,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_kill = sub.add_parser("kill", help="kill the agent (default SIGTERM)")
     sp_kill.add_argument("name")
     sp_kill.add_argument("signal", nargs="?", default="TERM")
+    sp_kill.add_argument(
+        "--force",
+        action="store_true",
+        help="kill a run whose state dir records no process identity, using its "
+        "recorded process group; cannot verify PID reuse",
+    )
     sp_kill.set_defaults(func=cmd_kill)
 
     sp_list = sub.add_parser(
