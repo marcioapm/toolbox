@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import errno
+import io
 import os
 import signal
 import struct
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -150,4 +152,93 @@ def test_keeper_ack_eof_raises_instead_of_hanging(tmp_path):
 
     assert os.WIFEXITED(status)
     assert os.WEXITSTATUS(status) == 2
+
+
+def test_attach_rejects_noninteractive_run(isolated_runs_root):
+    state = isolated_runs_root / "batch"
+    state.mkdir()
+    (state / "interactive").write_text("0\n")
+    (state / "pid").write_text("123\n")
+
+    with pytest.raises(SystemExit, match="not interactive"):
+        agent_run.cmd_attach(argparse.Namespace(name="batch"))
+
+
+def test_attach_rejects_dead_interactive_run(isolated_runs_root, monkeypatch):
+    state = isolated_runs_root / "dead"
+    state.mkdir()
+    (state / "interactive").write_text("1\n")
+    (state / "pid").write_text("123\n")
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: False)
+
+    with pytest.raises(SystemExit, match="is not running"):
+        agent_run.cmd_attach(argparse.Namespace(name="dead"))
+
+
+def test_main_dispatches_attach(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        agent_run,
+        "cmd_attach",
+        lambda args: captured.update(name=args.name) or 0,
+    )
+
+    assert agent_run.main(["attach", "live-run"]) == 0
+    assert captured == {"name": "live-run"}
+
+
+def _seed_attachable_run(root, name: str) -> Path:
+    state = root / name
+    state.mkdir()
+    (state / "interactive").write_text("1\n")
+    (state / "pid").write_text(f"{os.getpid()}\n")
+    os.mkfifo(state / "stdin")
+    os.mkfifo(state / "resize")
+    return state
+
+
+def test_attach_resets_terminal_modes_on_external_sigint(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    """Mirrors `tests/test_cli_clean.py::test_tail_resets_terminal_modes_after_ctrl_c`:
+    attach replays raw PTY bytes to a real terminal exactly like `tail` does,
+    so an external SIGINT (KeyboardInterrupt) must still run the same
+    `_reset_terminal_modes()` cleanup and exit quietly with 128+SIGINT."""
+    state = _seed_attachable_run(isolated_runs_root, "attach-sigint")
+    (isolated_log_root / "attach-sigint").mkdir()
+    (isolated_log_root / "attach-sigint" / "log").write_bytes(b"")
+    stdin_reader = os.open(state / "stdin", os.O_RDONLY | os.O_NONBLOCK)
+    resize_reader = os.open(state / "resize", os.O_RDONLY | os.O_NONBLOCK)
+
+    class _FakeStdout:
+        def __init__(self):
+            self.buffer = io.BytesIO()
+
+        def isatty(self) -> bool:
+            return True
+
+    stdout = _FakeStdout()
+    monkeypatch.setattr(agent_run.sys, "stdout", stdout)
+    monkeypatch.setattr(agent_run.sys.stdin, "fileno", lambda: 0)
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run.termios, "tcgetattr", lambda _fd: ["saved"])
+    monkeypatch.setattr(agent_run.tty, "setraw", lambda _fd: None)
+    monkeypatch.setattr(agent_run.termios, "tcsetattr", lambda *_a: None)
+    monkeypatch.setattr(
+        agent_run.os, "get_terminal_size", lambda _fd: os.terminal_size((80, 24))
+    )
+
+    def fail_select(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent_run.select, "select", fail_select)
+    try:
+        assert (
+            agent_run.cmd_attach(argparse.Namespace(name="attach-sigint"))
+            == 128 + agent_run.signal.SIGINT
+        )
+        assert stdout.buffer.getvalue() == agent_run._TERMINAL_MODE_RESET
+    finally:
+        os.close(stdin_reader)
+        os.close(resize_reader)
 

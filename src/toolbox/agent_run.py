@@ -1421,6 +1421,108 @@ def cmd_tail(args: argparse.Namespace) -> int:
         _reset_terminal_modes()
 
 
+def cmd_attach(args: argparse.Namespace) -> int:
+    name = _validate_run_name(args.name)
+    state_dir, pid = _require_live_interactive_run(name)
+    log = _require_log(name)
+    stdin_path = state_dir / "stdin"
+    resize_path = state_dir / "resize"
+    if not stdin_path.is_fifo():
+        sys.exit(f"agent-run: no stdin FIFO at {stdin_path}")
+    if not resize_path.is_fifo():
+        sys.exit(f"agent-run: no resize FIFO at {resize_path}")
+
+    local_fd = sys.stdin.fileno()
+    saved_termios = termios.tcgetattr(local_fd)
+    stdin_fd = os.open(str(stdin_path), os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        resize_fd = os.open(str(resize_path), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        os.close(stdin_fd)
+        raise
+    pending_input = b""
+    pending_resize: Optional[bytes] = None
+    resize_requested = True
+    previous_winch = None
+
+    # attach replays raw PTY bytes to a real terminal exactly like tail/logs
+    # do (see _reset_terminal_modes above), so it must reset DEC private
+    # modes on the way out, and an external SIGINT (kill -INT on this
+    # process, distinct from the in-band Ctrl-C byte handled below) must
+    # exit quietly with the conventional 128+SIGINT status instead of a
+    # traceback.
+    try:
+        tty.setraw(local_fd)
+
+        def on_winch(_signum, _frame):
+            nonlocal resize_requested
+            resize_requested = True
+
+        previous_winch = signal.signal(signal.SIGWINCH, on_winch)
+        with log.open("rb") as log_file:
+            while True:
+                if resize_requested:
+                    size = os.get_terminal_size(local_fd)
+                    pending_resize = _pack_resize(size.columns, size.lines)
+                    resize_requested = False
+
+                writable = []
+                if pending_input:
+                    writable.append(stdin_fd)
+                if pending_resize:
+                    writable.append(resize_fd)
+                readable, writable, _ = select.select([local_fd], writable, [], 0.2)
+
+                chunk = log_file.read(8192)
+                if chunk:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+
+                if not _pid_alive(pid):
+                    time.sleep(0.1)
+                    remaining = log_file.read()
+                    if remaining:
+                        sys.stdout.buffer.write(remaining)
+                        sys.stdout.buffer.flush()
+                    return 0
+
+                if local_fd in readable:
+                    data = os.read(local_fd, 4096)
+                    if not data or b"\x03" in data:
+                        return 0
+                    if len(pending_input) + len(data) > MAX_PTY_INPUT_BUFFER:
+                        raise BufferError(
+                            f"attach input buffer exceeded {MAX_PTY_INPUT_BUFFER} bytes"
+                        )
+                    pending_input += data
+
+                if stdin_fd in writable and pending_input:
+                    try:
+                        written = os.write(stdin_fd, pending_input)
+                    except BlockingIOError:
+                        written = 0
+                    pending_input = pending_input[written:]
+
+                if resize_fd in writable and pending_resize:
+                    try:
+                        os.write(resize_fd, pending_resize)
+                    except BlockingIOError:
+                        pass
+                    else:
+                        pending_resize = None
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 128 + signal.SIGINT
+    finally:
+        if previous_winch is not None:
+            signal.signal(signal.SIGWINCH, previous_winch)
+        os.close(stdin_fd)
+        os.close(resize_fd)
+        termios.tcsetattr(local_fd, termios.TCSADRAIN, saved_termios)
+        _reset_terminal_modes()
+
+
 # ---------------------------------------------------------------------------
 # clean (render PTY-captured logs into readable transcripts)
 # ---------------------------------------------------------------------------
@@ -2102,8 +2204,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
 # steer / kill
 # ---------------------------------------------------------------------------
 
-def cmd_steer(args: argparse.Namespace) -> int:
-    name = _validate_run_name(args.name)
+def _require_live_interactive_run(name: str) -> tuple[Path, int]:
     d = _require_state(name)
     if _read(d / "interactive") != "1":
         sys.exit(
@@ -2112,7 +2213,13 @@ def cmd_steer(args: argparse.Namespace) -> int:
         )
     pid = _require_positive_state_int(d, "pid", name)
     if not _pid_alive(pid):
-        sys.exit(f"agent-run: '{args.name}' is not running")
+        sys.exit(f"agent-run: '{name}' is not running")
+    return d, pid
+
+
+def cmd_steer(args: argparse.Namespace) -> int:
+    name = _validate_run_name(args.name)
+    d, pid = _require_live_interactive_run(name)
     fifo = d / "stdin"
     if not fifo.is_fifo():
         sys.exit(f"agent-run: no stdin FIFO at {fifo}")
@@ -3376,6 +3483,13 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_tail.add_argument("name")
     sp_tail.set_defaults(func=cmd_tail)
 
+    sp_attach = sub.add_parser(
+        "attach",
+        help="attach interactively (live keyboard + resize; Ctrl-C detaches)",
+    )
+    sp_attach.add_argument("name")
+    sp_attach.set_defaults(func=cmd_attach)
+
     sp_clean = sub.add_parser(
         "clean",
         help="render PTY-captured TUI log into a readable transcript via pyte",
@@ -3559,7 +3673,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         break
 
     # Try to dispatch a known subcommand; otherwise treat as launch.
-    known_subcommands = {"status", "logs", "tail", "clean", "steer", "kill", "list", "reap", "help"}
+    known_subcommands = {"status", "logs", "tail", "attach", "clean", "steer", "kill", "list", "reap", "help"}
     if (
         raw
         and raw[0] in known_subcommands
