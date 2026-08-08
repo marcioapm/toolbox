@@ -57,6 +57,16 @@ def test_apply_resize_ignores_closed_or_non_tty_master(monkeypatch, error):
     agent_run._apply_resize(99, 120, 42)
 
 
+@pytest.mark.parametrize("error", [errno.EACCES, errno.EPERM])
+def test_apply_resize_reraises_unexpected_errno(monkeypatch, error):
+    def fail_ioctl(*_args):
+        raise OSError(error, "expected test failure")
+
+    monkeypatch.setattr(agent_run.fcntl, "ioctl", fail_ioctl)
+    with pytest.raises(OSError):
+        agent_run._apply_resize(99, 120, 42)
+
+
 def test_drain_resize_records_preserves_partial_suffix(monkeypatch):
     applied = []
     monkeypatch.setattr(
@@ -96,3 +106,48 @@ def test_interactive_launch_creates_stdin_and_resize_fifos(isolated_runs_root):
             os.kill(int((state / "pid").read_text()), signal.SIGTERM)
         except ProcessLookupError:
             pass
+
+
+def test_keeper_ack_eof_raises_instead_of_hanging(tmp_path):
+    """If the keeper dies before acking (e.g. it failed to open one of the
+    control FIFOs), _run_interactive must raise promptly rather than block
+    forever on the subsequent blocking FIFO opens."""
+    state_dir = tmp_path / "state"
+    log_dir = tmp_path / "log"
+    state_dir.mkdir()
+    log_dir.mkdir()
+    (log_dir / "log").touch()
+    os.mkfifo(state_dir / "stdin")
+    # Deliberately omit the "resize" FIFO so the keeper's open() fails and it
+    # dies before writing its ack byte.
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            agent_run._run_interactive(
+                state_dir,
+                [sys.executable, "-c", "import time; time.sleep(0.3)"],
+                os.open(os.devnull, os.O_WRONLY),
+                lambda: None,
+            )
+            os._exit(0)
+        except RuntimeError:
+            os._exit(2)
+        except BaseException:
+            os._exit(3)
+
+    deadline = time.monotonic() + 5.0
+    waited_pid, status = 0, None
+    while time.monotonic() < deadline:
+        waited_pid, status = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        pytest.fail("child hung instead of raising for a keeper that died before acking")
+
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 2
+

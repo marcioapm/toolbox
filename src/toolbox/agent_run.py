@@ -3116,12 +3116,16 @@ def _run_interactive(
         os._exit(0)
 
     os.close(keeper_w)
-    # Wait for keeper to open the FIFO.
+    # Wait for keeper to open the FIFOs. An empty read means the keeper died
+    # (e.g. failed to open one of the control FIFOs) before acking; proceeding
+    # would hang forever on the blocking FIFO opens below.
     try:
-        os.read(keeper_r, 1)
+        ack = os.read(keeper_r, 1)
     except OSError:
-        pass
+        ack = b""
     os.close(keeper_r)
+    if not ack:
+        raise RuntimeError("keeper failed to open control FIFOs")
 
     # Fork + PTY for the agent.
     with _block_handled_runner_signals():
