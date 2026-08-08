@@ -316,6 +316,88 @@ def _seed_attachable_run(root, name: str) -> Path:
     return state
 
 
+def test_attach_requires_tty_stdin(isolated_runs_root, isolated_log_root, monkeypatch):
+    """C1 regression: a non-TTY stdin (e.g. `attach x < /dev/null`, or any
+    pipeline/CI invocation) must exit cleanly via sys.exit with the
+    established `agent-run: ...` message style, not an unhandled
+    termios.error traceback from tcgetattr()."""
+    state = _seed_attachable_run(isolated_runs_root, "attach-notty")
+    (isolated_log_root / "attach-notty").mkdir()
+    (isolated_log_root / "attach-notty" / "log").write_bytes(b"")
+    monkeypatch.setattr(agent_run.sys.stdin, "isatty", lambda: False)
+
+    with pytest.raises(SystemExit, match="requires an interactive terminal"):
+        agent_run.cmd_attach(argparse.Namespace(name="attach-notty"))
+
+
+def test_attach_rejects_run_missing_resize_fifo(isolated_runs_root, isolated_log_root):
+    """Coverage for a run launched before this branch's resize-FIFO support:
+    a state dir with a `stdin` FIFO but no `resize` FIFO must exit cleanly
+    via the existing `if not resize_path.is_fifo()` check rather than
+    reaching the terminal-relay loop."""
+    state = isolated_runs_root / "pre-feature"
+    state.mkdir()
+    (state / "interactive").write_text("1\n")
+    (state / "pid").write_text(f"{os.getpid()}\n")
+    os.mkfifo(state / "stdin")
+    (isolated_log_root / "pre-feature").mkdir()
+    (isolated_log_root / "pre-feature" / "log").write_bytes(b"")
+
+    with pytest.raises(SystemExit, match="no resize FIFO"):
+        agent_run.cmd_attach(argparse.Namespace(name="pre-feature"))
+
+
+def test_attach_skips_resize_when_terminal_size_is_zero(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    """C2 regression: os.get_terminal_size() can legitimately report 0x0
+    (e.g. a pty.openpty() master whose winsize was never set, or a terminal
+    mid-teardown). _pack_resize correctly rejects 0 as an out-of-range
+    dimension, so cmd_attach must skip sending a resize that iteration
+    instead of letting the ValueError escape as a traceback."""
+    state = _seed_attachable_run(isolated_runs_root, "attach-zerosize")
+    (isolated_log_root / "attach-zerosize").mkdir()
+    (isolated_log_root / "attach-zerosize" / "log").write_bytes(b"")
+    stdin_reader = os.open(state / "stdin", os.O_RDONLY | os.O_NONBLOCK)
+    resize_reader = os.open(state / "resize", os.O_RDONLY | os.O_NONBLOCK)
+
+    class _FakeStdout:
+        def __init__(self):
+            self.buffer = io.BytesIO()
+
+        def isatty(self) -> bool:
+            return True
+
+    stdout = _FakeStdout()
+    monkeypatch.setattr(agent_run.sys, "stdout", stdout)
+    monkeypatch.setattr(agent_run.sys.stdin, "fileno", lambda: 0)
+    monkeypatch.setattr(agent_run.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run.termios, "tcgetattr", lambda _fd: ["saved"])
+    monkeypatch.setattr(agent_run.tty, "setraw", lambda _fd: None)
+    monkeypatch.setattr(agent_run.termios, "tcsetattr", lambda *_a: None)
+    monkeypatch.setattr(
+        agent_run.os, "get_terminal_size", lambda _fd: os.terminal_size((0, 0))
+    )
+
+    def fail_select(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent_run.select, "select", fail_select)
+    try:
+        # A 0x0 size must not raise ValueError out of _pack_resize before
+        # reaching select() — if it did, the KeyboardInterrupt from
+        # fail_select would never fire and this would propagate ValueError
+        # instead of returning the expected exit status.
+        assert (
+            agent_run.cmd_attach(argparse.Namespace(name="attach-zerosize"))
+            == 128 + agent_run.signal.SIGINT
+        )
+    finally:
+        os.close(stdin_reader)
+        os.close(resize_reader)
+
+
 def test_attach_resets_terminal_modes_on_external_sigint(
     isolated_runs_root, isolated_log_root, monkeypatch
 ):
@@ -339,6 +421,7 @@ def test_attach_resets_terminal_modes_on_external_sigint(
     stdout = _FakeStdout()
     monkeypatch.setattr(agent_run.sys, "stdout", stdout)
     monkeypatch.setattr(agent_run.sys.stdin, "fileno", lambda: 0)
+    monkeypatch.setattr(agent_run.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(agent_run.termios, "tcgetattr", lambda _fd: ["saved"])
     monkeypatch.setattr(agent_run.tty, "setraw", lambda _fd: None)

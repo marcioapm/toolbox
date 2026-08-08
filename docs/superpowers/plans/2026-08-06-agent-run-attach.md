@@ -450,10 +450,21 @@ def cmd_attach(args: argparse.Namespace) -> int:
         previous_winch = signal.signal(signal.SIGWINCH, on_winch)
         with log.open("rb") as log_file:
             while True:
+                # Drain the log at full speed while output is pending, only
+                # blocking in select() once we've caught up to EOF — matches
+                # cmd_tail's "continue" loop so attach can't fall behind a
+                # fast-redrawing TUI (a single select() + one read(8192) per
+                # iteration bounds throughput to 8KB per 0.2s poll interval).
+                chunk = log_file.read(8192)
+                if chunk:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+                    continue
+
                 if resize_requested:
+                    resize_requested = False
                     size = os.get_terminal_size(local_fd)
                     pending_resize = _pack_resize(size.columns, size.lines)
-                    resize_requested = False
 
                 writable = []
                 if pending_input:
@@ -461,11 +472,6 @@ def cmd_attach(args: argparse.Namespace) -> int:
                 if pending_resize:
                     writable.append(resize_fd)
                 readable, writable, _ = select.select([local_fd], writable, [], 0.2)
-
-                chunk = log_file.read(8192)
-                if chunk:
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.buffer.flush()
 
                 if not _pid_alive(pid):
                     time.sleep(0.1)
@@ -477,7 +483,18 @@ def cmd_attach(args: argparse.Namespace) -> int:
 
                 if local_fd in readable:
                     data = os.read(local_fd, 4096)
-                    if not data or b"\x03" in data:
+                    if not data:
+                        return 0
+                    detach_at = data.find(b"\x03")
+                    if detach_at != -1:
+                        data = data[:detach_at]
+                        if len(pending_input) + len(data) <= MAX_PTY_INPUT_BUFFER:
+                            pending_input += data
+                            try:
+                                written = os.write(stdin_fd, pending_input)
+                                pending_input = pending_input[written:]
+                            except BlockingIOError:
+                                pass
                         return 0
                     if len(pending_input) + len(data) > MAX_PTY_INPUT_BUFFER:
                         raise BufferError(

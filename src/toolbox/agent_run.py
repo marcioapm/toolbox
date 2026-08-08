@@ -1432,14 +1432,22 @@ def cmd_attach(args: argparse.Namespace) -> int:
     if not resize_path.is_fifo():
         sys.exit(f"agent-run: no resize FIFO at {resize_path}")
 
+    if not sys.stdin.isatty():
+        sys.exit(
+            "agent-run: attach requires an interactive terminal "
+            "(use 'agent-run tail' instead)"
+        )
     local_fd = sys.stdin.fileno()
     saved_termios = termios.tcgetattr(local_fd)
-    stdin_fd = os.open(str(stdin_path), os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        stdin_fd = os.open(str(stdin_path), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        sys.exit(f"agent-run: failed to open stdin FIFO at {stdin_path}: {exc}")
     try:
         resize_fd = os.open(str(resize_path), os.O_WRONLY | os.O_NONBLOCK)
-    except OSError:
+    except OSError as exc:
         os.close(stdin_fd)
-        raise
+        sys.exit(f"agent-run: failed to open resize FIFO at {resize_path}: {exc}")
     pending_input = b""
     pending_resize: Optional[bytes] = None
     resize_requested = True
@@ -1464,8 +1472,9 @@ def cmd_attach(args: argparse.Namespace) -> int:
                 # Drain the log at full speed while output is pending, only
                 # blocking in select() once we've caught up to EOF — matches
                 # cmd_tail's "continue" loop so attach can't fall behind a
-                # fast-redrawing TUI (a single select() + one read(8192) per
-                # iteration bounds throughput to 8KB per 0.2s poll interval).
+                # fast-redrawing TUI. Without this continue, a single
+                # select() + one read(8192) per loop iteration would cap
+                # throughput at 8KB per 0.2s poll interval.
                 chunk = log_file.read(8192)
                 if chunk:
                     sys.stdout.buffer.write(chunk)
@@ -1475,14 +1484,20 @@ def cmd_attach(args: argparse.Namespace) -> int:
                 if resize_requested:
                     resize_requested = False
                     size = os.get_terminal_size(local_fd)
-                    pending_resize = _pack_resize(size.columns, size.lines)
+                    # A 0x0 size is a legitimate transient read (e.g. a PTY
+                    # whose winsize was never set, or a terminal mid-
+                    # teardown), not an error — _pack_resize rejects 0 as an
+                    # out-of-range dimension, so just skip sending a resize
+                    # this iteration rather than crashing.
+                    if size.columns and size.lines:
+                        pending_resize = _pack_resize(size.columns, size.lines)
 
-                writable = []
+                want_write = []
                 if pending_input:
-                    writable.append(stdin_fd)
+                    want_write.append(stdin_fd)
                 if pending_resize:
-                    writable.append(resize_fd)
-                readable, writable, _ = select.select([local_fd], writable, [], 0.2)
+                    want_write.append(resize_fd)
+                readable, writable, _ = select.select([local_fd], want_write, [], 0.2)
 
                 if not _pid_alive(pid):
                     time.sleep(0.1)
