@@ -46,29 +46,6 @@ Add them to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) for persistence.
 
 ---
 
-## agent-run
-
-Launch a coding agent in a detached, interactive PTY:
-
-```bash
-agent-run -i review-agent claude
-```
-
-Attach from any terminal to see live output and drive it with normal
-keystrokes:
-
-```bash
-agent-run attach review-agent
-```
-
-`attach` adopts the attached terminal's size immediately and after each
-window resize. Press `Ctrl-C` to detach without stopping the agent. Multiple
-attach sessions are allowed; keystrokes are shared and the latest resize
-wins. Use `agent-run tail review-agent` for read-only output, or
-`agent-run steer review-agent "message"` for one-shot prompt submission.
-
----
-
 ## gemini-image
 
 Generate images using Google's Imagen 4.0 or Gemini native image models.
@@ -597,9 +574,18 @@ agent-run status <name>                   # one-line status
 agent-run logs <name> [N]                 # last N lines (default 50)
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
+agent-run attach <name>                   # attach interactively (Ctrl-C detaches)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
 ```
+
+Unlike `tail`, which only streams output, `attach` gives live keyboard and
+terminal-resize passthrough to an interactive run — it adopts the attached
+terminal's size immediately and after every subsequent resize. Ctrl-C
+detaches the attach client locally without touching the wrapped agent,
+which keeps running. Multiple simultaneous attaches are allowed; keystrokes
+from any of them reach the agent, and the PTY size tracks whichever client
+resized most recently.
 
 `kill` sends TERM/INT/HUP straight to the identity-verified runner, which
 catches it and runs its own teardown (kill/reap the workload, publish
@@ -670,6 +656,7 @@ Ephemeral, under `$AGENT_RUN_STATE_DIR/<name>/` (default `/tmp/agent-runs`):
 | `argv` | JSON-encoded argv (authoritative form for replay) |
 | `started_at`, `ended_at` | ISO-8601 UTC timestamps |
 | `stdin` | FIFO for `steer` (only when launched with `-i`) |
+| `resize` | FIFO for terminal-resize records used by `attach` (only when launched with `-i`) |
 | `pty_pid` | PID of the PTY child (interactive only) |
 | `keeper_pid` | PID of the FIFO keeper (interactive only) |
 | `interactive` | `1` if launched with `-i`, else `0` |
