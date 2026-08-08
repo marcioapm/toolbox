@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import argparse
 import errno
+import fcntl
 import io
 import os
+import pty
+import select
 import signal
 import struct
+import subprocess
 import sys
+import termios
 import time
 from pathlib import Path
 
@@ -22,6 +27,120 @@ def _wait_until(predicate, timeout: float = 10.0) -> bool:
             return True
         time.sleep(0.05)
     return False
+
+
+def _environment(state_root: Path, log_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["AGENT_RUN_STATE_DIR"] = str(state_root)
+    env["AGENT_RUN_LOG_DIR"] = str(log_root)
+    return env
+
+
+def _launch_interactive(name: str, script: str, env: dict[str, str]) -> Path:
+    result = subprocess.run(
+        [sys.executable, "-m", "toolbox.agent_run", "-i", name, sys.executable, "-c", script],
+        capture_output=True,
+        env=env,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    state = Path(env["AGENT_RUN_STATE_DIR"]) / name
+    assert _wait_until(lambda: (state / "status").read_text().strip() == "running")
+    return state
+
+
+def _spawn_attach(name: str, env: dict[str, str], rows: int, cols: int):
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    process = subprocess.Popen(
+        [sys.executable, "-m", "toolbox.agent_run", "attach", name],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        start_new_session=True,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    return process, master_fd
+
+
+def _read_until(fd: int, needle: bytes, timeout: float = 10.0) -> bytes:
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if not readable:
+            continue
+        try:
+            output.extend(os.read(fd, 4096))
+        except OSError:
+            break
+        if needle in output:
+            return bytes(output)
+    raise AssertionError(f"did not receive {needle!r}; received {bytes(output)!r}")
+
+
+def _poke_until_size(fd: int, probe: bytes, needle: bytes, timeout: float = 10.0) -> bytes:
+    """Repeatedly write `probe` and read until `needle` appears.
+
+    Used for terminal-size assertions where a single probe byte can race a
+    resize record still in flight over the FIFO — retrying the probe until
+    the reader's reported size matches converges regardless of how many
+    stale reads (or echoed probe bytes) land first, without an arbitrary
+    fixed sleep.
+    """
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    while time.monotonic() < deadline:
+        os.write(fd, probe)
+        readable, _, _ = select.select([fd], [], [], 0.2)
+        if not readable:
+            continue
+        try:
+            output.extend(os.read(fd, 4096))
+        except OSError:
+            break
+        if needle in output:
+            return bytes(output)
+    raise AssertionError(f"did not receive {needle!r}; received {bytes(output)!r}")
+
+
+def _stop_run(state: Path) -> None:
+    try:
+        os.kill(int((state / "pid").read_text()), signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    assert _wait_until(lambda: (state / "status").read_text().strip() != "running")
+
+
+def _detach(process: subprocess.Popen, master_fd: int, timeout: float = 5.0) -> None:
+    """Send Ctrl-C and wait for `attach` to exit, draining its PTY master
+    the whole time.
+
+    `attach`'s cleanup calls `termios.tcsetattr(..., TCSADRAIN, ...)`, which
+    blocks until every byte it already wrote has actually been read by the
+    other end of the PTY. Any output left unread from an earlier
+    `_read_until`/`_poke_until_size` call (both stop as soon as their needle
+    appears, not necessarily after draining everything queued) can fill the
+    PTY's output buffer and wedge that tcsetattr forever unless something
+    keeps reading — exactly what a real attached terminal emulator would do
+    continuously.
+    """
+    try:
+        if process.poll() is None:
+            os.write(master_fd, b"\x03")
+            deadline = time.monotonic() + timeout
+            while process.poll() is None and time.monotonic() < deadline:
+                readable, _, _ = select.select([master_fd], [], [], 0.1)
+                if readable:
+                    try:
+                        os.read(master_fd, 65536)
+                    except OSError:
+                        break
+            assert process.wait(timeout=max(0.0, deadline - time.monotonic())) == 0
+    finally:
+        os.close(master_fd)
 
 
 def test_pack_resize_uses_four_byte_network_order():
@@ -241,4 +360,143 @@ def test_attach_resets_terminal_modes_on_external_sigint(
     finally:
         os.close(stdin_reader)
         os.close(resize_reader)
+
+
+def test_attach_relays_input_detaches_on_ctrl_c_and_restores_terminal(
+    isolated_runs_root, isolated_log_root
+):
+    env = _environment(isolated_runs_root, isolated_log_root)
+    script = """\
+import os, sys, termios, tty, time
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+print("READY", flush=True)
+print(f"GOT:{os.read(fd, 1).hex()}", flush=True)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+time.sleep(30)
+"""
+    state = _launch_interactive("attach-input", script, env)
+    process, master_fd = _spawn_attach("attach-input", env, rows=24, cols=80)
+    try:
+        original = termios.tcgetattr(master_fd)
+        _read_until(master_fd, b"READY")
+        os.write(master_fd, b"x")
+        _read_until(master_fd, b"GOT:78")
+        os.write(master_fd, b"\x03")
+        assert process.wait(timeout=5) == 0
+        assert termios.tcgetattr(master_fd) == original
+        assert (state / "status").read_text().strip() == "running"
+        assert agent_run._pid_alive(int((state / "pid").read_text()))
+    finally:
+        _detach(process, master_fd)
+        _stop_run(state)
+
+
+def test_attach_applies_initial_and_changed_terminal_size(
+    isolated_runs_root, isolated_log_root
+):
+    env = _environment(isolated_runs_root, isolated_log_root)
+    script = """\
+import os, sys, termios, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+print("READY", flush=True)
+while True:
+    b = os.read(fd, 1)
+    if not b:
+        break
+    size = os.get_terminal_size(fd)
+    print(f"SIZE:{size.columns}x{size.lines}", flush=True)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+"""
+    state = _launch_interactive("attach-size", script, env)
+    process, master_fd = _spawn_attach("attach-size", env, rows=31, cols=101)
+    try:
+        _read_until(master_fd, b"READY")
+        # The initial resize record races the probe keystroke over separate
+        # FIFOs, so retry the probe until the reported size reflects it
+        # rather than asserting on a single round trip.
+        _poke_until_size(master_fd, b"s", b"SIZE:101x31")
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 47, 133, 0, 0))
+        os.kill(process.pid, signal.SIGWINCH)
+        _poke_until_size(master_fd, b"s", b"SIZE:133x47")
+    finally:
+        _detach(process, master_fd)
+        _stop_run(state)
+
+
+def test_multiple_attaches_share_output_and_last_resize_wins(
+    isolated_runs_root, isolated_log_root
+):
+    # Two independently-spawned attach processes each send their own
+    # "initial connect" resize record over the *same* shared resize FIFO,
+    # so if they were spawned concurrently, which one is applied last would
+    # be an unavoidable race. To keep the test deterministic, connect and
+    # settle `first` on its own, THEN spawn `second` — at that point
+    # `second` is the only source of a fresh resize record for its own
+    # connect. Each size assertion also retries its probe keystroke (see
+    # _poke_until_size) since a resize record can still race an individual
+    # keystroke over the separate stdin/resize FIFOs.
+    env = _environment(isolated_runs_root, isolated_log_root)
+    script = """\
+import os, sys, termios, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+print("READY", flush=True)
+while True:
+    b = os.read(fd, 1)
+    if not b:
+        break
+    size = os.get_terminal_size(fd)
+    print(f"SIZE:{size.columns}x{size.lines}", flush=True)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+"""
+    state = _launch_interactive("attach-many", script, env)
+    first, first_master = _spawn_attach("attach-many", env, rows=24, cols=80)
+    try:
+        _read_until(first_master, b"READY")
+        _poke_until_size(first_master, b"s", b"SIZE:80x24")
+
+        second, second_master = _spawn_attach("attach-many", env, rows=50, cols=120)
+        try:
+            # Before `attach` calls tty.setraw() on its own controlling
+            # terminal, the PTY slave is still in canonical/echoing mode, so
+            # a probe byte sent too early gets echoed back onto
+            # second_master (and never reaches attach's stdin) instead of
+            # being read by the wrapped script — wait for the replayed log
+            # (containing "READY" from the very start, since attach opens
+            # the log with no seek) to confirm attach has reached its main
+            # loop before probing.
+            _read_until(second_master, b"READY")
+            _poke_until_size(second_master, b"s", b"SIZE:120x50")
+
+            fcntl.ioctl(first_master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 90, 0, 0))
+            os.kill(first.pid, signal.SIGWINCH)
+            _poke_until_size(first_master, b"s", b"SIZE:90x40")
+            _poke_until_size(second_master, b"s", b"SIZE:90x40")
+        finally:
+            _detach(second, second_master)
+    finally:
+        _detach(first, first_master)
+        _stop_run(state)
+
+
+def test_attach_drains_final_output_and_exits_zero(isolated_runs_root, isolated_log_root):
+    env = _environment(isolated_runs_root, isolated_log_root)
+    script = "import time; time.sleep(0.3); print('FINAL-ATTACH-OUTPUT', flush=True)"
+    state = _launch_interactive("attach-final", script, env)
+    process, master_fd = _spawn_attach("attach-final", env, rows=24, cols=80)
+    try:
+        _read_until(master_fd, b"FINAL-ATTACH-OUTPUT")
+        assert process.wait(timeout=5) == 0
+        assert _wait_until(lambda: (state / "status").read_text().strip() == "done")
+    finally:
+        if process.poll() is None:
+            _detach(process, master_fd)
+        else:
+            os.close(master_fd)
+
 
