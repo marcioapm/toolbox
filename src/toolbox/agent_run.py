@@ -1514,16 +1514,38 @@ def cmd_tail(args: argparse.Namespace) -> int:
 # so the keystroke leaks straight through attach into the wrapped agent's
 # stdin instead of detaching. Recognize both known encodings: the legacy
 # xterm "modifyOtherKeys" form (`ESC[27;<mod>;99~`, what iTerm2 sends) and
-# the kitty-native CSI-u form (`ESC[99;<mod>u`). <mod> is 1 + a bitmask of
-# held modifiers (Shift=1, Alt=2, Ctrl=4, ...); 99 is the Unicode codepoint
-# for the letter 'c'. Only trigger when the Ctrl bit is actually set.
-_CTRL_C_CSI_RE = re.compile(rb"\x1b\[(?:27;(\d{1,3});99~|99;(\d{1,3})u)")
+# the kitty-native CSI-u form (`ESC[99[:alt-codes];<mod>[:event][;text]u`).
+# <mod> is 1 + a bitmask of held modifiers (Shift=1, Alt=2, Ctrl=4, ...);
+# 99 is the Unicode codepoint for the letter 'c'. Only trigger when the
+# Ctrl bit is actually set.
+#
+# The kitty form's optional colon-separated subparameters are matched but
+# ignored, not just tolerated by accident: some terminals include them even
+# when the client only requested the base "disambiguate escape codes" flag
+# (not the full "report event types"/"report alternate keys" opt-ins), so a
+# strict two-token match would silently stop working on those terminals.
+# `[:alt-codes]` after the key code carries shifted/base-layout key
+# alternates (up to two extra `:digits` groups); `[:event]` after the
+# modifier is the press(1)/repeat(2)/release(3) event type -- defaulting to
+# press when omitted, and harmless to match on any value here since we only
+# care that Ctrl was held, not which event fired (a held Ctrl-C can
+# legitimately generate a press, then repeats, then a release, all
+# equally valid detach triggers, and only the first one reached matters).
+# A trailing `;<codepoints>` carries the "report associated text" field
+# (one or more colon-separated Unicode codepoints) when that opt-in flag is
+# enabled; also matched-and-ignored for the same forward-compatibility
+# reason.
+_CTRL_C_CSI_RE = re.compile(
+    rb"\x1b\[(?:27;(\d{1,3});99~|99(?::\d*){0,2};(\d{1,3})(?::\d+)?(?:;[\d:]+)?u)"
+)
 
-# Comfortably longer than any real Ctrl-C trigger form (13 bytes) or any
-# other single-keystroke CSI sequence a terminal legitimately sends, so a
+# Comfortably longer than any real Ctrl-C trigger form -- including the
+# kitty protocol's full form with alt-key-code and associated-text
+# subparameters, which can run to several dozen bytes -- or any other
+# single-keystroke CSI sequence a terminal legitimately sends, so a
 # pending, not-yet-terminated escape sequence can never withhold input
 # indefinitely if it turns out not to be one of the forms above.
-_MAX_PENDING_ESCAPE_BYTES = 32
+_MAX_PENDING_ESCAPE_BYTES = 64
 
 # How long a possibly-incomplete escape sequence is held back waiting for
 # more bytes before being flushed through as literal input. A real CSI

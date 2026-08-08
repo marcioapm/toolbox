@@ -562,13 +562,42 @@ def test_find_ctrl_c_trigger_recognizes_kitty_csi_u_form():
 
 
 @pytest.mark.parametrize(
+    "trigger",
+    [
+        b"\x1b[99;5:1u",  # explicit press event type
+        b"\x1b[99;5:2u",  # repeat event type -- a held-down Ctrl-C
+        b"\x1b[99;5:3u",  # release event type
+        b"\x1b[99:65:67;5u",  # shifted + base-layout alt-key-codes
+        b"\x1b[99:65;5u",  # a single alt-key-code
+        b"\x1b[99;5;99u",  # "report associated text" field, one codepoint
+        b"\x1b[99;5;99:100u",  # associated text, multiple codepoints
+        b"\x1b[99:65:67;5:1;99u",  # alt-codes + event type + associated text together
+    ],
+)
+def test_find_ctrl_c_trigger_recognizes_kitty_optional_subparameters(trigger):
+    # Terminals implementing the kitty keyboard protocol may include these
+    # optional colon-separated subparameters even when the client (Claude
+    # Code) only requested the base "disambiguate escape codes" flag --
+    # some terminals apply their own defaults regardless of exactly what
+    # was requested. Detection must not depend on the client's requested
+    # flags matching the terminal's actual behavior.
+    data = b"ab" + trigger + b"cd"
+    start, end = agent_run._find_ctrl_c_trigger(data)
+    assert data[:start] == b"ab"
+    assert data[end:] == b"cd"
+    assert data[start:end] == trigger
+
+
+@pytest.mark.parametrize(
     "data",
     [
         b"\x1b[27;1;99~",  # mod=1 -> no modifiers held at all, not Ctrl-C
         b"\x1b[27;2;99~",  # mod=2 -> Shift only
         b"\x1b[27;3;99~",  # mod=3 -> Shift+Alt, still no Ctrl bit
         b"\x1b[99;1u",
+        b"\x1b[99:65;1u",  # alt-key-code present, but still no Ctrl modifier
         b"\x1b[27;5;100~",  # codepoint 100 = 'd', not 'c'
+        b"\x1b[100;5u",  # kitty form, wrong codepoint
     ],
 )
 def test_find_ctrl_c_trigger_ignores_non_ctrl_csi_forms(data):
@@ -649,6 +678,54 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         assert b"BYTE:1b" not in log  # the CSI sequence's ESC never delivered
         assert b"BYTE:63" not in log  # 'c' (after the CSI trigger) dropped
         assert b"BYTE:64" not in log  # 'd' (after the CSI trigger) dropped
+
+        assert (state / "status").read_text().strip() == "running"
+        assert agent_run._pid_alive(int((state / "pid").read_text()))
+    finally:
+        _detach(process, master_fd)
+        _stop_run(state)
+
+
+def test_attach_ctrl_c_via_kitty_extended_csi_form_detaches_without_leaking(
+    isolated_runs_root, isolated_log_root
+):
+    """Terminals implementing the kitty keyboard protocol can send the
+    optional alt-key-codes/event-type/associated-text subparameters even
+    when Claude Code only requested the base disambiguation flag -- proves
+    the whole attach pipeline (not just the unit-level regex) still
+    detaches on one of those extended forms rather than only the minimal
+    `ESC[99;5u`."""
+    env = _environment(isolated_runs_root, isolated_log_root)
+    name = "attach-ctrlc-kitty-ext"
+    script = """\
+import os, sys, termios, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+print("READY", flush=True)
+while True:
+    b = os.read(fd, 1)
+    if not b:
+        break
+    print(f"BYTE:{b.hex()}", flush=True)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+"""
+    state = _launch_interactive(name, script, env)
+    process, master_fd = _spawn_attach(name, env, rows=24, cols=80)
+    try:
+        _read_until(master_fd, b"READY")
+        # Alt-key-codes (65:67) + explicit press event type (:1) together.
+        os.write(master_fd, b"ab\x1b[99:65:67;5:1ucd")
+        assert process.wait(timeout=5) == 0
+
+        log_path = isolated_log_root / name / "log"
+        assert _wait_until(lambda: b"BYTE:62" in log_path.read_bytes(), timeout=5)
+        log = log_path.read_bytes()
+        assert b"BYTE:61" in log
+        assert b"BYTE:62" in log
+        assert b"BYTE:1b" not in log
+        assert b"BYTE:63" not in log
+        assert b"BYTE:64" not in log
 
         assert (state / "status").read_text().strip() == "running"
         assert agent_run._pid_alive(int((state / "pid").read_text()))
