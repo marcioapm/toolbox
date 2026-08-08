@@ -199,11 +199,14 @@ import shlex
 import shutil
 import signal
 import stat as _stat_module
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 import traceback
+import tty
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
@@ -216,6 +219,8 @@ PRUNE_AFTER_DAYS = 21
 SUBMIT_MODE_CR = "cr"
 SUBMIT_MODE_CRLF = "crlf"
 MAX_PTY_INPUT_BUFFER = 1024 * 1024
+RESIZE_RECORD_FORMAT = ">HH"
+RESIZE_RECORD_SIZE = struct.calcsize(RESIZE_RECORD_FORMAT)
 MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
 FINAL_RENDER_TIMEOUT_SECONDS = 10.0
 FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
@@ -2492,19 +2497,25 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     # Create resources that can fail (fifo, pipe) before publishing
     # "starting" wherever possible: a failure here means the run never
     # appeared active, so there is no stranded state to clean up.
-    fifo_path: Optional[Path] = None
+    fifo_paths: tuple[Path, ...] = ()
     if args.interactive:
-        fifo_path = d / "stdin"
-        if fifo_path.exists():
-            fifo_path.unlink()
+        fifo_paths = (d / "stdin", d / "resize")
         try:
-            os.mkfifo(str(fifo_path))
+            for fifo_path in fifo_paths:
+                os.mkfifo(str(fifo_path))
         except OSError as exc:
+            for fifo_path in fifo_paths:
+                try:
+                    fifo_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
             sys.exit(f"agent-run: failed to create control fifo: {exc}")
     try:
         r_ack, w_ack = os.pipe()
     except OSError as exc:
-        if fifo_path is not None:
+        for fifo_path in fifo_paths:
             try:
                 fifo_path.unlink()
             except OSError:
@@ -3029,6 +3040,32 @@ def _drain_pty_input(master_fd: int, buffered: bytes) -> bytes:
     return buffered
 
 
+def _pack_resize(cols: int, rows: int) -> bytes:
+    if not (1 <= cols <= 0xFFFF and 1 <= rows <= 0xFFFF):
+        raise ValueError("terminal dimensions must be between 1 and 65535")
+    return struct.pack(RESIZE_RECORD_FORMAT, cols, rows)
+
+
+def _apply_resize(master_fd: int, cols: int, rows: int) -> None:
+    try:
+        fcntl.ioctl(
+            master_fd,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", rows, cols, 0, 0),
+        )
+    except OSError as exc:
+        if exc.errno not in {errno.EBADF, errno.EIO, errno.EINVAL, errno.ENOTTY}:
+            raise
+
+
+def _drain_resize_records(master_fd: int, buffered: bytes) -> bytes:
+    while len(buffered) >= RESIZE_RECORD_SIZE:
+        record, buffered = buffered[:RESIZE_RECORD_SIZE], buffered[RESIZE_RECORD_SIZE:]
+        cols, rows = struct.unpack(RESIZE_RECORD_FORMAT, record)
+        _apply_resize(master_fd, cols, rows)
+    return buffered
+
+
 def _run_interactive(
     state_dir: Path,
     argv: Sequence[str],
@@ -3037,11 +3074,12 @@ def _run_interactive(
     prompt_file: Optional[str] = None,
     submit_mode: str = SUBMIT_MODE_CR,
 ) -> int:
-    fifo_path = state_dir / "stdin"
+    stdin_path = state_dir / "stdin"
+    resize_path = state_dir / "resize"
 
-    # Persistent keeper process: holds the FIFO open for writing so the reader
+    # Persistent keeper process: holds the FIFOs open for writing so the reader
     # (the PTY runner) never sees EOF between steers. We fork a dedicated
-    # child that blocks on a long sleep while holding the write end open.
+    # child that blocks on a long sleep while holding the write ends open.
     keeper_r, keeper_w = os.pipe()
     with _block_handled_runner_signals():
         keeper_pid = os.fork()
@@ -3052,9 +3090,10 @@ def _run_interactive(
     if keeper_pid == 0:
         _reset_runner_signal_handlers()
         os.close(keeper_r)
-        # Open FIFO for writing (blocks until a reader appears, that's us below).
+        # Open FIFOs for writing (blocks until a reader appears, that's us below).
         # Use a background-safe open: O_RDWR avoids the reader-blocking behavior.
-        fd = os.open(str(fifo_path), os.O_RDWR)
+        fd = os.open(str(stdin_path), os.O_RDWR)
+        resize_fd_keeper = os.open(str(resize_path), os.O_RDWR)
         # Ack and go to sleep.
         try:
             os.write(keeper_w, b".")
@@ -3068,6 +3107,10 @@ def _run_interactive(
         finally:
             try:
                 os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.close(resize_fd_keeper)
             except OSError:
                 pass
         os._exit(0)
@@ -3126,13 +3169,13 @@ def _run_interactive(
                 # even if the first one races input-buffer reset.
                 submit_writes = _prompt_submission_writes(data, submit_mode)
                 try:
-                    fd = os.open(str(fifo_path), os.O_WRONLY)
+                    fd = os.open(str(stdin_path), os.O_WRONLY)
                     try:
                         os.write(fd, submit_writes[0])
                     finally:
                         os.close(fd)
                     time.sleep(0.5)
-                    fd = os.open(str(fifo_path), os.O_WRONLY)
+                    fd = os.open(str(stdin_path), os.O_WRONLY)
                     try:
                         os.write(fd, submit_writes[1])
                     finally:
@@ -3142,9 +3185,10 @@ def _run_interactive(
             finally:
                 os._exit(0)
 
-    # Open FIFO read end (blocks until the keeper has opened for writing,
+    # Open FIFO read ends (blocks until the keeper has opened for writing,
     # which it has by the time we got the ack).
-    fifo_fd = os.open(str(fifo_path), os.O_RDONLY)
+    fifo_fd = os.open(str(stdin_path), os.O_RDONLY)
+    resize_fd = os.open(str(resize_path), os.O_RDONLY)
     # Make non-blocking for the select loop below? Keep blocking; we gate on select.
 
     # Make master non-blocking so reads don't stall when select lies briefly.
@@ -3152,15 +3196,18 @@ def _run_interactive(
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
     flags = fcntl.fcntl(fifo_fd, fcntl.F_GETFL)
     fcntl.fcntl(fifo_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    flags = fcntl.fcntl(resize_fd, fcntl.F_GETFL)
+    fcntl.fcntl(resize_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
     _write(state_dir / "status", "running\n")
     ready()
 
     exit_code: Optional[int] = None
     buf_in = b""
+    buf_resize = b""
     while True:
         try:
             writable = [master_fd] if buf_in else []
-            r, w, _ = select.select([master_fd, fifo_fd], writable, [], 0.5)
+            r, w, _ = select.select([master_fd, fifo_fd, resize_fd], writable, [], 0.5)
         except (OSError, select.error) as exc:
             if isinstance(exc, OSError) and exc.errno == errno.EINTR:
                 continue
@@ -3209,6 +3256,17 @@ def _run_interactive(
                     )
                 buf_in += chunk
 
+        if resize_fd in r:
+            try:
+                chunk = os.read(resize_fd, 4096)
+            except BlockingIOError:
+                chunk = b""
+            except OSError:
+                chunk = b""
+            if chunk:
+                buf_resize += chunk
+            buf_resize = _drain_resize_records(master_fd, buf_resize)
+
         if master_fd in w and buf_in:
             buf_in = _drain_pty_input(master_fd, buf_in)
 
@@ -3243,6 +3301,10 @@ def _run_interactive(
         pass
     try:
         os.close(fifo_fd)
+    except OSError:
+        pass
+    try:
+        os.close(resize_fd)
     except OSError:
         pass
     try:
