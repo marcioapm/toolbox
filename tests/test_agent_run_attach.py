@@ -851,3 +851,196 @@ def test_attach_is_listed_in_cli_help(capsys):
     assert "attach" in capsys.readouterr().out
 
 
+def _spawn_tail(name: str, env: dict[str, str], rows: int = 24, cols: int = 80):
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    process = subprocess.Popen(
+        [sys.executable, "-m", "toolbox.agent_run", "tail", name],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        start_new_session=True,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    return process, master_fd
+
+
+def _detach_tail(process: subprocess.Popen, master_fd: int, trigger: bytes, timeout: float = 5.0) -> None:
+    """Send `trigger` (raw 0x03 or a CSI Ctrl-C form) to a `tail` subprocess
+    and wait for it to exit, draining its PTY master the whole time so a
+    real terminal's TCSADRAIN-equivalent cleanup can never wedge -- same
+    rationale as `_detach` for `attach`.
+
+    Retries the write: `tail` briefly buffers unread bytes in the kernel's
+    raw-mode input queue until it reaches its select() loop and actually
+    reads them, but there is no readiness marker to wait on (unlike
+    `attach`, `tail` never prints anything of its own on startup), so a
+    single early write can race that transition. Re-sending is harmless --
+    once raw mode is active the first delivered trigger detaches
+    immediately and every retry after that becomes a no-op against an
+    already-exited process.
+    """
+    try:
+        deadline = time.monotonic() + timeout
+        while process.poll() is None and time.monotonic() < deadline:
+            try:
+                os.write(master_fd, trigger)
+            except OSError:
+                break
+            readable, _, _ = select.select([master_fd], [], [], 0.1)
+            if readable:
+                try:
+                    os.read(master_fd, 65536)
+                except OSError:
+                    break
+        assert process.wait(timeout=max(0.0, deadline - time.monotonic())) == 128 + signal.SIGINT
+    finally:
+        os.close(master_fd)
+
+
+def test_tail_raw_ctrl_c_exits_without_forwarding_anywhere(
+    isolated_runs_root, isolated_log_root
+):
+    """A plain raw 0x03 must still stop `tail` once stdin is in raw mode
+    (the kernel's own cooked-mode SIGINT generation is disabled by ISIG in
+    raw mode, so `tail` must detect the byte itself)."""
+    env = _environment(isolated_runs_root, isolated_log_root)
+    name = "tail-ctrlc-raw"
+    script = "import time; time.sleep(30)"
+    state = _launch_interactive(name, script, env)
+    process, master_fd = _spawn_tail(name, env)
+    try:
+        _detach_tail(process, master_fd, b"\x03")
+        assert (state / "status").read_text().strip() == "running"
+        assert agent_run._pid_alive(int((state / "pid").read_text()))
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        _stop_run(state)
+
+
+def test_tail_csi_ctrl_c_exits_cleanly(isolated_runs_root, isolated_log_root):
+    """Reproduces the real-world bug: once the wrapped agent's TUI (e.g.
+    Claude Code) negotiates the kitty/CSI-u keyboard protocol via output
+    `tail` faithfully replays, a terminal honoring it (iTerm2, kitty, ...)
+    sends Ctrl-C as `ESC[27;5;99~` instead of raw 0x03. The kernel's
+    cooked-mode SIGINT generation never recognizes that sequence, so
+    without active detection `tail` never exits on Ctrl-C at all -- the
+    escape bytes just sit unread (and, in cooked mode, get locally echoed
+    as garbage)."""
+    env = _environment(isolated_runs_root, isolated_log_root)
+    name = "tail-ctrlc-csi"
+    script = "import time; time.sleep(30)"
+    state = _launch_interactive(name, script, env)
+    process, master_fd = _spawn_tail(name, env)
+    try:
+        _detach_tail(process, master_fd, b"\x1b[27;5;99~")
+        assert (state / "status").read_text().strip() == "running"
+        assert agent_run._pid_alive(int((state / "pid").read_text()))
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        _stop_run(state)
+
+
+def test_tail_drains_mouse_garbage_without_echoing_it(
+    isolated_runs_root, isolated_log_root
+):
+    """Mouse-tracking escape sequences arriving on stdin while `tail` runs
+    (because the wrapped TUI enabled mouse tracking and the real terminal
+    is now sending motion events) must be silently discarded, not echoed
+    onto the screen or left sitting in the terminal's input queue. Raw mode
+    disables local echo; actively reading stdin drains them.
+
+    Repeatedly re-sends the mouse report over ~1s rather than a single
+    write immediately after spawn: `tail` has no readiness marker of its
+    own (unlike `attach`, it prints nothing on startup), so a single early
+    write could race the transition into raw mode. Re-sending is harmless
+    here since every send is independently expected to be silently
+    discarded."""
+    env = _environment(isolated_runs_root, isolated_log_root)
+    name = "tail-mouse-garbage"
+    script = "import time; time.sleep(30)"
+    state = _launch_interactive(name, script, env)
+    process, master_fd = _spawn_tail(name, env)
+    try:
+        # A representative SGR mouse-motion report, distinct from any
+        # Ctrl-C trigger form.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                os.write(master_fd, b"\x1b[<35;10;5M")
+            except OSError:
+                break
+            time.sleep(0.1)
+        assert process.poll() is None  # tail must NOT have exited on this
+    finally:
+        _detach_tail(process, master_fd, b"\x03")
+        _stop_run(state)
+
+
+def test_tail_bare_escape_does_not_exit_or_hang(isolated_runs_root, isolated_log_root):
+    """A bare Escape byte (no following CSI bytes) must be drained and
+    ignored -- not mistaken for the start of a Ctrl-C sequence and held
+    forever, and not confused with the detach trigger itself. See
+    test_tail_drains_mouse_garbage_without_echoing_it for why this retries
+    the write instead of sending once."""
+    env = _environment(isolated_runs_root, isolated_log_root)
+    name = "tail-bare-esc"
+    script = "import time; time.sleep(30)"
+    state = _launch_interactive(name, script, env)
+    process, master_fd = _spawn_tail(name, env)
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                os.write(master_fd, b"\x1b")
+            except OSError:
+                break
+            time.sleep(0.1)
+        assert process.poll() is None
+    finally:
+        _detach_tail(process, master_fd, b"\x03")
+        _stop_run(state)
+
+
+def test_tail_non_tty_stdin_uses_keyboardinterrupt_fallback_unchanged(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    """Piped/redirected stdin must skip the raw-mode/CSI-detection path
+    entirely and keep relying on the existing KeyboardInterrupt-based exit
+    -- confirms the TTY guard actually gates the new behavior."""
+    run = isolated_runs_root / "tail-non-tty"
+    run.mkdir()
+    (run / "pid").write_text("123\n")
+    log_dir = isolated_log_root / "tail-non-tty"
+    log_dir.mkdir()
+    (log_dir / "log").write_bytes(b"")
+
+    class _FakeStdin:
+        def isatty(self) -> bool:
+            return False
+
+    class _FakeStdout:
+        def __init__(self):
+            self.buffer = io.BytesIO()
+
+    monkeypatch.setattr(agent_run.sys, "stdin", _FakeStdin())
+    monkeypatch.setattr(agent_run.sys, "stdout", _FakeStdout())
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        agent_run.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+    monkeypatch.setattr(
+        agent_run.select,
+        "select",
+        lambda *_a, **_k: pytest.fail("select() must not be called for non-TTY stdin"),
+    )
+
+    assert agent_run.cmd_tail(argparse.Namespace(name="tail-non-tty")) == 128 + signal.SIGINT
+
+

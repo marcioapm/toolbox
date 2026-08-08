@@ -1382,11 +1382,50 @@ def cmd_tail(args: argparse.Namespace) -> int:
         pid = int(pid_raw) if pid_raw else None
     except ValueError:
         pid = None
-    # Stream the whole file then tail until the agent dies or log stops growing.
+
+    # When stdin is a real terminal, put it into raw mode and actively read
+    # (and discard -- tail is strictly read-only, this never writes
+    # anywhere) whatever arrives on it. This serves two purposes at once:
+    #
+    # 1. Ctrl-C detection. tail replays the wrapped agent's raw output,
+    #    including whatever terminal-protocol negotiation the agent's own
+    #    TUI performs (e.g. Claude Code requesting the kitty/CSI-u
+    #    "disambiguate escape codes" keyboard protocol via ESC[>1u). Once a
+    #    terminal emulator honors that, it stops sending plain 0x03 for
+    #    Ctrl-C and starts sending a CSI escape sequence instead -- which
+    #    the kernel's cooked-mode SIGINT generation never recognizes, so no
+    #    signal is ever raised and the KeyboardInterrupt fallback below
+    #    never fires. Raw mode disables that kernel-level SIGINT generation
+    #    entirely (ISIG), so once raw mode is on, both the CSI form *and*
+    #    the raw 0x03 byte must be detected here (the same detector
+    #    cmd_attach uses), not relied on via the kernel.
+    # 2. Mouse-move garbage. The same TUI negotiation can enable mouse
+    #    tracking, which makes the real terminal start sending mouse-event
+    #    escape sequences on stdin. In cooked mode those sit unread and get
+    #    locally echoed onto the screen as garbage (and, worse, executed as
+    #    a shell command once the user hits Enter after tail exits). Raw
+    #    mode disables local echo, and actively draining stdin here means
+    #    those bytes never accumulate in the terminal's input queue either.
+    #
+    # Skipped entirely when stdin isn't a TTY (piped/redirected tail in a
+    # script): there is no real terminal to protect, and the existing
+    # KeyboardInterrupt-based fallback below is untouched for that case.
+    stdin_is_tty = sys.stdin.isatty()
+    local_fd = sys.stdin.fileno() if stdin_is_tty else -1
+    saved_termios = termios.tcgetattr(local_fd) if stdin_is_tty else None
+    held_escape = b""
+    held_escape_deadline: Optional[float] = None
+
     # Ctrl-C is the normal way to stop following (same as `tail -f`): catch it
     # here so it exits quietly with the conventional 128+SIGINT status instead
     # of dumping a traceback, while still running the terminal-mode reset.
+    # This remains the exit path for a non-TTY stdin, and for an external
+    # SIGINT (`kill -INT` on this process) even when stdin is a TTY -- ISIG
+    # only suppresses signal *generation from typed characters*, not from an
+    # externally delivered signal.
     try:
+        if stdin_is_tty:
+            tty.setraw(local_fd)
         with log.open("rb") as f:
             while True:
                 chunk = f.read(8192)
@@ -1414,10 +1453,55 @@ def cmd_tail(args: argparse.Namespace) -> int:
                         except BrokenPipeError:
                             pass
                     return 0
-                time.sleep(0.2)
+
+                if not stdin_is_tty:
+                    time.sleep(0.2)
+                    continue
+
+                select_timeout = 0.2
+                if held_escape_deadline is not None:
+                    select_timeout = max(0.0, min(select_timeout, held_escape_deadline - time.monotonic()))
+                readable, _, _ = select.select([local_fd], [], [], select_timeout)
+
+                if (
+                    held_escape
+                    and local_fd not in readable
+                    and held_escape_deadline is not None
+                    and time.monotonic() >= held_escape_deadline
+                ):
+                    # No follow-up bytes arrived in time for the pending ESC
+                    # prefix to be part of a real CSI sequence -- discard it
+                    # (tail never forwards input anywhere) rather than
+                    # holding it forever.
+                    held_escape = b""
+                    held_escape_deadline = None
+
+                if local_fd in readable:
+                    data = os.read(local_fd, 4096)
+                    if data:
+                        if held_escape:
+                            data = held_escape + data
+                            held_escape = b""
+                            held_escape_deadline = None
+                        detach_start, _detach_end = _find_ctrl_c_trigger(data)
+                        if detach_start != -1:
+                            return 128 + signal.SIGINT
+                        _, held_escape = _split_trailing_incomplete_escape(data)
+                        if held_escape:
+                            held_escape_deadline = time.monotonic() + _ESCAPE_HOLD_TIMEOUT_SECONDS
+                    # Non-Ctrl-C bytes (including a fully-resolved non-Ctrl-C
+                    # CSI sequence) are intentionally dropped here -- see the
+                    # mouse-move-garbage rationale above. `data == b""` is
+                    # stdin EOF (e.g. `< /dev/null`), which is not an error
+                    # for a read-only command like tail: just keep tailing.
     except KeyboardInterrupt:
         return 128 + signal.SIGINT
     finally:
+        if stdin_is_tty and saved_termios is not None:
+            try:
+                termios.tcsetattr(local_fd, termios.TCSADRAIN, saved_termios)
+            except termios.error:
+                pass
         _reset_terminal_modes()
 
 
