@@ -1421,6 +1421,79 @@ def cmd_tail(args: argparse.Namespace) -> int:
         _reset_terminal_modes()
 
 
+# Terminals that negotiate the "disambiguate escape codes" keyboard protocol
+# encode Ctrl-C as a CSI sequence instead of the raw 0x03 byte -- Claude
+# Code's TUI requests this protocol (`ESC[>1u`) on startup, and terminals
+# that honor it (iTerm2, kitty, wezterm, ghostty, ...) then send every
+# modified/disambiguated key, including Ctrl-C, as an escape sequence rather
+# than a legacy control byte. A plain search for 0x03 misses this entirely,
+# so the keystroke leaks straight through attach into the wrapped agent's
+# stdin instead of detaching. Recognize both known encodings: the legacy
+# xterm "modifyOtherKeys" form (`ESC[27;<mod>;99~`, what iTerm2 sends) and
+# the kitty-native CSI-u form (`ESC[99;<mod>u`). <mod> is 1 + a bitmask of
+# held modifiers (Shift=1, Alt=2, Ctrl=4, ...); 99 is the Unicode codepoint
+# for the letter 'c'. Only trigger when the Ctrl bit is actually set.
+_CTRL_C_CSI_RE = re.compile(rb"\x1b\[(?:27;(\d{1,3});99~|99;(\d{1,3})u)")
+
+# Comfortably longer than any real Ctrl-C trigger form (13 bytes) or any
+# other single-keystroke CSI sequence a terminal legitimately sends, so a
+# pending, not-yet-terminated escape sequence can never withhold input
+# indefinitely if it turns out not to be one of the forms above.
+_MAX_PENDING_ESCAPE_BYTES = 32
+
+# How long a possibly-incomplete escape sequence is held back waiting for
+# more bytes before being flushed through as literal input. A real CSI
+# sequence arrives as one terminal write (its bytes land in the same or
+# next os.read() essentially instantly); a bare ESC keypress (Alt-prefix,
+# or the Escape key itself -- routinely used to cancel/back out in TUIs
+# including Claude Code's own) never gets any follow-up bytes at all. Long
+# enough to absorb scheduler jitter across two reads, far below normal
+# human keypress-to-keypress timing so a solitary Escape never feels
+# delayed.
+_ESCAPE_HOLD_TIMEOUT_SECONDS = 0.05
+
+
+def _find_ctrl_c_trigger(data: bytes) -> tuple:
+    """Return the (start, end) byte range of a Ctrl-C detach trigger in
+    ``data``, or ``(-1, -1)`` if none is present. Recognizes the raw 0x03
+    byte and the CSI-encoded forms described above _CTRL_C_CSI_RE."""
+    idx = data.find(b"\x03")
+    if idx != -1:
+        return idx, idx + 1
+    for m in _CTRL_C_CSI_RE.finditer(data):
+        mod = int(m.group(1) or m.group(2))
+        if (mod - 1) & 4:
+            return m.start(), m.end()
+    return -1, -1
+
+
+def _split_trailing_incomplete_escape(data: bytes) -> tuple:
+    """Split ``data`` into ``(forwardable, held_back)`` so a CSI sequence
+    split across two reads from the local terminal is never torn mid-
+    sequence: the trailing, not-yet-terminated portion (starting at the
+    last ESC) is held back to be prepended to the next read. Bounded by
+    _MAX_PENDING_ESCAPE_BYTES so a pathological non-terminating sequence
+    cannot withhold input forever. Does not hold back a lone ESC/Alt-key
+    prefix that is not actually the start of a CSI sequence (no following
+    ``[``) -- only genuine in-flight CSI sequences are delayed."""
+    esc_at = data.rfind(b"\x1b")
+    if esc_at == -1:
+        return data, b""
+    tail = data[esc_at:]
+    if len(tail) > _MAX_PENDING_ESCAPE_BYTES:
+        return data, b""
+    if len(tail) == 1:
+        return data[:esc_at], tail
+    if tail[1:2] != b"[":
+        return data, b""
+    # CSI parameter/intermediate bytes are 0x20-0x3F; a final byte in
+    # 0x40-0x7E terminates the sequence. Nothing terminating yet means the
+    # sequence is still incomplete.
+    if not any(0x40 <= byte <= 0x7E for byte in tail[2:]):
+        return data[:esc_at], tail
+    return data, b""
+
+
 def cmd_attach(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     state_dir, pid = _require_live_interactive_run(name)
@@ -1452,6 +1525,8 @@ def cmd_attach(args: argparse.Namespace) -> int:
     pending_resize: Optional[bytes] = None
     resize_requested = True
     previous_winch = None
+    held_escape = b""
+    held_escape_deadline: Optional[float] = None
 
     # attach replays raw PTY bytes to a real terminal exactly like tail/logs
     # do (see _reset_terminal_modes above), so it must reset DEC private
@@ -1497,7 +1572,10 @@ def cmd_attach(args: argparse.Namespace) -> int:
                     want_write.append(stdin_fd)
                 if pending_resize:
                     want_write.append(resize_fd)
-                readable, writable, _ = select.select([local_fd], want_write, [], 0.2)
+                select_timeout = 0.2
+                if held_escape_deadline is not None:
+                    select_timeout = max(0.0, min(select_timeout, held_escape_deadline - time.monotonic()))
+                readable, writable, _ = select.select([local_fd], want_write, [], select_timeout)
 
                 if not _pid_alive(pid):
                     time.sleep(0.1)
@@ -1507,13 +1585,33 @@ def cmd_attach(args: argparse.Namespace) -> int:
                         sys.stdout.buffer.flush()
                     return 0
 
+                if (
+                    held_escape
+                    and local_fd not in readable
+                    and held_escape_deadline is not None
+                    and time.monotonic() >= held_escape_deadline
+                ):
+                    # No follow-up bytes arrived in time for the pending ESC
+                    # prefix to be part of a real CSI sequence -- it was a
+                    # bare Escape keypress (or an unrelated Alt-prefixed
+                    # key). Release it as ordinary input rather than
+                    # holding it forever.
+                    if len(pending_input) + len(held_escape) <= MAX_PTY_INPUT_BUFFER:
+                        pending_input += held_escape
+                    held_escape = b""
+                    held_escape_deadline = None
+
                 if local_fd in readable:
                     data = os.read(local_fd, 4096)
                     if not data:
                         return 0
-                    detach_at = data.find(b"\x03")
-                    if detach_at != -1:
-                        data = data[:detach_at]
+                    if held_escape:
+                        data = held_escape + data
+                        held_escape = b""
+                        held_escape_deadline = None
+                    detach_start, _detach_end = _find_ctrl_c_trigger(data)
+                    if detach_start != -1:
+                        data = data[:detach_start]
                         if len(pending_input) + len(data) <= MAX_PTY_INPUT_BUFFER:
                             pending_input += data
                             try:
@@ -1522,6 +1620,9 @@ def cmd_attach(args: argparse.Namespace) -> int:
                             except BlockingIOError:
                                 pass
                         return 0
+                    data, held_escape = _split_trailing_incomplete_escape(data)
+                    if held_escape:
+                        held_escape_deadline = time.monotonic() + _ESCAPE_HOLD_TIMEOUT_SECONDS
                     if len(pending_input) + len(data) > MAX_PTY_INPUT_BUFFER:
                         raise BufferError(
                             f"attach input buffer exceeded {MAX_PTY_INPUT_BUFFER} bytes"

@@ -539,6 +539,206 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         _stop_run(state)
 
 
+def test_find_ctrl_c_trigger_recognizes_raw_byte():
+    assert agent_run._find_ctrl_c_trigger(b"ab\x03cd") == (2, 3)
+
+
+def test_find_ctrl_c_trigger_recognizes_iterm_csi_form():
+    # What iTerm2 actually sends for Ctrl-C once Claude Code's TUI has
+    # negotiated the "disambiguate escape codes" keyboard protocol: the
+    # legacy xterm modifyOtherKeys form, ESC[27;<mod>;<codepoint>~, with
+    # mod=5 (1 + Ctrl's bit 4) and codepoint=99 ('c').
+    data = b"ab\x1b[27;5;99~cd"
+    start, end = agent_run._find_ctrl_c_trigger(data)
+    assert data[:start] == b"ab"
+    assert data[end:] == b"cd"
+
+
+def test_find_ctrl_c_trigger_recognizes_kitty_csi_u_form():
+    data = b"ab\x1b[99;5ucd"
+    start, end = agent_run._find_ctrl_c_trigger(data)
+    assert data[:start] == b"ab"
+    assert data[end:] == b"cd"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"\x1b[27;1;99~",  # mod=1 -> no modifiers held at all, not Ctrl-C
+        b"\x1b[27;2;99~",  # mod=2 -> Shift only
+        b"\x1b[27;3;99~",  # mod=3 -> Shift+Alt, still no Ctrl bit
+        b"\x1b[99;1u",
+        b"\x1b[27;5;100~",  # codepoint 100 = 'd', not 'c'
+    ],
+)
+def test_find_ctrl_c_trigger_ignores_non_ctrl_csi_forms(data):
+    assert agent_run._find_ctrl_c_trigger(data) == (-1, -1)
+
+
+def test_split_trailing_incomplete_escape_holds_back_in_flight_csi():
+    forwardable, held = agent_run._split_trailing_incomplete_escape(b"ab\x1b[27;5")
+    assert forwardable == b"ab"
+    assert held == b"\x1b[27;5"
+
+
+def test_split_trailing_incomplete_escape_releases_terminated_sequence():
+    data = b"ab\x1b[27;5;99~"
+    forwardable, held = agent_run._split_trailing_incomplete_escape(data)
+    assert forwardable == data
+    assert held == b""
+
+
+def test_split_trailing_incomplete_escape_holds_back_lone_esc():
+    forwardable, held = agent_run._split_trailing_incomplete_escape(b"ab\x1b")
+    assert forwardable == b"ab"
+    assert held == b"\x1b"
+
+
+def test_split_trailing_incomplete_escape_releases_esc_without_bracket():
+    # ESC not followed by '[' (e.g. an Alt-modified letter key) is not the
+    # start of a CSI sequence -- never held back.
+    data = b"ab\x1bc"
+    forwardable, held = agent_run._split_trailing_incomplete_escape(data)
+    assert forwardable == data
+    assert held == b""
+
+
+def test_split_trailing_incomplete_escape_bounds_pathological_sequences():
+    data = b"\x1b[" + b"9" * agent_run._MAX_PENDING_ESCAPE_BYTES
+    forwardable, held = agent_run._split_trailing_incomplete_escape(data)
+    assert forwardable == data
+    assert held == b""
+
+
+def test_attach_ctrl_c_via_csi_sequence_detaches_without_leaking(
+    isolated_runs_root, isolated_log_root
+):
+    """Reproduces the real-world bug: iTerm2 (and any terminal honoring the
+    kitty/CSI-u "disambiguate escape codes" keyboard protocol Claude Code's
+    TUI requests) sends Ctrl-C as `ESC[27;5;99~`, not a raw `\\x03` byte. A
+    detector that only looks for `\\x03` never fires, and the whole escape
+    sequence leaks straight into the wrapped agent's stdin instead of
+    detaching `attach` locally."""
+    env = _environment(isolated_runs_root, isolated_log_root)
+    name = "attach-ctrlc-csi"
+    script = """\
+import os, sys, termios, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+print("READY", flush=True)
+while True:
+    b = os.read(fd, 1)
+    if not b:
+        break
+    print(f"BYTE:{b.hex()}", flush=True)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+"""
+    state = _launch_interactive(name, script, env)
+    process, master_fd = _spawn_attach(name, env, rows=24, cols=80)
+    try:
+        _read_until(master_fd, b"READY")
+        os.write(master_fd, b"ab\x1b[27;5;99~cd")
+        assert process.wait(timeout=5) == 0
+
+        log_path = isolated_log_root / name / "log"
+        assert _wait_until(lambda: b"BYTE:62" in log_path.read_bytes(), timeout=5)
+        log = log_path.read_bytes()
+        assert b"BYTE:61" in log  # 'a' delivered
+        assert b"BYTE:62" in log  # 'b' delivered
+        assert b"BYTE:1b" not in log  # the CSI sequence's ESC never delivered
+        assert b"BYTE:63" not in log  # 'c' (after the CSI trigger) dropped
+        assert b"BYTE:64" not in log  # 'd' (after the CSI trigger) dropped
+
+        assert (state / "status").read_text().strip() == "running"
+        assert agent_run._pid_alive(int((state / "pid").read_text()))
+    finally:
+        _detach(process, master_fd)
+        _stop_run(state)
+
+
+def test_attach_ctrl_c_via_csi_split_across_two_reads_still_detaches(
+    isolated_runs_root, isolated_log_root
+):
+    """The CSI-u Ctrl-C trigger can legitimately arrive split across two
+    local-terminal reads (e.g. a slow pty writer, or scheduler jitter). The
+    held-back-prefix logic must reassemble it rather than either missing
+    the detach or corrupting/duplicating forwarded bytes."""
+    env = _environment(isolated_runs_root, isolated_log_root)
+    name = "attach-ctrlc-csi-split"
+    script = """\
+import os, sys, termios, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+print("READY", flush=True)
+while True:
+    b = os.read(fd, 1)
+    if not b:
+        break
+    print(f"BYTE:{b.hex()}", flush=True)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+"""
+    state = _launch_interactive(name, script, env)
+    process, master_fd = _spawn_attach(name, env, rows=24, cols=80)
+    try:
+        _read_until(master_fd, b"READY")
+        os.write(master_fd, b"ab\x1b[27;5")
+        time.sleep(0.01)
+        os.write(master_fd, b";99~cd")
+        assert process.wait(timeout=5) == 0
+
+        log_path = isolated_log_root / name / "log"
+        assert _wait_until(lambda: b"BYTE:62" in log_path.read_bytes(), timeout=5)
+        log = log_path.read_bytes()
+        assert b"BYTE:61" in log
+        assert b"BYTE:62" in log
+        assert b"BYTE:1b" not in log
+        assert b"BYTE:63" not in log
+        assert b"BYTE:64" not in log
+
+        assert (state / "status").read_text().strip() == "running"
+    finally:
+        _detach(process, master_fd)
+        _stop_run(state)
+
+
+def test_attach_bare_escape_key_still_reaches_wrapped_agent(
+    isolated_runs_root, isolated_log_root
+):
+    """A bare Escape keypress (used constantly in TUIs, including Claude
+    Code's own, to cancel/back out) must still be forwarded — the
+    CSI-sequence-holdback logic must not swallow it just because it starts
+    with the same ESC byte a CSI sequence would."""
+    env = _environment(isolated_runs_root, isolated_log_root)
+    name = "attach-bare-esc"
+    script = """\
+import os, sys, termios, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+print("READY", flush=True)
+while True:
+    b = os.read(fd, 1)
+    if not b:
+        break
+    print(f"BYTE:{b.hex()}", flush=True)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+"""
+    state = _launch_interactive(name, script, env)
+    process, master_fd = _spawn_attach(name, env, rows=24, cols=80)
+    try:
+        _read_until(master_fd, b"READY")
+        os.write(master_fd, b"\x1b")
+
+        log_path = isolated_log_root / name / "log"
+        assert _wait_until(lambda: b"BYTE:1b" in log_path.read_bytes(), timeout=5)
+        assert (state / "status").read_text().strip() == "running"
+    finally:
+        _detach(process, master_fd)
+        _stop_run(state)
+
+
 def test_attach_applies_initial_and_changed_terminal_size(
     isolated_runs_root, isolated_log_root
 ):
