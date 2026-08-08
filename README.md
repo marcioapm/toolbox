@@ -13,7 +13,7 @@ A collection of lightweight CLI tools for AI content generation and chat operati
 | `gemini-vision` | Analyze images/videos via Gemini (supports YouTube, Instagram, TikTok) | `GEMINI_API_KEY` |
 | `slackcli` | Lightweight Slack client (channels, messages, search, reactions) | `SLACK_USER_TOKEN` |
 | `llm-usage` | Monitor LLM token usage, costs, and quotas across providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` |
-| `agent-run` | Background wrapper for coding agents (Claude Code, Codex…) with PTY steering + live log streaming | — |
+| `agent-run` | Background wrapper for coding agents (Claude Code, Codex…) with interactive attach/steering + live log streaming | — |
 
 ## Install
 
@@ -43,6 +43,29 @@ export SLACK_USER_TOKEN="xoxp-your-token-here"
 ```
 
 Add them to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) for persistence.
+
+---
+
+## agent-run
+
+Launch a coding agent in a detached, interactive PTY:
+
+```bash
+agent-run -i review-agent claude
+```
+
+Attach from any terminal to see live output and drive it with normal
+keystrokes:
+
+```bash
+agent-run attach review-agent
+```
+
+`attach` adopts the attached terminal's size immediately and after each
+window resize. Press `Ctrl-C` to detach without stopping the agent. Multiple
+attach sessions are allowed; keystrokes are shared and the latest resize
+wins. Use `agent-run tail review-agent` for read-only output, or
+`agent-run steer review-agent "message"` for one-shot prompt submission.
 
 ---
 

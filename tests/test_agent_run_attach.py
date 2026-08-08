@@ -563,3 +563,8 @@ def test_attach_drains_final_output_and_exits_zero(isolated_runs_root, isolated_
             os.close(master_fd)
 
 
+def test_attach_is_listed_in_cli_help(capsys):
+    assert agent_run.main(["--help"]) == 0
+    assert "attach" in capsys.readouterr().out
+
+
