@@ -393,6 +393,69 @@ time.sleep(30)
         _stop_run(state)
 
 
+def test_attach_ctrl_c_forwards_only_bytes_before_marker_within_one_chunk(
+    isolated_runs_root, isolated_log_root
+):
+    """Direct coverage for the Task 2 byte-preservation fix.
+
+    `test_attach_relays_input_detaches_on_ctrl_c_and_restores_terminal` only
+    catches a leaked `\\x03` *indirectly*: its wrapped Python script happens
+    to raise `KeyboardInterrupt` if a stray `\\x03` reaches it, flipping
+    status to `failed`. A wrapped agent that ignores SIGINT (or doesn't run
+    Python) would leak the same byte with nothing catching it. This test
+    proves delivery directly: the wrapped agent logs every byte it reads, a
+    single write of `b"ab\\x03cd"` is sent as one chunk (matching
+    `cmd_attach`'s "scan each raw read chunk for `\\x03`" behavior), and the
+    test asserts (1) the bytes before `\\x03` (0x61 'a', 0x62 'b') were
+    delivered, (2) `\\x03` itself was not, (3) nothing after it in the same
+    chunk (0x63 'c', 0x64 'd') was either, and (4) the wrapped run stayed
+    alive/running throughout — only `attach` detaches, never the run.
+
+    Reads the persistent log file directly rather than `attach`'s own PTY
+    output: `cmd_attach` returns immediately after forwarding the
+    pre-`\\x03` bytes and detecting the detach marker, in the same loop
+    iteration, without looping back to drain the log growth the wrapped
+    agent's own `BYTE:..` writes produce — so by the time `attach` exits,
+    those log lines have not necessarily been replayed onto its stdout yet.
+    """
+    env = _environment(isolated_runs_root, isolated_log_root)
+    name = "attach-ctrlc-truncate"
+    script = """\
+import os, sys, termios, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+print("READY", flush=True)
+while True:
+    b = os.read(fd, 1)
+    if not b:
+        break
+    print(f"BYTE:{b.hex()}", flush=True)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+"""
+    state = _launch_interactive(name, script, env)
+    process, master_fd = _spawn_attach(name, env, rows=24, cols=80)
+    try:
+        _read_until(master_fd, b"READY")
+        os.write(master_fd, b"ab\x03cd")
+        assert process.wait(timeout=5) == 0
+
+        log_path = isolated_log_root / name / "log"
+        assert _wait_until(lambda: b"BYTE:62" in log_path.read_bytes(), timeout=5)
+        log = log_path.read_bytes()
+        assert b"BYTE:61" in log  # 'a' delivered
+        assert b"BYTE:62" in log  # 'b' delivered
+        assert b"BYTE:03" not in log  # '\x03' itself never delivered
+        assert b"BYTE:63" not in log  # 'c' (after \x03 in the chunk) dropped
+        assert b"BYTE:64" not in log  # 'd' (after \x03 in the chunk) dropped
+
+        assert (state / "status").read_text().strip() == "running"
+        assert agent_run._pid_alive(int((state / "pid").read_text()))
+    finally:
+        _detach(process, master_fd)
+        _stop_run(state)
+
+
 def test_attach_applies_initial_and_changed_terminal_size(
     isolated_runs_root, isolated_log_root
 ):
