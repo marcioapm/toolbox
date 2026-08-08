@@ -13,7 +13,7 @@ A collection of lightweight CLI tools for AI content generation and chat operati
 | `gemini-vision` | Analyze images/videos via Gemini (supports YouTube, Instagram, TikTok) | `GEMINI_API_KEY` |
 | `slackcli` | Lightweight Slack client (channels, messages, search, reactions) | `SLACK_USER_TOKEN` |
 | `llm-usage` | Monitor LLM token usage, costs, and quotas across providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` |
-| `agent-run` | Background wrapper for coding agents (Claude Code, Codex…) with PTY steering + live log streaming | — |
+| `agent-run` | Background wrapper for coding agents (Claude Code, Codex…) with interactive attach/steering + live log streaming | — |
 
 ## Install
 
@@ -574,9 +574,18 @@ agent-run status <name>                   # one-line status
 agent-run logs <name> [N]                 # last N lines (default 50)
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
+agent-run attach <name>                   # attach interactively (Ctrl-C detaches)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
 ```
+
+Unlike `tail`, which only streams output, `attach` gives live keyboard and
+terminal-resize passthrough to an interactive run — it adopts the attached
+terminal's size immediately and after every subsequent resize. Ctrl-C
+detaches the attach client locally without touching the wrapped agent,
+which keeps running. Multiple simultaneous attaches are allowed; keystrokes
+from any of them reach the agent, and the PTY size tracks whichever client
+resized most recently.
 
 `kill` sends TERM/INT/HUP straight to the identity-verified runner, which
 catches it and runs its own teardown (kill/reap the workload, publish
@@ -647,6 +656,7 @@ Ephemeral, under `$AGENT_RUN_STATE_DIR/<name>/` (default `/tmp/agent-runs`):
 | `argv` | JSON-encoded argv (authoritative form for replay) |
 | `started_at`, `ended_at` | ISO-8601 UTC timestamps |
 | `stdin` | FIFO for `steer` (only when launched with `-i`) |
+| `resize` | FIFO for terminal-resize records used by `attach` (only when launched with `-i`) |
 | `pty_pid` | PID of the PTY child (interactive only) |
 | `keeper_pid` | PID of the FIFO keeper (interactive only) |
 | `interactive` | `1` if launched with `-i`, else `0` |

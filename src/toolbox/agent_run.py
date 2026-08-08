@@ -205,11 +205,14 @@ import shlex
 import shutil
 import signal
 import stat as _stat_module
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 import traceback
+import tty
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
@@ -222,6 +225,8 @@ PRUNE_AFTER_DAYS = 21
 SUBMIT_MODE_CR = "cr"
 SUBMIT_MODE_CRLF = "crlf"
 MAX_PTY_INPUT_BUFFER = 1024 * 1024
+RESIZE_RECORD_FORMAT = ">HH"
+RESIZE_RECORD_SIZE = struct.calcsize(RESIZE_RECORD_FORMAT)
 MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
 FINAL_RENDER_TIMEOUT_SECONDS = 10.0
 FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
@@ -1456,11 +1461,50 @@ def cmd_tail(args: argparse.Namespace) -> int:
         pid = int(pid_raw) if pid_raw else None
     except ValueError:
         pid = None
-    # Stream the whole file then tail until the agent dies or log stops growing.
+
+    # When stdin is a real terminal, put it into raw mode and actively read
+    # (and discard -- tail is strictly read-only, this never writes
+    # anywhere) whatever arrives on it. This serves two purposes at once:
+    #
+    # 1. Ctrl-C detection. tail replays the wrapped agent's raw output,
+    #    including whatever terminal-protocol negotiation the agent's own
+    #    TUI performs (e.g. Claude Code requesting the kitty/CSI-u
+    #    "disambiguate escape codes" keyboard protocol via ESC[>1u). Once a
+    #    terminal emulator honors that, it stops sending plain 0x03 for
+    #    Ctrl-C and starts sending a CSI escape sequence instead -- which
+    #    the kernel's cooked-mode SIGINT generation never recognizes, so no
+    #    signal is ever raised and the KeyboardInterrupt fallback below
+    #    never fires. Raw mode disables that kernel-level SIGINT generation
+    #    entirely (ISIG), so once raw mode is on, both the CSI form *and*
+    #    the raw 0x03 byte must be detected here (the same detector
+    #    cmd_attach uses), not relied on via the kernel.
+    # 2. Mouse-move garbage. The same TUI negotiation can enable mouse
+    #    tracking, which makes the real terminal start sending mouse-event
+    #    escape sequences on stdin. In cooked mode those sit unread and get
+    #    locally echoed onto the screen as garbage (and, worse, executed as
+    #    a shell command once the user hits Enter after tail exits). Raw
+    #    mode disables local echo, and actively draining stdin here means
+    #    those bytes never accumulate in the terminal's input queue either.
+    #
+    # Skipped entirely when stdin isn't a TTY (piped/redirected tail in a
+    # script): there is no real terminal to protect, and the existing
+    # KeyboardInterrupt-based fallback below is untouched for that case.
+    stdin_is_tty = sys.stdin.isatty()
+    local_fd = sys.stdin.fileno() if stdin_is_tty else -1
+    saved_termios = termios.tcgetattr(local_fd) if stdin_is_tty else None
+    held_escape = b""
+    held_escape_deadline: Optional[float] = None
+
     # Ctrl-C is the normal way to stop following (same as `tail -f`): catch it
     # here so it exits quietly with the conventional 128+SIGINT status instead
     # of dumping a traceback, while still running the terminal-mode reset.
+    # This remains the exit path for a non-TTY stdin, and for an external
+    # SIGINT (`kill -INT` on this process) even when stdin is a TTY -- ISIG
+    # only suppresses signal *generation from typed characters*, not from an
+    # externally delivered signal.
     try:
+        if stdin_is_tty:
+            tty.setraw(local_fd)
         with log.open("rb") as f:
             while True:
                 chunk = f.read(8192)
@@ -1488,10 +1532,312 @@ def cmd_tail(args: argparse.Namespace) -> int:
                         except BrokenPipeError:
                             pass
                     return 0
-                time.sleep(0.2)
+
+                if not stdin_is_tty:
+                    time.sleep(0.2)
+                    continue
+
+                select_timeout = 0.2
+                if held_escape_deadline is not None:
+                    select_timeout = max(0.0, min(select_timeout, held_escape_deadline - time.monotonic()))
+                readable, _, _ = select.select([local_fd], [], [], select_timeout)
+
+                if (
+                    held_escape
+                    and local_fd not in readable
+                    and held_escape_deadline is not None
+                    and time.monotonic() >= held_escape_deadline
+                ):
+                    # No follow-up bytes arrived in time for the pending ESC
+                    # prefix to be part of a real CSI sequence -- discard it
+                    # (tail never forwards input anywhere) rather than
+                    # holding it forever.
+                    held_escape = b""
+                    held_escape_deadline = None
+
+                if local_fd in readable:
+                    data = os.read(local_fd, 4096)
+                    if data:
+                        if held_escape:
+                            data = held_escape + data
+                            held_escape = b""
+                            held_escape_deadline = None
+                        detach_start, _detach_end = _find_ctrl_c_trigger(data)
+                        if detach_start != -1:
+                            return 128 + signal.SIGINT
+                        _, held_escape = _split_trailing_incomplete_escape(data)
+                        if held_escape:
+                            held_escape_deadline = time.monotonic() + _ESCAPE_HOLD_TIMEOUT_SECONDS
+                    # Non-Ctrl-C bytes (including a fully-resolved non-Ctrl-C
+                    # CSI sequence) are intentionally dropped here -- see the
+                    # mouse-move-garbage rationale above. `data == b""` is
+                    # stdin EOF (e.g. `< /dev/null`), which is not an error
+                    # for a read-only command like tail: just keep tailing.
     except KeyboardInterrupt:
         return 128 + signal.SIGINT
     finally:
+        if stdin_is_tty and saved_termios is not None:
+            try:
+                termios.tcsetattr(local_fd, termios.TCSADRAIN, saved_termios)
+            except termios.error:
+                pass
+        _reset_terminal_modes()
+
+
+# Terminals that negotiate the "disambiguate escape codes" keyboard protocol
+# encode Ctrl-C as a CSI sequence instead of the raw 0x03 byte -- Claude
+# Code's TUI requests this protocol (`ESC[>1u`) on startup, and terminals
+# that honor it (iTerm2, kitty, wezterm, ghostty, ...) then send every
+# modified/disambiguated key, including Ctrl-C, as an escape sequence rather
+# than a legacy control byte. A plain search for 0x03 misses this entirely,
+# so the keystroke leaks straight through attach into the wrapped agent's
+# stdin instead of detaching. Recognize both known encodings: the legacy
+# xterm "modifyOtherKeys" form (`ESC[27;<mod>;99~`, what iTerm2 sends) and
+# the kitty-native CSI-u form (`ESC[99[:alt-codes];<mod>[:event][;text]u`).
+# <mod> is 1 + a bitmask of held modifiers (Shift=1, Alt=2, Ctrl=4, ...);
+# 99 is the Unicode codepoint for the letter 'c'. Only trigger when the
+# Ctrl bit is actually set.
+#
+# The kitty form's optional colon-separated subparameters are matched but
+# ignored, not just tolerated by accident: some terminals include them even
+# when the client only requested the base "disambiguate escape codes" flag
+# (not the full "report event types"/"report alternate keys" opt-ins), so a
+# strict two-token match would silently stop working on those terminals.
+# `[:alt-codes]` after the key code carries shifted/base-layout key
+# alternates (up to two extra `:digits` groups); `[:event]` after the
+# modifier is the press(1)/repeat(2)/release(3) event type -- defaulting to
+# press when omitted, and harmless to match on any value here since we only
+# care that Ctrl was held, not which event fired (a held Ctrl-C can
+# legitimately generate a press, then repeats, then a release, all
+# equally valid detach triggers, and only the first one reached matters).
+# A trailing `;<codepoints>` carries the "report associated text" field
+# (one or more colon-separated Unicode codepoints) when that opt-in flag is
+# enabled; also matched-and-ignored for the same forward-compatibility
+# reason.
+_CTRL_C_CSI_RE = re.compile(
+    rb"\x1b\[(?:27;(\d{1,3});99~|99(?::\d*){0,2};(\d{1,3})(?::\d+)?(?:;[\d:]+)?u)"
+)
+
+# Comfortably longer than any real Ctrl-C trigger form -- including the
+# kitty protocol's full form with alt-key-code and associated-text
+# subparameters, which can run to several dozen bytes -- or any other
+# single-keystroke CSI sequence a terminal legitimately sends, so a
+# pending, not-yet-terminated escape sequence can never withhold input
+# indefinitely if it turns out not to be one of the forms above.
+_MAX_PENDING_ESCAPE_BYTES = 64
+
+# How long a possibly-incomplete escape sequence is held back waiting for
+# more bytes before being flushed through as literal input. A real CSI
+# sequence arrives as one terminal write (its bytes land in the same or
+# next os.read() essentially instantly); a bare ESC keypress (Alt-prefix,
+# or the Escape key itself -- routinely used to cancel/back out in TUIs
+# including Claude Code's own) never gets any follow-up bytes at all. Long
+# enough to absorb scheduler jitter across two reads, far below normal
+# human keypress-to-keypress timing so a solitary Escape never feels
+# delayed.
+_ESCAPE_HOLD_TIMEOUT_SECONDS = 0.05
+
+
+def _find_ctrl_c_trigger(data: bytes) -> tuple:
+    """Return the (start, end) byte range of a Ctrl-C detach trigger in
+    ``data``, or ``(-1, -1)`` if none is present. Recognizes the raw 0x03
+    byte and the CSI-encoded forms described above _CTRL_C_CSI_RE."""
+    idx = data.find(b"\x03")
+    if idx != -1:
+        return idx, idx + 1
+    for m in _CTRL_C_CSI_RE.finditer(data):
+        mod = int(m.group(1) or m.group(2))
+        if (mod - 1) & 4:
+            return m.start(), m.end()
+    return -1, -1
+
+
+def _split_trailing_incomplete_escape(data: bytes) -> tuple:
+    """Split ``data`` into ``(forwardable, held_back)`` so a CSI sequence
+    split across two reads from the local terminal is never torn mid-
+    sequence: the trailing, not-yet-terminated portion (starting at the
+    last ESC) is held back to be prepended to the next read. Bounded by
+    _MAX_PENDING_ESCAPE_BYTES so a pathological non-terminating sequence
+    cannot withhold input forever. Does not hold back a lone ESC/Alt-key
+    prefix that is not actually the start of a CSI sequence (no following
+    ``[``) -- only genuine in-flight CSI sequences are delayed."""
+    esc_at = data.rfind(b"\x1b")
+    if esc_at == -1:
+        return data, b""
+    tail = data[esc_at:]
+    if len(tail) > _MAX_PENDING_ESCAPE_BYTES:
+        return data, b""
+    if len(tail) == 1:
+        return data[:esc_at], tail
+    if tail[1:2] != b"[":
+        return data, b""
+    # CSI parameter/intermediate bytes are 0x20-0x3F; a final byte in
+    # 0x40-0x7E terminates the sequence. Nothing terminating yet means the
+    # sequence is still incomplete.
+    if not any(0x40 <= byte <= 0x7E for byte in tail[2:]):
+        return data[:esc_at], tail
+    return data, b""
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    name = _validate_run_name(args.name)
+    state_dir, pid = _require_live_interactive_run(name)
+    log = _require_log(name)
+    stdin_path = state_dir / "stdin"
+    resize_path = state_dir / "resize"
+    if not stdin_path.is_fifo():
+        sys.exit(f"agent-run: no stdin FIFO at {stdin_path}")
+    if not resize_path.is_fifo():
+        sys.exit(f"agent-run: no resize FIFO at {resize_path}")
+
+    if not sys.stdin.isatty():
+        sys.exit(
+            "agent-run: attach requires an interactive terminal "
+            "(use 'agent-run tail' instead)"
+        )
+    local_fd = sys.stdin.fileno()
+    saved_termios = termios.tcgetattr(local_fd)
+    try:
+        stdin_fd = os.open(str(stdin_path), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        sys.exit(f"agent-run: failed to open stdin FIFO at {stdin_path}: {exc}")
+    try:
+        resize_fd = os.open(str(resize_path), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        os.close(stdin_fd)
+        sys.exit(f"agent-run: failed to open resize FIFO at {resize_path}: {exc}")
+    pending_input = b""
+    pending_resize: Optional[bytes] = None
+    resize_requested = True
+    previous_winch = None
+    held_escape = b""
+    held_escape_deadline: Optional[float] = None
+
+    # attach replays raw PTY bytes to a real terminal exactly like tail/logs
+    # do (see _reset_terminal_modes above), so it must reset DEC private
+    # modes on the way out, and an external SIGINT (kill -INT on this
+    # process, distinct from the in-band Ctrl-C byte handled below) must
+    # exit quietly with the conventional 128+SIGINT status instead of a
+    # traceback.
+    try:
+        tty.setraw(local_fd)
+
+        def on_winch(_signum, _frame):
+            nonlocal resize_requested
+            resize_requested = True
+
+        previous_winch = signal.signal(signal.SIGWINCH, on_winch)
+        with log.open("rb") as log_file:
+            while True:
+                # Drain the log at full speed while output is pending, only
+                # blocking in select() once we've caught up to EOF — matches
+                # cmd_tail's "continue" loop so attach can't fall behind a
+                # fast-redrawing TUI. Without this continue, a single
+                # select() + one read(8192) per loop iteration would cap
+                # throughput at 8KB per 0.2s poll interval.
+                chunk = log_file.read(8192)
+                if chunk:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+                    continue
+
+                if resize_requested:
+                    resize_requested = False
+                    size = os.get_terminal_size(local_fd)
+                    # A 0x0 size is a legitimate transient read (e.g. a PTY
+                    # whose winsize was never set, or a terminal mid-
+                    # teardown), not an error — _pack_resize rejects 0 as an
+                    # out-of-range dimension, so just skip sending a resize
+                    # this iteration rather than crashing.
+                    if size.columns and size.lines:
+                        pending_resize = _pack_resize(size.columns, size.lines)
+
+                want_write = []
+                if pending_input:
+                    want_write.append(stdin_fd)
+                if pending_resize:
+                    want_write.append(resize_fd)
+                select_timeout = 0.2
+                if held_escape_deadline is not None:
+                    select_timeout = max(0.0, min(select_timeout, held_escape_deadline - time.monotonic()))
+                readable, writable, _ = select.select([local_fd], want_write, [], select_timeout)
+
+                if not _pid_alive(pid):
+                    time.sleep(0.1)
+                    remaining = log_file.read()
+                    if remaining:
+                        sys.stdout.buffer.write(remaining)
+                        sys.stdout.buffer.flush()
+                    return 0
+
+                if (
+                    held_escape
+                    and local_fd not in readable
+                    and held_escape_deadline is not None
+                    and time.monotonic() >= held_escape_deadline
+                ):
+                    # No follow-up bytes arrived in time for the pending ESC
+                    # prefix to be part of a real CSI sequence -- it was a
+                    # bare Escape keypress (or an unrelated Alt-prefixed
+                    # key). Release it as ordinary input rather than
+                    # holding it forever.
+                    if len(pending_input) + len(held_escape) <= MAX_PTY_INPUT_BUFFER:
+                        pending_input += held_escape
+                    held_escape = b""
+                    held_escape_deadline = None
+
+                if local_fd in readable:
+                    data = os.read(local_fd, 4096)
+                    if not data:
+                        return 0
+                    if held_escape:
+                        data = held_escape + data
+                        held_escape = b""
+                        held_escape_deadline = None
+                    detach_start, _detach_end = _find_ctrl_c_trigger(data)
+                    if detach_start != -1:
+                        data = data[:detach_start]
+                        if len(pending_input) + len(data) <= MAX_PTY_INPUT_BUFFER:
+                            pending_input += data
+                            try:
+                                written = os.write(stdin_fd, pending_input)
+                                pending_input = pending_input[written:]
+                            except BlockingIOError:
+                                pass
+                        return 0
+                    data, held_escape = _split_trailing_incomplete_escape(data)
+                    if held_escape:
+                        held_escape_deadline = time.monotonic() + _ESCAPE_HOLD_TIMEOUT_SECONDS
+                    if len(pending_input) + len(data) > MAX_PTY_INPUT_BUFFER:
+                        raise BufferError(
+                            f"attach input buffer exceeded {MAX_PTY_INPUT_BUFFER} bytes"
+                        )
+                    pending_input += data
+
+                if stdin_fd in writable and pending_input:
+                    try:
+                        written = os.write(stdin_fd, pending_input)
+                    except BlockingIOError:
+                        written = 0
+                    pending_input = pending_input[written:]
+
+                if resize_fd in writable and pending_resize:
+                    try:
+                        os.write(resize_fd, pending_resize)
+                    except BlockingIOError:
+                        pass
+                    else:
+                        pending_resize = None
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 128 + signal.SIGINT
+    finally:
+        if previous_winch is not None:
+            signal.signal(signal.SIGWINCH, previous_winch)
+        os.close(stdin_fd)
+        os.close(resize_fd)
+        termios.tcsetattr(local_fd, termios.TCSADRAIN, saved_termios)
         _reset_terminal_modes()
 
 
@@ -2176,8 +2522,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
 # steer / kill
 # ---------------------------------------------------------------------------
 
-def cmd_steer(args: argparse.Namespace) -> int:
-    name = _validate_run_name(args.name)
+def _require_live_interactive_run(name: str) -> tuple[Path, int]:
     d = _require_state(name)
     if _read(d / "interactive") != "1":
         sys.exit(
@@ -2186,7 +2531,13 @@ def cmd_steer(args: argparse.Namespace) -> int:
         )
     pid = _require_positive_state_int(d, "pid", name)
     if not _pid_alive(pid):
-        sys.exit(f"agent-run: '{args.name}' is not running")
+        sys.exit(f"agent-run: '{name}' is not running")
+    return d, pid
+
+
+def cmd_steer(args: argparse.Namespace) -> int:
+    name = _validate_run_name(args.name)
+    d, pid = _require_live_interactive_run(name)
     fifo = d / "stdin"
     if not fifo.is_fifo():
         sys.exit(f"agent-run: no stdin FIFO at {fifo}")
@@ -2669,19 +3020,25 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     # Create resources that can fail (fifo, pipe) before publishing
     # "starting" wherever possible: a failure here means the run never
     # appeared active, so there is no stranded state to clean up.
-    fifo_path: Optional[Path] = None
+    fifo_paths: tuple[Path, ...] = ()
     if args.interactive:
-        fifo_path = d / "stdin"
-        if fifo_path.exists():
-            fifo_path.unlink()
+        fifo_paths = (d / "stdin", d / "resize")
         try:
-            os.mkfifo(str(fifo_path))
+            for fifo_path in fifo_paths:
+                os.mkfifo(str(fifo_path))
         except OSError as exc:
+            for fifo_path in fifo_paths:
+                try:
+                    fifo_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
             sys.exit(f"agent-run: failed to create control fifo: {exc}")
     try:
         r_ack, w_ack = os.pipe()
     except OSError as exc:
-        if fifo_path is not None:
+        for fifo_path in fifo_paths:
             try:
                 fifo_path.unlink()
             except OSError:
@@ -3423,6 +3780,32 @@ def _drain_pty_input(master_fd: int, buffered: bytes) -> bytes:
     return buffered
 
 
+def _pack_resize(cols: int, rows: int) -> bytes:
+    if not (1 <= cols <= 0xFFFF and 1 <= rows <= 0xFFFF):
+        raise ValueError("terminal dimensions must be between 1 and 65535")
+    return struct.pack(RESIZE_RECORD_FORMAT, cols, rows)
+
+
+def _apply_resize(master_fd: int, cols: int, rows: int) -> None:
+    try:
+        fcntl.ioctl(
+            master_fd,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", rows, cols, 0, 0),
+        )
+    except OSError as exc:
+        if exc.errno not in {errno.EBADF, errno.EIO, errno.EINVAL, errno.ENOTTY}:
+            raise
+
+
+def _drain_resize_records(master_fd: int, buffered: bytes) -> bytes:
+    while len(buffered) >= RESIZE_RECORD_SIZE:
+        record, buffered = buffered[:RESIZE_RECORD_SIZE], buffered[RESIZE_RECORD_SIZE:]
+        cols, rows = struct.unpack(RESIZE_RECORD_FORMAT, record)
+        _apply_resize(master_fd, cols, rows)
+    return buffered
+
+
 def _run_interactive(
     state_dir: Path,
     argv: Sequence[str],
@@ -3431,11 +3814,12 @@ def _run_interactive(
     prompt_file: Optional[str] = None,
     submit_mode: str = SUBMIT_MODE_CR,
 ) -> int:
-    fifo_path = state_dir / "stdin"
+    stdin_path = state_dir / "stdin"
+    resize_path = state_dir / "resize"
 
-    # Persistent keeper process: holds the FIFO open for writing so the reader
+    # Persistent keeper process: holds the FIFOs open for writing so the reader
     # (the PTY runner) never sees EOF between steers. We fork a dedicated
-    # child that blocks on a long sleep while holding the write end open.
+    # child that blocks on a long sleep while holding the write ends open.
     keeper_r, keeper_w = os.pipe()
     with _block_handled_runner_signals():
         keeper_pid = os.fork()
@@ -3446,9 +3830,10 @@ def _run_interactive(
     if keeper_pid == 0:
         _reset_runner_signal_handlers()
         os.close(keeper_r)
-        # Open FIFO for writing (blocks until a reader appears, that's us below).
+        # Open FIFOs for writing (blocks until a reader appears, that's us below).
         # Use a background-safe open: O_RDWR avoids the reader-blocking behavior.
-        fd = os.open(str(fifo_path), os.O_RDWR)
+        fd = os.open(str(stdin_path), os.O_RDWR)
+        resize_fd_keeper = os.open(str(resize_path), os.O_RDWR)
         # Ack and go to sleep.
         try:
             os.write(keeper_w, b".")
@@ -3464,15 +3849,23 @@ def _run_interactive(
                 os.close(fd)
             except OSError:
                 pass
+            try:
+                os.close(resize_fd_keeper)
+            except OSError:
+                pass
         os._exit(0)
 
     os.close(keeper_w)
-    # Wait for keeper to open the FIFO.
+    # Wait for keeper to open the FIFOs. An empty read means the keeper died
+    # (e.g. failed to open one of the control FIFOs) before acking; proceeding
+    # would hang forever on the blocking FIFO opens below.
     try:
-        os.read(keeper_r, 1)
+        ack = os.read(keeper_r, 1)
     except OSError:
-        pass
+        ack = b""
     os.close(keeper_r)
+    if not ack:
+        raise RuntimeError("keeper failed to open control FIFOs")
 
     # Fork + PTY for the agent.
     with _block_handled_runner_signals():
@@ -3522,13 +3915,13 @@ def _run_interactive(
                 # even if the first one races input-buffer reset.
                 submit_writes = _prompt_submission_writes(data, submit_mode)
                 try:
-                    fd = os.open(str(fifo_path), os.O_WRONLY)
+                    fd = os.open(str(stdin_path), os.O_WRONLY)
                     try:
                         os.write(fd, submit_writes[0])
                     finally:
                         os.close(fd)
                     time.sleep(0.5)
-                    fd = os.open(str(fifo_path), os.O_WRONLY)
+                    fd = os.open(str(stdin_path), os.O_WRONLY)
                     try:
                         os.write(fd, submit_writes[1])
                     finally:
@@ -3541,9 +3934,10 @@ def _run_interactive(
             finally:
                 os._exit(0)
 
-    # Open FIFO read end (blocks until the keeper has opened for writing,
+    # Open FIFO read ends (blocks until the keeper has opened for writing,
     # which it has by the time we got the ack).
-    fifo_fd = os.open(str(fifo_path), os.O_RDONLY)
+    fifo_fd = os.open(str(stdin_path), os.O_RDONLY)
+    resize_fd = os.open(str(resize_path), os.O_RDONLY)
     # Make non-blocking for the select loop below? Keep blocking; we gate on select.
 
     # Make master non-blocking so reads don't stall when select lies briefly.
@@ -3551,15 +3945,18 @@ def _run_interactive(
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
     flags = fcntl.fcntl(fifo_fd, fcntl.F_GETFL)
     fcntl.fcntl(fifo_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    flags = fcntl.fcntl(resize_fd, fcntl.F_GETFL)
+    fcntl.fcntl(resize_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
     _write(state_dir / "status", "running\n")
     ready()
 
     exit_code: Optional[int] = None
     buf_in = b""
+    buf_resize = b""
     while True:
         try:
             writable = [master_fd] if buf_in else []
-            r, w, _ = select.select([master_fd, fifo_fd], writable, [], 0.5)
+            r, w, _ = select.select([master_fd, fifo_fd, resize_fd], writable, [], 0.5)
         except (OSError, select.error) as exc:
             if isinstance(exc, OSError) and exc.errno == errno.EINTR:
                 continue
@@ -3608,6 +4005,17 @@ def _run_interactive(
                     )
                 buf_in += chunk
 
+        if resize_fd in r:
+            try:
+                chunk = os.read(resize_fd, 4096)
+            except BlockingIOError:
+                chunk = b""
+            except OSError:
+                chunk = b""
+            if chunk:
+                buf_resize += chunk
+            buf_resize = _drain_resize_records(master_fd, buf_resize)
+
         if master_fd in w and buf_in:
             buf_in = _drain_pty_input(master_fd, buf_in)
 
@@ -3642,6 +4050,10 @@ def _run_interactive(
         pass
     try:
         os.close(fifo_fd)
+    except OSError:
+        pass
+    try:
+        os.close(resize_fd)
     except OSError:
         pass
     try:
@@ -3708,6 +4120,13 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_tail = sub.add_parser("tail", help="follow log in real time (tail -f)")
     sp_tail.add_argument("name")
     sp_tail.set_defaults(func=cmd_tail)
+
+    sp_attach = sub.add_parser(
+        "attach",
+        help="attach interactively (live keyboard + resize; Ctrl-C detaches)",
+    )
+    sp_attach.add_argument("name")
+    sp_attach.set_defaults(func=cmd_attach)
 
     sp_clean = sub.add_parser(
         "clean",
@@ -3916,7 +4335,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         break
 
     # Try to dispatch a known subcommand; otherwise treat as launch.
-    known_subcommands = {"status", "logs", "tail", "clean", "steer", "kill", "list", "reap", "help"}
+    known_subcommands = {"status", "logs", "tail", "attach", "clean", "steer", "kill", "list", "reap", "help"}
     if (
         raw
         and raw[0] in known_subcommands
