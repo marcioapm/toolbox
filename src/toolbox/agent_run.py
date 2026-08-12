@@ -48,6 +48,7 @@ Usage::
     agent-run tail <name>                # follow log in real time
     agent-run logs <name> [N]            # last N lines (default 50)
     agent-run status <name>              # one-line status
+    agent-run watch <name> [--json] [--repo PATH]  # stateless fact snapshot for pollers
     agent-run steer <name> <msg...>      # send text to agent stdin (needs -i)
     agent-run kill <name> [SIGNAL]       # TERM by default; see "kill" below
     agent-run list [--all] [--status S]  # list runs; defaults to non-terminal only
@@ -103,6 +104,9 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     started_at   ISO-8601 UTC
     ended_at     ISO-8601 UTC (after completion)
     interactive  "1" if launched with -i, else "0"
+    cwd          absolute launch-time working directory (used by `watch` to
+                 locate the repo for git facts; absent on runs started
+                 before this field existed)
     stdin        FIFO for steering (interactive only)
     reap_reason  set by `agent-run reap` when it changes status (died/killed)
     tmp_dir      absolute path to this run's scratch dir (see below)
@@ -291,6 +295,23 @@ def _parse_idle_stall_seconds() -> float:
 
 
 IDLE_STALL_SECONDS: float = _parse_idle_stall_seconds()
+
+# `watch` is stateless — it has no record of the log's size on the previous
+# poll — so "growing" is approximated as "written to recently" rather than
+# "bytes increased since last check". This is a description of recency, not
+# a liveness verdict; the consumer decides what a stale log means.
+WATCH_LOG_GROWING_MAX_AGE_SECONDS: float = 60.0
+
+# Thresholds for `watch`'s repeated-line/repeated-read signals (see
+# cmd_watch). Named constants, not inline literals, so a consumer can see
+# and tune the definition without touching the scan logic. These describe
+# what was observed in the log tail; they are not an escalation policy.
+WATCH_TAIL_LINES: int = 200
+WATCH_REPEAT_THRESHOLD: int = 3
+WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS: float = 2.5
+
+_WATCH_ERROR_LINE_RE = re.compile(r"error|Error|ERROR|Traceback|FAILED|exception")
+_WATCH_READ_LINE_RE = re.compile(r"\bRead\s+(\S+)")
 
 # Terminal-state garbage-collection age threshold: how long a run must have
 # been sitting in a conclusively terminal status (see TERMINAL_STATUSES)
@@ -1394,6 +1415,310 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"{suffix}"
     )
     return 0
+
+
+def _watch_parse_iso(raw: str) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _watch_run_git(repo: Path, git_args: Sequence[str]) -> Optional[str]:
+    """Run one bounded, lock-free git read; ``None`` on any failure (not a
+    repo, git missing, non-zero exit, or a timeout) so the caller can
+    collapse the whole git-facts object rather than emit partial data."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "--no-optional-locks", *git_args],
+            capture_output=True,
+            text=True,
+            timeout=WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout
+
+
+_WATCH_SHORTSTAT_FILES_RE = re.compile(r"(\d+) files? changed")
+_WATCH_SHORTSTAT_INS_RE = re.compile(r"(\d+) insertions?\(\+\)")
+_WATCH_SHORTSTAT_DEL_RE = re.compile(r"(\d+) deletions?\(-\)")
+
+
+def _watch_parse_shortstat(text: str) -> tuple[int, int, int]:
+    files_m = _WATCH_SHORTSTAT_FILES_RE.search(text)
+    ins_m = _WATCH_SHORTSTAT_INS_RE.search(text)
+    del_m = _WATCH_SHORTSTAT_DEL_RE.search(text)
+    files = int(files_m.group(1)) if files_m else 0
+    insertions = int(ins_m.group(1)) if ins_m else 0
+    deletions = int(del_m.group(1)) if del_m else 0
+    return files, insertions, deletions
+
+
+def _watch_git_facts(repo: Path, started_at: Optional[datetime]) -> Optional[dict]:
+    """Read-only git facts for ``repo``. Returns ``None`` on any failure —
+    not a git repo, git not installed, a wedged command hitting the bounded
+    timeout, or a repo mid-rebase/mid-merge with an unreadable index — never
+    raises. Reads only (``status --porcelain``, ``diff``, ``log``, ``rev-
+    list``); nothing here mutates the repo or contends with an agent's own
+    git operations (``--no-optional-locks``).
+
+    ``commits_since_start`` is null, not 0, when ``started_at`` itself is
+    unknown (e.g. ``--repo`` given but the run's own state dir is gone) —
+    the count is genuinely undetermined, not zero.
+    """
+    if not repo.is_dir():
+        return None
+    head = _watch_run_git(repo, ["rev-parse", "--short", "HEAD"])
+    if head is None:
+        return None
+    porcelain = _watch_run_git(repo, ["status", "--porcelain"])
+    if porcelain is None:
+        return None
+    shortstat = _watch_run_git(repo, ["diff", "HEAD", "--shortstat"])
+    if shortstat is None:
+        return None
+    files_changed, insertions, deletions = _watch_parse_shortstat(shortstat)
+
+    commits_since_start: Optional[int] = None
+    if started_at is not None:
+        since = started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        count_out = _watch_run_git(
+            repo, ["rev-list", "--count", f"--since={since}", "HEAD"]
+        )
+        if count_out is None:
+            return None
+        try:
+            commits_since_start = int(count_out.strip())
+        except ValueError:
+            return None
+
+    last_commit_epoch = _watch_run_git(repo, ["log", "-1", "--format=%ct", "HEAD"])
+    if last_commit_epoch is None:
+        return None
+    last_commit_age_s: Optional[float] = None
+    stripped = last_commit_epoch.strip()
+    if stripped:
+        try:
+            last_commit_age_s = max(0.0, time.time() - int(stripped))
+        except ValueError:
+            last_commit_age_s = None
+
+    return {
+        "head": head.strip(),
+        "dirty": bool(porcelain.strip()),
+        "files_changed": files_changed,
+        "insertions": insertions,
+        "deletions": deletions,
+        "commits_since_start": commits_since_start,
+        "last_commit_age_s": last_commit_age_s,
+    }
+
+
+def _watch_tail_lines(log: Optional[Path], n: int) -> List[str]:
+    """Last ``n`` decoded text lines of a log, or ``[]`` on any read failure
+    (missing file, permission error, stale NFS handle)."""
+    if log is None:
+        return []
+    try:
+        with log.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            block = 65536
+            data = b""
+            pos = end
+            while pos > 0 and data.count(b"\n") <= n:
+                read_size = min(block, pos)
+                pos -= read_size
+                f.seek(pos)
+                data = f.read(read_size) + data
+    except OSError:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return lines[-n:]
+
+
+def _watch_repeated_error(lines: List[str]) -> Optional[str]:
+    """The first log-tail line matching an error signature that recurs at
+    least ``WATCH_REPEAT_THRESHOLD`` times verbatim, truncated to 200 chars,
+    or ``None``. A description of what was observed, not a verdict."""
+    counts: dict = {}
+    order: List[str] = []
+    for line in lines:
+        if not _WATCH_ERROR_LINE_RE.search(line):
+            continue
+        if line not in counts:
+            order.append(line)
+        counts[line] = counts.get(line, 0) + 1
+    for line in order:
+        if counts[line] >= WATCH_REPEAT_THRESHOLD:
+            return line[:200]
+    return None
+
+
+def _watch_read_signals(lines: List[str]) -> tuple[int, Optional[dict]]:
+    """Distinct ``Read <path>`` targets in the log tail, and the most-
+    repeated one when it recurs at least ``WATCH_REPEAT_THRESHOLD`` times."""
+    counts: dict = {}
+    order: List[str] = []
+    for line in lines:
+        m = _WATCH_READ_LINE_RE.search(line)
+        if not m:
+            continue
+        path = m.group(1)
+        if path not in counts:
+            order.append(path)
+        counts[path] = counts.get(path, 0) + 1
+    top_path = max(order, key=lambda p: counts[p], default=None)
+    top: Optional[dict] = None
+    if top_path is not None and counts[top_path] >= WATCH_REPEAT_THRESHOLD:
+        top = {"path": top_path, "count": counts[top_path]}
+    return len(order), top
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Emit a stateless, read-only JSON fact snapshot for one run.
+
+    Pure observation: no escalation policy, no thresholds-as-actions, no
+    network, no model calls, no mutations. Exits non-zero only when the run
+    name itself is unresolvable (matching ``cmd_status``); every other
+    failure mode (dead run, missing ``cwd`` file, git repo unreadable, log
+    unreadable) degrades individual fields to ``null`` rather than raising
+    or exiting non-zero, so a poller can call this every 30s forever.
+    """
+    name = _validate_run_name(args.name)
+    state_dir = _state_dir(name)
+    log_dir = _log_dir(name)
+    if not state_dir.is_dir() and not log_dir.is_dir():
+        sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
+
+    observed_at = _now_iso()
+    log = _log_file_for(name)
+
+    if not state_dir.is_dir():
+        # State dir gone, log survived: matches cmd_status's "not running
+        # (log preserved)" case — usually a reboot. The `cwd` state file is
+        # gone with it, so git facts are only available via an explicit
+        # --repo; every process fact is unknowable.
+        launch_error = _read(log_dir / "launch_error") or None
+        repo_arg: Optional[str] = getattr(args, "repo", None)
+        repo_path = Path(repo_arg) if repo_arg else None
+        payload = {
+            "schema": "agent-run.watch.v1",
+            "name": name,
+            "observed_at": observed_at,
+            "status": "not running (log preserved)",
+            "exit_code": None,
+            "pid": None,
+            "interactive": None,
+            "started_at": None,
+            "ended_at": None,
+            "elapsed_s": None,
+            "terminal": True,
+            "launch_error": launch_error,
+            "log": _watch_log_facts(log),
+            "repo": repo_arg,
+            "git": _watch_git_facts(repo_path, None) if repo_path is not None else None,
+            "signals": _watch_signals(log),
+        }
+        if args.json:
+            print(json.dumps(payload))
+        else:
+            print(
+                f"name={name} status={payload['status']} "
+                f"lines={(payload['log'] or {}).get('lines')}"
+            )
+        return 0
+
+    status = _effective_status(state_dir)
+    terminal = status in TERMINAL_STATUSES
+    pid_raw = _read(state_dir / "pid")
+    pid = int(pid_raw) if pid_raw.isdigit() else None
+    started_raw = _read(state_dir / "started_at") or None
+    ended_raw = _read(state_dir / "ended_at") or None
+    started_dt = _watch_parse_iso(started_raw) if started_raw else None
+    ended_dt = _watch_parse_iso(ended_raw) if ended_raw else None
+    exit_code_raw = _read(state_dir / "exit_code")
+    exit_code = int(exit_code_raw) if exit_code_raw.lstrip("-").isdigit() else None
+    interactive_raw = _read(state_dir / "interactive")
+    interactive = interactive_raw == "1" if interactive_raw in {"0", "1"} else None
+    launch_error = (
+        _read(state_dir / "launch_error") or _read(log_dir / "launch_error") or None
+    )
+
+    elapsed_s: Optional[float] = None
+    if started_dt is not None:
+        end_ref = ended_dt if (terminal and ended_dt is not None) else datetime.now(timezone.utc)
+        elapsed_s = max(0.0, (end_ref - started_dt).total_seconds())
+
+    repo_arg: Optional[str] = getattr(args, "repo", None)
+    repo_str = repo_arg or (_read(state_dir / "cwd") or None)
+    repo_path = Path(repo_str) if repo_str else None
+    git = _watch_git_facts(repo_path, started_dt) if repo_path is not None else None
+
+    payload = {
+        "schema": "agent-run.watch.v1",
+        "name": name,
+        "observed_at": observed_at,
+        "status": status,
+        "exit_code": exit_code,
+        "pid": pid,
+        "interactive": interactive,
+        "started_at": started_raw,
+        "ended_at": ended_raw,
+        "elapsed_s": elapsed_s,
+        "terminal": terminal,
+        "launch_error": launch_error,
+        "log": _watch_log_facts(log),
+        "repo": repo_str,
+        "git": git,
+        "signals": _watch_signals(log),
+    }
+    if args.json:
+        print(json.dumps(payload))
+        return 0
+    log_bytes = (payload["log"] or {}).get("bytes")
+    print(
+        f"name={name} status={status} pid={pid} elapsed_s={elapsed_s} "
+        f"terminal={terminal} log_bytes={log_bytes} repo={repo_str}"
+    )
+    return 0
+
+
+def _watch_log_facts(log: Optional[Path]) -> Optional[dict]:
+    """Byte/line/freshness facts for the run's log, or ``None`` if it
+    cannot be stat'd (missing, permission error, stale mount)."""
+    if log is None:
+        return None
+    try:
+        st = log.stat()
+    except OSError:
+        return None
+    mtime_age_s = max(0.0, time.time() - st.st_mtime)
+    return {
+        "path": str(log),
+        "bytes": st.st_size,
+        "lines": _log_line_count(log),
+        "mtime_age_s": mtime_age_s,
+        "growing": mtime_age_s < WATCH_LOG_GROWING_MAX_AGE_SECONDS,
+    }
+
+
+def _watch_signals(log: Optional[Path]) -> dict:
+    """Repeated-error and repeated-read signals over the log's last
+    ``WATCH_TAIL_LINES`` lines. Always returns a populated object (never
+    None) — a signals object with all-null fields when the log is
+    unreadable is still a valid, well-formed fact."""
+    lines = _watch_tail_lines(log, WATCH_TAIL_LINES)
+    distinct_files_read, top_repeated_read = _watch_read_signals(lines)
+    return {
+        "repeated_error": _watch_repeated_error(lines),
+        "distinct_files_read": distinct_files_read,
+        "top_repeated_read": top_repeated_read,
+    }
 
 
 # Logs are raw PTY captures of the wrapped TUI agent, which routinely enable
@@ -2696,6 +3021,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     _write(d / "started_at", _now_iso() + "\n")
     _write(d / "status", "starting\n")
     _write(d / "interactive", "1\n" if args.interactive else "0\n")
+    _write(d / "cwd", str(Path.cwd()) + "\n")
     (log_d / "log").touch()
     if prompt_file:
         # Snapshot the prompt-file path so introspection shows what was fed in,
@@ -3700,6 +4026,23 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_status.add_argument("name")
     sp_status.set_defaults(func=cmd_status)
 
+    sp_watch = sub.add_parser(
+        "watch",
+        help="print a stateless read-only JSON fact snapshot (log, git, "
+        "signals) for a poller to apply its own policy to",
+    )
+    sp_watch.add_argument("name")
+    sp_watch.add_argument(
+        "--json", action="store_true", help="emit the full JSON fact object"
+    )
+    sp_watch.add_argument(
+        "--repo",
+        default=None,
+        help="repo path for git facts; defaults to the run's recorded launch "
+        "cwd, else no git facts",
+    )
+    sp_watch.set_defaults(func=cmd_watch)
+
     sp_logs = sub.add_parser("logs", help="print last N lines of the log")
     sp_logs.add_argument("name")
     sp_logs.add_argument("n", nargs="?", type=_positive_int, default=50)
@@ -3916,7 +4259,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         break
 
     # Try to dispatch a known subcommand; otherwise treat as launch.
-    known_subcommands = {"status", "logs", "tail", "clean", "steer", "kill", "list", "reap", "help"}
+    known_subcommands = {"status", "watch", "logs", "tail", "clean", "steer", "kill", "list", "reap", "help"}
     if (
         raw
         and raw[0] in known_subcommands
