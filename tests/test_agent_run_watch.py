@@ -49,6 +49,7 @@ def _make_run(
     log_age_secs: Optional[float] = None,
     write_state: bool = True,
     write_log: bool = True,
+    process_identity: Optional[str] = None,
 ) -> tuple[Path, Path]:
     sd = state_root / name
     ld = log_root / name
@@ -68,6 +69,8 @@ def _make_run(
             (sd / "exit_code").write_text(f"{exit_code}\n")
         if cwd is not None:
             (sd / "cwd").write_text(cwd + "\n")
+        if process_identity is not None:
+            (sd / "process_identity").write_text(process_identity + "\n")
     if write_log:
         log_file = ld / "log"
         log_file.write_text(log_text)
@@ -79,6 +82,15 @@ def _make_run(
 
 def _watch_args(name: str, *, as_json: bool = True, repo: Optional[str] = None) -> argparse.Namespace:
     return argparse.Namespace(name=name, json=as_json, repo=repo)
+
+
+def _mock_verified_alive(monkeypatch, token: str = "linux:1000") -> str:
+    """Mock a pid as alive with a live identity of ``token``; the caller is
+    responsible for recording the same token as the run's process_identity
+    so watch's identity check matches."""
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _p: token)
+    return token
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -108,11 +120,11 @@ class TestStatusMapping:
     def test_running_alive_fresh_log_is_not_terminal(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
     ):
+        token = _mock_verified_alive(monkeypatch)
         _make_run(
             isolated_runs_root, isolated_log_root, "r1",
-            status="running", pid=111, log_age_secs=1,
+            status="running", pid=111, log_age_secs=1, process_identity=token,
         )
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         rc = agent_run.cmd_watch(_watch_args("r1"))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
@@ -149,6 +161,96 @@ class TestStatusMapping:
         assert payload["status"] == "died"
         assert payload["terminal"] is True
 
+    def test_identity_match_reports_running(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        token = _mock_verified_alive(monkeypatch, token="linux:5000")
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r25",
+            status="running", pid=111, log_age_secs=1, process_identity=token,
+        )
+        rc = agent_run.cmd_watch(_watch_args("r25"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "running"
+        assert payload["terminal"] is False
+
+    def test_identity_mismatch_reports_died_and_terminal(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(agent_run, "_process_identity", lambda _p: "linux:9999")
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r26",
+            status="running", pid=111, log_age_secs=1, process_identity="linux:1111",
+        )
+        rc = agent_run.cmd_watch(_watch_args("r26"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "died"
+        assert payload["terminal"] is True
+
+    def test_no_identity_recorded_reports_unverified(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r27",
+            status="running", pid=111, log_age_secs=1,
+        )
+        rc = agent_run.cmd_watch(_watch_args("r27"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "unverified"
+        assert payload["terminal"] is False
+
+    def test_unreadable_identity_reports_unverified(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(agent_run, "_process_identity", lambda _p: None)
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r28",
+            status="running", pid=111, log_age_secs=1, process_identity="linux:1111",
+        )
+        rc = agent_run.cmd_watch(_watch_args("r28"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "unverified"
+        assert payload["terminal"] is False
+
+    def test_status_cmd_unchanged_for_run_with_no_process_identity(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """Proves `_effective_status` itself was not altered: `cmd_status`
+        must still print "running" for a live pid with no identity token,
+        even though `watch` reports "unverified" for the same run."""
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r29",
+            status="running", pid=111, log_age_secs=1,
+        )
+        rc = agent_run.cmd_status(argparse.Namespace(name="r29"))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert out.startswith("name=r29 status=running ")
+
+    def test_logs_cmd_unchanged_for_run_with_no_process_identity(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """`cmd_logs` never calls `_effective_status` (it has no status line
+        to print); this proves it is unaffected by identity verification
+        by printing its usual log-tail output for a run with no identity
+        token recorded, the same as it would before this change."""
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r30",
+            status="running", pid=111, log_text="line-a\nline-b\n",
+        )
+        rc = agent_run.cmd_logs(argparse.Namespace(name="r30", n=50))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert out == "line-a\nline-b\n"
+
     def test_schema_and_exact_keys(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
     ):
@@ -171,11 +273,11 @@ class TestStatusMapping:
     def test_human_output_is_not_json(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
     ):
+        token = _mock_verified_alive(monkeypatch)
         _make_run(
             isolated_runs_root, isolated_log_root, "r5",
-            status="running", pid=111, log_age_secs=1,
+            status="running", pid=111, log_age_secs=1, process_identity=token,
         )
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         rc = agent_run.cmd_watch(_watch_args("r5", as_json=False))
         assert rc == 0
         out = capsys.readouterr().out

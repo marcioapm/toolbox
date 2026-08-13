@@ -81,6 +81,10 @@ eligible for garbage collection once old enough (see `reap` below).
 Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 
     status       starting | running | done | failed | launch_failed | died | killed
+                 (`watch` additionally reports two values computed rather
+                 than persisted here: `stalled` — pid alive, log idle past
+                 the threshold; `unverified` — pid alive but its identity
+                 could not be confirmed against a recorded launch token)
     exit_code    numeric exit code (after completion)
     pid          runner process id
     pgid         process group id (also the `kill --force` fallback target)
@@ -1101,6 +1105,43 @@ def _effective_status(state_dir: Path, idle_threshold: Optional[float] = None) -
     return "running"
 
 
+def _watch_effective_status(state_dir: Path, idle_threshold: Optional[float] = None) -> str:
+    """`watch`'s liveness resolution: layers pid-identity verification on top
+    of ``_effective_status``'s raw/pid/idle result, without altering that
+    shared function's behaviour for ``cmd_status``/``cmd_logs``/``cmd_list``.
+
+    When the resolved status is "running" or "stalled" (both imply an alive
+    pid), the live process's identity is compared against the token recorded
+    at launch: a mismatch means the pid was recycled by an unrelated process
+    and the run is reported "died"; a live pid whose identity cannot be
+    confirmed at all (no token recorded, or the token is unreadable) is
+    reported "unverified" rather than "running".
+
+    ``_gc_pid_is_live_runner`` treats that same unverifiable case as
+    conservatively still-live, because GC's safe direction is never deleting
+    state out from under a run it can't rule out. `watch`'s safe direction is
+    the opposite — an unconfirmable pid must never be reported as a healthy
+    "running" run — so the two intentionally diverge on this case.
+    """
+    status = _effective_status(state_dir, idle_threshold)
+    if status not in {"running", "stalled"}:
+        return status
+    pid_raw = _read(state_dir / "pid")
+    try:
+        pid = int(pid_raw)
+    except (TypeError, ValueError):
+        return "unverified"
+    recorded = _read(state_dir / "process_identity")
+    if not recorded:
+        return "unverified"
+    live = _process_identity(pid)
+    if live is None:
+        return "unverified"
+    if live != recorded:
+        return "died"
+    return status
+
+
 def _opportunistic_heal(state_root: Optional[Path] = None) -> None:
     """Mark clearly-dead (pid gone) "running"/"starting" runs as "died".
 
@@ -1656,6 +1697,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
     unreadable) degrades individual fields to ``null`` rather than raising
     or exiting non-zero, so a poller can call this every 30s forever.
 
+    ``status`` is resolved via ``_watch_effective_status``, which layers pid-
+    identity verification on top of the module's shared raw/pid/idle status
+    logic: an alive pid whose recorded launch identity does not match the
+    live process's is a recycled pid and reports "died"; an alive pid whose
+    identity cannot be confirmed at all reports "unverified" rather than
+    "running", since this contract must never claim a run is healthy on
+    weaker evidence than that.
+
     ``observation_error`` is ``null`` on every normal path. If observation
     hits an exception no individual-field degradation anticipated, the
     top-level guard fires: the full contract is still emitted with every
@@ -1751,7 +1800,7 @@ def _cmd_watch_observe(
             )
         return 0
 
-    status = _effective_status(state_dir)
+    status = _watch_effective_status(state_dir)
     terminal = status in TERMINAL_STATUSES
     pid_raw = _read(state_dir / "pid")
     pid = _safe_int(pid_raw)
