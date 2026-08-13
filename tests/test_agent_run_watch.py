@@ -518,10 +518,12 @@ class TestTerminalDerivability:
 # ---------------------------------------------------------------------------
 
 class TestUnresolvable:
-    def test_unknown_run_exits_nonzero(self, isolated_runs_root, isolated_log_root):
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run.cmd_watch(_watch_args("nope"))
-        assert exc_info.value.code != 0
+    def test_unknown_run_exits_2_with_empty_stdout(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        rc = agent_run.cmd_watch(_watch_args("nope"))
+        assert rc == 2
+        assert capsys.readouterr().out == ""
 
     def test_missing_state_dir_surviving_log_dir(
         self, isolated_runs_root, isolated_log_root, capsys
@@ -1647,6 +1649,44 @@ class TestNeverRaise:
         assert payload["git_error"] is None
 
 
+class TestExitCodes:
+    """The three ``cmd_watch`` exit codes must stay distinct: 2 for an
+    unresolvable run name (nothing printed), 0 for a valid contract (even
+    one with ``observation_error`` set), and cmd_status must be unaffected."""
+
+    def test_unresolvable_name_exits_2_with_empty_stdout(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        rc = agent_run.cmd_watch(_watch_args("does-not-exist"))
+        assert rc == 2
+        assert capsys.readouterr().out == ""
+
+    def test_internal_observation_failure_exits_0_with_valid_contract(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "exitcode-crash",
+            status="running", pid=111, log_age_secs=1,
+        )
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("synthetic crash")
+
+        monkeypatch.setattr(agent_run, "_effective_status", _boom)
+        rc = agent_run.cmd_watch(_watch_args("exitcode-crash"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert payload["observation_error"] is not None
+
+    def test_cmd_status_unaffected_by_watch_exit_code_split(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.cmd_status(argparse.Namespace(name="does-not-exist"))
+        assert exc_info.value.code != 0
+
+
 class TestLaunchWritesCwd:
     def test_launch_records_absolute_cwd(
         self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path
@@ -1819,11 +1859,12 @@ class TestIsDirSafe:
         assert isinstance(payload["observation_error"], str)
         assert payload["observation_error"]
 
-    def test_cmd_watch_unresolvable_run_name_is_unchanged(
-        self, isolated_runs_root, isolated_log_root
+    def test_cmd_watch_unresolvable_run_name_exits_2_with_empty_stdout(
+        self, isolated_runs_root, isolated_log_root, capsys
     ):
-        with pytest.raises(SystemExit, match="no run named"):
-            agent_run.cmd_watch(_watch_args("does-not-exist"))
+        rc = agent_run.cmd_watch(_watch_args("does-not-exist"))
+        assert rc == 2
+        assert capsys.readouterr().out == ""
 
     def test_cmd_watch_eloop_symlink_state_dir_treated_as_absent(
         self, isolated_runs_root, isolated_log_root, capsys

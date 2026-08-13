@@ -1964,11 +1964,26 @@ def cmd_watch(args: argparse.Namespace) -> int:
     """Emit a stateless, read-only JSON fact snapshot for one run.
 
     Pure observation: no escalation policy, no thresholds-as-actions, no
-    network, no model calls, no mutations. Exits non-zero only when the run
-    name itself is unresolvable (matching ``cmd_status``); every other
-    failure mode (dead run, missing ``cwd`` file, git repo unreadable, log
-    unreadable) degrades individual fields to ``null`` rather than raising
-    or exiting non-zero, so a poller can call this every 30s forever.
+    network, no model calls, no mutations. Exit codes carry three distinct
+    meanings a poller must be able to tell apart:
+
+        0  a valid contract was printed. This includes the case where
+           observation itself failed unexpectedly (see below) — the
+           contract still came out, with ``observation_error`` set instead
+           of null, so the poller has a fact object to act on either way.
+        1  the tool itself failed before it could print anything (e.g. an
+           invalid run name) — nothing was observed and nothing was printed.
+        2  the run name is unresolvable: no state dir and no log dir exist
+           for it. Stdout is empty. This is the one code a poller should
+           treat as "stop polling this name", as distinct from 1 (the tool
+           is broken) or 0 with ``observation_error`` set (the tool ran but
+           couldn't observe this particular run).
+
+    Every other failure mode (dead run, missing ``cwd`` file, git repo
+    unreadable, log unreadable) degrades individual fields to ``null``
+    rather than raising or exiting non-zero, so a poller can call this
+    every 30s forever. ``cmd_status`` is unaffected by this split — it
+    keeps exiting 1 for an unresolvable name, as before.
 
     ``status`` is resolved via ``_watch_effective_status``, which layers pid-
     identity verification on top of the module's shared raw/pid/idle status
@@ -1998,7 +2013,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
     state_dir = _state_dir(name)
     log_dir = _log_dir(name)
     if not _is_dir_safe(state_dir) and not _is_dir_safe(log_dir):
-        sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
+        # Distinct from the never-raise guard below: this is "there is
+        # nothing to observe", not "observation broke". Empty stdout, exit
+        # 2, so a poller can tell it apart from both exit 1 (the tool
+        # itself failed) and exit 0 with observation_error set (the tool
+        # ran but couldn't observe this run).
+        print(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}", file=sys.stderr)
+        return 2
 
     # Everything below observes best-effort facts about a run this process
     # does not control; an unanticipated failure here must still print the
