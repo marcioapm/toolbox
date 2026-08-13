@@ -681,6 +681,55 @@ class TestRepoResolution:
         assert payload["git"]["last_commit_age_s"] is not None
 
 
+class TestRepoArgValidation:
+    @pytest.mark.parametrize("bad_repo", ["", "   ", "\t"])
+    def test_empty_or_whitespace_repo_is_rejected(
+        self, isolated_runs_root, isolated_log_root, bad_repo
+    ):
+        _make_run(isolated_runs_root, isolated_log_root, "repoval1")
+        with pytest.raises(SystemExit):
+            agent_run.cmd_watch(_watch_args("repoval1", repo=bad_repo))
+
+    def test_rejecting_empty_repo_mutates_nothing(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        sd, _ld = _make_run(isolated_runs_root, isolated_log_root, "repoval2")
+        before = {p.name: p.read_text() for p in sd.iterdir()}
+        with pytest.raises(SystemExit):
+            agent_run.cmd_watch(_watch_args("repoval2", repo=""))
+        after = {p.name: p.read_text() for p in sd.iterdir()}
+        assert before == after
+
+    def test_relative_repo_is_resolved_to_absolute(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        repo = tmp_path / "relrepo"
+        _init_repo(repo)
+        _make_run(isolated_runs_root, isolated_log_root, "repoval3")
+        monkeypatch.chdir(tmp_path)
+        rc = agent_run.cmd_watch(_watch_args("repoval3", repo="relrepo"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["repo"] == str(repo.resolve())
+        assert Path(payload["repo"]).is_absolute()
+
+    def test_cwd_file_first_line_only_is_echoed(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        sd, _ld = _make_run(
+            isolated_runs_root, isolated_log_root, "repoval4",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+        )
+        (sd / "cwd").write_text(f"{repo}\nsome-second-line\n")
+        rc = agent_run.cmd_watch(_watch_args("repoval4"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["repo"] == str(repo)
+        assert "\n" not in payload["repo"]
+
+
 # ---------------------------------------------------------------------------
 # git_error discriminator
 # ---------------------------------------------------------------------------

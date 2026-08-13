@@ -1971,6 +1971,27 @@ def _watch_read_signals(lines: List[str]) -> tuple[int, Optional[dict]]:
     return len(counts), top
 
 
+def _watch_validate_repo_arg(repo_arg: Optional[str]) -> Optional[str]:
+    """Validate and resolve an explicit ``--repo`` value before it is ever
+    used to locate git facts.
+
+    An empty/whitespace-only value is rejected outright rather than treated
+    as absent: ``--repo ""`` is a caller mistake (e.g. an unset shell
+    variable interpolated blank), and silently falling back to the run's
+    recorded launch ``cwd`` would hide that mistake instead of surfacing
+    it. Rejecting mutates nothing — this runs before any file is touched.
+
+    Resolved (``Path.resolve()``) so a relative ``--repo`` is echoed back
+    as the absolute path git actually read, matching the recorded launch
+    ``cwd`` — which is always absolute — instead of leaving the two
+    representations inconsistent."""
+    if repo_arg is None:
+        return None
+    if not repo_arg.strip():
+        sys.exit("agent-run: --repo must not be empty or whitespace-only")
+    return str(Path(repo_arg).resolve())
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Emit a stateless, read-only JSON fact snapshot for one run.
 
@@ -2027,6 +2048,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
     "repeated" signals in one payload answer the same question.
     """
     name = _validate_run_name(args.name)
+    repo_arg = _watch_validate_repo_arg(getattr(args, "repo", None))
+    args.repo = repo_arg
     state_dir = _state_dir(name)
     log_dir = _log_dir(name)
     if not _is_dir_safe(state_dir) and not _is_dir_safe(log_dir):
@@ -2090,6 +2113,16 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
     return payload
 
 
+def _watch_read_cwd_file(path: Path) -> str:
+    """Read the recorded launch ``cwd``, taking only the first line: it is
+    written as a single trusted line by ``cmd_launch``, but a state file is
+    still untrusted input by the time ``watch`` reads it — a multi-line
+    value must not be echoed back verbatim (e.g. with an embedded
+    newline) into the JSON contract's ``repo`` field."""
+    raw = _read(path)
+    return raw.splitlines()[0] if raw else ""
+
+
 def _watch_repo_git(repo: Optional[str], started_at: Optional[datetime]) -> _WatchGitFactsResult:
     """Git facts for the run's repo, or the ``no_repo_path`` discriminator
     when no repo path is known at all."""
@@ -2151,7 +2184,7 @@ def _cmd_watch_observe(
         end_ref = ended_dt if (terminal and ended_dt is not None) else datetime.now(timezone.utc)
         elapsed_s = max(0.0, (end_ref - started_dt).total_seconds())
 
-    repo_str = repo_arg or (_read(state_dir / "cwd") or None)
+    repo_str = repo_arg or (_watch_read_cwd_file(state_dir / "cwd") or None)
     git, git_error = _watch_repo_git(repo_str, started_dt)
 
     payload = _watch_payload(
