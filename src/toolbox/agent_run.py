@@ -309,6 +309,10 @@ WATCH_LOG_GROWING_MAX_AGE_SECONDS: float = 60.0
 WATCH_TAIL_LINES: int = 200
 WATCH_REPEAT_THRESHOLD: int = 3
 WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS: float = 2.5
+WATCH_TAIL_READ_BLOCK_BYTES: int = 65536
+# A 30s poll loop must not read an unbounded log: cap how far the tail scan
+# walks back regardless of how few newlines it has found.
+WATCH_TAIL_MAX_BYTES: int = 256 * 1024
 
 # Git env vars that redirect a command at a different repo/index than the one
 # named on the command line; a poll must not inherit these from its caller.
@@ -1575,21 +1579,29 @@ def _watch_git_facts(repo: Path, started_at: Optional[datetime]) -> Optional[dic
 
 def _watch_tail_lines(log: Optional[Path], n: int) -> List[str]:
     """Last ``n`` decoded text lines of a log, or ``[]`` on any read failure
-    (missing file, permission error, stale NFS handle)."""
+    (missing file, permission error, stale NFS handle). The backward scan
+    never reads past ``WATCH_TAIL_MAX_BYTES``, even if fewer than ``n``
+    newlines have been found by then; a truncated scan returns whatever
+    lines were found within the cap rather than the full tail."""
     if log is None:
         return []
     try:
         with log.open("rb") as f:
             f.seek(0, os.SEEK_END)
             end = f.tell()
-            block = 65536
-            data = b""
+            chunks: List[bytes] = []
             pos = end
-            while pos > 0 and data.count(b"\n") <= n:
-                read_size = min(block, pos)
+            newline_count = 0
+            bytes_read = 0
+            while pos > 0 and newline_count <= n and bytes_read < WATCH_TAIL_MAX_BYTES:
+                read_size = min(WATCH_TAIL_READ_BLOCK_BYTES, pos)
                 pos -= read_size
                 f.seek(pos)
-                data = f.read(read_size) + data
+                chunk = f.read(read_size)
+                newline_count += chunk.count(b"\n")
+                bytes_read += len(chunk)
+                chunks.append(chunk)
+            data = b"".join(reversed(chunks))
     except OSError:
         return []
     lines = data.decode("utf-8", errors="replace").splitlines()

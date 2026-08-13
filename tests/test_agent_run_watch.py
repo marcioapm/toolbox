@@ -785,3 +785,48 @@ class TestLaunchWritesCwd:
         while not (sd / "cwd").exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert (sd / "cwd").read_text().strip() == str(workdir.resolve())
+
+
+# ---------------------------------------------------------------------------
+# _watch_tail_lines: byte-bounded backward scan
+# ---------------------------------------------------------------------------
+
+class TestWatchTailLinesByteBound:
+    def test_ordinary_tail_is_unchanged(self, tmp_path):
+        lines = [f"line {i}\n" for i in range(500)]
+        log = tmp_path / "log"
+        log.write_text("".join(lines))
+        result = agent_run._watch_tail_lines(log, 50)
+        assert result == [f"line {i}" for i in range(450, 500)]
+
+    def test_byte_cap_enforced_on_newline_free_file(self, tmp_path):
+        log = tmp_path / "log"
+        log.write_bytes(b"x" * (2 * 1024 * 1024))
+        result = agent_run._watch_tail_lines(log, 200)
+        total_chars = sum(len(line) for line in result)
+        max_expected = agent_run.WATCH_TAIL_MAX_BYTES + agent_run.WATCH_TAIL_READ_BLOCK_BYTES
+        assert total_chars <= max_expected
+
+    def test_cap_with_sparse_newlines(self, tmp_path):
+        log = tmp_path / "log"
+        with log.open("wb") as f:
+            f.write(b"first\n")
+            f.write(b"second\n")
+            f.write(b"y" * (2 * 1024 * 1024))
+        result = agent_run._watch_tail_lines(log, 200)
+        total_chars = sum(len(line) for line in result)
+        max_expected = agent_run.WATCH_TAIL_MAX_BYTES + agent_run.WATCH_TAIL_READ_BLOCK_BYTES
+        assert total_chars <= max_expected
+        assert "first" not in result
+
+    def test_small_file_returns_every_line(self, tmp_path):
+        log = tmp_path / "log"
+        log.write_text("a\nb\nc\n")
+        result = agent_run._watch_tail_lines(log, 200)
+        assert result == ["a", "b", "c"]
+
+    def test_empty_file_returns_empty_list(self, tmp_path):
+        log = tmp_path / "log"
+        log.write_bytes(b"")
+        result = agent_run._watch_tail_lines(log, 200)
+        assert result == []
