@@ -1080,6 +1080,36 @@ class TestLogFacts:
         payload = json.loads(capsys.readouterr().out)
         assert payload["log"]["growing"] is False
 
+    def test_future_mtime_beyond_tolerance_degrades_to_null_age_not_growing(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        # A log mtime an hour in the future (clock skew / NFS server-side
+        # timestamp) must not read as freshly growing — that is precisely
+        # the wrong direction for a contract that fails toward firing.
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r15b",
+            status="running", pid=1, log_age_secs=-3600.0,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("r15b"))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["log"]["mtime_age_s"] is None
+        assert payload["log"]["growing"] is False
+
+    def test_small_future_mtime_within_tolerance_still_clamps_to_zero(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r15c",
+            status="running", pid=1,
+            log_age_secs=-(agent_run.WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS / 2),
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("r15c"))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["log"]["mtime_age_s"] == 0.0
+        assert payload["log"]["growing"] is True
+
     def test_missing_log_file_yields_null_log(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
     ):

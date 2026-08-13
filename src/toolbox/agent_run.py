@@ -306,6 +306,15 @@ IDLE_STALL_SECONDS: float = _parse_idle_stall_seconds()
 # a liveness verdict; the consumer decides what a stale log means.
 WATCH_LOG_GROWING_MAX_AGE_SECONDS: float = 60.0
 
+# A negative mtime delta (log mtime in the future relative to this host's
+# clock) means the two clocks disagree, not that the log is fresh: over ssh
+# against a skewed clock or an NFS server-side timestamp, clamping that to
+# 0.0 would report a long-dead log as freshly growing — the wrong direction
+# for a contract that must fail toward firing. A small negative delta within
+# this tolerance is ordinary clock jitter and still clamps to 0; anything
+# past it degrades mtime_age_s to null instead of a confident (wrong) number.
+WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS: float = 2.0
+
 # Thresholds for `watch`'s repeated-line/repeated-read signals (see
 # cmd_watch). Named constants, not inline literals, so a consumer can see
 # and tune the definition without touching the scan logic. These describe
@@ -2178,14 +2187,22 @@ def _watch_log_facts(log: Optional[Path]) -> Optional[dict]:
         if f is None:
             return None
         st = os.fstat(f.fileno())
-        mtime_age_s = max(0.0, time.time() - st.st_mtime)
+        delta = time.time() - st.st_mtime
+        if delta < -WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS:
+            # Clock skew, not freshness: a log claiming to be from the
+            # future is unobservable, not confidently growing.
+            mtime_age_s: Optional[float] = None
+            growing = False
+        else:
+            mtime_age_s = max(0.0, delta)
+            growing = mtime_age_s < WATCH_LOG_GROWING_MAX_AGE_SECONDS
         lines = sum(1 for _ in f)
         return {
             "path": str(log),
             "bytes": st.st_size,
             "lines": lines,
             "mtime_age_s": mtime_age_s,
-            "growing": mtime_age_s < WATCH_LOG_GROWING_MAX_AGE_SECONDS,
+            "growing": growing,
         }
 
 
