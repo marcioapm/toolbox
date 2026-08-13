@@ -1581,3 +1581,94 @@ class TestWatchTailLinesByteBound:
         log.write_bytes(b"")
         result = agent_run._watch_tail_lines(log, 200)
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _is_dir_safe: the existence check ahead of cmd_watch's/cmd_status's guard
+# ---------------------------------------------------------------------------
+
+class TestIsDirSafe:
+    ROOT_SKIP = pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root ignores permission bits",
+    )
+
+    def test_returns_true_for_a_real_directory(self, tmp_path):
+        assert agent_run._is_dir_safe(tmp_path) is True
+
+    def test_returns_false_for_a_missing_path(self, tmp_path):
+        assert agent_run._is_dir_safe(tmp_path / "nope") is False
+
+    def test_returns_false_for_a_file(self, tmp_path):
+        f = tmp_path / "f"
+        f.write_text("x")
+        assert agent_run._is_dir_safe(f) is False
+
+    @ROOT_SKIP
+    def test_returns_false_instead_of_raising_when_parent_is_unreadable(self, tmp_path):
+        parent = tmp_path / "unreadable"
+        parent.mkdir()
+        target = parent / "child"
+        target.mkdir()
+        parent.chmod(0o000)
+        try:
+            assert agent_run._is_dir_safe(target) is False
+        finally:
+            parent.chmod(0o755)
+
+    @ROOT_SKIP
+    def test_cmd_watch_exits_zero_with_full_payload_when_state_root_unreadable(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "w1",
+            status="running", pid=111, log_age_secs=1,
+        )
+        isolated_runs_root.chmod(0o000)
+        try:
+            rc = agent_run.cmd_watch(_watch_args("w1"))
+        finally:
+            isolated_runs_root.chmod(0o755)
+        assert rc == 0
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert isinstance(payload["observation_error"], str)
+        assert payload["observation_error"]
+
+    def test_cmd_watch_unresolvable_run_name_is_unchanged(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        with pytest.raises(SystemExit, match="no run named"):
+            agent_run.cmd_watch(_watch_args("does-not-exist"))
+
+    def test_cmd_watch_eloop_symlink_state_dir_treated_as_absent(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        state_link = isolated_runs_root / "w2"
+        state_link.symlink_to(state_link)  # self-referential -> ELOOP on stat
+        log_dir = isolated_log_root / "w2"
+        log_dir.mkdir(parents=True)
+        (log_dir / "log").write_text("line1\n")
+        rc = agent_run.cmd_watch(_watch_args("w2"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "not running (log preserved)"
+        assert payload["observation_error"] is None
+
+    @ROOT_SKIP
+    def test_cmd_status_does_not_raise_when_state_root_unreadable(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "w3",
+            status="running", pid=111, log_age_secs=1,
+        )
+        isolated_runs_root.chmod(0o000)
+        try:
+            rc = agent_run.cmd_status(argparse.Namespace(name="w3"))
+        finally:
+            isolated_runs_root.chmod(0o755)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "not running (log preserved)" in out

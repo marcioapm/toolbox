@@ -715,13 +715,24 @@ def _log_file_for(name: str) -> Optional[Path]:
     """Resolve the persistent log for a run, preferring the new split
     layout ($AGENT_RUN_LOG_DIR/<name>/log) and falling back to the old
     single-directory layout ($AGENT_RUN_STATE_DIR/<name>/log) so in-flight
-    runs started before this split remain readable."""
+    runs started before this split remain readable.
+
+    Never raises: like ``Path.is_dir()``, ``Path.exists()`` propagates
+    ``OSError`` (e.g. an unreadable parent directory) instead of returning
+    ``False``, and this is reachable from ``cmd_status``, which has no
+    enclosing never-raise guard."""
     new_log = _log_dir(name) / "log"
-    if new_log.exists():
-        return new_log
+    try:
+        if new_log.exists():
+            return new_log
+    except OSError:
+        pass
     old_log = _state_dir(name) / "log"
-    if old_log.exists():
-        return old_log
+    try:
+        if old_log.exists():
+            return old_log
+    except OSError:
+        pass
     return None
 
 
@@ -752,6 +763,21 @@ def _path_entry_exists(path: Path) -> bool:
     except FileNotFoundError:
         return False
     return True
+
+
+def _is_dir_safe(path: Path) -> bool:
+    """Like ``Path.is_dir()``, but never raises.
+
+    ``Path.is_dir()`` propagates ``OSError`` (e.g. ``PermissionError`` from
+    an unreadable parent directory) instead of returning ``False``. The
+    existence checks that gate `cmd_watch`/`cmd_status` must degrade to a
+    full payload with ``observation_error`` set rather than crash, so an
+    unresolvable run name stays the only exit-non-zero case.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
 
 
 def _require_state(name: str) -> Path:
@@ -1541,10 +1567,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     state_dir = _state_dir(name)
     log_dir = _log_dir(name)
-    if not state_dir.is_dir() and not log_dir.is_dir():
+    if not _is_dir_safe(state_dir) and not _is_dir_safe(log_dir):
         sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
     lines = _log_line_count(_log_file_for(name))
-    if not state_dir.is_dir():
+    if not _is_dir_safe(state_dir):
         # The state dir is volatile; a launch failure recorded alongside the
         # log outlives it and is exactly what a post-reboot status needs.
         launch_error = _read(_log_dir(name) / "launch_error")
@@ -1928,7 +1954,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     state_dir = _state_dir(name)
     log_dir = _log_dir(name)
-    if not state_dir.is_dir() and not log_dir.is_dir():
+    if not _is_dir_safe(state_dir) and not _is_dir_safe(log_dir):
         sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
 
     # Everything below observes best-effort facts about a run this process
