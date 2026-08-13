@@ -111,6 +111,11 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     cwd          absolute launch-time working directory (used by `watch` to
                  locate the repo for git facts; absent on runs started
                  before this field existed)
+    launch_head  full git commit hash HEAD pointed to at launch, if `cwd`
+                 was a git repo (used by `watch` to count commits made
+                 during the run without trusting commit timestamps; absent
+                 when `cwd` wasn't a repo, or on runs started before this
+                 field existed)
     stdin        FIFO for steering (interactive only)
     reap_reason  set by `agent-run reap` when it changes status (died/killed)
     tmp_dir      absolute path to this run's scratch dir (see below)
@@ -1773,7 +1778,7 @@ class _WatchGitFactsResult(NamedTuple):
     git_error: Optional[str]
 
 
-def _watch_git_facts_checked(repo: Path, started_at: Optional[datetime]) -> _WatchGitFactsResult:
+def _watch_git_facts_checked(repo: Path, launch_head: Optional[str]) -> _WatchGitFactsResult:
     """Read-only git facts for ``repo``, plus why they're missing on failure
     — not a git repo, git not installed, a wedged command hitting the
     bounded timeout, a brand-new repo with no commits yet, or a repo mid-
@@ -1782,9 +1787,20 @@ def _watch_git_facts_checked(repo: Path, started_at: Optional[datetime]) -> _Wat
     mutates the repo or contends with an agent's own git operations
     (``--no-optional-locks``).
 
-    ``commits_since_start`` is null, not 0, when ``started_at`` itself is
-    unknown (e.g. ``--repo`` given but the run's own state dir is gone) —
-    the count is genuinely undetermined, not zero.
+    ``commits_since_start`` is ``rev-list <launch_head>..HEAD --count`` —
+    which commit is HEAD, not when git says it was authored/committed,
+    since the committing process controls those timestamps and can
+    backdate them. It is null, not 0, when ``launch_head`` itself is
+    unknown (no recorded launch HEAD — e.g. a run started before this
+    field existed, or ``cwd`` wasn't a git repo at launch): the count is
+    genuinely undetermined, not zero.
+
+    ``untracked_files`` counts working-tree files git doesn't track yet
+    (``status --porcelain``'s ``??`` entries) — real agent output that the
+    tracked-file-only diff counters below would otherwise miss entirely.
+    Ignored files are deliberately excluded from every counter: an agent's
+    own build/dependency output is not progress, and ``.gitignore`` is the
+    project's explicit statement of what that output is.
 
     ``toplevel`` is the work-tree root git resolved for this observation
     (from ``rev-parse --show-toplevel``, resolved), or ``None`` if that
@@ -1836,15 +1852,18 @@ def _watch_git_facts_checked(repo: Path, started_at: Optional[datetime]) -> _Wat
     if porcelain_outcome.stdout is None:
         return _WatchGitFactsResult(None, porcelain_outcome.error)
     porcelain = porcelain_outcome.stdout
+    # `git status --porcelain` already omits ignored paths by default, so
+    # counting "??" lines here counts exactly the untracked-and-not-ignored
+    # set — no separate ignored-file filtering needed.
+    untracked_files = sum(1 for line in porcelain.splitlines() if line.startswith("??"))
     shortstat_outcome = run_git(["diff", "HEAD", "--shortstat"])
     if shortstat_outcome.stdout is None:
         return _WatchGitFactsResult(None, shortstat_outcome.error)
     files_changed, insertions, deletions = _watch_parse_shortstat(shortstat_outcome.stdout)
 
     commits_since_start: Optional[int] = None
-    if started_at is not None:
-        since = started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-        count_outcome = run_git(["rev-list", "--count", f"--since={since}", "HEAD"])
+    if launch_head is not None:
+        count_outcome = run_git(["rev-list", "--count", f"{launch_head}..HEAD"])
         if count_outcome.stdout is None:
             return _WatchGitFactsResult(None, count_outcome.error)
         try:
@@ -1880,6 +1899,7 @@ def _watch_git_facts_checked(repo: Path, started_at: Optional[datetime]) -> _Wat
             "files_changed": files_changed,
             "insertions": insertions,
             "deletions": deletions,
+            "untracked_files": untracked_files,
             "commits_since_start": commits_since_start,
             "last_commit_age_s": last_commit_age_s,
             "toplevel": toplevel,
@@ -2041,6 +2061,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
     this repo" (alarming) apart from "observed it, there is nothing there"
     (benign), which a bare ``git: null`` cannot express on its own.
 
+    ``git``, when populated, has exactly these keys: ``head``, ``dirty``,
+    ``files_changed``, ``insertions``, ``deletions`` (tracked-file diff
+    stats against HEAD), ``untracked_files`` (untracked, not-ignored
+    working-tree files — real agent output the tracked-file diff above
+    cannot see), ``commits_since_start`` (commits made after the run's
+    recorded launch HEAD, or ``null`` if no launch HEAD was recorded),
+    ``last_commit_age_s``, and ``toplevel``.
+
     ``signals.repeated_error`` and ``signals.top_repeated_read`` use the
     same winner rule — the most-repeated qualifying line/path in the log
     tail, as ``{"line"/"path": ..., "count": ...}``, or ``null`` if nothing
@@ -2123,12 +2151,12 @@ def _watch_read_cwd_file(path: Path) -> str:
     return raw.splitlines()[0] if raw else ""
 
 
-def _watch_repo_git(repo: Optional[str], started_at: Optional[datetime]) -> _WatchGitFactsResult:
+def _watch_repo_git(repo: Optional[str], launch_head: Optional[str]) -> _WatchGitFactsResult:
     """Git facts for the run's repo, or the ``no_repo_path`` discriminator
     when no repo path is known at all."""
     if not repo:
         return _WatchGitFactsResult(None, "no_repo_path")
-    return _watch_git_facts_checked(Path(repo), started_at)
+    return _watch_git_facts_checked(Path(repo), launch_head)
 
 
 def _cmd_watch_observe(
@@ -2185,7 +2213,8 @@ def _cmd_watch_observe(
         elapsed_s = max(0.0, (end_ref - started_dt).total_seconds())
 
     repo_str = repo_arg or (_watch_read_cwd_file(state_dir / "cwd") or None)
-    git, git_error = _watch_repo_git(repo_str, started_dt)
+    launch_head = _read(state_dir / "launch_head") or None
+    git, git_error = _watch_repo_git(repo_str, launch_head)
 
     payload = _watch_payload(
         name,
@@ -3567,6 +3596,13 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         cwd = None
     if cwd is not None:
         _write(d / "cwd", cwd + "\n")
+        # Best-effort: only recorded when cwd is itself a git repo. `watch`
+        # uses this instead of commit timestamps (which the committing
+        # process controls and can backdate) to count commits made during
+        # the run.
+        head_outcome = _watch_run_git_checked(Path(cwd), ["rev-parse", "HEAD"])
+        if head_outcome.stdout is not None:
+            _write(d / "launch_head", head_outcome.stdout.strip() + "\n")
     _write(d / "started_at", _now_iso() + "\n")
     _write(d / "status", "starting\n")
     _write(d / "interactive", "1\n" if args.interactive else "0\n")

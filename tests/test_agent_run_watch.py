@@ -48,6 +48,7 @@ def _make_run(
     ended_age_secs: Optional[float] = None,
     exit_code: Optional[int] = None,
     cwd: Optional[str] = None,
+    launch_head: Optional[str] = None,
     log_text: str = "some output\n",
     log_age_secs: Optional[float] = None,
     write_state: bool = True,
@@ -72,6 +73,8 @@ def _make_run(
             (sd / "exit_code").write_text(f"{exit_code}\n")
         if cwd is not None:
             (sd / "cwd").write_text(cwd + "\n")
+        if launch_head is not None:
+            (sd / "launch_head").write_text(launch_head + "\n")
         if process_identity is not None:
             (sd / "process_identity").write_text(process_identity + "\n")
     if write_log:
@@ -665,11 +668,13 @@ class TestRepoResolution:
     ):
         repo = tmp_path / "repo"
         _init_repo(repo)
-        # Run started now; make one more commit "after" the run started.
+        launch_head = agent_run._watch_run_git_checked(
+            repo, ["rev-parse", "HEAD"]
+        ).stdout.strip()
         _make_run(
             isolated_runs_root, isolated_log_root, "r13",
             status="done", pid=1, exit_code=0, ended_age_secs=1,
-            started_age_secs=5, cwd=str(repo),
+            started_age_secs=5, cwd=str(repo), launch_head=launch_head,
         )
         (repo / "b.txt").write_text("more\n")
         _git(repo, "add", "b.txt")
@@ -677,8 +682,60 @@ class TestRepoResolution:
         rc = agent_run.cmd_watch(_watch_args("r13"))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
-        assert payload["git"]["commits_since_start"] >= 1
+        assert payload["git"]["commits_since_start"] == 1
         assert payload["git"]["last_commit_age_s"] is not None
+
+    def test_commits_since_start_is_null_without_a_recorded_launch_head(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r13b",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            started_age_secs=5, cwd=str(repo),
+        )
+        rc = agent_run.cmd_watch(_watch_args("r13b"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"]["commits_since_start"] is None
+        assert "commits_since_start" in payload["git"]
+
+    def test_commits_since_start_counts_a_backdated_commit(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        """A commit's author/committer date is controlled by the committing
+        process and can be backdated; commits_since_start must count by HEAD
+        movement, not by trusting that timestamp."""
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        launch_head = agent_run._watch_run_git_checked(
+            repo, ["rev-parse", "HEAD"]
+        ).stdout.strip()
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r13c",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            started_age_secs=5, cwd=str(repo), launch_head=launch_head,
+        )
+        (repo / "b.txt").write_text("more\n")
+        subprocess.run(
+            ["git", "add", "b.txt"], cwd=repo, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "backdated"],
+            cwd=repo, check=True, capture_output=True,
+            env={
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.com",
+                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.com",
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00",
+                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00",
+            },
+        )
+        rc = agent_run.cmd_watch(_watch_args("r13c"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"]["commits_since_start"] == 1
 
 
 class TestRepoArgValidation:
@@ -997,9 +1054,8 @@ class TestGitTotalBudget:
             return _FakeResult()
 
         monkeypatch.setattr(agent_run.subprocess, "run", _slow_run)
-        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
         start = time.monotonic()
-        agent_run._watch_git_facts_checked(repo, started_at)
+        agent_run._watch_git_facts_checked(repo, "0" * 40)
         elapsed = time.monotonic() - start
         assert elapsed < agent_run.WATCH_GIT_TOTAL_BUDGET_SECONDS + 2.0
 
@@ -1017,8 +1073,7 @@ class TestGitTotalBudget:
             return _FakeResult()
 
         monkeypatch.setattr(agent_run.subprocess, "run", _fast_run)
-        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = agent_run._watch_git_facts_checked(repo, started_at).facts
+        result = agent_run._watch_git_facts_checked(repo, "0" * 40).facts
         assert result is not None
         assert len(seen_timeouts) == 7
         assert all(t <= agent_run.WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS for t in seen_timeouts)
@@ -1036,24 +1091,29 @@ class TestGitTotalBudget:
 
         monkeypatch.setattr(agent_run.subprocess, "run", _slow_run)
         monkeypatch.setattr(agent_run, "WATCH_GIT_TOTAL_BUDGET_SECONDS", 0.05)
-        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = agent_run._watch_git_facts_checked(repo, started_at).facts
+        result = agent_run._watch_git_facts_checked(repo, "0" * 40).facts
         assert result is None
 
     def test_happy_path_returns_fully_populated_facts(self, tmp_path):
         repo = tmp_path / "repo"
         _init_repo(repo)
+        launch_head = agent_run._watch_run_git_checked(
+            repo, ["rev-parse", "HEAD"]
+        ).stdout.strip()
+        (repo / "b.txt").write_text("more\n")
+        _git(repo, "add", "b.txt")
+        _git(repo, "commit", "-q", "-m", "second")
         expected_head = agent_run._watch_run_git_checked(
             repo, ["rev-parse", "--short", "HEAD"]
         ).stdout.strip()
-        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = agent_run._watch_git_facts_checked(repo, started_at).facts
+        result = agent_run._watch_git_facts_checked(repo, launch_head).facts
         assert result == {
             "head": expected_head,
             "dirty": False,
             "files_changed": 0,
             "insertions": 0,
             "deletions": 0,
+            "untracked_files": 0,
             "commits_since_start": 1,
             "last_commit_age_s": result["last_commit_age_s"],
             "toplevel": str(repo.resolve()),
@@ -1062,12 +1122,53 @@ class TestGitTotalBudget:
         assert result["last_commit_age_s"] >= 0.0
 
 
+class TestGitUntrackedFiles:
+    def test_untracked_file_is_counted_and_repo_reads_dirty(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        (repo / "new-agent-file").write_text("work\n")
+        _make_run(
+            isolated_runs_root, isolated_log_root, "untracked1",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+        rc = agent_run.cmd_watch(_watch_args("untracked1"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"]["dirty"] is True
+        assert payload["git"]["untracked_files"] == 1
+        # Tracked-file diff counters stay 0 — no tracked file changed.
+        assert payload["git"]["files_changed"] == 0
+
+    def test_ignored_file_is_not_counted(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        (repo / ".gitignore").write_text("generated/\n")
+        _git(repo, "add", ".gitignore")
+        _git(repo, "commit", "-q", "-m", "add gitignore")
+        (repo / "generated").mkdir()
+        (repo / "generated" / "work").write_text("build output\n")
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ignored1",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+        rc = agent_run.cmd_watch(_watch_args("ignored1"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"]["untracked_files"] == 0
+        assert payload["git"]["dirty"] is False
+
+
 class TestGitToplevel:
     def test_repo_at_its_own_root(self, tmp_path):
         repo = tmp_path / "repo"
         _init_repo(repo)
-        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
-        outcome = agent_run._watch_git_facts_checked(repo, started_at)
+        outcome = agent_run._watch_git_facts_checked(repo, None)
         assert outcome.git_error is None
         assert outcome.facts is not None
         assert outcome.facts["toplevel"] == str(repo.resolve())
@@ -1080,8 +1181,7 @@ class TestGitToplevel:
         (subdir / "b.txt").write_text("more\n")
         _git(repo, "add", "sub/b.txt")
         _git(repo, "commit", "-q", "-m", "second")
-        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
-        outcome = agent_run._watch_git_facts_checked(subdir, started_at)
+        outcome = agent_run._watch_git_facts_checked(subdir, None)
         assert outcome.git_error is None
         assert outcome.facts is not None
         assert outcome.facts["toplevel"] == str(repo.resolve())
@@ -1091,8 +1191,7 @@ class TestGitToplevel:
         _init_repo(outer)
         plain_subdir = outer / "plain-subdir"
         plain_subdir.mkdir()
-        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
-        outcome = agent_run._watch_git_facts_checked(plain_subdir, started_at)
+        outcome = agent_run._watch_git_facts_checked(plain_subdir, None)
         assert outcome.git_error is None
         assert outcome.facts is not None
         assert outcome.facts["toplevel"] == str(outer.resolve())
@@ -1818,6 +1917,55 @@ class TestLaunchWritesCwd:
         while not (sd / "cwd").exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert (sd / "cwd").read_text().strip() == str(workdir.resolve())
+
+    def test_launch_records_launch_head_when_cwd_is_a_repo(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path
+    ):
+        workdir = tmp_path / "launch_repo"
+        _init_repo(workdir)
+        expected_head = agent_run._watch_run_git_checked(
+            workdir, ["rev-parse", "HEAD"]
+        ).stdout.strip()
+        monkeypatch.chdir(workdir)
+        ns = argparse.Namespace(
+            command=["true"],
+            interactive=False,
+            prompt_file=None,
+            echo=False,
+            echo_interval=2.0,
+            submit_mode=None,
+            idle_timeout=None,
+            name="launched_repo",
+        )
+        agent_run.cmd_launch(ns)
+        sd = isolated_runs_root / "launched_repo"
+        deadline = time.monotonic() + 5.0
+        while not (sd / "launch_head").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert (sd / "launch_head").read_text().strip() == expected_head
+
+    def test_launch_skips_launch_head_when_cwd_is_not_a_repo(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path
+    ):
+        workdir = tmp_path / "launch_plain"
+        workdir.mkdir()
+        monkeypatch.chdir(workdir)
+        ns = argparse.Namespace(
+            command=["true"],
+            interactive=False,
+            prompt_file=None,
+            echo=False,
+            echo_interval=2.0,
+            submit_mode=None,
+            idle_timeout=None,
+            name="launched_plain",
+        )
+        agent_run.cmd_launch(ns)
+        sd = isolated_runs_root / "launched_plain"
+        deadline = time.monotonic() + 5.0
+        while not (sd / "pid").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not (sd / "launch_head").exists()
 
     def test_unreadable_cwd_skips_cwd_file_without_stranding_run(
         self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path, capsys
