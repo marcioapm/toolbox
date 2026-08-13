@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -285,6 +287,114 @@ class TestStatusMapping:
         assert out.startswith("name=r5 status=running")
         with pytest.raises(json.JSONDecodeError):
             json.loads(out)
+
+
+# ---------------------------------------------------------------------------
+# zombie detection: watch-local liveness must not trust a matching identity
+# for a pid that exited but was never reaped
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    not hasattr(os, "fork") or not hasattr(os, "waitpid"),
+    reason="requires a POSIX fork/waitpid to construct a real zombie",
+)
+class TestZombieDetection:
+    def test_unwaited_zombie_child_reports_died_and_terminal(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        try:
+            # Give the child time to exit and settle into state Z before we
+            # probe it; never reaped by this test, so it stays a zombie for
+            # the duration of the assertions below.
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    stat_text = Path(f"/proc/{pid}/stat").read_text()
+                    _before, after = stat_text.rsplit(")", 1)
+                    if after.split()[0] == "Z":
+                        break
+                except OSError:
+                    pass
+                if sys.platform == "darwin":
+                    result = subprocess.run(
+                        ["ps", "-o", "stat=", "-p", str(pid)],
+                        capture_output=True, text=True,
+                    )
+                    if result.stdout.strip().startswith("Z"):
+                        break
+                time.sleep(0.05)
+            else:
+                pytest.skip("could not observe child in zombie state on this platform")
+
+            token = agent_run._process_identity(pid)
+            assert token is not None
+            _make_run(
+                isolated_runs_root, isolated_log_root, "zombie1",
+                status="running", pid=pid, log_age_secs=1, process_identity=token,
+            )
+            rc = agent_run.cmd_watch(_watch_args("zombie1"))
+            assert rc == 0
+            payload = json.loads(capsys.readouterr().out)
+            assert payload["status"] == "died"
+            assert payload["terminal"] is True
+        finally:
+            os.waitpid(pid, 0)
+
+    def test_live_non_zombie_child_reports_running(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(5)
+            os._exit(0)
+        try:
+            token = agent_run._process_identity(pid)
+            assert token is not None
+            _make_run(
+                isolated_runs_root, isolated_log_root, "zombie2",
+                status="running", pid=pid, log_age_secs=1, process_identity=token,
+            )
+            rc = agent_run.cmd_watch(_watch_args("zombie2"))
+            assert rc == 0
+            payload = json.loads(capsys.readouterr().out)
+            assert payload["status"] == "running"
+            assert payload["terminal"] is False
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+    def test_zombie_probe_failure_falls_through_without_raising(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """The zombie probe's own OS-level read failing (unreadable /proc
+        entry, ps failure) must degrade to "not a known zombie" rather than
+        propagate, so a probe failure falls through to the existing
+        identity-based verdict instead of crashing the poll."""
+        token = _mock_verified_alive(monkeypatch, token="linux:7000")
+        monkeypatch.setattr(agent_run.platform, "system", lambda: "Linux")
+
+        real_read_text = Path.read_text
+
+        def boom(self, *a, **k):
+            if str(self).startswith("/proc/"):
+                raise OSError("forced zombie-probe failure")
+            return real_read_text(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", boom)
+        assert agent_run._watch_pid_is_zombie(222) is False
+
+        _make_run(
+            isolated_runs_root, isolated_log_root, "zombie3",
+            status="running", pid=222, log_age_secs=1, process_identity=token,
+        )
+        rc = agent_run.cmd_watch(_watch_args("zombie3"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "running"
+        assert payload["terminal"] is False
 
 
 # ---------------------------------------------------------------------------

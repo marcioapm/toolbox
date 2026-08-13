@@ -944,6 +944,45 @@ def _process_identity(pid: int) -> Optional[str]:
     return None
 
 
+def _watch_pid_is_zombie(pid: int) -> bool:
+    """Is ``pid`` currently in zombie state (exited, not yet reaped)?
+
+    A zombie's pid entry and its ``_process_identity`` birth token both
+    survive until the parent reaps it, so ``os.kill(pid, 0)`` succeeding and
+    the identity token matching are not evidence the process is still doing
+    work — only that it has not been reaped yet. Watch-local only: callers
+    outside `watch`'s liveness path must not use this.
+
+    Platform detection mirrors ``_process_identity``'s branching. Any
+    unreadable/failed probe (missing /proc entry, ps failure, unexpected
+    format) or an unsupported platform returns ``False`` — never invent a
+    zombie verdict from a failed probe.
+    """
+    system = platform.system()
+    if system == "Linux":
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text()
+            _before, after = stat_text.rsplit(")", 1)
+            state = after.split()[0]
+        except (IndexError, OSError, ValueError):
+            return False
+        return state == "Z"
+    if system == "Darwin":
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True,
+                check=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        stat_out = result.stdout.strip()
+        return bool(stat_out) and stat_out[0] == "Z"
+    return False
+
+
 def _read_process_identity(state_dir: Path, name: str) -> str:
     token = _read(state_dir / "process_identity")
     if not token:
@@ -1213,6 +1252,10 @@ def _watch_effective_status(state_dir: Path, idle_threshold: Optional[float] = N
     state out from under a run it can't rule out. `watch`'s safe direction is
     the opposite — an unconfirmable pid must never be reported as a healthy
     "running" run — so the two intentionally diverge on this case.
+
+    A zombie pid is rejected as "died" before the identity comparison even
+    runs: a zombie's pid and birth token both survive until reaped, so a
+    matching identity is not evidence of liveness here.
     """
     status = _effective_status(state_dir, idle_threshold)
     if status not in {"running", "stalled"}:
@@ -1222,6 +1265,8 @@ def _watch_effective_status(state_dir: Path, idle_threshold: Optional[float] = N
         pid = int(pid_raw)
     except (TypeError, ValueError):
         return "unverified"
+    if _watch_pid_is_zombie(pid):
+        return "died"
     recorded = _read(state_dir / "process_identity")
     if not recorded:
         return "unverified"
