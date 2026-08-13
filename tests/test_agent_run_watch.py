@@ -811,7 +811,7 @@ class TestGitTotalBudget:
         started_at = datetime.now(timezone.utc) - timedelta(hours=1)
         result = agent_run._watch_git_facts(repo, started_at)
         assert result is not None
-        assert len(seen_timeouts) == 5
+        assert len(seen_timeouts) == 6
         assert all(t <= agent_run.WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS for t in seen_timeouts)
 
     def test_budget_exhaustion_returns_none(self, tmp_path, monkeypatch):
@@ -847,9 +847,46 @@ class TestGitTotalBudget:
             "deletions": 0,
             "commits_since_start": 1,
             "last_commit_age_s": result["last_commit_age_s"],
+            "toplevel": str(repo.resolve()),
         }
         assert result["last_commit_age_s"] is not None
         assert result["last_commit_age_s"] >= 0.0
+
+
+class TestGitToplevel:
+    def test_repo_at_its_own_root(self, tmp_path):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        outcome = agent_run._watch_git_facts_checked(repo, started_at)
+        assert outcome.git_error is None
+        assert outcome.facts is not None
+        assert outcome.facts["toplevel"] == str(repo.resolve())
+
+    def test_subdirectory_of_its_own_repo_reports_repo_root(self, tmp_path):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        subdir = repo / "sub"
+        subdir.mkdir()
+        (subdir / "b.txt").write_text("more\n")
+        _git(repo, "add", "sub/b.txt")
+        _git(repo, "commit", "-q", "-m", "second")
+        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        outcome = agent_run._watch_git_facts_checked(subdir, started_at)
+        assert outcome.git_error is None
+        assert outcome.facts is not None
+        assert outcome.facts["toplevel"] == str(repo.resolve())
+
+    def test_plain_subdir_inside_unrelated_outer_repo_reports_outer_toplevel(self, tmp_path):
+        outer = tmp_path / "outer"
+        _init_repo(outer)
+        plain_subdir = outer / "plain-subdir"
+        plain_subdir.mkdir()
+        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        outcome = agent_run._watch_git_facts_checked(plain_subdir, started_at)
+        assert outcome.git_error is None
+        assert outcome.facts is not None
+        assert outcome.facts["toplevel"] == str(outer.resolve())
 
 
 # ---------------------------------------------------------------------------

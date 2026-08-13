@@ -1704,6 +1704,12 @@ def _watch_git_facts_checked(repo: Path, started_at: Optional[datetime]) -> _Wat
     ``commits_since_start`` is null, not 0, when ``started_at`` itself is
     unknown (e.g. ``--repo`` given but the run's own state dir is gone) —
     the count is genuinely undetermined, not zero.
+
+    ``toplevel`` is the work-tree root git resolved for this observation
+    (from ``rev-parse --show-toplevel``, resolved), or ``None`` if that
+    call failed. It may be an **enclosing** repo when the observed path is
+    not itself a repository — the consumer should compare it against the
+    repo it expects.
     """
     if not repo.is_dir():
         return _WatchGitFactsResult(None, "no_repo_path")
@@ -1762,6 +1768,16 @@ def _watch_git_facts_checked(repo: Path, started_at: Optional[datetime]) -> _Wat
         except ValueError:
             last_commit_age_s = None
 
+    # Reported, not enforced: git discovery walks upward to the nearest
+    # enclosing repo, so a legitimate subdirectory of its own repo and a
+    # plain directory nested inside an unrelated repo are indistinguishable
+    # by path alone. The consumer knows which repo a run belongs to, so it
+    # compares this against its own expectation rather than us guessing.
+    toplevel: Optional[str] = None
+    toplevel_outcome = run_git(["rev-parse", "--show-toplevel"])
+    if toplevel_outcome.stdout is not None:
+        toplevel = str(Path(toplevel_outcome.stdout.strip()).resolve())
+
     return _WatchGitFactsResult(
         {
             "head": head.strip(),
@@ -1771,6 +1787,7 @@ def _watch_git_facts_checked(repo: Path, started_at: Optional[datetime]) -> _Wat
             "deletions": deletions,
             "commits_since_start": commits_since_start,
             "last_commit_age_s": last_commit_age_s,
+            "toplevel": toplevel,
         },
         None,
     )
