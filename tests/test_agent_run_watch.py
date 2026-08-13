@@ -288,6 +288,128 @@ class TestStatusMapping:
 
 
 # ---------------------------------------------------------------------------
+# terminal / status derivability
+# ---------------------------------------------------------------------------
+
+class TestTerminalDerivability:
+    """`terminal` must be exactly derivable from `status` via
+    `_watch_is_terminal`, watch-local and independent from the shared
+    `TERMINAL_STATUSES`/`KNOWN_NONTERMINAL_STATUSES` reap vocabulary."""
+
+    @pytest.mark.parametrize(
+        "status",
+        sorted(agent_run.TERMINAL_STATUSES)
+        + sorted(agent_run.KNOWN_NONTERMINAL_STATUSES)
+        + ["unknown", "some_garbage_status"],
+    )
+    def test_terminal_matches_watch_is_terminal_for_every_emittable_status(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys, status
+    ):
+        """Drives `watch` end-to-end for every status it can emit via a raw
+        status file (all TERMINAL_STATUSES and KNOWN_NONTERMINAL_STATUSES
+        members, "unknown", and one garbage string) and asserts
+        `payload["terminal"] == _watch_is_terminal(payload["status"])`
+        exactly. The log-preserved, "unverified", and top-level-guard
+        "unknown" cases are covered by the dedicated tests above/below
+        since they are not reachable via a raw status file alone."""
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(agent_run, "_process_identity", lambda _p: "linux:1")
+        _make_run(
+            isolated_runs_root, isolated_log_root, "tdmatrix",
+            status=status, pid=111, log_age_secs=1, process_identity="linux:1",
+        )
+        rc = agent_run.cmd_watch(_watch_args("tdmatrix"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == status
+        assert payload["terminal"] == agent_run._watch_is_terminal(payload["status"])
+
+    def test_log_preserved_branch_status_and_terminal(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "td1",
+            write_state=False, log_text="line1\n",
+        )
+        rc = agent_run.cmd_watch(_watch_args("td1"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "not running (log preserved)"
+        assert payload["status"] == agent_run.WATCH_STATUS_LOG_PRESERVED
+        assert payload["terminal"] is True
+
+    def test_missing_status_file_reports_unknown_and_terminal(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "td2",
+            status="running", pid=111,
+        )
+        (isolated_runs_root / "td2" / "status").unlink()
+        rc = agent_run.cmd_watch(_watch_args("td2"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "unknown"
+        assert payload["terminal"] is True
+
+    def test_empty_status_file_is_terminal_as_an_unrecognized_status(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """An empty (0-byte) status file reads as `""`, distinct from a
+        missing file's `"unknown"` default -- both are unrecognized strings
+        outside TERMINAL_STATUSES/KNOWN_NONTERMINAL_STATUSES, so both must
+        be terminal under `_watch_is_terminal`."""
+        _make_run(
+            isolated_runs_root, isolated_log_root, "td3",
+            status="running", pid=111,
+        )
+        (isolated_runs_root / "td3" / "status").write_text("")
+        rc = agent_run.cmd_watch(_watch_args("td3"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == ""
+        assert payload["terminal"] is True
+
+    def test_unverified_status_is_not_terminal(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        _make_run(
+            isolated_runs_root, isolated_log_root, "td4",
+            status="running", pid=111, log_age_secs=1,
+        )
+        rc = agent_run.cmd_watch(_watch_args("td4"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "unverified"
+        assert payload["terminal"] is False
+
+    def test_running_status_is_not_terminal(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        token = _mock_verified_alive(monkeypatch)
+        _make_run(
+            isolated_runs_root, isolated_log_root, "td5",
+            status="running", pid=111, log_age_secs=1, process_identity=token,
+        )
+        rc = agent_run.cmd_watch(_watch_args("td5"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "running"
+        assert payload["terminal"] is False
+
+    def test_shared_gc_status_sets_are_not_widened(self):
+        """Proves this task did not touch reap's GC vocabulary: the two
+        shared frozensets must contain exactly their pre-existing members."""
+        assert agent_run.TERMINAL_STATUSES == frozenset(
+            {"done", "failed", "launch_failed", "died", "killed"}
+        )
+        assert agent_run.KNOWN_NONTERMINAL_STATUSES == frozenset(
+            {"starting", "running", "stalled"}
+        )
+
+
+# ---------------------------------------------------------------------------
 # missing state dir / missing run
 # ---------------------------------------------------------------------------
 
@@ -1265,7 +1387,7 @@ class TestNeverRaise:
         assert rc == 0
         payload = self._payload(capsys)
         assert payload["status"] == "unknown"
-        assert payload["terminal"] is False
+        assert payload["terminal"] is True
         assert payload["pid"] is None
         assert payload["started_at"] is None
         assert payload["ended_at"] is None
@@ -1306,7 +1428,7 @@ class TestNeverRaise:
         payload = self._payload(capsys)
         assert payload["observation_error"] == "RuntimeError: synthetic failure for guard test"
         assert payload["status"] == "unknown"
-        assert payload["terminal"] is False
+        assert payload["terminal"] is True
         assert payload["pid"] is None
         assert payload["log"] is None
         assert payload["git"] is None

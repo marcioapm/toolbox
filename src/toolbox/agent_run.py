@@ -1186,6 +1186,37 @@ def _watch_effective_status(state_dir: Path, idle_threshold: Optional[float] = N
     return status
 
 
+# Status string emitted by `watch` when the state dir is gone but the log
+# survived (see `_cmd_watch_observe`). Not a member of TERMINAL_STATUSES:
+# that shared set is reap's GC vocabulary, and this string is watch-only.
+WATCH_STATUS_LOG_PRESERVED = "not running (log preserved)"
+
+
+def _watch_is_terminal(status: str) -> bool:
+    """Single source of truth for the `terminal` field in the `watch`
+    payload: `terminal` is exactly derivable from `status` via this rule.
+
+    Deliberately watch-local rather than `status in TERMINAL_STATUSES`:
+    TERMINAL_STATUSES is reap's GC vocabulary and must stay narrow so reap
+    never implicitly deletes state for an unrecognized status (see
+    KNOWN_NONTERMINAL_STATUSES docstring). `watch` has a different
+    obligation — a poller must never wait forever on a status that will
+    never change — so unrecognized statuses (including "unknown") are
+    terminal here even though reap still refuses to touch them.
+    """
+    if status in TERMINAL_STATUSES:
+        return True
+    if status == WATCH_STATUS_LOG_PRESERVED:
+        return True
+    if status == "unverified":
+        return False
+    if status in KNOWN_NONTERMINAL_STATUSES:
+        return False
+    # Any other unrecognized string (including "unknown"): unrecoverable,
+    # not pending — the consumer must be free to stop waiting.
+    return True
+
+
 def _opportunistic_heal(state_root: Optional[Path] = None) -> None:
     """Mark clearly-dead (pid gone) "running"/"starting" runs as "died".
 
@@ -1856,6 +1887,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
     "running", since this contract must never claim a run is healthy on
     weaker evidence than that.
 
+    ``terminal`` is exactly derivable from ``status``: every payload branch
+    computes it via ``_watch_is_terminal``, a watch-local rule that is
+    deliberately not ``status in TERMINAL_STATUSES`` (that shared set is
+    reap's narrower GC vocabulary — see ``_watch_is_terminal``'s docstring).
+
     ``observation_error`` is ``null`` on every normal path. If observation
     hits an exception no individual-field degradation anticipated, the
     top-level guard fires: the full contract is still emitted with every
@@ -1897,7 +1933,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             "started_at": None,
             "ended_at": None,
             "elapsed_s": None,
-            "terminal": False,
+            "terminal": _watch_is_terminal("unknown"),
             "launch_error": None,
             "log": None,
             "repo": None,
@@ -1940,14 +1976,14 @@ def _cmd_watch_observe(
             "schema": "agent-run.watch.v1",
             "name": name,
             "observed_at": observed_at,
-            "status": "not running (log preserved)",
+            "status": WATCH_STATUS_LOG_PRESERVED,
             "exit_code": None,
             "pid": None,
             "interactive": None,
             "started_at": None,
             "ended_at": None,
             "elapsed_s": None,
-            "terminal": True,
+            "terminal": _watch_is_terminal(WATCH_STATUS_LOG_PRESERVED),
             "launch_error": launch_error,
             "log": _watch_log_facts(log),
             "repo": repo_arg,
@@ -1966,7 +2002,7 @@ def _cmd_watch_observe(
         return 0
 
     status = _watch_effective_status(state_dir)
-    terminal = status in TERMINAL_STATUSES
+    terminal = _watch_is_terminal(status)
     pid_raw = _read(state_dir / "pid")
     pid = _safe_int(pid_raw)
     started_raw = _read(state_dir / "started_at") or None
