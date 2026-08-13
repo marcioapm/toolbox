@@ -22,6 +22,13 @@ import pytest
 from toolbox import agent_run
 
 
+WATCH_CONTRACT_KEYS = {
+    "schema", "name", "observed_at", "status", "exit_code", "pid",
+    "interactive", "started_at", "ended_at", "elapsed_s", "terminal",
+    "launch_error", "log", "repo", "git", "signals", "observation_error",
+}
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -153,11 +160,7 @@ class TestStatusMapping:
         agent_run.cmd_watch(_watch_args("r4"))
         payload = json.loads(capsys.readouterr().out)
         assert payload["schema"] == "agent-run.watch.v1"
-        assert set(payload.keys()) == {
-            "schema", "name", "observed_at", "status", "exit_code", "pid",
-            "interactive", "started_at", "ended_at", "elapsed_s", "terminal",
-            "launch_error", "log", "repo", "git", "signals",
-        }
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
         assert set(payload["log"].keys()) == {
             "path", "bytes", "lines", "mtime_age_s", "growing",
         }
@@ -579,6 +582,185 @@ class TestReadOnly:
 # ---------------------------------------------------------------------------
 # launch writes cwd
 # ---------------------------------------------------------------------------
+
+class TestNeverRaise:
+    """The only documented failure mode is an unresolvable run name; every
+    other observation failure — corrupt values, unreadable state, an
+    unanticipated exception — must degrade individual fields and still
+    exit 0 with the full contract."""
+
+    ROOT_SKIP = pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root ignores permission bits",
+    )
+
+    @staticmethod
+    def _payload(capsys) -> dict:
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        return payload
+
+    def test_unicode_digit_pid_is_null(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "u1", status="running",
+        )
+        (sd / "pid").write_text("\u00b2\n")
+        rc = agent_run.cmd_watch(_watch_args("u1"))
+        assert rc == 0
+        payload = self._payload(capsys)
+        assert payload["pid"] is None
+        assert payload["observation_error"] is None
+
+    def test_unicode_digit_exit_code_is_null(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "u2",
+            status="done", ended_age_secs=1,
+        )
+        (sd / "exit_code").write_text("\u00b2\n")
+        rc = agent_run.cmd_watch(_watch_args("u2"))
+        assert rc == 0
+        payload = self._payload(capsys)
+        assert payload["exit_code"] is None
+        assert payload["observation_error"] is None
+
+    def test_state_file_that_is_a_directory_degrades_to_default(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "u3",
+            status="running", pid=111,
+        )
+        (sd / "pid").unlink()
+        (sd / "pid").mkdir()
+        rc = agent_run.cmd_watch(_watch_args("u3"))
+        assert rc == 0
+        payload = self._payload(capsys)
+        assert payload["pid"] is None
+        assert payload["observation_error"] is None
+
+    @ROOT_SKIP
+    def test_state_file_at_mode_000_degrades_to_default(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "u4",
+            status="running", pid=111,
+        )
+        target = sd / "pid"
+        target.chmod(0o000)
+        try:
+            rc = agent_run.cmd_watch(_watch_args("u4"))
+        finally:
+            target.chmod(0o644)
+        assert rc == 0
+        payload = self._payload(capsys)
+        assert payload["pid"] is None
+        assert payload["observation_error"] is None
+
+    def test_state_file_with_invalid_utf8_degrades_to_default(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "u5",
+            status="running", pid=111,
+        )
+        (sd / "pid").write_bytes(b"\xff\xfe123")
+        rc = agent_run.cmd_watch(_watch_args("u5"))
+        assert rc == 0
+        payload = self._payload(capsys)
+        assert payload["pid"] is None
+        assert payload["observation_error"] is None
+
+    @ROOT_SKIP
+    def test_log_file_at_mode_000_degrades_line_count(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "u6",
+            status="running", pid=111, log_age_secs=1,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        log_file = ld / "log"
+        log_file.chmod(0o000)
+        try:
+            rc = agent_run.cmd_watch(_watch_args("u6"))
+        finally:
+            log_file.chmod(0o644)
+        assert rc == 0
+        payload = self._payload(capsys)
+        assert payload["log"]["lines"] == 0
+        assert payload["signals"] == {
+            "repeated_error": None,
+            "distinct_files_read": 0,
+            "top_repeated_read": None,
+        }
+        assert payload["observation_error"] is None
+
+    @ROOT_SKIP
+    def test_state_dir_at_mode_000_degrades_every_field(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "u7",
+            status="running", pid=111, log_age_secs=1,
+        )
+        sd.chmod(0o000)
+        try:
+            rc = agent_run.cmd_watch(_watch_args("u7"))
+        finally:
+            sd.chmod(0o755)
+        assert rc == 0
+        payload = self._payload(capsys)
+        assert payload["status"] == "unknown"
+        assert payload["terminal"] is False
+        assert payload["pid"] is None
+        assert payload["started_at"] is None
+        assert payload["ended_at"] is None
+        assert payload["exit_code"] is None
+        assert payload["interactive"] is None
+        assert payload["launch_error"] is None
+        assert payload["repo"] is None
+        assert payload["git"] is None
+        assert payload["observation_error"] is None
+
+    def test_observation_error_is_null_on_a_healthy_run(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "u8",
+            status="running", pid=111, log_age_secs=1,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        rc = agent_run.cmd_watch(_watch_args("u8"))
+        assert rc == 0
+        payload = self._payload(capsys)
+        assert payload["observation_error"] is None
+
+    def test_observation_error_set_when_top_level_guard_fires(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "u9",
+            status="running", pid=111, log_age_secs=1,
+        )
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("synthetic failure for guard test")
+
+        monkeypatch.setattr(agent_run, "_effective_status", _boom)
+        rc = agent_run.cmd_watch(_watch_args("u9"))
+        assert rc == 0
+        payload = self._payload(capsys)
+        assert payload["observation_error"] == "RuntimeError: synthetic failure for guard test"
+        assert payload["status"] == "unknown"
+        assert payload["terminal"] is False
+        assert payload["pid"] is None
+        assert payload["log"] is None
+
 
 class TestLaunchWritesCwd:
     def test_launch_records_absolute_cwd(

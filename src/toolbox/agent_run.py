@@ -439,10 +439,26 @@ def _write(path: Path, text: str) -> None:
 
 
 def _read(path: Path, default: str = "") -> str:
+    # A poll loop must degrade on an unreadable state file, not crash: a
+    # directory in place of a file, mode 000, or non-UTF-8 bytes are all
+    # observation failures, not process failures.
     try:
         return path.read_text().strip()
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError, UnicodeError):
         return default
+
+
+def _safe_int(value: str) -> Optional[int]:
+    """Parse ``value`` as an int, or ``None`` for anything that isn't one.
+
+    ``str.isdigit()`` is not a safe pre-check (it accepts non-ASCII digits
+    like ``"\u00b2"`` that ``int()`` then rejects), so callers must use this
+    instead of an ``isdigit()`` guard followed by a bare ``int()`` call.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 _RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -1264,7 +1280,7 @@ def _log_line_count(log: Optional[Path]) -> int:
     try:
         with log.open("rb") as f:
             return sum(1 for _ in f)
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError, UnicodeError):
         return 0
 
 
@@ -1627,6 +1643,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
     failure mode (dead run, missing ``cwd`` file, git repo unreadable, log
     unreadable) degrades individual fields to ``null`` rather than raising
     or exiting non-zero, so a poller can call this every 30s forever.
+
+    ``observation_error`` is ``null`` on every normal path. If observation
+    hits an exception no individual-field degradation anticipated, the
+    top-level guard fires: the full contract is still emitted with every
+    other field degraded to its null/unknown value, and
+    ``observation_error`` is set to the exception class name plus a
+    truncated message (~200 chars) instead.
     """
     name = _validate_run_name(args.name)
     state_dir = _state_dir(name)
@@ -1634,6 +1657,49 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if not state_dir.is_dir() and not log_dir.is_dir():
         sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
 
+    # Everything below observes best-effort facts about a run this process
+    # does not control; an unanticipated failure here must still print the
+    # full contract and exit 0, so a poller can never mistake "observation
+    # broke" for "no such run".
+    try:
+        return _cmd_watch_observe(args, name, state_dir, log_dir)
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"[:200]
+        payload = {
+            "schema": "agent-run.watch.v1",
+            "name": name,
+            "observed_at": _now_iso(),
+            "status": "unknown",
+            "exit_code": None,
+            "pid": None,
+            "interactive": None,
+            "started_at": None,
+            "ended_at": None,
+            "elapsed_s": None,
+            "terminal": False,
+            "launch_error": None,
+            "log": None,
+            "repo": None,
+            "git": None,
+            "signals": {
+                "repeated_error": None,
+                "distinct_files_read": 0,
+                "top_repeated_read": None,
+            },
+            "observation_error": message,
+        }
+        if args.json:
+            print(json.dumps(payload))
+        else:
+            print(f"name={name} status={payload['status']} observation_error={message!r}")
+        return 0
+
+
+def _cmd_watch_observe(
+    args: argparse.Namespace, name: str, state_dir: Path, log_dir: Path
+) -> int:
+    """Build and print the watch contract. May raise; ``cmd_watch`` is the
+    never-raise boundary that catches it."""
     observed_at = _now_iso()
     log = _log_file_for(name)
 
@@ -1662,6 +1728,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             "repo": repo_arg,
             "git": _watch_git_facts(repo_path, None) if repo_path is not None else None,
             "signals": _watch_signals(log),
+            "observation_error": None,
         }
         if args.json:
             print(json.dumps(payload))
@@ -1675,13 +1742,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
     status = _effective_status(state_dir)
     terminal = status in TERMINAL_STATUSES
     pid_raw = _read(state_dir / "pid")
-    pid = int(pid_raw) if pid_raw.isdigit() else None
+    pid = _safe_int(pid_raw)
     started_raw = _read(state_dir / "started_at") or None
     ended_raw = _read(state_dir / "ended_at") or None
     started_dt = _watch_parse_iso(started_raw) if started_raw else None
     ended_dt = _watch_parse_iso(ended_raw) if ended_raw else None
     exit_code_raw = _read(state_dir / "exit_code")
-    exit_code = int(exit_code_raw) if exit_code_raw.lstrip("-").isdigit() else None
+    exit_code = _safe_int(exit_code_raw)
     interactive_raw = _read(state_dir / "interactive")
     interactive = interactive_raw == "1" if interactive_raw in {"0", "1"} else None
     launch_error = (
@@ -1715,6 +1782,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         "repo": repo_str,
         "git": git,
         "signals": _watch_signals(log),
+        "observation_error": None,
     }
     if args.json:
         print(json.dumps(payload))
