@@ -313,6 +313,9 @@ WATCH_LOG_GROWING_MAX_AGE_SECONDS: float = 60.0
 WATCH_TAIL_LINES: int = 200
 WATCH_REPEAT_THRESHOLD: int = 3
 WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS: float = 2.5
+# A supervisor polls N runs inside a 30s cycle, so one repo's five git calls
+# must not each spend up to the per-call timeout; this bounds their total.
+WATCH_GIT_TOTAL_BUDGET_SECONDS: float = 5.0
 WATCH_TAIL_READ_BLOCK_BYTES: int = 65536
 # A 30s poll loop must not read an unbounded log: cap how far the tail scan
 # walks back regardless of how few newlines it has found.
@@ -1502,7 +1505,11 @@ def _watch_parse_iso(raw: str) -> Optional[datetime]:
         return None
 
 
-def _watch_run_git(repo: Path, git_args: Sequence[str]) -> Optional[str]:
+def _watch_run_git(
+    repo: Path,
+    git_args: Sequence[str],
+    timeout: float = WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS,
+) -> Optional[str]:
     """Run one bounded, lock-free git read; ``None`` on any failure (not a
     repo, git missing, non-zero exit, or a timeout) so the caller can
     collapse the whole git-facts object rather than emit partial data."""
@@ -1533,7 +1540,7 @@ def _watch_run_git(repo: Path, git_args: Sequence[str]) -> Optional[str]:
                 *git_args,
             ],
             capture_output=True,
-            timeout=WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS,
+            timeout=timeout,
             check=True,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -1572,13 +1579,24 @@ def _watch_git_facts(repo: Path, started_at: Optional[datetime]) -> Optional[dic
     """
     if not repo.is_dir():
         return None
-    head = _watch_run_git(repo, ["rev-parse", "--short", "HEAD"])
+
+    deadline = time.monotonic() + WATCH_GIT_TOTAL_BUDGET_SECONDS
+
+    def run_git(git_args: Sequence[str]) -> Optional[str]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        return _watch_run_git(
+            repo, git_args, timeout=min(WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS, max(0.05, remaining))
+        )
+
+    head = run_git(["rev-parse", "--short", "HEAD"])
     if head is None:
         return None
-    porcelain = _watch_run_git(repo, ["status", "--porcelain"])
+    porcelain = run_git(["status", "--porcelain"])
     if porcelain is None:
         return None
-    shortstat = _watch_run_git(repo, ["diff", "HEAD", "--shortstat"])
+    shortstat = run_git(["diff", "HEAD", "--shortstat"])
     if shortstat is None:
         return None
     files_changed, insertions, deletions = _watch_parse_shortstat(shortstat)
@@ -1586,9 +1604,7 @@ def _watch_git_facts(repo: Path, started_at: Optional[datetime]) -> Optional[dic
     commits_since_start: Optional[int] = None
     if started_at is not None:
         since = started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-        count_out = _watch_run_git(
-            repo, ["rev-list", "--count", f"--since={since}", "HEAD"]
-        )
+        count_out = run_git(["rev-list", "--count", f"--since={since}", "HEAD"])
         if count_out is None:
             return None
         try:
@@ -1596,7 +1612,7 @@ def _watch_git_facts(repo: Path, started_at: Optional[datetime]) -> Optional[dic
         except ValueError:
             return None
 
-    last_commit_epoch = _watch_run_git(repo, ["log", "-1", "--format=%ct", "HEAD"])
+    last_commit_epoch = run_git(["log", "-1", "--format=%ct", "HEAD"])
     if last_commit_epoch is None:
         return None
     last_commit_age_s: Optional[float] = None

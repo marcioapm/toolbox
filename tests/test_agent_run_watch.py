@@ -496,6 +496,87 @@ class TestGitHardening:
 
 
 # ---------------------------------------------------------------------------
+# shared time budget across the five git calls
+# ---------------------------------------------------------------------------
+
+class TestGitTotalBudget:
+    def test_total_wall_time_is_bounded(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        class _FakeResult:
+            stdout = b"0\n"
+
+        def _slow_run(*_args, **kwargs):
+            time.sleep(kwargs["timeout"])
+            return _FakeResult()
+
+        monkeypatch.setattr(agent_run.subprocess, "run", _slow_run)
+        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        start = time.monotonic()
+        agent_run._watch_git_facts(repo, started_at)
+        elapsed = time.monotonic() - start
+        assert elapsed < agent_run.WATCH_GIT_TOTAL_BUDGET_SECONDS + 2.0
+
+    def test_per_call_cap_holds(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        class _FakeResult:
+            stdout = b"0\n"
+
+        seen_timeouts: list[float] = []
+
+        def _fast_run(*_args, **kwargs):
+            seen_timeouts.append(kwargs["timeout"])
+            return _FakeResult()
+
+        monkeypatch.setattr(agent_run.subprocess, "run", _fast_run)
+        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        result = agent_run._watch_git_facts(repo, started_at)
+        assert result is not None
+        assert len(seen_timeouts) == 5
+        assert all(t <= agent_run.WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS for t in seen_timeouts)
+
+    def test_budget_exhaustion_returns_none(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        class _FakeResult:
+            stdout = b"0\n"
+
+        def _slow_run(*_args, **_kwargs):
+            time.sleep(0.3)
+            return _FakeResult()
+
+        monkeypatch.setattr(agent_run.subprocess, "run", _slow_run)
+        monkeypatch.setattr(agent_run, "WATCH_GIT_TOTAL_BUDGET_SECONDS", 0.05)
+        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        result = agent_run._watch_git_facts(repo, started_at)
+        assert result is None
+
+    def test_happy_path_returns_fully_populated_facts(self, tmp_path):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        expected_head = agent_run._watch_run_git(
+            repo, ["rev-parse", "--short", "HEAD"]
+        ).strip()
+        started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        result = agent_run._watch_git_facts(repo, started_at)
+        assert result == {
+            "head": expected_head,
+            "dirty": False,
+            "files_changed": 0,
+            "insertions": 0,
+            "deletions": 0,
+            "commits_since_start": 1,
+            "last_commit_age_s": result["last_commit_age_s"],
+        }
+        assert result["last_commit_age_s"] is not None
+        assert result["last_commit_age_s"] >= 0.0
+
+
+# ---------------------------------------------------------------------------
 # log facts
 # ---------------------------------------------------------------------------
 
