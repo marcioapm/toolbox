@@ -1310,7 +1310,10 @@ class TestSignals:
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         agent_run.cmd_watch(_watch_args("r17"))
         payload = json.loads(capsys.readouterr().out)
-        assert payload["signals"]["repeated_error"] == "Error: boom"
+        assert payload["signals"]["repeated_error"] == {
+            "line": "Error: boom",
+            "count": agent_run.WATCH_REPEAT_THRESHOLD,
+        }
 
     def test_repeated_error_below_threshold_is_null(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
@@ -1337,7 +1340,7 @@ class TestSignals:
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         agent_run.cmd_watch(_watch_args("r19"))
         payload = json.loads(capsys.readouterr().out)
-        assert len(payload["signals"]["repeated_error"]) == 200
+        assert len(payload["signals"]["repeated_error"]["line"]) == 200
 
     def test_repeated_read_detected_at_threshold(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
@@ -1432,7 +1435,10 @@ class TestSignals:
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         agent_run.cmd_watch(_watch_args("r24"))
         payload = json.loads(capsys.readouterr().out)
-        assert payload["signals"]["repeated_error"] == error_line
+        assert payload["signals"]["repeated_error"] == {
+            "line": error_line,
+            "count": agent_run.WATCH_REPEAT_THRESHOLD,
+        }
 
     def test_repeated_read_ansi_wrapped_lines_collapse_to_clean_path(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
@@ -1479,7 +1485,30 @@ class TestSignals:
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         agent_run.cmd_watch(_watch_args("r27"))
         payload = json.loads(capsys.readouterr().out)
-        assert payload["signals"]["repeated_error"] == "Error: boom"
+        assert payload["signals"]["repeated_error"] == {"line": "Error: boom", "count": 4}
+
+    def test_repeated_error_picks_max_count_not_first_encountered(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        # "Error: first" appears first but fewer times than "Error: loudest",
+        # which appears later — the winner must be the most-repeated line,
+        # matching top_repeated_read's rule, not encounter order.
+        lines = (
+            ["Error: first"] * agent_run.WATCH_REPEAT_THRESHOLD
+            + ["Error: loudest"] * (agent_run.WATCH_REPEAT_THRESHOLD + 5)
+        )
+        text = "\n".join(lines) + "\n"
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r27b",
+            status="running", pid=1, log_text=text, log_age_secs=1,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("r27b"))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["signals"]["repeated_error"] == {
+            "line": "Error: loudest",
+            "count": agent_run.WATCH_REPEAT_THRESHOLD + 5,
+        }
 
 
 # ---------------------------------------------------------------------------

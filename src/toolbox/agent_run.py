@@ -1930,11 +1930,14 @@ def _watch_normalize_lines(lines: List[str]) -> List[str]:
     return [_ANSI_ESCAPE_RE.sub("", line) for line in lines]
 
 
-def _watch_repeated_error(lines: List[str]) -> Optional[str]:
-    """The first log-tail line matching an error signature that recurs at
-    least ``WATCH_REPEAT_THRESHOLD`` times verbatim, truncated to
-    ``WATCH_ERROR_LINE_MAX_CHARS``, or ``None``. A description of what was
-    observed, not a verdict."""
+def _watch_repeated_error(lines: List[str]) -> Optional[dict]:
+    """The most-repeated log-tail line matching an error signature, when it
+    recurs at least ``WATCH_REPEAT_THRESHOLD`` times verbatim, as
+    ``{"line": ..., "count": ...}`` truncated to ``WATCH_ERROR_LINE_MAX_CHARS``,
+    or ``None``. Uses max-count, the same winner rule ``top_repeated_read``
+    uses, so the two "repeated" signals in one payload answer the same
+    question instead of one picking encounter-order and the other picking
+    the loudest. A description of what was observed, not a verdict."""
     counts: dict = {}
     for line in _watch_normalize_lines(lines):
         trimmed = line.strip()
@@ -1943,11 +1946,10 @@ def _watch_repeated_error(lines: List[str]) -> Optional[str]:
         if _WATCH_ERROR_ZERO_COUNT_RE.search(trimmed):
             continue
         counts[line] = counts.get(line, 0) + 1
-    # dicts iterate in insertion order, so this is the first such line.
-    for line, count in counts.items():
-        if count >= WATCH_REPEAT_THRESHOLD:
-            return line[:WATCH_ERROR_LINE_MAX_CHARS]
-    return None
+    top_line = max(counts, key=lambda ln: counts[ln], default=None)
+    if top_line is None or counts[top_line] < WATCH_REPEAT_THRESHOLD:
+        return None
+    return {"line": top_line[:WATCH_ERROR_LINE_MAX_CHARS], "count": counts[top_line]}
 
 
 def _watch_read_signals(lines: List[str]) -> tuple[int, Optional[dict]]:
@@ -2017,6 +2019,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
     toward escalating on unknown state must be able to tell "cannot observe
     this repo" (alarming) apart from "observed it, there is nothing there"
     (benign), which a bare ``git: null`` cannot express on its own.
+
+    ``signals.repeated_error`` and ``signals.top_repeated_read`` use the
+    same winner rule — the most-repeated qualifying line/path in the log
+    tail, as ``{"line"/"path": ..., "count": ...}``, or ``null`` if nothing
+    repeats at least ``WATCH_REPEAT_THRESHOLD`` times — so the two
+    "repeated" signals in one payload answer the same question.
     """
     name = _validate_run_name(args.name)
     state_dir = _state_dir(name)
