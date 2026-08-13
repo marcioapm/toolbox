@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -624,6 +625,126 @@ class TestLogFacts:
             "distinct_files_read": 0,
             "top_repeated_read": None,
         }
+
+
+# ---------------------------------------------------------------------------
+# non-regular log paths (FIFO, directory, symlinks) must never be opened
+# ---------------------------------------------------------------------------
+
+_DEGRADED_SIGNALS = {
+    "repeated_error": None,
+    "distinct_files_read": 0,
+    "top_repeated_read": None,
+}
+
+
+class TestRegularLogPath:
+    def test_fifo_log_is_rejected_by_the_helper(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("os.mkfifo unavailable on this platform")
+        _, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "fifo1", write_log=False,
+        )
+        os.mkfifo(ld / "log")
+        assert agent_run._watch_regular_log_path("fifo1") is None
+
+    def test_fifo_log_end_to_end_returns_instead_of_hanging(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("os.mkfifo unavailable on this platform")
+        _, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "fifo2",
+            status="running", pid=1, write_log=False,
+        )
+        os.mkfifo(ld / "log")
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+
+        result: dict = {}
+
+        def _call() -> None:
+            result["rc"] = agent_run.cmd_watch(_watch_args("fifo2"))
+
+        thread = threading.Thread(target=_call, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "watch hung reading a FIFO log with no writer"
+        assert result["rc"] == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert payload["log"] is None
+        assert payload["signals"] == _DEGRADED_SIGNALS
+
+    def test_directory_in_place_of_log_is_rejected(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "dirlog",
+            status="running", pid=1, write_log=False,
+        )
+        (ld / "log").mkdir()
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        assert agent_run._watch_regular_log_path("dirlog") is None
+        rc = agent_run.cmd_watch(_watch_args("dirlog"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["log"] is None
+        assert payload["signals"] == _DEGRADED_SIGNALS
+
+    def test_symlink_to_a_regular_file_is_accepted(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "symreal",
+            status="running", pid=1, log_age_secs=1, log_text="line one\nline two\n",
+        )
+        target = ld / "log.real"
+        (ld / "log").rename(target)
+        (ld / "log").symlink_to(target)
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        assert agent_run._watch_regular_log_path("symreal") == ld / "log"
+        rc = agent_run.cmd_watch(_watch_args("symreal"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["log"]["bytes"] == len("line one\nline two\n")
+        assert payload["log"]["lines"] == 2
+
+    def test_symlink_to_a_fifo_is_rejected(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("os.mkfifo unavailable on this platform")
+        _, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "symfifo",
+            status="running", pid=1, write_log=False,
+        )
+        fifo_path = ld / "log.fifo"
+        os.mkfifo(fifo_path)
+        (ld / "log").symlink_to(fifo_path)
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        assert agent_run._watch_regular_log_path("symfifo") is None
+        rc = agent_run.cmd_watch(_watch_args("symfifo"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["log"] is None
+        assert payload["signals"] == _DEGRADED_SIGNALS
+
+    def test_ordinary_regular_file_is_unchanged(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "regular1",
+            status="running", pid=1, log_age_secs=1, log_text="line one\nline two\n",
+        )
+        assert agent_run._watch_regular_log_path("regular1") == ld / "log"
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        rc = agent_run.cmd_watch(_watch_args("regular1"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["log"]["bytes"] == len("line one\nline two\n")
+        assert payload["log"]["lines"] == 2
 
 
 # ---------------------------------------------------------------------------

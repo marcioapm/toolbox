@@ -704,6 +704,26 @@ def _log_file_for(name: str) -> Optional[Path]:
     return None
 
 
+def _watch_regular_log_path(name: str) -> Optional[Path]:
+    """Like ``_log_file_for``, but returns ``None`` unless the resolved path
+    stats as a regular file. Opening a FIFO blocks forever and no timeout
+    covers log reads, so a non-regular file there must never reach `open()`
+    from the watch poll. ``stat`` follows symlinks, so a symlink to a
+    regular file still passes and a symlink to a FIFO is still rejected.
+    Never raises: any ``OSError`` (missing, permission denied, dangling
+    symlink) is treated the same as a missing log."""
+    log = _log_file_for(name)
+    if log is None:
+        return None
+    try:
+        st = log.stat()
+    except OSError:
+        return None
+    if not _stat_module.S_ISREG(st.st_mode):
+        return None
+    return log
+
+
 def _path_entry_exists(path: Path) -> bool:
     """Does a directory entry exist, without following a possible symlink?"""
     try:
@@ -1778,7 +1798,7 @@ def _cmd_watch_observe(
     """Build and print the watch contract. May raise; ``cmd_watch`` is the
     never-raise boundary that catches it."""
     observed_at = _now_iso()
-    log = _log_file_for(name)
+    log = _watch_regular_log_path(name)
 
     if not state_dir.is_dir():
         # State dir gone, log survived: matches cmd_status's "not running
