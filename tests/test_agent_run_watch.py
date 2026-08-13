@@ -342,6 +342,55 @@ class TestRepoResolution:
 
 
 # ---------------------------------------------------------------------------
+# git subprocess hardening
+# ---------------------------------------------------------------------------
+
+class TestGitHardening:
+    def test_fsmonitor_is_not_executed(self, tmp_path):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        marker = tmp_path / "marker"
+        script = tmp_path / "fsmonitor.sh"
+        script.write_text(f"#!/bin/sh\ntouch '{marker}'\nprintf '2\\n'\n")
+        script.chmod(0o755)
+        _git(repo, "config", "core.fsmonitor", str(script))
+        agent_run._watch_run_git(repo, ["status", "--porcelain"])
+        assert marker.exists() is False
+
+    def test_git_dir_env_is_ignored(self, tmp_path, monkeypatch):
+        repo_a = tmp_path / "repo_a"
+        repo_b = tmp_path / "repo_b"
+        _init_repo(repo_a)
+        _init_repo(repo_b)
+        (repo_b / "b.txt").write_text("more\n")
+        _git(repo_b, "add", "b.txt")
+        _git(repo_b, "commit", "-q", "-m", "second")
+
+        expected_head = agent_run._watch_run_git(
+            repo_a, ["rev-parse", "--short", "HEAD"]
+        ).strip()
+
+        monkeypatch.setenv("GIT_DIR", str(repo_b / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(repo_b))
+        result = agent_run._watch_run_git(repo_a, ["rev-parse", "--short", "HEAD"])
+        assert result.strip() == expected_head
+
+    def test_undecodable_output_does_not_raise(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+
+        class _FakeResult:
+            stdout = b"A\xff\xfeB"
+
+        def _fake_run(*_args, **_kwargs):
+            return _FakeResult()
+
+        monkeypatch.setattr(agent_run.subprocess, "run", _fake_run)
+        result = agent_run._watch_run_git(repo, ["status", "--porcelain"])
+        assert result == "A\ufffd\ufffdB"
+
+
+# ---------------------------------------------------------------------------
 # log facts
 # ---------------------------------------------------------------------------
 

@@ -310,6 +310,21 @@ WATCH_TAIL_LINES: int = 200
 WATCH_REPEAT_THRESHOLD: int = 3
 WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS: float = 2.5
 
+# Git env vars that redirect a command at a different repo/index than the one
+# named on the command line; a poll must not inherit these from its caller.
+WATCH_GIT_ENV_VARS_TO_STRIP: frozenset[str] = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+    }
+)
+
 _WATCH_ERROR_LINE_RE = re.compile(r"error|Error|ERROR|Traceback|FAILED|exception")
 _WATCH_READ_LINE_RE = re.compile(r"\bRead\s+(\S+)")
 
@@ -1430,17 +1445,41 @@ def _watch_run_git(repo: Path, git_args: Sequence[str]) -> Optional[str]:
     """Run one bounded, lock-free git read; ``None`` on any failure (not a
     repo, git missing, non-zero exit, or a timeout) so the caller can
     collapse the whole git-facts object rather than emit partial data."""
+    # Strip inherited GIT_* pointers so the query can't be silently redirected
+    # at a different repo/index, and block config that runs external programs.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in WATCH_GIT_ENV_VARS_TO_STRIP and not k.startswith("GIT_CONFIG")
+    }
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo), "--no-optional-locks", *git_args],
+            [
+                "git",
+                "-C",
+                str(repo),
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "diff.external=",
+                "-c",
+                "core.pager=cat",
+                *git_args,
+            ],
             capture_output=True,
-            text=True,
             timeout=WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS,
             check=True,
+            env=env,
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return result.stdout
+    return result.stdout.decode("utf-8", errors="replace")
 
 
 _WATCH_SHORTSTAT_FILES_RE = re.compile(r"(\d+) files? changed")
