@@ -2007,7 +2007,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     try:
         return _cmd_watch_observe(args, name, state_dir, log_dir)
     except Exception as exc:
-        message = f"{type(exc).__name__}: {exc}"[:200]
+        message = f"{type(exc).__name__}: {exc}"[:WATCH_ERROR_LINE_MAX_CHARS]
         payload = _watch_payload(name, _now_iso(), "unknown", observation_error=message)
         if args.json:
             print(json.dumps(payload))
