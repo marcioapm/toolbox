@@ -3186,10 +3186,18 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     submit_mode = _persist_submit_mode(
         d, argv, getattr(args, "submit_mode", None)
     )
+    # Resolved and written before "starting" is published: if the launch
+    # directory is gone, Path.cwd() raises, and that must not happen after
+    # this run already looks active with nothing behind it.
+    try:
+        cwd = str(Path.cwd())
+    except OSError:
+        cwd = None
+    if cwd is not None:
+        _write(d / "cwd", cwd + "\n")
     _write(d / "started_at", _now_iso() + "\n")
     _write(d / "status", "starting\n")
     _write(d / "interactive", "1\n" if args.interactive else "0\n")
-    _write(d / "cwd", str(Path.cwd()) + "\n")
     (log_d / "log").touch()
     if prompt_file:
         # Snapshot the prompt-file path so introspection shows what was fed in,

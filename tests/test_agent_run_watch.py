@@ -888,6 +888,47 @@ class TestLaunchWritesCwd:
             time.sleep(0.02)
         assert (sd / "cwd").read_text().strip() == str(workdir.resolve())
 
+    def test_unreadable_cwd_skips_cwd_file_without_stranding_run(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path, capsys
+    ):
+        real_cwd = Path.cwd
+
+        def _raising_cwd():
+            raise FileNotFoundError("launch directory removed")
+
+        monkeypatch.setattr(agent_run.Path, "cwd", staticmethod(_raising_cwd))
+        ns = argparse.Namespace(
+            command=["true"],
+            interactive=False,
+            prompt_file=None,
+            echo=False,
+            echo_interval=2.0,
+            submit_mode=None,
+            idle_timeout=None,
+            name="launched_no_cwd",
+        )
+        agent_run.cmd_launch(ns)
+        monkeypatch.setattr(agent_run.Path, "cwd", staticmethod(real_cwd))
+
+        sd = isolated_runs_root / "launched_no_cwd"
+        deadline = time.monotonic() + 5.0
+        while not (sd / "pid").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not (sd / "cwd").exists()
+        # The run must have fully published, not be stranded as "starting"
+        # with no pid behind it.
+        status = (sd / "status").read_text().strip()
+        pid_exists = (sd / "pid").exists()
+        assert not (status == "starting" and not pid_exists)
+        capsys.readouterr()
+
+        rc = agent_run.cmd_watch(_watch_args("launched_no_cwd"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["repo"] is None
+        assert payload["git"] is None
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+
 
 # ---------------------------------------------------------------------------
 # _watch_tail_lines: byte-bounded backward scan
