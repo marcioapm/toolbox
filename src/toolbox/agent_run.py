@@ -1115,13 +1115,34 @@ def _gc_status_eligible(status: str, *, force_unknown: bool) -> bool:
     )
 
 
+# Sentinel returned by _gc_live_runner_pid for "pid file unreadable" —
+# never a real pid (pids are positive), so callers can tell it apart from
+# both a verified-live pid and None ("safe to GC").
+PID_UNREADABLE = -1
+
+
+# GC's fail-safe direction is a spurious skip, never a spurious delete, which
+# is the opposite of watch/status's fail-safe direction (degrade to a null
+# field, never crash a read-only poll) — so this reads its pid file strictly
+# instead of through the lenient shared `_read`: an unreadable pid file
+# (mode 000, a directory in its place) must block GC exactly like a
+# confirmed-live pid would, not read as "no pid" and let GC proceed.
 def _gc_live_runner_pid(state_dir: Path) -> Optional[int]:
-    """Return the verified live recorded runner PID, if one blocks GC."""
-    raw = _read(state_dir / "pid")
+    """Return the recorded runner PID if it still blocks GC, or ``None`` if
+    the run is safe to garbage-collect.
+
+    The recorded pid itself is returned when it is verified alive; when the
+    pid file cannot be read at all, ``PID_UNREADABLE`` is returned instead —
+    a distinct non-``None`` value so callers refuse GC the same way they
+    would for a confirmed-live pid, without claiming to know which pid.
+    """
     try:
-        pid = int(raw) if raw else None
-    except ValueError:
+        raw = (state_dir / "pid").read_text().strip()
+    except FileNotFoundError:
         return None
+    except (OSError, UnicodeError):
+        return PID_UNREADABLE
+    pid = _safe_int(raw)
     if pid is not None and _pid_alive(pid) and _gc_pid_is_live_runner(state_dir, pid):
         return pid
     return None
