@@ -221,7 +221,7 @@ import traceback
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, NamedTuple, Optional, Sequence
 
 
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
@@ -1554,6 +1554,44 @@ def _watch_run_git(
     """Run one bounded, lock-free git read; ``None`` on any failure (not a
     repo, git missing, non-zero exit, or a timeout) so the caller can
     collapse the whole git-facts object rather than emit partial data."""
+    return _watch_run_git_checked(repo, git_args, timeout=timeout).stdout
+
+
+class _WatchGitOutcome(NamedTuple):
+    """Result of one bounded git read: exactly one field is set.
+
+    ``_watch_run_git`` above discards the ``error`` half for its one other
+    caller; ``_watch_git_facts`` needs it to populate the watch contract's
+    ``git_error`` discriminator, since collapsing every failure to the same
+    ``None`` (as ``_watch_run_git`` does) hides *why* facts are unavailable.
+    """
+
+    stdout: Optional[str]
+    error: Optional[str]
+
+
+# Substrings of git's own stderr text used to tell "not a repository at all"
+# apart from other non-zero exits. "No commits yet" has no single stable
+# stderr wording across the different git commands/versions this module
+# runs, so that case is instead disambiguated with a follow-up
+# ``--is-inside-work-tree`` probe (see ``_watch_git_facts_checked``).
+_WATCH_GIT_NOT_A_REPO_STDERR = "not a git repository"
+
+
+def _watch_classify_git_stderr(stderr: str) -> str:
+    """Map a non-zero git exit's stderr to a ``git_error`` discriminator."""
+    if _WATCH_GIT_NOT_A_REPO_STDERR in stderr.lower():
+        return "not_a_repo"
+    return "git_failed"
+
+
+def _watch_run_git_checked(
+    repo: Path,
+    git_args: Sequence[str],
+    timeout: float = WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS,
+) -> _WatchGitOutcome:
+    """Like ``_watch_run_git``, but reports *why* a failed read failed
+    instead of collapsing every cause to ``None``."""
     # Strip inherited GIT_* pointers so the query can't be silently redirected
     # at a different repo/index, and block config that runs external programs.
     env = {
@@ -1586,9 +1624,16 @@ def _watch_run_git(
             env=env,
             stdin=subprocess.DEVNULL,
         )
+    except FileNotFoundError:
+        return _WatchGitOutcome(None, "git_missing")
+    except subprocess.TimeoutExpired:
+        return _WatchGitOutcome(None, "timeout")
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")
+        return _WatchGitOutcome(None, _watch_classify_git_stderr(stderr))
     except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout.decode("utf-8", errors="replace")
+        return _WatchGitOutcome(None, "git_failed")
+    return _WatchGitOutcome(result.stdout.decode("utf-8", errors="replace"), None)
 
 
 _WATCH_SHORTSTAT_FILES_RE = re.compile(r"(\d+) files? changed")
@@ -1606,73 +1651,104 @@ def _watch_parse_shortstat(text: str) -> tuple[int, int, int]:
     return files, insertions, deletions
 
 
-def _watch_git_facts(repo: Path, started_at: Optional[datetime]) -> Optional[dict]:
-    """Read-only git facts for ``repo``. Returns ``None`` on any failure —
-    not a git repo, git not installed, a wedged command hitting the bounded
-    timeout, or a repo mid-rebase/mid-merge with an unreadable index — never
-    raises. Reads only (``status --porcelain``, ``diff``, ``log``, ``rev-
-    list``); nothing here mutates the repo or contends with an agent's own
-    git operations (``--no-optional-locks``).
+class _WatchGitFactsResult(NamedTuple):
+    """``facts`` and ``git_error`` are never both set: the watch contract's
+    top-level ``git_error`` discriminator must say *why* ``git`` is null
+    rather than collapsing "cannot observe" and "observed nothing" into the
+    same null the consumer already treats as "no facts"."""
+
+    facts: Optional[dict]
+    git_error: Optional[str]
+
+
+def _watch_git_facts_checked(repo: Path, started_at: Optional[datetime]) -> _WatchGitFactsResult:
+    """Read-only git facts for ``repo``, plus why they're missing on failure
+    — not a git repo, git not installed, a wedged command hitting the
+    bounded timeout, a brand-new repo with no commits yet, or a repo mid-
+    rebase/mid-merge with an unreadable index — never raises. Reads only
+    (``status --porcelain``, ``diff``, ``log``, ``rev-list``); nothing here
+    mutates the repo or contends with an agent's own git operations
+    (``--no-optional-locks``).
 
     ``commits_since_start`` is null, not 0, when ``started_at`` itself is
     unknown (e.g. ``--repo`` given but the run's own state dir is gone) —
     the count is genuinely undetermined, not zero.
     """
     if not repo.is_dir():
-        return None
+        return _WatchGitFactsResult(None, "no_repo_path")
 
     deadline = time.monotonic() + WATCH_GIT_TOTAL_BUDGET_SECONDS
 
-    def run_git(git_args: Sequence[str]) -> Optional[str]:
+    def run_git(git_args: Sequence[str]) -> _WatchGitOutcome:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return None
-        return _watch_run_git(
+            return _WatchGitOutcome(None, "timeout")
+        return _watch_run_git_checked(
             repo, git_args, timeout=min(WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS, max(0.05, remaining))
         )
 
-    head = run_git(["rev-parse", "--short", "HEAD"])
-    if head is None:
-        return None
-    porcelain = run_git(["status", "--porcelain"])
-    if porcelain is None:
-        return None
-    shortstat = run_git(["diff", "HEAD", "--shortstat"])
-    if shortstat is None:
-        return None
-    files_changed, insertions, deletions = _watch_parse_shortstat(shortstat)
+    head_outcome = run_git(["rev-parse", "--short", "HEAD"])
+    if head_outcome.stdout is None:
+        # A non-zero exit here is ambiguous between "not a repo" (already
+        # classified) and "repo exists, zero commits yet" — git's own
+        # stderr wording for the latter isn't stable across commands/
+        # versions, so disambiguate with a cheap follow-up probe: inside a
+        # work tree but HEAD still fails to resolve means no commits.
+        if head_outcome.error == "git_failed":
+            probe = run_git(["rev-parse", "--is-inside-work-tree"])
+            if probe.stdout is not None and probe.stdout.strip() == "true":
+                return _WatchGitFactsResult(None, "no_commits")
+        return _WatchGitFactsResult(None, head_outcome.error)
+    head = head_outcome.stdout
+    porcelain_outcome = run_git(["status", "--porcelain"])
+    if porcelain_outcome.stdout is None:
+        return _WatchGitFactsResult(None, porcelain_outcome.error)
+    porcelain = porcelain_outcome.stdout
+    shortstat_outcome = run_git(["diff", "HEAD", "--shortstat"])
+    if shortstat_outcome.stdout is None:
+        return _WatchGitFactsResult(None, shortstat_outcome.error)
+    files_changed, insertions, deletions = _watch_parse_shortstat(shortstat_outcome.stdout)
 
     commits_since_start: Optional[int] = None
     if started_at is not None:
         since = started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-        count_out = run_git(["rev-list", "--count", f"--since={since}", "HEAD"])
-        if count_out is None:
-            return None
+        count_outcome = run_git(["rev-list", "--count", f"--since={since}", "HEAD"])
+        if count_outcome.stdout is None:
+            return _WatchGitFactsResult(None, count_outcome.error)
         try:
-            commits_since_start = int(count_out.strip())
+            commits_since_start = int(count_outcome.stdout.strip())
         except ValueError:
-            return None
+            return _WatchGitFactsResult(None, "git_failed")
 
-    last_commit_epoch = run_git(["log", "-1", "--format=%ct", "HEAD"])
-    if last_commit_epoch is None:
-        return None
+    last_commit_outcome = run_git(["log", "-1", "--format=%ct", "HEAD"])
+    if last_commit_outcome.stdout is None:
+        return _WatchGitFactsResult(None, last_commit_outcome.error)
     last_commit_age_s: Optional[float] = None
-    stripped = last_commit_epoch.strip()
+    stripped = last_commit_outcome.stdout.strip()
     if stripped:
         try:
             last_commit_age_s = max(0.0, time.time() - int(stripped))
         except ValueError:
             last_commit_age_s = None
 
-    return {
-        "head": head.strip(),
-        "dirty": bool(porcelain.strip()),
-        "files_changed": files_changed,
-        "insertions": insertions,
-        "deletions": deletions,
-        "commits_since_start": commits_since_start,
-        "last_commit_age_s": last_commit_age_s,
-    }
+    return _WatchGitFactsResult(
+        {
+            "head": head.strip(),
+            "dirty": bool(porcelain.strip()),
+            "files_changed": files_changed,
+            "insertions": insertions,
+            "deletions": deletions,
+            "commits_since_start": commits_since_start,
+            "last_commit_age_s": last_commit_age_s,
+        },
+        None,
+    )
+
+
+def _watch_git_facts(repo: Path, started_at: Optional[datetime]) -> Optional[dict]:
+    """Facts-only convenience wrapper over ``_watch_git_facts_checked`` for
+    callers that don't need the failure discriminator."""
+    return _watch_git_facts_checked(repo, started_at).facts
 
 
 def _watch_tail_lines(log: Optional[Path], n: int) -> List[str]:
@@ -1786,6 +1862,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
     other field degraded to its null/unknown value, and
     ``observation_error`` is set to the exception class name plus a
     truncated message (~200 chars) instead.
+
+    ``git_error`` is ``null`` whenever ``git`` is populated, and otherwise
+    exactly one of ``"no_repo_path"``, ``"not_a_repo"``, ``"no_commits"``,
+    ``"timeout"``, ``"git_missing"``, ``"git_failed"`` — a poller that fails
+    toward escalating on unknown state must be able to tell "cannot observe
+    this repo" (alarming) apart from "observed it, there is nothing there"
+    (benign), which a bare ``git: null`` cannot express on its own. Present
+    in every payload branch, including the missing-state-dir and top-level
+    ``observation_error`` guard cases, so the key set never varies.
     """
     name = _validate_run_name(args.name)
     state_dir = _state_dir(name)
@@ -1817,6 +1902,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             "log": None,
             "repo": None,
             "git": None,
+            "git_error": None,
             "signals": {
                 "repeated_error": None,
                 "distinct_files_read": 0,
@@ -1847,6 +1933,9 @@ def _cmd_watch_observe(
         launch_error = _read(log_dir / "launch_error") or None
         repo_arg: Optional[str] = getattr(args, "repo", None)
         repo_path = Path(repo_arg) if repo_arg else None
+        git_facts, git_error = (
+            _watch_git_facts_checked(repo_path, None) if repo_path is not None else (None, "no_repo_path")
+        )
         payload = {
             "schema": "agent-run.watch.v1",
             "name": name,
@@ -1862,7 +1951,8 @@ def _cmd_watch_observe(
             "launch_error": launch_error,
             "log": _watch_log_facts(log),
             "repo": repo_arg,
-            "git": _watch_git_facts(repo_path, None) if repo_path is not None else None,
+            "git": git_facts,
+            "git_error": git_error,
             "signals": _watch_signals(log),
             "observation_error": None,
         }
@@ -1899,7 +1989,9 @@ def _cmd_watch_observe(
     repo_arg: Optional[str] = getattr(args, "repo", None)
     repo_str = repo_arg or (_read(state_dir / "cwd") or None)
     repo_path = Path(repo_str) if repo_str else None
-    git = _watch_git_facts(repo_path, started_dt) if repo_path is not None else None
+    git, git_error = (
+        _watch_git_facts_checked(repo_path, started_dt) if repo_path is not None else (None, "no_repo_path")
+    )
 
     payload = {
         "schema": "agent-run.watch.v1",
@@ -1917,6 +2009,7 @@ def _cmd_watch_observe(
         "log": _watch_log_facts(log),
         "repo": repo_str,
         "git": git,
+        "git_error": git_error,
         "signals": _watch_signals(log),
         "observation_error": None,
     }

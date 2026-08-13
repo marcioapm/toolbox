@@ -26,7 +26,7 @@ from toolbox import agent_run
 WATCH_CONTRACT_KEYS = {
     "schema", "name", "observed_at", "status", "exit_code", "pid",
     "interactive", "started_at", "ended_at", "elapsed_s", "terminal",
-    "launch_error", "log", "repo", "git", "signals", "observation_error",
+    "launch_error", "log", "repo", "git", "git_error", "signals", "observation_error",
 }
 
 
@@ -313,6 +313,7 @@ class TestUnresolvable:
         assert payload["started_at"] is None
         assert payload["repo"] is None
         assert payload["git"] is None
+        assert payload["git_error"] == "no_repo_path"
         assert payload["log"]["lines"] == 2
 
     def test_missing_state_dir_with_explicit_repo_still_reads_git(
@@ -330,6 +331,7 @@ class TestUnresolvable:
         assert payload["repo"] == str(repo)
         assert payload["git"] is not None
         assert payload["git"]["head"]
+        assert payload["git_error"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +352,7 @@ class TestRepoResolution:
         payload = json.loads(capsys.readouterr().out)
         assert payload["repo"] is None
         assert payload["git"] is None
+        assert payload["git_error"] == "no_repo_path"
         # every other field still populated
         assert payload["status"] == "done"
         assert payload["exit_code"] == 0
@@ -370,6 +373,7 @@ class TestRepoResolution:
         assert payload["repo"] == str(repo)
         assert payload["git"]["dirty"] is False
         assert payload["git"]["files_changed"] == 0
+        assert payload["git_error"] is None
 
     def test_repo_flag_overrides_cwd_file(
         self, isolated_runs_root, isolated_log_root, tmp_path, capsys
@@ -403,6 +407,7 @@ class TestRepoResolution:
         payload = json.loads(capsys.readouterr().out)
         assert payload["repo"] == str(not_a_repo)
         assert payload["git"] is None
+        assert payload["git_error"] == "not_a_repo"
 
     def test_git_timeout_yields_null_git(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
@@ -423,6 +428,7 @@ class TestRepoResolution:
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
         assert payload["git"] is None
+        assert payload["git_error"] == "timeout"
         # everything else stays populated
         assert payload["status"] == "done"
 
@@ -445,6 +451,153 @@ class TestRepoResolution:
         payload = json.loads(capsys.readouterr().out)
         assert payload["git"]["commits_since_start"] >= 1
         assert payload["git"]["last_commit_age_s"] is not None
+
+
+# ---------------------------------------------------------------------------
+# git_error discriminator
+# ---------------------------------------------------------------------------
+
+class TestGitErrorDiscriminator:
+    def test_nonexistent_repo_path_yields_no_repo_path(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        missing = tmp_path / "does-not-exist"
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge1",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(missing),
+        )
+        rc = agent_run.cmd_watch(_watch_args("ge1"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is None
+        assert payload["git_error"] == "no_repo_path"
+
+    def test_plain_directory_not_a_repo_yields_not_a_repo(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        plain = tmp_path / "plain-dir"
+        plain.mkdir()
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge2",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(plain),
+        )
+        rc = agent_run.cmd_watch(_watch_args("ge2"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is None
+        assert payload["git_error"] == "not_a_repo"
+
+    def test_git_init_zero_commits_yields_no_commits(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "empty-repo"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge3",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+        rc = agent_run.cmd_watch(_watch_args("ge3"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is None
+        assert payload["git_error"] == "no_commits"
+
+    def test_timeout_expired_yields_timeout(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge4",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+
+        def _wedged(*_args, **_kwargs):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=2.5)
+
+        monkeypatch.setattr(agent_run.subprocess, "run", _wedged)
+        rc = agent_run.cmd_watch(_watch_args("ge4"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is None
+        assert payload["git_error"] == "timeout"
+
+    def test_git_binary_missing_yields_git_missing(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge5",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+
+        def _no_git(*_args, **_kwargs):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(agent_run.subprocess, "run", _no_git)
+        rc = agent_run.cmd_watch(_watch_args("ge5"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is None
+        assert payload["git_error"] == "git_missing"
+
+    def test_healthy_repo_yields_fully_populated_git_and_null_git_error(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge6",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+        rc = agent_run.cmd_watch(_watch_args("ge6"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is not None
+        assert payload["git"]["head"]
+        assert payload["git_error"] is None
+
+    def test_git_error_present_in_missing_state_dir_branch(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge7",
+            write_state=False, log_text="line1\n",
+        )
+        rc = agent_run.cmd_watch(_watch_args("ge7"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert "git_error" in payload
+        assert payload["git"] is None
+        assert payload["git_error"] == "no_repo_path"
+
+    def test_git_error_present_in_observation_error_guard_branch(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge8",
+            status="running", pid=111, log_age_secs=1,
+        )
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("synthetic failure for git_error guard test")
+
+        monkeypatch.setattr(agent_run, "_effective_status", _boom)
+        rc = agent_run.cmd_watch(_watch_args("ge8"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert "git_error" in payload
+        assert payload["git"] is None
+        assert payload["git_error"] is None
+        assert payload["observation_error"] == "RuntimeError: synthetic failure for git_error guard test"
 
 
 # ---------------------------------------------------------------------------
@@ -1156,6 +1309,8 @@ class TestNeverRaise:
         assert payload["terminal"] is False
         assert payload["pid"] is None
         assert payload["log"] is None
+        assert payload["git"] is None
+        assert payload["git_error"] is None
 
 
 class TestLaunchWritesCwd:
