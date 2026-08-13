@@ -448,36 +448,29 @@ class TestTerminalDerivability:
         assert payload["status"] == agent_run.WATCH_STATUS_LOG_PRESERVED
         assert payload["terminal"] is True
 
-    def test_missing_status_file_reports_unknown_and_terminal(
-        self, isolated_runs_root, isolated_log_root, capsys
+    @pytest.mark.parametrize(
+        "mutate, expected_status",
+        [
+            (lambda p: p.unlink(), "unknown"),
+            (lambda p: p.write_text(""), ""),
+        ],
+        ids=["missing_status_file", "empty_status_file"],
+    )
+    def test_unreadable_status_file_is_terminal_as_unrecognized(
+        self, isolated_runs_root, isolated_log_root, capsys, mutate, expected_status
     ):
+        """A missing status file reads as `"unknown"` and an empty one as
+        `""`. Both are outside TERMINAL_STATUSES/KNOWN_NONTERMINAL_STATUSES,
+        so both must be terminal — a poller must not wait forever on them."""
         _make_run(
             isolated_runs_root, isolated_log_root, "td2",
             status="running", pid=111,
         )
-        (isolated_runs_root / "td2" / "status").unlink()
+        mutate(isolated_runs_root / "td2" / "status")
         rc = agent_run.cmd_watch(_watch_args("td2"))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
-        assert payload["status"] == "unknown"
-        assert payload["terminal"] is True
-
-    def test_empty_status_file_is_terminal_as_an_unrecognized_status(
-        self, isolated_runs_root, isolated_log_root, capsys
-    ):
-        """An empty (0-byte) status file reads as `""`, distinct from a
-        missing file's `"unknown"` default -- both are unrecognized strings
-        outside TERMINAL_STATUSES/KNOWN_NONTERMINAL_STATUSES, so both must
-        be terminal under `_watch_is_terminal`."""
-        _make_run(
-            isolated_runs_root, isolated_log_root, "td3",
-            status="running", pid=111,
-        )
-        (isolated_runs_root / "td3" / "status").write_text("")
-        rc = agent_run.cmd_watch(_watch_args("td3"))
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["status"] == ""
+        assert payload["status"] == expected_status
         assert payload["terminal"] is True
 
     def test_unverified_status_is_not_terminal(
@@ -509,8 +502,9 @@ class TestTerminalDerivability:
         assert payload["terminal"] is False
 
     def test_shared_gc_status_sets_are_not_widened(self):
-        """Proves this task did not touch reap's GC vocabulary: the two
-        shared frozensets must contain exactly their pre-existing members."""
+        """Reap's GC vocabulary must stay exactly as narrow as it is:
+        widening either set would make `reap` start deleting state for
+        statuses it currently refuses to touch."""
         assert agent_run.TERMINAL_STATUSES == frozenset(
             {"done", "failed", "launch_failed", "died", "killed"}
         )
@@ -689,151 +683,108 @@ class TestRepoResolution:
 # git_error discriminator
 # ---------------------------------------------------------------------------
 
+def _repo_missing(tmp_path: Path) -> Path:
+    return tmp_path / "does-not-exist"
+
+
+def _repo_plain_dir(tmp_path: Path) -> Path:
+    plain = tmp_path / "plain-dir"
+    plain.mkdir()
+    return plain
+
+
+def _repo_no_commits(tmp_path: Path) -> Path:
+    repo = tmp_path / "empty-repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    return repo
+
+
+def _repo_dangling_head(tmp_path: Path) -> Path:
+    repo = tmp_path / "dangling-head-repo"
+    _init_repo(repo)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/does-not-exist\n")
+    return repo
+
+
+def _repo_corrupt_index(tmp_path: Path) -> Path:
+    repo = tmp_path / "corrupt-index-repo"
+    _init_repo(repo)
+    (repo / ".git" / "index").write_text("garbage-not-an-index")
+    return repo
+
+
+def _repo_refs_wiped(tmp_path: Path) -> Path:
+    repo = tmp_path / "refs-wiped-repo"
+    _init_repo(repo)
+    for entry in (repo / ".git" / "refs").rglob("*"):
+        if entry.is_file():
+            entry.unlink()
+    packed_refs = repo / ".git" / "packed-refs"
+    if packed_refs.exists():
+        packed_refs.unlink()
+    return repo
+
+
+def _repo_objects_removed(tmp_path: Path) -> Path:
+    repo = tmp_path / "objects-removed-repo"
+    _init_repo(repo)
+    for entry in (repo / ".git" / "objects").rglob("*"):
+        if entry.is_file():
+            entry.unlink()
+    return repo
+
+
+def _repo_blob_removed(tmp_path: Path) -> Path:
+    """Only the blob under HEAD is gone: the stat-cache-driven reads can skip
+    re-reading it, so this is the case that requires the connectivity fsck."""
+    repo = tmp_path / "blob-removed-repo"
+    _init_repo(repo)
+    blob = subprocess.run(
+        ["git", "rev-parse", "HEAD:a.txt"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    return repo
+
+
 class TestGitErrorDiscriminator:
-    def test_nonexistent_repo_path_yields_no_repo_path(
-        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    # Each entry reproduces a distinct way a repo can be unobservable, paired
+    # with the discriminator it must produce. ANY_ERROR means "some non-null
+    # discriminator" — the damage is detected, but git's exact wording for it
+    # is not part of the contract.
+    ANY_ERROR = object()
+
+    @pytest.mark.parametrize(
+        "damage, expected",
+        [
+            pytest.param(_repo_missing, "no_repo_path", id="nonexistent_path"),
+            pytest.param(_repo_plain_dir, "not_a_repo", id="plain_directory"),
+            pytest.param(_repo_no_commits, "no_commits", id="init_zero_commits"),
+            pytest.param(_repo_dangling_head, "git_failed", id="dangling_head"),
+            pytest.param(_repo_corrupt_index, "git_failed", id="corrupt_index"),
+            pytest.param(_repo_refs_wiped, ANY_ERROR, id="refs_wiped"),
+            pytest.param(_repo_objects_removed, ANY_ERROR, id="objects_removed"),
+            pytest.param(_repo_blob_removed, ANY_ERROR, id="tracked_blob_removed"),
+        ],
+    )
+    def test_unobservable_repo_yields_null_git_and_a_discriminator(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys, damage, expected
     ):
-        missing = tmp_path / "does-not-exist"
+        repo = damage(tmp_path)
         _make_run(
             isolated_runs_root, isolated_log_root, "ge1",
             status="done", pid=1, exit_code=0, ended_age_secs=1,
-            cwd=str(missing),
+            cwd=str(repo),
         )
         rc = agent_run.cmd_watch(_watch_args("ge1"))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
         assert payload["git"] is None
-        assert payload["git_error"] == "no_repo_path"
-
-    def test_plain_directory_not_a_repo_yields_not_a_repo(
-        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
-    ):
-        plain = tmp_path / "plain-dir"
-        plain.mkdir()
-        _make_run(
-            isolated_runs_root, isolated_log_root, "ge2",
-            status="done", pid=1, exit_code=0, ended_age_secs=1,
-            cwd=str(plain),
-        )
-        rc = agent_run.cmd_watch(_watch_args("ge2"))
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["git"] is None
-        assert payload["git_error"] == "not_a_repo"
-
-    def test_git_init_zero_commits_yields_no_commits(
-        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
-    ):
-        repo = tmp_path / "empty-repo"
-        repo.mkdir()
-        _git(repo, "init", "-q")
-        _make_run(
-            isolated_runs_root, isolated_log_root, "ge3",
-            status="done", pid=1, exit_code=0, ended_age_secs=1,
-            cwd=str(repo),
-        )
-        rc = agent_run.cmd_watch(_watch_args("ge3"))
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["git"] is None
-        assert payload["git_error"] == "no_commits"
-
-    def test_dangling_head_yields_git_failed_not_no_commits(
-        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
-    ):
-        repo = tmp_path / "dangling-head-repo"
-        _init_repo(repo)
-        (repo / ".git" / "HEAD").write_text("ref: refs/heads/does-not-exist\n")
-        _make_run(
-            isolated_runs_root, isolated_log_root, "ge3b",
-            status="done", pid=1, exit_code=0, ended_age_secs=1,
-            cwd=str(repo),
-        )
-        rc = agent_run.cmd_watch(_watch_args("ge3b"))
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["git"] is None
-        assert payload["git_error"] == "git_failed"
-
-    def test_refs_wiped_yields_null_git_with_error(
-        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
-    ):
-        repo = tmp_path / "refs-wiped-repo"
-        _init_repo(repo)
-        for entry in (repo / ".git" / "refs").rglob("*"):
-            if entry.is_file():
-                entry.unlink()
-        packed_refs = repo / ".git" / "packed-refs"
-        if packed_refs.exists():
-            packed_refs.unlink()
-        _make_run(
-            isolated_runs_root, isolated_log_root, "ge3c",
-            status="done", pid=1, exit_code=0, ended_age_secs=1,
-            cwd=str(repo),
-        )
-        rc = agent_run.cmd_watch(_watch_args("ge3c"))
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["git"] is None
-        assert payload["git_error"] is not None
-
-    def test_objects_removed_yields_null_git_with_error(
-        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
-    ):
-        repo = tmp_path / "objects-removed-repo"
-        _init_repo(repo)
-        for entry in (repo / ".git" / "objects").rglob("*"):
-            if entry.is_file():
-                entry.unlink()
-        _make_run(
-            isolated_runs_root, isolated_log_root, "ge3d",
-            status="done", pid=1, exit_code=0, ended_age_secs=1,
-            cwd=str(repo),
-        )
-        rc = agent_run.cmd_watch(_watch_args("ge3d"))
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["git"] is None
-        assert payload["git_error"] is not None
-
-    def test_tracked_blob_removed_yields_null_git_with_error(
-        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
-    ):
-        repo = tmp_path / "blob-removed-repo"
-        _init_repo(repo)
-        blob = subprocess.run(
-            ["git", "rev-parse", "HEAD:a.txt"],
-            cwd=repo, check=True, capture_output=True, text=True,
-        ).stdout.strip()
-        obj_path = repo / ".git" / "objects" / blob[:2] / blob[2:]
-        obj_path.unlink()
-        _make_run(
-            isolated_runs_root, isolated_log_root, "ge3e",
-            status="done", pid=1, exit_code=0, ended_age_secs=1,
-            cwd=str(repo),
-        )
-        rc = agent_run.cmd_watch(_watch_args("ge3e"))
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["git"] is None
-        assert payload["git_error"] is not None
-
-    def test_corrupt_index_yields_git_failed(
-        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
-    ):
-        repo = tmp_path / "corrupt-index-repo"
-        _init_repo(repo)
-        (repo / ".git" / "index").write_text("garbage-not-an-index")
-        _make_run(
-            isolated_runs_root, isolated_log_root, "ge3f",
-            status="done", pid=1, exit_code=0, ended_age_secs=1,
-            cwd=str(repo),
-        )
-        rc = agent_run.cmd_watch(_watch_args("ge3f"))
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["git"] is None
-        assert payload["git_error"] == "git_failed"
+        if expected is self.ANY_ERROR:
+            assert payload["git_error"] is not None
+        else:
+            assert payload["git_error"] == expected
 
     def test_timeout_expired_yields_timeout(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
@@ -942,7 +893,7 @@ class TestGitHardening:
         script.write_text(f"#!/bin/sh\ntouch '{marker}'\nprintf '2\\n'\n")
         script.chmod(0o755)
         _git(repo, "config", "core.fsmonitor", str(script))
-        agent_run._watch_run_git(repo, ["status", "--porcelain"])
+        agent_run._watch_run_git_checked(repo, ["status", "--porcelain"])
         assert marker.exists() is False
 
     def test_git_dir_env_is_ignored(self, tmp_path, monkeypatch):
@@ -954,14 +905,14 @@ class TestGitHardening:
         _git(repo_b, "add", "b.txt")
         _git(repo_b, "commit", "-q", "-m", "second")
 
-        expected_head = agent_run._watch_run_git(
+        expected_head = agent_run._watch_run_git_checked(
             repo_a, ["rev-parse", "--short", "HEAD"]
-        ).strip()
+        ).stdout.strip()
 
         monkeypatch.setenv("GIT_DIR", str(repo_b / ".git"))
         monkeypatch.setenv("GIT_WORK_TREE", str(repo_b))
-        result = agent_run._watch_run_git(repo_a, ["rev-parse", "--short", "HEAD"])
-        assert result.strip() == expected_head
+        result = agent_run._watch_run_git_checked(repo_a, ["rev-parse", "--short", "HEAD"])
+        assert result.stdout.strip() == expected_head
 
     def test_undecodable_output_does_not_raise(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"
@@ -974,8 +925,8 @@ class TestGitHardening:
             return _FakeResult()
 
         monkeypatch.setattr(agent_run.subprocess, "run", _fake_run)
-        result = agent_run._watch_run_git(repo, ["status", "--porcelain"])
-        assert result == "A\ufffd\ufffdB"
+        result = agent_run._watch_run_git_checked(repo, ["status", "--porcelain"])
+        assert result.stdout == "A\ufffd\ufffdB"
 
 
 # ---------------------------------------------------------------------------
@@ -997,7 +948,7 @@ class TestGitTotalBudget:
         monkeypatch.setattr(agent_run.subprocess, "run", _slow_run)
         started_at = datetime.now(timezone.utc) - timedelta(hours=1)
         start = time.monotonic()
-        agent_run._watch_git_facts(repo, started_at)
+        agent_run._watch_git_facts_checked(repo, started_at)
         elapsed = time.monotonic() - start
         assert elapsed < agent_run.WATCH_GIT_TOTAL_BUDGET_SECONDS + 2.0
 
@@ -1016,7 +967,7 @@ class TestGitTotalBudget:
 
         monkeypatch.setattr(agent_run.subprocess, "run", _fast_run)
         started_at = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = agent_run._watch_git_facts(repo, started_at)
+        result = agent_run._watch_git_facts_checked(repo, started_at).facts
         assert result is not None
         assert len(seen_timeouts) == 7
         assert all(t <= agent_run.WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS for t in seen_timeouts)
@@ -1035,17 +986,17 @@ class TestGitTotalBudget:
         monkeypatch.setattr(agent_run.subprocess, "run", _slow_run)
         monkeypatch.setattr(agent_run, "WATCH_GIT_TOTAL_BUDGET_SECONDS", 0.05)
         started_at = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = agent_run._watch_git_facts(repo, started_at)
+        result = agent_run._watch_git_facts_checked(repo, started_at).facts
         assert result is None
 
     def test_happy_path_returns_fully_populated_facts(self, tmp_path):
         repo = tmp_path / "repo"
         _init_repo(repo)
-        expected_head = agent_run._watch_run_git(
+        expected_head = agent_run._watch_run_git_checked(
             repo, ["rev-parse", "--short", "HEAD"]
-        ).strip()
+        ).stdout.strip()
         started_at = datetime.now(timezone.utc) - timedelta(hours=1)
-        result = agent_run._watch_git_facts(repo, started_at)
+        result = agent_run._watch_git_facts_checked(repo, started_at).facts
         assert result == {
             "head": expected_head,
             "dirty": False,
@@ -1560,14 +1511,31 @@ class TestNeverRaise:
         assert set(payload.keys()) == WATCH_CONTRACT_KEYS
         return payload
 
-    def test_unicode_digit_pid_is_null(
-        self, isolated_runs_root, isolated_log_root, capsys
+    @pytest.mark.parametrize(
+        "corrupt",
+        [
+            pytest.param(lambda p: p.write_text("\u00b2\n"), id="non_ascii_digit"),
+            pytest.param(lambda p: p.write_bytes(b"\xff\xfe123"), id="invalid_utf8"),
+            pytest.param(lambda p: (p.unlink(), p.mkdir()), id="directory_in_place"),
+            pytest.param(lambda p: p.chmod(0o000), id="mode_000", marks=ROOT_SKIP),
+        ],
+    )
+    def test_unreadable_pid_file_degrades_to_null_pid(
+        self, isolated_runs_root, isolated_log_root, capsys, corrupt
     ):
-        sd, ld = _make_run(
-            isolated_runs_root, isolated_log_root, "u1", status="running",
+        """Every way a pid file can be unreadable or unparseable degrades
+        `pid` to null and still emits the full contract at exit 0."""
+        sd, _ld = _make_run(
+            isolated_runs_root, isolated_log_root, "u1",
+            status="running", pid=111,
         )
-        (sd / "pid").write_text("\u00b2\n")
-        rc = agent_run.cmd_watch(_watch_args("u1"))
+        target = sd / "pid"
+        corrupt(target)
+        try:
+            rc = agent_run.cmd_watch(_watch_args("u1"))
+        finally:
+            if target.is_file():
+                target.chmod(0o644)
         assert rc == 0
         payload = self._payload(capsys)
         assert payload["pid"] is None
@@ -1585,54 +1553,6 @@ class TestNeverRaise:
         assert rc == 0
         payload = self._payload(capsys)
         assert payload["exit_code"] is None
-        assert payload["observation_error"] is None
-
-    def test_state_file_that_is_a_directory_degrades_to_default(
-        self, isolated_runs_root, isolated_log_root, capsys
-    ):
-        sd, ld = _make_run(
-            isolated_runs_root, isolated_log_root, "u3",
-            status="running", pid=111,
-        )
-        (sd / "pid").unlink()
-        (sd / "pid").mkdir()
-        rc = agent_run.cmd_watch(_watch_args("u3"))
-        assert rc == 0
-        payload = self._payload(capsys)
-        assert payload["pid"] is None
-        assert payload["observation_error"] is None
-
-    @ROOT_SKIP
-    def test_state_file_at_mode_000_degrades_to_default(
-        self, isolated_runs_root, isolated_log_root, capsys
-    ):
-        sd, ld = _make_run(
-            isolated_runs_root, isolated_log_root, "u4",
-            status="running", pid=111,
-        )
-        target = sd / "pid"
-        target.chmod(0o000)
-        try:
-            rc = agent_run.cmd_watch(_watch_args("u4"))
-        finally:
-            target.chmod(0o644)
-        assert rc == 0
-        payload = self._payload(capsys)
-        assert payload["pid"] is None
-        assert payload["observation_error"] is None
-
-    def test_state_file_with_invalid_utf8_degrades_to_default(
-        self, isolated_runs_root, isolated_log_root, capsys
-    ):
-        sd, ld = _make_run(
-            isolated_runs_root, isolated_log_root, "u5",
-            status="running", pid=111,
-        )
-        (sd / "pid").write_bytes(b"\xff\xfe123")
-        rc = agent_run.cmd_watch(_watch_args("u5"))
-        assert rc == 0
-        payload = self._payload(capsys)
-        assert payload["pid"] is None
         assert payload["observation_error"] is None
 
     @ROOT_SKIP
@@ -1842,6 +1762,12 @@ class TestWatchTailLinesByteBound:
 # _is_dir_safe: the existence check ahead of cmd_watch's/cmd_status's guard
 # ---------------------------------------------------------------------------
 
+def _write_file(parent: Path) -> Path:
+    f = parent / "f"
+    f.write_text("x")
+    return f
+
+
 class TestIsDirSafe:
     ROOT_SKIP = pytest.mark.skipif(
         hasattr(os, "geteuid") and os.geteuid() == 0,
@@ -1851,13 +1777,15 @@ class TestIsDirSafe:
     def test_returns_true_for_a_real_directory(self, tmp_path):
         assert agent_run._is_dir_safe(tmp_path) is True
 
-    def test_returns_false_for_a_missing_path(self, tmp_path):
-        assert agent_run._is_dir_safe(tmp_path / "nope") is False
-
-    def test_returns_false_for_a_file(self, tmp_path):
-        f = tmp_path / "f"
-        f.write_text("x")
-        assert agent_run._is_dir_safe(f) is False
+    @pytest.mark.parametrize(
+        "make",
+        [
+            pytest.param(lambda p: p / "nope", id="missing_path"),
+            pytest.param(_write_file, id="regular_file"),
+        ],
+    )
+    def test_returns_false_for_a_non_directory(self, tmp_path, make):
+        assert agent_run._is_dir_safe(make(tmp_path)) is False
 
     @ROOT_SKIP
     def test_returns_false_instead_of_raising_when_parent_is_unreadable(self, tmp_path):
