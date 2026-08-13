@@ -312,6 +312,9 @@ WATCH_LOG_GROWING_MAX_AGE_SECONDS: float = 60.0
 # what was observed in the log tail; they are not an escalation policy.
 WATCH_TAIL_LINES: int = 200
 WATCH_REPEAT_THRESHOLD: int = 3
+# The consumer sees a silently clipped string past this width, so the width
+# is a contract, not scratch formatting.
+WATCH_ERROR_LINE_MAX_CHARS: int = 200
 WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS: float = 2.5
 # A supervisor polls N runs inside a 30s cycle, so one repo's five git calls
 # must not each spend up to the per-call timeout; this bounds their total.
@@ -336,8 +339,26 @@ WATCH_GIT_ENV_VARS_TO_STRIP: frozenset[str] = frozenset(
     }
 )
 
-_WATCH_ERROR_LINE_RE = re.compile(r"error|Error|ERROR|Traceback|FAILED|exception")
+# Anchored at (stripped) line start, optionally after a `path:`/`prefix:`
+# token, with word boundaries — a bare substring match fires on lint/test
+# noise like "0 errors, 0 warnings" or a table header "| Error | Count |".
+_WATCH_ERROR_LINE_RE = re.compile(r"(?i)^\s*(?:\S+:\s*)?(error|traceback|exception|failed)\b")
+# A count of 0 next to the matched word (either order, plural or not) is a
+# negation, not an occurrence: "0 errors", "0 failed", "errors: 0".
+_WATCH_ERROR_ZERO_COUNT_RE = re.compile(r"(?i)\b0\s+(?:error|fail)\w*\b|\b(?:error|fail)\w*:\s*0\b")
 _WATCH_READ_LINE_RE = re.compile(r"\bRead\s+(\S+)")
+# A `Read` target must look like a path (contains `/` or `.`), so prose like
+# "Please Read carefully" doesn't parse "carefully" as a file.
+_WATCH_READ_PATH_LIKE_RE = re.compile(r"[/.]")
+# CSI sequences (`\x1b[...<final>`) and other two-byte escapes (`\x1b` plus
+# one byte in `@`-`Z` or `\`-`_`), e.g. from colour codes in a TUI capture.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI/CSI escape sequences from a raw PTY capture line."""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
 
 # Terminal-state garbage-collection age threshold: how long a run must have
 # been sitting in a conclusively terminal status (see TERMINAL_STATUSES)
@@ -1685,21 +1706,37 @@ def _watch_tail_lines(log: Optional[Path], n: int) -> List[str]:
     return lines[-n:]
 
 
+def _watch_normalize_lines(lines: List[str]) -> List[str]:
+    """ANSI-strip each tail line and split it on ``\\r`` in addition to the
+    ``\\n`` boundaries the tail scan already applied. The source is a raw
+    PTY capture of a TUI, so colour codes and same-line redraws are
+    otherwise indistinguishable from real content to a line-oriented scan."""
+    normalized: List[str] = []
+    for line in lines:
+        for part in _strip_ansi(line).split("\r"):
+            normalized.append(part)
+    return normalized
+
+
 def _watch_repeated_error(lines: List[str]) -> Optional[str]:
     """The first log-tail line matching an error signature that recurs at
-    least ``WATCH_REPEAT_THRESHOLD`` times verbatim, truncated to 200 chars,
-    or ``None``. A description of what was observed, not a verdict."""
+    least ``WATCH_REPEAT_THRESHOLD`` times verbatim, truncated to
+    ``WATCH_ERROR_LINE_MAX_CHARS``, or ``None``. A description of what was
+    observed, not a verdict."""
     counts: dict = {}
     order: List[str] = []
-    for line in lines:
-        if not _WATCH_ERROR_LINE_RE.search(line):
+    for line in _watch_normalize_lines(lines):
+        trimmed = line.strip()
+        if not _WATCH_ERROR_LINE_RE.match(trimmed):
+            continue
+        if _WATCH_ERROR_ZERO_COUNT_RE.search(trimmed):
             continue
         if line not in counts:
             order.append(line)
         counts[line] = counts.get(line, 0) + 1
     for line in order:
         if counts[line] >= WATCH_REPEAT_THRESHOLD:
-            return line[:200]
+            return line[:WATCH_ERROR_LINE_MAX_CHARS]
     return None
 
 
@@ -1708,11 +1745,13 @@ def _watch_read_signals(lines: List[str]) -> tuple[int, Optional[dict]]:
     repeated one when it recurs at least ``WATCH_REPEAT_THRESHOLD`` times."""
     counts: dict = {}
     order: List[str] = []
-    for line in lines:
+    for line in _watch_normalize_lines(lines):
         m = _WATCH_READ_LINE_RE.search(line)
         if not m:
             continue
         path = m.group(1)
+        if not _WATCH_READ_PATH_LIKE_RE.search(path):
+            continue
         if path not in counts:
             order.append(path)
         counts[path] = counts.get(path, 0) + 1

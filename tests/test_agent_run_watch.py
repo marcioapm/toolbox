@@ -842,6 +842,98 @@ class TestSignals:
         payload = json.loads(capsys.readouterr().out)
         assert payload["signals"]["repeated_error"] is None
 
+    @pytest.mark.parametrize(
+        "noisy_line",
+        [
+            "  0 errors, 0 warnings",
+            "PASS test_exception_is_swallowed",
+            "| Error | Count |",
+            "step NOTFAILED ok",
+            "Read /src/errors.py",
+            "errors: 0",
+        ],
+    )
+    def test_repeated_error_ignores_healthy_lookalikes(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys, noisy_line
+    ):
+        text = (noisy_line + "\n") * agent_run.WATCH_REPEAT_THRESHOLD
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r23",
+            status="running", pid=1, log_text=text, log_age_secs=1,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("r23"))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["signals"]["repeated_error"] is None
+
+    @pytest.mark.parametrize(
+        "error_line",
+        [
+            "Error: ENOENT: no such file",
+            "src/foo.py: error: bad thing",
+            "Traceback (most recent call last):",
+        ],
+    )
+    def test_repeated_error_detects_genuine_errors(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys, error_line
+    ):
+        text = (error_line + "\n") * agent_run.WATCH_REPEAT_THRESHOLD
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r24",
+            status="running", pid=1, log_text=text, log_age_secs=1,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("r24"))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["signals"]["repeated_error"] == error_line
+
+    def test_repeated_read_ansi_wrapped_lines_collapse_to_clean_path(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        plain = "Read /a/one.py"
+        colour = "Read \x1b[36m/a/one.py\x1b[0m"
+        lines = [plain, colour, plain, colour, plain, colour]
+        text = "\n".join(lines) + "\n"
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r25",
+            status="running", pid=1, log_text=text, log_age_secs=1,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("r25"))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["signals"]["distinct_files_read"] == 1
+        assert payload["signals"]["top_repeated_read"] == {
+            "path": "/a/one.py",
+            "count": 6,
+        }
+
+    def test_repeated_read_rejects_prose_target(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        text = ("Please Read carefully\n") * 3
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r26",
+            status="running", pid=1, log_text=text, log_age_secs=1,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("r26"))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["signals"]["top_repeated_read"] is None
+
+    def test_repeated_error_detected_across_cr_redraws(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        # A TUI frame redrawing in place puts repeats on one physical line.
+        text = "Error: boom\r" * 4 + "\n"
+        _make_run(
+            isolated_runs_root, isolated_log_root, "r27",
+            status="running", pid=1, log_text=text, log_age_secs=1,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("r27"))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["signals"]["repeated_error"] == "Error: boom"
+
 
 # ---------------------------------------------------------------------------
 # read-only guarantee
