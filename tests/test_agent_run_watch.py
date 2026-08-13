@@ -1167,7 +1167,8 @@ class TestRegularLogPath:
             isolated_runs_root, isolated_log_root, "fifo1", write_log=False,
         )
         os.mkfifo(ld / "log")
-        assert agent_run._watch_regular_log_path("fifo1") is None
+        with agent_run._watch_open_validated_log(agent_run._log_file_for("fifo1")) as f:
+            assert f is None
 
     def test_fifo_log_end_to_end_returns_instead_of_hanging(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
@@ -1205,7 +1206,8 @@ class TestRegularLogPath:
         )
         (ld / "log").mkdir()
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        assert agent_run._watch_regular_log_path("dirlog") is None
+        with agent_run._watch_open_validated_log(agent_run._log_file_for("dirlog")) as f:
+            assert f is None
         rc = agent_run.cmd_watch(_watch_args("dirlog"))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
@@ -1223,7 +1225,8 @@ class TestRegularLogPath:
         (ld / "log").rename(target)
         (ld / "log").symlink_to(target)
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        assert agent_run._watch_regular_log_path("symreal") == ld / "log"
+        with agent_run._watch_open_validated_log(agent_run._log_file_for("symreal")) as f:
+            assert f is not None
         rc = agent_run.cmd_watch(_watch_args("symreal"))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
@@ -1243,7 +1246,8 @@ class TestRegularLogPath:
         os.mkfifo(fifo_path)
         (ld / "log").symlink_to(fifo_path)
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        assert agent_run._watch_regular_log_path("symfifo") is None
+        with agent_run._watch_open_validated_log(agent_run._log_file_for("symfifo")) as f:
+            assert f is None
         rc = agent_run.cmd_watch(_watch_args("symfifo"))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
@@ -1257,13 +1261,54 @@ class TestRegularLogPath:
             isolated_runs_root, isolated_log_root, "regular1",
             status="running", pid=1, log_age_secs=1, log_text="line one\nline two\n",
         )
-        assert agent_run._watch_regular_log_path("regular1") == ld / "log"
+        with agent_run._watch_open_validated_log(agent_run._log_file_for("regular1")) as f:
+            assert f is not None
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         rc = agent_run.cmd_watch(_watch_args("regular1"))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
         assert payload["log"]["bytes"] == len("line one\nline two\n")
         assert payload["log"]["lines"] == 2
+
+    def test_inode_swapped_between_stat_and_read_returns_instead_of_hanging(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """TOCTOU regression: something replaces the regular log with a FIFO
+        after validation would have passed by path but before the fd-based
+        open+fstat in _watch_open_validated_log runs. Structured to fail
+        (hang, caught by the join timeout) rather than wedge the suite if
+        the descriptor-based validation regresses to path-based validation."""
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("os.mkfifo unavailable on this platform")
+        _, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "toctou1",
+            status="done", pid=1, log_age_secs=1, log_text="line one\n",
+        )
+        log_path = ld / "log"
+        real_open = agent_run._watch_open_validated_log
+
+        def swap_then_open(path):
+            if path == log_path and log_path.exists() and not log_path.is_symlink():
+                log_path.unlink()
+                os.mkfifo(log_path)
+            return real_open(path)
+
+        monkeypatch.setattr(agent_run, "_watch_open_validated_log", swap_then_open)
+
+        result: dict = {}
+
+        def _call() -> None:
+            result["rc"] = agent_run.cmd_watch(_watch_args("toctou1"))
+
+        thread = threading.Thread(target=_call, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "watch_still_blocked"
+        assert result["rc"] == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert payload["log"] is None
+        assert payload["signals"] == _DEGRADED_SIGNALS
 
 
 # ---------------------------------------------------------------------------
@@ -1594,6 +1639,9 @@ class TestNeverRaise:
     def test_log_file_at_mode_000_degrades_line_count(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
     ):
+        """Log facts and the signal scan both open through the same
+        validated fd, so a permission-denied open degrades the whole `log`
+        object to null rather than a byte count paired with lines=0."""
         sd, ld = _make_run(
             isolated_runs_root, isolated_log_root, "u6",
             status="running", pid=111, log_age_secs=1,
@@ -1607,7 +1655,7 @@ class TestNeverRaise:
             log_file.chmod(0o644)
         assert rc == 0
         payload = self._payload(capsys)
-        assert payload["log"]["lines"] == 0
+        assert payload["log"] is None
         assert payload["signals"] == {
             "repeated_error": None,
             "distinct_files_read": 0,

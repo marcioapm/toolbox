@@ -736,24 +736,58 @@ def _log_file_for(name: str) -> Optional[Path]:
     return None
 
 
-def _watch_regular_log_path(name: str) -> Optional[Path]:
-    """Like ``_log_file_for``, but returns ``None`` unless the resolved path
-    stats as a regular file. Opening a FIFO blocks forever and no timeout
-    covers log reads, so a non-regular file there must never reach `open()`
-    from the watch poll. ``stat`` follows symlinks, so a symlink to a
-    regular file still passes and a symlink to a FIFO is still rejected.
-    Never raises: any ``OSError`` (missing, permission denied, dangling
-    symlink) is treated the same as a missing log."""
-    log = _log_file_for(name)
-    if log is None:
-        return None
+@contextmanager
+def _watch_open_validated_log(path: Optional[Path]):
+    """Open *path* and validate it is a regular file on the resulting
+    descriptor, yielding a binary file object — or ``None`` if *path* is
+    unset, cannot be opened, or does not stat as a regular file once open.
+
+    Validation happens on the descriptor rather than on the pathname because
+    the inode a path names can be replaced (rotation, an agent recreating
+    its log, a hostile swap) between an earlier check of the path and a
+    later open of it; a descriptor, once opened, always refers to the same
+    inode it was opened against, so fstat-ing it is the only check that
+    cannot be raced out from under the caller. ``O_NONBLOCK`` makes the
+    open itself safe even against a FIFO with no writer (returns
+    immediately instead of blocking forever), and is cleared again before
+    handing back the file object so a regular-file read behaves normally.
+    Never raises: any ``OSError`` degrades to yielding ``None``, and the fd
+    is closed on every path, including a validation failure.
+    """
+    if path is None:
+        yield None
+        return
+    fd = -1
     try:
-        st = log.stat()
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
-        return None
+        yield None
+        return
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        yield None
+        return
     if not _stat_module.S_ISREG(st.st_mode):
-        return None
-    return log
+        os.close(fd)
+        yield None
+        return
+    try:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+    except OSError:
+        pass
+    try:
+        f = os.fdopen(fd, "rb")
+    except OSError:
+        os.close(fd)
+        yield None
+        return
+    try:
+        yield f
+    finally:
+        f.close()
 
 
 def _path_entry_exists(path: Path) -> bool:
@@ -1907,14 +1941,16 @@ def _watch_git_facts(repo: Path, started_at: Optional[datetime]) -> Optional[dic
 
 def _watch_tail_lines(log: Optional[Path], n: int) -> List[str]:
     """Last ``n`` decoded text lines of a log, or ``[]`` on any read failure
-    (missing file, permission error, stale NFS handle). The backward scan
-    never reads past ``WATCH_TAIL_MAX_BYTES``, even if fewer than ``n``
-    newlines have been found by then; a truncated scan returns whatever
-    lines were found within the cap rather than the full tail."""
-    if log is None:
-        return []
-    try:
-        with log.open("rb") as f:
+    (missing file, permission error, stale NFS handle, non-regular file).
+    The backward scan never reads past ``WATCH_TAIL_MAX_BYTES``, even if
+    fewer than ``n`` newlines have been found by then; a truncated scan
+    returns whatever lines were found within the cap rather than the full
+    tail. Reads through ``_watch_open_validated_log`` so this reader and
+    the log-facts reader cannot drift apart on what counts as a safe log."""
+    with _watch_open_validated_log(log) as f:
+        if f is None:
+            return []
+        try:
             f.seek(0, os.SEEK_END)
             end = f.tell()
             chunks: List[bytes] = []
@@ -1930,8 +1966,8 @@ def _watch_tail_lines(log: Optional[Path], n: int) -> List[str]:
                 bytes_read += len(chunk)
                 chunks.append(chunk)
             data = b"".join(reversed(chunks))
-    except OSError:
-        return []
+        except OSError:
+            return []
     lines = data.decode("utf-8", errors="replace").splitlines()
     return lines[-n:]
 
@@ -2082,7 +2118,10 @@ def _cmd_watch_observe(
     """Build and print the watch contract. May raise; ``cmd_watch`` is the
     never-raise boundary that catches it."""
     observed_at = _now_iso()
-    log = _watch_regular_log_path(name)
+    # Only the path is resolved here; regular-file validation happens later,
+    # on the open descriptor, inside _watch_open_validated_log — the inode a
+    # path names can change between this line and the actual read.
+    log = _log_file_for(name)
 
     if not state_dir.is_dir():
         # State dir gone, log survived: matches cmd_status's "not running
@@ -2185,21 +2224,26 @@ def _cmd_watch_observe(
 
 def _watch_log_facts(log: Optional[Path]) -> Optional[dict]:
     """Byte/line/freshness facts for the run's log, or ``None`` if it
-    cannot be stat'd (missing, permission error, stale mount)."""
-    if log is None:
-        return None
-    try:
-        st = log.stat()
-    except OSError:
-        return None
-    mtime_age_s = max(0.0, time.time() - st.st_mtime)
-    return {
-        "path": str(log),
-        "bytes": st.st_size,
-        "lines": _log_line_count(log),
-        "mtime_age_s": mtime_age_s,
-        "growing": mtime_age_s < WATCH_LOG_GROWING_MAX_AGE_SECONDS,
-    }
+    cannot be opened and validated as a regular file (missing, permission
+    error, stale mount, or a non-regular file at that path).
+
+    Reads through ``_watch_open_validated_log`` so the size/mtime/line-count
+    all come from the one descriptor that was fstat-validated, instead of a
+    stat-by-name followed by a second open-by-name that could land on a
+    different inode."""
+    with _watch_open_validated_log(log) as f:
+        if f is None:
+            return None
+        st = os.fstat(f.fileno())
+        mtime_age_s = max(0.0, time.time() - st.st_mtime)
+        lines = sum(1 for _ in f)
+        return {
+            "path": str(log),
+            "bytes": st.st_size,
+            "lines": lines,
+            "mtime_age_s": mtime_age_s,
+            "growing": mtime_age_s < WATCH_LOG_GROWING_MAX_AGE_SECONDS,
+        }
 
 
 def _watch_signals(log: Optional[Path]) -> dict:
