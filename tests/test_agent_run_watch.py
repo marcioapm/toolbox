@@ -628,6 +628,103 @@ class TestGitErrorDiscriminator:
         assert payload["git"] is None
         assert payload["git_error"] == "no_commits"
 
+    def test_dangling_head_yields_git_failed_not_no_commits(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "dangling-head-repo"
+        _init_repo(repo)
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/does-not-exist\n")
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge3b",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+        rc = agent_run.cmd_watch(_watch_args("ge3b"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is None
+        assert payload["git_error"] == "git_failed"
+
+    def test_refs_wiped_yields_null_git_with_error(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "refs-wiped-repo"
+        _init_repo(repo)
+        for entry in (repo / ".git" / "refs").rglob("*"):
+            if entry.is_file():
+                entry.unlink()
+        packed_refs = repo / ".git" / "packed-refs"
+        if packed_refs.exists():
+            packed_refs.unlink()
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge3c",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+        rc = agent_run.cmd_watch(_watch_args("ge3c"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is None
+        assert payload["git_error"] is not None
+
+    def test_objects_removed_yields_null_git_with_error(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "objects-removed-repo"
+        _init_repo(repo)
+        for entry in (repo / ".git" / "objects").rglob("*"):
+            if entry.is_file():
+                entry.unlink()
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge3d",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+        rc = agent_run.cmd_watch(_watch_args("ge3d"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is None
+        assert payload["git_error"] is not None
+
+    def test_tracked_blob_removed_yields_null_git_with_error(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "blob-removed-repo"
+        _init_repo(repo)
+        blob = subprocess.run(
+            ["git", "rev-parse", "HEAD:a.txt"],
+            cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        obj_path = repo / ".git" / "objects" / blob[:2] / blob[2:]
+        obj_path.unlink()
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge3e",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+        rc = agent_run.cmd_watch(_watch_args("ge3e"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is None
+        assert payload["git_error"] is not None
+
+    def test_corrupt_index_yields_git_failed(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = tmp_path / "corrupt-index-repo"
+        _init_repo(repo)
+        (repo / ".git" / "index").write_text("garbage-not-an-index")
+        _make_run(
+            isolated_runs_root, isolated_log_root, "ge3f",
+            status="done", pid=1, exit_code=0, ended_age_secs=1,
+            cwd=str(repo),
+        )
+        rc = agent_run.cmd_watch(_watch_args("ge3f"))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["git"] is None
+        assert payload["git_error"] == "git_failed"
+
     def test_timeout_expired_yields_timeout(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
     ):
@@ -811,7 +908,7 @@ class TestGitTotalBudget:
         started_at = datetime.now(timezone.utc) - timedelta(hours=1)
         result = agent_run._watch_git_facts(repo, started_at)
         assert result is not None
-        assert len(seen_timeouts) == 6
+        assert len(seen_timeouts) == 7
         assert all(t <= agent_run.WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS for t in seen_timeouts)
 
     def test_budget_exhaustion_returns_none(self, tmp_path, monkeypatch):

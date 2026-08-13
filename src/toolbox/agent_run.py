@@ -1651,8 +1651,8 @@ class _WatchGitOutcome(NamedTuple):
 # Substrings of git's own stderr text used to tell "not a repository at all"
 # apart from other non-zero exits. "No commits yet" has no single stable
 # stderr wording across the different git commands/versions this module
-# runs, so that case is instead disambiguated with a follow-up
-# ``--is-inside-work-tree`` probe (see ``_watch_git_facts_checked``).
+# runs, so that case is instead disambiguated with a follow-up refs probe
+# (see ``_watch_git_facts_checked``).
 _WATCH_GIT_NOT_A_REPO_STDERR = "not a git repository"
 
 
@@ -1776,14 +1776,28 @@ def _watch_git_facts_checked(repo: Path, started_at: Optional[datetime]) -> _Wat
         # A non-zero exit here is ambiguous between "not a repo" (already
         # classified) and "repo exists, zero commits yet" — git's own
         # stderr wording for the latter isn't stable across commands/
-        # versions, so disambiguate with a cheap follow-up probe: inside a
-        # work tree but HEAD still fails to resolve means no commits.
+        # versions, so disambiguate with a cheap follow-up read. An unborn
+        # HEAD and a dangling/corrupt HEAD are both unresolvable, but only
+        # the former has no refs at all; ``no_commits`` must require that
+        # absence, not just a failed HEAD resolution, or repo damage reads
+        # as the one discriminator value callers treat as benign.
         if head_outcome.error == "git_failed":
-            probe = run_git(["rev-parse", "--is-inside-work-tree"])
-            if probe.stdout is not None and probe.stdout.strip() == "true":
+            refs_outcome = run_git(["rev-list", "--all", "--count"])
+            if refs_outcome.stdout is not None and refs_outcome.stdout.strip() == "0":
                 return _WatchGitFactsResult(None, "no_commits")
         return _WatchGitFactsResult(None, head_outcome.error)
     head = head_outcome.stdout
+
+    # Mandatory: the stat-cache-driven reads below (status, diff) can skip
+    # re-reading a tracked file's blob entirely when its working-tree mtime
+    # still matches the index, so a missing or corrupt object below HEAD
+    # would otherwise go undetected and this function would return fully
+    # populated facts. A connectivity-only fsck is the cheap, read-only way
+    # to catch that before any fact is built.
+    fsck_outcome = run_git(["fsck", "--connectivity-only", "--no-progress"])
+    if fsck_outcome.stdout is None:
+        return _WatchGitFactsResult(None, fsck_outcome.error)
+
     porcelain_outcome = run_git(["status", "--porcelain"])
     if porcelain_outcome.stdout is None:
         return _WatchGitFactsResult(None, porcelain_outcome.error)
