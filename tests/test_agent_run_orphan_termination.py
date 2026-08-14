@@ -16,17 +16,13 @@ import argparse
 import os
 import signal
 import time
-from pathlib import Path
 from typing import List, Optional, Tuple
-from unittest.mock import patch
 
 import pytest
 
 from toolbox import agent_run
 from toolbox.agent_run import (
     ORPHAN_KILL_GRACE_SECONDS,
-    _OrphanCandidate,
-    _OrphanSkip,
     _ProcEntry,
     _parse_orphan_min_age_seconds,
     cmd_reap,
@@ -114,27 +110,6 @@ def _reap_args(
         orphan_processes=orphan_processes,
         orphan_min_age_hours=orphan_min_age_hours,
     )
-
-
-class _FakeSignalSender:
-    """Captures (pid, signal) pairs sent by the orphan termination pass."""
-
-    def __init__(self):
-        self.calls: List[Tuple[int, int]] = []
-        self.killpg_calls: List[Tuple[int, int]] = []
-
-    def kill(self, pid: int, sig: int) -> None:
-        self.calls.append((pid, sig))
-
-    def killpg(self, pgid: int, sig: int) -> None:
-        self.killpg_calls.append((pgid, sig))
-
-    @property
-    def all_sigs_sent(self) -> List[int]:
-        return [sig for _pid, sig in self.calls + self.killpg_calls]
-
-    def sent_to(self, pid: int) -> List[int]:
-        return [sig for p, sig in self.calls if p == pid]
 
 
 def _extract_summary(capsys) -> str:
