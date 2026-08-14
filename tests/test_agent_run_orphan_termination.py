@@ -34,6 +34,27 @@ from toolbox.agent_run import (
 
 
 # ---------------------------------------------------------------------------
+# Module-level safety guards
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _no_real_signals(monkeypatch):
+    """Any test reaching a real os.kill/os.killpg is a bug: fail loudly instead
+    of terminating a live process.  Tests that legitimately assert on signalling
+    install their own recording stubs via monkeypatch, which override these."""
+    monkeypatch.setattr(os, "kill", lambda *a, **k: pytest.fail(f"real os.kill{a}"))
+    monkeypatch.setattr(os, "killpg", lambda *a, **k: pytest.fail(f"real os.killpg{a}"))
+
+
+@pytest.fixture(autouse=True)
+def _no_real_scan(monkeypatch):
+    """Prevent any test from accidentally enumerating the host process table.
+    Tests that need a table install their own stub via monkeypatch, overriding
+    this default."""
+    monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [])
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
