@@ -12,7 +12,10 @@ or killed.  The helpers under test:
 from __future__ import annotations
 
 import os
+import subprocess
 import time
+import types as _types
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -28,6 +31,7 @@ from toolbox.agent_run import (
     _run_name_from_argv,
     _find_orphan_runners,
     _parse_orphan_min_age_seconds,
+    cmd_reap,
 )
 
 
@@ -570,4 +574,330 @@ class TestDarwinLstartNormalise:
         assert scanner_identity == verify_identity, (
             f"scanner identity {scanner_identity!r} != "
             f"verify identity {verify_identity!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _scan_process_table_darwin — start_time correctness (C1: TZ, C2: locale)
+# ---------------------------------------------------------------------------
+
+def _fake_ps_run_for_lstart(lstart: str, pid: int = 4242):
+    """Return a fake subprocess.run stub that emits one ps -axo line with
+    the given lstart string.  Used to test start_time parsing in isolation."""
+    my_uid = os.getuid()
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = ""
+            returncode = 0
+        r = R()
+        if cmd[:2] == ["ps", "-axo"]:
+            # Column order: pid ppid pgid uid lstart command
+            r.stdout = (
+                f"  {pid}     1  {pid} {my_uid} {lstart}"
+                f" /usr/bin/agent-run testrun claude\n"
+            )
+        return r
+
+    return fake_run
+
+
+class TestDarwinStartTimeParsing:
+    """Verify that _scan_process_table_darwin converts lstart to the correct
+    epoch, independent of the host's TZ and locale (C1, C2).
+
+    All tests run on every platform via a subprocess.run stub — no Darwin
+    dependency.  The TZ environment variable and time.tzset() are used to
+    change the interpreter's local timezone so that datetime.timestamp()
+    computes the right epoch for each case.
+    """
+
+    def _parse_lstart_in_tz(self, lstart: str, tz: str, monkeypatch) -> Optional[float]:
+        """Run the Darwin scanner with a fake ps line and the given TZ,
+        return the start_time from the first entry, or None if empty."""
+        old_tz = os.environ.get("TZ")
+        monkeypatch.setenv("TZ", tz)
+        time.tzset()
+        try:
+            monkeypatch.setattr(subprocess, "run", _fake_ps_run_for_lstart(lstart))
+            monkeypatch.setattr(
+                agent_run, "platform",
+                _types.SimpleNamespace(system=lambda: "Darwin"),
+            )
+            entries = agent_run._scan_process_table_darwin()
+            return entries[0].start_time if entries else None
+        finally:
+            if old_tz is None:
+                monkeypatch.delenv("TZ", raising=False)
+            else:
+                monkeypatch.setenv("TZ", old_tz)
+            time.tzset()
+
+    @pytest.mark.parametrize("tz,lstart,expected_utc_hour", [
+        # UTC: local == UTC, so 10:00 local == 10:00 UTC.
+        ("UTC", "Mon Aug 10 10:00:00 2026", 10),
+        # America/Los_Angeles is PDT (UTC-7) in August.
+        # 03:00 local == 10:00 UTC.
+        ("America/Los_Angeles", "Mon Aug 10 03:00:00 2026", 10),
+        # Asia/Tokyo is JST (UTC+9) year-round.
+        # 19:00 local == 10:00 UTC.
+        ("Asia/Tokyo", "Mon Aug 10 19:00:00 2026", 10),
+    ])
+    def test_lstart_parsed_as_local_time(
+        self, tz, lstart, expected_utc_hour, monkeypatch
+    ):
+        """lstart is wall-clock local time; the parsed epoch must equal the
+        corresponding UTC instant regardless of the host timezone."""
+        # Reference UTC epoch: 2026-08-10 10:00:00 UTC
+        reference_utc = datetime(2026, 8, 10, 10, 0, 0)
+        # Compute expected epoch in UTC (force UTC for this calculation).
+        old_tz = os.environ.get("TZ")
+        monkeypatch.setenv("TZ", "UTC")
+        time.tzset()
+        expected_epoch = reference_utc.timestamp()
+        # Restore before calling _parse_lstart_in_tz.
+        if old_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", old_tz)
+        time.tzset()
+
+        result = self._parse_lstart_in_tz(lstart, tz, monkeypatch)
+        assert result is not None, f"scanner returned no entry for TZ={tz}"
+        assert result == pytest.approx(expected_epoch, abs=2.0), (
+            f"TZ={tz}: expected epoch {expected_epoch} (UTC 10:00), got {result}"
+        )
+
+    def test_dst_boundary_spring_forward_america_los_angeles(self, monkeypatch):
+        """Across a DST transition the epoch must still be correct.
+
+        2026-03-08 02:00 clocks spring forward to 03:00 in America/Los_Angeles,
+        so 03:30 local that day is PDT (UTC-7), not PST (UTC-8).
+        03:30 PDT == 10:30 UTC.
+        """
+        lstart = "Sun Mar  8 03:30:00 2026"
+        result = self._parse_lstart_in_tz(lstart, "America/Los_Angeles", monkeypatch)
+        assert result is not None
+
+        # Compute the expected epoch: 2026-03-08 10:30:00 UTC.
+        old_tz = os.environ.get("TZ")
+        monkeypatch.setenv("TZ", "UTC")
+        time.tzset()
+        expected_epoch = datetime(2026, 3, 8, 10, 30, 0).timestamp()
+        if old_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", old_tz)
+        time.tzset()
+
+        assert result == pytest.approx(expected_epoch, abs=2.0), (
+            f"DST boundary: expected {expected_epoch} (2026-03-08 10:30 UTC), "
+            f"got {result}"
+        )
+
+
+class TestDarwinLocaleHandling:
+    """Verify that a non-C locale in ps output produces start_time=None and
+    that _find_orphan_runners emits start_time_unknown (fail-closed) (C2)."""
+
+    def test_unparsable_lstart_yields_start_time_none(self, monkeypatch):
+        """A localised lstart (e.g. French 'ven. 14 août 23:00:18 2026')
+        must produce start_time=None, not 0.0 (the epoch)."""
+        # A localised lstart that strptime cannot parse with "%a %b %d %H:%M:%S %Y".
+        localised_lstart = "ven. 14 aout 23:00:18 2026"
+        monkeypatch.setattr(subprocess, "run",
+                            _fake_ps_run_for_lstart(localised_lstart))
+        monkeypatch.setattr(
+            agent_run, "platform",
+            _types.SimpleNamespace(system=lambda: "Darwin"),
+        )
+        entries = agent_run._scan_process_table_darwin()
+        assert entries, "scanner returned no entries"
+        assert entries[0].start_time is None, (
+            f"expected None for unparsable lstart, got {entries[0].start_time!r}"
+        )
+
+    def test_start_time_none_skipped_not_candidate(self, isolated_runs_root):
+        """An entry with start_time=None must be emitted as start_time_unknown,
+        never as a candidate — an unknown age cannot satisfy any threshold."""
+        _make_log_dir("localerun")
+        entry = _ProcEntry(
+            pid=8800, ppid=1, uid=MY_UID,
+            argv=["agent-run", "localerun", "claude"],
+            start_time=None,
+            identity="darwin:8800-test",
+            pgid=0,
+        )
+        candidates, skips = _find([entry])
+        assert not candidates, "start_time=None entry must never be a candidate"
+        assert any(s.pid == 8800 and s.reason == "start_time_unknown" for s in skips), (
+            f"expected start_time_unknown skip, got: {skips}"
+        )
+
+    def test_start_time_none_never_satisfies_any_threshold(self, isolated_runs_root):
+        """Even with min_age_seconds=0, start_time=None is not a candidate."""
+        _make_log_dir("localerun2")
+        entry = _ProcEntry(
+            pid=8801, ppid=1, uid=MY_UID,
+            argv=["agent-run", "localerun2", "claude"],
+            start_time=None,
+            identity="darwin:8801-test",
+            pgid=0,
+        )
+        candidates, skips = _find([entry], min_age_seconds=0.0)
+        assert not candidates
+        assert any(s.reason == "start_time_unknown" for s in skips)
+
+
+# ---------------------------------------------------------------------------
+# C3: log-dir corroboration and argv ambiguity detection
+# ---------------------------------------------------------------------------
+
+class TestArgvCorroboration:
+    """Verify the log-dir existence check and argv-ambiguity guard (C3/S1)."""
+
+    def test_spaced_path_misparse_realrun_not_candidate(self, isolated_runs_root):
+        """The space-in-path scenario from S1:
+
+        True argv: ['agent-run', '-f', '/tmp/my prompt.md', 'realrun', '--', 'claude']
+        ps output: 'agent-run -f /tmp/my prompt.md realrun -- claude'
+        shlex recovers name='prompt.md' (wrong); plain split also gets 'prompt.md'.
+
+        Neither 'realrun' nor 'prompt.md' should be a candidate:
+        - 'realrun' is never seen by the scanner (the recovered name is 'prompt.md').
+        - 'prompt.md' has no LOG_ROOT entry → log_dir_missing skip.
+        """
+        # Create the log and state dirs for 'realrun' (the real, tracked run).
+        _make_log_dir("realrun")
+        (isolated_runs_root / "realrun").mkdir(parents=True, exist_ok=True)
+
+        # Entry as the scanner would produce it after shlex-splitting the ps output.
+        # ps joins with spaces: 'agent-run -f /tmp/my prompt.md realrun -- claude'
+        # shlex.split produces: ['agent-run','-f','/tmp/my','prompt.md','realrun','--','claude']
+        misparse_argv = ["agent-run", "-f", "/tmp/my", "prompt.md", "realrun", "--", "claude"]
+        entry = _make_entry(7777, misparse_argv, start_time=FAR_PAST)
+        candidates, skips = _find([entry])
+
+        assert not candidates, (
+            f"mis-parsed entry must not be a candidate; candidates={candidates}"
+        )
+        # The recovered name is 'prompt.md'; it should be skipped for log_dir_missing.
+        assert any(s.pid == 7777 and s.reason == "log_dir_missing" for s in skips), (
+            f"expected log_dir_missing for 'prompt.md', got: {skips}"
+        )
+        # 'realrun' must not appear anywhere — it was never the recovered name.
+        assert not any(
+            hasattr(x, "name") and getattr(x, "name", None) == "realrun"
+            for x in candidates + skips
+        )
+
+    def test_log_dir_missing_skips_candidate(self, isolated_runs_root):
+        """A well-formed entry whose LOG_ROOT/<name> does not exist is skipped."""
+        # Do NOT create LOG_ROOT/missinglog.
+        entry = _make_entry(7778, ["agent-run", "missinglog", "claude"])
+        candidates, skips = _find([entry])
+        assert not candidates
+        assert any(s.pid == 7778 and s.reason == "log_dir_missing" for s in skips)
+
+    def test_log_dir_symlink_skips_candidate(self, isolated_runs_root):
+        """A LOG_ROOT/<name> that is a symlink (not a real directory) is rejected.
+
+        A real runner always creates a plain directory; a symlink is not a
+        trustworthy corroboration because it can point anywhere."""
+        outside = isolated_runs_root.parent / "outside-dir"
+        outside.mkdir(exist_ok=True)
+        symlink_log = agent_run.LOG_ROOT / "symlinkrun"
+        agent_run.LOG_ROOT.mkdir(parents=True, exist_ok=True)
+        symlink_log.symlink_to(outside, target_is_directory=True)
+
+        entry = _make_entry(7779, ["agent-run", "symlinkrun", "claude"])
+        candidates, skips = _find([entry])
+        assert not candidates
+        assert any(s.pid == 7779 and s.reason == "log_dir_missing" for s in skips), (
+            f"symlink should produce log_dir_missing, got: {skips}"
+        )
+
+    def test_argv_ambiguous_when_shlex_and_plain_split_disagree(self, isolated_runs_root):
+        """When re-joining entry.argv and re-splitting with str.split() yields a
+        different name than entry.argv itself, emit argv_ambiguous and skip.
+
+        This covers the case where a pre-name flag value carries an embedded
+        space inside an argv token — the re-join loses the token boundary and
+        plain split misidentifies the name.
+
+        argv = ['agent-run', '-f', '/tmp/my file.md', 'realrun', 'claude']
+        shlex name (from entry.argv directly) = 'realrun'
+        re-join = 'agent-run -f /tmp/my file.md realrun claude'
+        plain.split() = ['agent-run','-f','/tmp/my','file.md','realrun','claude']
+        plain name = 'file.md'   (file.md != realrun → argv_ambiguous)
+        """
+        # 'realrun' and 'file.md' would both need log dirs if either were to
+        # become a candidate, but the ambiguity check fires before the log-dir
+        # check, so neither log dir is needed here.
+        ambiguous_argv = ["agent-run", "-f", "/tmp/my file.md", "realrun", "claude"]
+        entry = _make_entry(7780, ambiguous_argv)
+        candidates, skips = _find([entry])
+        assert not candidates
+        assert any(s.pid == 7780 and s.reason == "argv_ambiguous" for s in skips), (
+            f"expected argv_ambiguous, got: {skips}"
+        )
+
+    def test_log_dir_present_allows_candidate(self, isolated_runs_root):
+        """A well-formed entry with an existing LOG_ROOT/<name> real directory
+        passes the corroboration check and becomes a candidate."""
+        _make_log_dir("corrobrun")
+        entry = _make_entry(7790, ["agent-run", "corrobrun", "claude"])
+        candidates, skips = _find([entry])
+        assert any(c.pid == 7790 and c.name == "corrobrun" for c in candidates), (
+            f"entry with valid log dir should be a candidate; got candidates={candidates}"
+        )
+
+    def test_spaced_path_end_to_end_through_cmd_reap(
+        self, isolated_runs_root, monkeypatch, capsys
+    ):
+        """End-to-end: the S1 mis-parse scenario kills no process through cmd_reap.
+
+        'realrun' has a state dir (tracked) and a log dir. 'prompt.md' has
+        neither.  The scanner returns the mis-parsed argv.  cmd_reap must not
+        signal any process and must not produce a candidate for 'realrun' or
+        'prompt.md'.
+        """
+        import argparse
+
+        _make_log_dir("realrun2")
+        (isolated_runs_root / "realrun2").mkdir(parents=True, exist_ok=True)
+
+        # Mis-parsed argv as the scanner would produce it.
+        misparse_argv = ["agent-run", "-f", "/tmp/my", "prompt.md", "realrun2", "--", "claude"]
+        entry = _ProcEntry(
+            pid=7800, ppid=1, uid=MY_UID,
+            argv=misparse_argv,
+            start_time=FAR_PAST,
+            identity="darwin:7800-test",
+            pgid=0,
+        )
+
+        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
+        monkeypatch.setattr(agent_run, "_process_identity",
+                            lambda p: f"darwin:{p}-test")
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+
+        signals_sent = []
+        monkeypatch.setattr(os, "kill", lambda *a: signals_sent.append(a))
+        monkeypatch.setattr(os, "killpg", lambda *a: signals_sent.append(a))
+
+        reap_args = argparse.Namespace(
+            dry_run=False, idle_hours=None, min_age_hours=None,
+            name=None, force_unknown=False, include_logs=False,
+            log_min_age_hours=None, orphan_processes=True,
+            orphan_min_age_hours=None,
+        )
+        agent_run.cmd_reap(reap_args)
+
+        assert not signals_sent, (
+            f"cmd_reap must not signal any process in S1 scenario; sent={signals_sent}"
+        )
+        out = capsys.readouterr().out
+        assert "realrun2" not in out or "state_dir_exists" in out, (
+            "realrun2 must not appear as a candidate"
         )
