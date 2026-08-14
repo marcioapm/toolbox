@@ -48,6 +48,7 @@ Usage::
     agent-run tail <name>                # follow log in real time
     agent-run logs <name> [N]            # last N lines (default 50)
     agent-run status <name>              # one-line status
+    agent-run watch <name> [--json] [--repo PATH]  # stateless fact snapshot for pollers
     agent-run steer <name> <msg...>      # send text to agent stdin (needs -i)
     agent-run kill <name> [SIGNAL]       # TERM by default; see "kill" below
     agent-run list [--all] [--status S]  # list runs; defaults to non-terminal only
@@ -80,6 +81,10 @@ eligible for garbage collection once old enough (see `reap` below).
 Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 
     status       starting | running | done | failed | launch_failed | died | killed
+                 (`watch` additionally reports two values computed rather
+                 than persisted here: `stalled` — pid alive, log idle past
+                 the threshold; `unverified` — pid alive but its identity
+                 could not be confirmed against a recorded launch token)
     exit_code    numeric exit code (after completion)
     pid          runner process id
     pgid         process group id (also the `kill --force` fallback target)
@@ -103,6 +108,12 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     started_at   ISO-8601 UTC
     ended_at     ISO-8601 UTC (after completion)
     interactive  "1" if launched with -i, else "0"
+    cwd          absolute launch-time working directory (used by `watch` to
+                 locate the repo for git facts; may be absent on legacy runs)
+    launch_head  full git commit hash HEAD pointed to at launch, if `cwd` was
+                 a git repo (used by `watch` to count commits made during the
+                 run without trusting commit timestamps; absent when `cwd`
+                 wasn't a repo, and on legacy runs)
     stdin        FIFO for steering (interactive only)
     reap_reason  set by `agent-run reap` when it changes status (died/killed)
     tmp_dir      absolute path to this run's scratch dir (see below)
@@ -213,7 +224,7 @@ import traceback
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, NamedTuple, Optional, Sequence
 
 
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
@@ -291,6 +302,62 @@ def _parse_idle_stall_seconds() -> float:
 
 
 IDLE_STALL_SECONDS: float = _parse_idle_stall_seconds()
+
+# `watch` is stateless, so "growing" means "written to recently" rather than
+# "bytes increased since the previous poll": a recency description, not a
+# liveness verdict.
+WATCH_LOG_GROWING_MAX_AGE_SECONDS: float = 60.0
+
+# A log mtime further than this into the future means the host clock and the
+# log's clock disagree (ssh to a skewed host, NFS server-side timestamps),
+# not that the log is fresh. Clamping such a delta to 0.0 would report a
+# long-dead log as freshly growing — the wrong direction for a contract that
+# must fail toward firing — so it degrades mtime_age_s to null instead.
+# Smaller negative deltas are ordinary jitter and still clamp to 0.
+WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS: float = 2.0
+
+WATCH_TAIL_LINES: int = 200
+WATCH_REPEAT_THRESHOLD: int = 3
+# Consumers see a line silently clipped at this width, so it is contract.
+WATCH_ERROR_LINE_MAX_CHARS: int = 200
+WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS: float = 2.5
+# A supervisor polls N runs inside a 30s cycle, so one repo's git calls must
+# not each spend up to the per-call timeout; this bounds their total.
+WATCH_GIT_TOTAL_BUDGET_SECONDS: float = 5.0
+WATCH_TAIL_READ_BLOCK_BYTES: int = 65536
+# Cap how far the tail scan walks back, however few newlines it has found.
+WATCH_TAIL_MAX_BYTES: int = 256 * 1024
+
+# Git env vars that redirect a command at a different repo/index than the one
+# named on the command line; a poll must not inherit these from its caller.
+WATCH_GIT_ENV_VARS_TO_STRIP: frozenset[str] = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+    }
+)
+
+# Anchored at (stripped) line start, optionally after a `path:`/`prefix:`
+# token, with word boundaries — a bare substring match fires on lint/test
+# noise like "0 errors, 0 warnings" or a table header "| Error | Count |".
+_WATCH_ERROR_LINE_RE = re.compile(r"(?i)^\s*(?:\S+:\s*)?(error|traceback|exception|failed)\b")
+# A count of 0 next to the matched word (either order, plural or not) is a
+# negation, not an occurrence: "0 errors", "0 failed", "errors: 0".
+_WATCH_ERROR_ZERO_COUNT_RE = re.compile(r"(?i)\b0\s+(?:error|fail)\w*\b|\b(?:error|fail)\w*:\s*0\b")
+_WATCH_READ_LINE_RE = re.compile(r"\bRead\s+(\S+)")
+# A `Read` target must look like a path (contains `/` or `.`), so prose like
+# "Please Read carefully" doesn't parse "carefully" as a file.
+_WATCH_READ_PATH_LIKE_RE = re.compile(r"[/.]")
+# CSI sequences (`\x1b[...<final>`) and other two-byte escapes (`\x1b` plus
+# one byte in `@`-`Z` or `\`-`_`), e.g. from colour codes in a TUI capture.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+
 
 # Terminal-state garbage-collection age threshold: how long a run must have
 # been sitting in a conclusively terminal status (see TERMINAL_STATUSES)
@@ -403,10 +470,26 @@ def _write(path: Path, text: str) -> None:
 
 
 def _read(path: Path, default: str = "") -> str:
+    # A poll loop must degrade on an unreadable state file, not crash: a
+    # directory in place of a file, mode 000, or non-UTF-8 bytes are all
+    # observation failures, not process failures.
     try:
         return path.read_text().strip()
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError, UnicodeError):
         return default
+
+
+def _safe_int(value: str) -> Optional[int]:
+    """Parse ``value`` as an int, or ``None`` for anything that isn't one.
+
+    Use this rather than an ``isdigit()`` guard around ``int()``:
+    ``str.isdigit()`` accepts non-ASCII digits like ``"\u00b2"`` that
+    ``int()`` then rejects.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 _RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -631,14 +714,57 @@ def _log_file_for(name: str) -> Optional[Path]:
     """Resolve the persistent log for a run, preferring the new split
     layout ($AGENT_RUN_LOG_DIR/<name>/log) and falling back to the old
     single-directory layout ($AGENT_RUN_STATE_DIR/<name>/log) so in-flight
-    runs started before this split remain readable."""
-    new_log = _log_dir(name) / "log"
-    if new_log.exists():
-        return new_log
-    old_log = _state_dir(name) / "log"
-    if old_log.exists():
-        return old_log
+    runs started before this split remain readable.
+
+    Never raises: like ``Path.is_dir()``, ``Path.exists()`` propagates
+    ``OSError`` (e.g. an unreadable parent directory) instead of returning
+    ``False``, and this is reachable from ``cmd_status``, which has no
+    enclosing never-raise guard."""
+    for log in (_log_dir(name) / "log", _state_dir(name) / "log"):
+        try:
+            if log.exists():
+                return log
+        except OSError:
+            continue
     return None
+
+
+@contextmanager
+def _watch_open_validated_log(path: Optional[Path]):
+    """Open *path* and validate it is a regular file on the resulting
+    descriptor, yielding a binary file object — or ``None`` if *path* is
+    unset, cannot be opened, or does not stat as a regular file once open.
+
+    Validation is on the descriptor, not the pathname: the inode a path
+    names can be replaced (rotation, an agent recreating its log, a hostile
+    swap) between a check and a later open, whereas a descriptor always
+    refers to the inode it was opened against. ``O_NONBLOCK`` keeps the open
+    itself safe against a FIFO with no writer, and is cleared again so a
+    regular-file read behaves normally. Never raises: any ``OSError``
+    degrades to yielding ``None``, and the fd is closed on every path.
+    """
+    fd: Optional[int] = None
+    f = None
+    try:
+        if path is not None:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                if _stat_module.S_ISREG(os.fstat(fd).st_mode):
+                    try:
+                        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                        fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+                    except OSError:
+                        pass
+                    f = os.fdopen(fd, "rb")
+                    fd = None  # ownership transferred to f
+            except OSError:
+                pass
+        yield f
+    finally:
+        if f is not None:
+            f.close()
+        elif fd is not None:
+            os.close(fd)
 
 
 def _path_entry_exists(path: Path) -> bool:
@@ -648,6 +774,20 @@ def _path_entry_exists(path: Path) -> bool:
     except FileNotFoundError:
         return False
     return True
+
+
+def _is_dir_safe(path: Path) -> bool:
+    """Like ``Path.is_dir()``, but never raises.
+
+    ``Path.is_dir()`` propagates ``OSError`` (e.g. ``PermissionError`` from
+    an unreadable parent directory) instead of returning ``False``. The
+    existence checks gating `cmd_watch`/`cmd_status` must degrade rather
+    than crash, so an unresolvable run name stays the only non-zero exit.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
 
 
 def _require_state(name: str) -> Path:
@@ -777,6 +917,33 @@ def _require_positive_state_int(state_dir: Path, field: str, name: str) -> int:
     return value
 
 
+def _proc_stat_fields(pid: int) -> Optional[List[str]]:
+    """Whitespace-split fields of ``/proc/<pid>/stat`` after the comm field
+    (so a comm containing spaces or ')' cannot shift the indices), or
+    ``None`` if it cannot be read or parsed. Linux only."""
+    try:
+        _before, after = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)
+        return after.split()
+    except (IndexError, OSError, ValueError):
+        return None
+
+
+def _ps_field(pid: int, fmt: str) -> Optional[str]:
+    """One ``ps -o <fmt>=`` field for ``pid``, or ``None`` if ps fails or
+    prints nothing."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", f"{fmt}="],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
+
+
 def _process_identity(pid: int) -> Optional[str]:
     """Return a stable platform-specific birth token for ``pid``, if readable."""
     if os.environ.get("AGENT_RUN_TEST_SLOW_IDENTITY"):
@@ -788,30 +955,36 @@ def _process_identity(pid: int) -> Optional[str]:
         time.sleep(1.5)
     system = platform.system()
     if system == "Linux":
-        try:
-            stat_text = Path(f"/proc/{pid}/stat").read_text()
-            _before, after = stat_text.rsplit(")", 1)
-            fields = after.split()
-            starttime = fields[19]
-            if not starttime.isdigit():
-                return None
-        except (IndexError, OSError, ValueError):
+        fields = _proc_stat_fields(pid)
+        if fields is None or len(fields) <= 19 or not fields[19].isdigit():
             return None
-        return f"linux:{starttime}"
+        return f"linux:{fields[19]}"
     if system == "Darwin":
-        try:
-            result = subprocess.run(
-                ["ps", "-p", str(pid), "-o", "lstart="],
-                capture_output=True,
-                check=True,
-                text=True,
-                timeout=2,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        start = result.stdout.strip()
+        start = _ps_field(pid, "lstart")
         return f"darwin:{start}" if start else None
     return None
+
+
+def _watch_pid_is_zombie(pid: int) -> bool:
+    """Is ``pid`` currently in zombie state (exited, not yet reaped)?
+
+    A zombie's pid entry and its ``_process_identity`` birth token both
+    survive until the parent reaps it, so ``os.kill(pid, 0)`` succeeding and
+    the identity token matching are not evidence the process is still doing
+    work. Watch-local only: callers outside `watch`'s liveness path must not
+    use this.
+
+    Any unreadable/failed probe or an unsupported platform returns
+    ``False`` — never invent a zombie verdict from a failed probe.
+    """
+    system = platform.system()
+    if system == "Linux":
+        fields = _proc_stat_fields(pid)
+        return bool(fields) and fields[0] == "Z"
+    if system == "Darwin":
+        state = _ps_field(pid, "stat")
+        return bool(state) and state[0] == "Z"
+    return False
 
 
 def _read_process_identity(state_dir: Path, name: str) -> str:
@@ -985,13 +1158,34 @@ def _gc_status_eligible(status: str, *, force_unknown: bool) -> bool:
     )
 
 
+# Sentinel returned by _gc_live_runner_pid for "pid file unreadable" —
+# never a real pid (pids are positive), so callers can tell it apart from
+# both a verified-live pid and None ("safe to GC").
+PID_UNREADABLE = -1
+
+
 def _gc_live_runner_pid(state_dir: Path) -> Optional[int]:
-    """Return the verified live recorded runner PID, if one blocks GC."""
-    raw = _read(state_dir / "pid")
+    """Return the recorded runner PID if it still blocks GC, or ``None`` if
+    the run is safe to garbage-collect.
+
+    The recorded pid itself is returned when it is verified alive; when the
+    pid file cannot be read at all, ``PID_UNREADABLE`` is returned instead —
+    a distinct non-``None`` value so callers refuse GC the same way they
+    would for a confirmed-live pid, without claiming to know which pid.
+
+    GC's fail-safe direction is a spurious skip, never a spurious delete —
+    the opposite of watch/status's — so the pid file is read strictly here
+    rather than through the lenient shared `_read`: an unreadable pid file
+    (mode 000, a directory in its place) must block GC exactly like a
+    confirmed-live pid, not read as "no pid" and let GC proceed.
+    """
     try:
-        pid = int(raw) if raw else None
-    except ValueError:
+        raw = (state_dir / "pid").read_text().strip()
+    except FileNotFoundError:
         return None
+    except (OSError, UnicodeError):
+        return PID_UNREADABLE
+    pid = _safe_int(raw)
     if pid is not None and _pid_alive(pid) and _gc_pid_is_live_runner(state_dir, pid):
         return pid
     return None
@@ -1043,6 +1237,68 @@ def _effective_status(state_dir: Path, idle_threshold: Optional[float] = None) -
             pass
 
     return "running"
+
+
+def _watch_effective_status(state_dir: Path, idle_threshold: Optional[float] = None) -> str:
+    """`watch`'s liveness resolution: pid-identity verification layered on
+    top of ``_effective_status``'s raw/pid/idle result, leaving that shared
+    function's behaviour for ``cmd_status``/``cmd_logs``/``cmd_list`` alone.
+
+    When the resolved status is "running" or "stalled" (both imply an alive
+    pid), the live process's identity is compared against the token recorded
+    at launch: a mismatch means the pid was recycled by an unrelated process
+    and the run is reported "died"; a live pid whose identity cannot be
+    confirmed at all (no token recorded, or the token is unreadable) is
+    reported "unverified" rather than "running".
+
+    ``_gc_pid_is_live_runner`` treats that same unverifiable case as
+    conservatively still-live, because GC's safe direction is never deleting
+    state out from under a run it can't rule out. `watch`'s safe direction is
+    the opposite — an unconfirmable pid must never be reported as a healthy
+    "running" run — so the two intentionally diverge on this case.
+
+    A zombie pid is rejected as "died" before the identity comparison even
+    runs: a zombie's pid and birth token both survive until reaped, so a
+    matching identity is not evidence of liveness here.
+    """
+    status = _effective_status(state_dir, idle_threshold)
+    if status not in {"running", "stalled"}:
+        return status
+    pid = _safe_int(_read(state_dir / "pid"))
+    if pid is None:
+        return "unverified"
+    if _watch_pid_is_zombie(pid):
+        return "died"
+    recorded = _read(state_dir / "process_identity")
+    if not recorded:
+        return "unverified"
+    live = _process_identity(pid)
+    if live is None:
+        return "unverified"
+    if live != recorded:
+        return "died"
+    return status
+
+
+# Status string emitted by `watch` when the state dir is gone but the log
+# survived. Not a member of TERMINAL_STATUSES: that set is reap's GC
+# vocabulary, and this string is watch-only.
+WATCH_STATUS_LOG_PRESERVED = "not running (log preserved)"
+
+
+def _watch_is_terminal(status: str) -> bool:
+    """Single source of truth for the `terminal` field in the `watch`
+    payload, so it cannot drift from `status`.
+
+    Deliberately watch-local rather than `status in TERMINAL_STATUSES`:
+    that set is reap's GC vocabulary and must stay narrow so reap never
+    implicitly deletes state for an unrecognized status. `watch` has the
+    opposite obligation — a poller must never wait forever on a status that
+    will never change — so anything not known to be pending, including
+    "unknown" and any other unrecognized string, is terminal here even
+    though reap still refuses to touch it.
+    """
+    return status not in (KNOWN_NONTERMINAL_STATUSES | {"unverified"})
 
 
 def _opportunistic_heal(state_root: Optional[Path] = None) -> None:
@@ -1228,7 +1484,7 @@ def _log_line_count(log: Optional[Path]) -> int:
     try:
         with log.open("rb") as f:
             return sum(1 for _ in f)
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError, UnicodeError):
         return 0
 
 
@@ -1369,10 +1625,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     state_dir = _state_dir(name)
     log_dir = _log_dir(name)
-    if not state_dir.is_dir() and not log_dir.is_dir():
+    if not _is_dir_safe(state_dir) and not _is_dir_safe(log_dir):
         sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
     lines = _log_line_count(_log_file_for(name))
-    if not state_dir.is_dir():
+    if not _is_dir_safe(state_dir):
         # The state dir is volatile; a launch failure recorded alongside the
         # log outlives it and is exactly what a post-reboot status needs.
         launch_error = _read(_log_dir(name) / "launch_error")
@@ -1394,6 +1650,592 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"{suffix}"
     )
     return 0
+
+
+def _watch_parse_iso(raw: Optional[str]) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+class _WatchGitOutcome(NamedTuple):
+    """Result of one bounded git read: exactly one field is set. ``error``
+    populates the watch contract's ``git_error`` discriminator, since
+    collapsing every failure to a bare ``None`` hides *why* facts are
+    unavailable."""
+
+    stdout: Optional[str]
+    error: Optional[str]
+
+
+# "No commits yet" has no single stable stderr wording across the git
+# commands/versions this module runs, so that case is instead disambiguated
+# with a follow-up refs probe (see ``_watch_git_facts_checked``).
+_WATCH_GIT_NOT_A_REPO_STDERR = "not a git repository"
+
+
+def _watch_run_git_checked(
+    repo: Path,
+    git_args: Sequence[str],
+    timeout: float = WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS,
+) -> _WatchGitOutcome:
+    """Run one bounded, lock-free git read, reporting *why* a failed read
+    failed rather than collapsing every cause to ``None``."""
+    # Strip inherited GIT_* pointers so the query can't be silently redirected
+    # at a different repo/index, and block config that runs external programs.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in WATCH_GIT_ENV_VARS_TO_STRIP and not k.startswith("GIT_CONFIG")
+    }
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "diff.external=",
+                "-c",
+                "core.pager=cat",
+                *git_args,
+            ],
+            capture_output=True,
+            timeout=timeout,
+            check=True,
+            env=env,
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return _WatchGitOutcome(None, "git_missing")
+    except subprocess.TimeoutExpired:
+        return _WatchGitOutcome(None, "timeout")
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")
+        if _WATCH_GIT_NOT_A_REPO_STDERR in stderr.lower():
+            return _WatchGitOutcome(None, "not_a_repo")
+        return _WatchGitOutcome(None, "git_failed")
+    except (OSError, subprocess.SubprocessError):
+        return _WatchGitOutcome(None, "git_failed")
+    return _WatchGitOutcome(result.stdout.decode("utf-8", errors="replace"), None)
+
+
+_WATCH_SHORTSTAT_RES = (
+    re.compile(r"(\d+) files? changed"),
+    re.compile(r"(\d+) insertions?\(\+\)"),
+    re.compile(r"(\d+) deletions?\(-\)"),
+)
+
+
+def _watch_parse_shortstat(text: str) -> tuple[int, int, int]:
+    """``files_changed, insertions, deletions`` from ``diff --shortstat``
+    output; each counter absent from the text is 0."""
+    counts = tuple(
+        int(m.group(1)) if (m := pattern.search(text)) else 0
+        for pattern in _WATCH_SHORTSTAT_RES
+    )
+    files, insertions, deletions = counts
+    return files, insertions, deletions
+
+
+class _WatchGitFactsResult(NamedTuple):
+    """``facts`` and ``git_error`` are never both set: the watch contract's
+    top-level ``git_error`` discriminator must say *why* ``git`` is null
+    rather than collapsing "cannot observe" and "observed nothing" into the
+    same null the consumer already treats as "no facts"."""
+
+    facts: Optional[dict]
+    git_error: Optional[str]
+
+
+def _watch_git_facts_checked(repo: Path, launch_head: Optional[str]) -> _WatchGitFactsResult:
+    """Read-only git facts for ``repo``, plus why they're missing on failure
+    — not a git repo, git not installed, a wedged command hitting the
+    bounded timeout, a brand-new repo with no commits yet, or a repo mid-
+    rebase/mid-merge with an unreadable index — never raises. Reads only,
+    and ``--no-optional-locks`` keeps it from contending with an agent's own
+    git operations.
+
+    ``commits_since_start`` is ``rev-list <launch_head>..HEAD --count``:
+    which commit HEAD is, not when git says it was committed, since the
+    committing process controls those timestamps and can backdate them. It
+    is null, not 0, when ``launch_head`` itself is unknown (``cwd`` wasn't a
+    git repo at launch, or it is a legacy run without the field) — the count
+    is genuinely undetermined, not zero.
+
+    ``untracked_files`` counts working-tree files git doesn't track yet
+    (``status --porcelain``'s ``??`` entries) — real agent output the
+    tracked-file-only diff counters would otherwise miss. Ignored files are
+    excluded from every counter: an agent's own build/dependency output is
+    not progress, and ``.gitignore`` states what that output is.
+
+    ``toplevel`` is the work-tree root git resolved for this observation, or
+    ``None`` if that call failed. It may be an **enclosing** repo when the
+    observed path is not itself a repository — the consumer compares it
+    against the repo it expects.
+    """
+    if not repo.is_dir():
+        return _WatchGitFactsResult(None, "no_repo_path")
+
+    deadline = time.monotonic() + WATCH_GIT_TOTAL_BUDGET_SECONDS
+
+    def run_git(git_args: Sequence[str]) -> _WatchGitOutcome:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _WatchGitOutcome(None, "timeout")
+        return _watch_run_git_checked(
+            repo, git_args, timeout=min(WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS, max(0.05, remaining))
+        )
+
+    head_outcome = run_git(["rev-parse", "--short", "HEAD"])
+    if head_outcome.stdout is None:
+        # A non-zero exit is ambiguous between "not a repo" (already
+        # classified) and "repo exists, zero commits yet", and git's stderr
+        # wording for the latter isn't stable across commands/versions. An
+        # unborn HEAD and a dangling/corrupt HEAD are both unresolvable, but
+        # only the former has no refs at all, so ``no_commits`` requires
+        # that absence — otherwise repo damage would read as the one
+        # discriminator value callers treat as benign.
+        if head_outcome.error == "git_failed":
+            refs_outcome = run_git(["rev-list", "--all", "--count"])
+            if refs_outcome.stdout is not None and refs_outcome.stdout.strip() == "0":
+                return _WatchGitFactsResult(None, "no_commits")
+        return _WatchGitFactsResult(None, head_outcome.error)
+    head = head_outcome.stdout
+
+    # Mandatory: the stat-cache-driven reads below (status, diff) can skip
+    # re-reading a tracked file's blob when its mtime still matches the
+    # index, so a missing or corrupt object below HEAD would otherwise go
+    # undetected and this function would return fully populated facts.
+    fsck_outcome = run_git(["fsck", "--connectivity-only", "--no-progress"])
+    if fsck_outcome.stdout is None:
+        return _WatchGitFactsResult(None, fsck_outcome.error)
+
+    porcelain_outcome = run_git(["status", "--porcelain"])
+    if porcelain_outcome.stdout is None:
+        return _WatchGitFactsResult(None, porcelain_outcome.error)
+    porcelain = porcelain_outcome.stdout
+    # `status --porcelain` omits ignored paths by default, so counting "??"
+    # lines counts exactly the untracked-and-not-ignored set.
+    untracked_files = sum(1 for line in porcelain.splitlines() if line.startswith("??"))
+    shortstat_outcome = run_git(["diff", "HEAD", "--shortstat"])
+    if shortstat_outcome.stdout is None:
+        return _WatchGitFactsResult(None, shortstat_outcome.error)
+    files_changed, insertions, deletions = _watch_parse_shortstat(shortstat_outcome.stdout)
+
+    commits_since_start: Optional[int] = None
+    if launch_head is not None:
+        count_outcome = run_git(["rev-list", "--count", f"{launch_head}..HEAD"])
+        if count_outcome.stdout is None:
+            return _WatchGitFactsResult(None, count_outcome.error)
+        try:
+            commits_since_start = int(count_outcome.stdout.strip())
+        except ValueError:
+            return _WatchGitFactsResult(None, "git_failed")
+
+    last_commit_outcome = run_git(["log", "-1", "--format=%ct", "HEAD"])
+    if last_commit_outcome.stdout is None:
+        return _WatchGitFactsResult(None, last_commit_outcome.error)
+    last_commit_age_s: Optional[float] = None
+    stripped = last_commit_outcome.stdout.strip()
+    if stripped:
+        try:
+            last_commit_age_s = max(0.0, time.time() - int(stripped))
+        except ValueError:
+            last_commit_age_s = None
+
+    # Reported, not enforced: git discovery walks upward to the nearest
+    # enclosing repo, so a legitimate subdirectory of its own repo and a
+    # plain directory nested inside an unrelated repo are indistinguishable
+    # by path alone. The consumer knows which repo a run belongs to.
+    toplevel: Optional[str] = None
+    toplevel_outcome = run_git(["rev-parse", "--show-toplevel"])
+    if toplevel_outcome.stdout is not None:
+        toplevel = str(Path(toplevel_outcome.stdout.strip()).resolve())
+
+    return _WatchGitFactsResult(
+        {
+            "head": head.strip(),
+            "dirty": bool(porcelain.strip()),
+            "files_changed": files_changed,
+            "insertions": insertions,
+            "deletions": deletions,
+            "untracked_files": untracked_files,
+            "commits_since_start": commits_since_start,
+            "last_commit_age_s": last_commit_age_s,
+            "toplevel": toplevel,
+        },
+        None,
+    )
+
+
+def _watch_tail_lines(log: Optional[Path], n: int) -> List[str]:
+    """Last ``n`` decoded text lines of a log, or ``[]`` on any read failure
+    (missing file, permission error, stale NFS handle, non-regular file).
+    The backward scan never reads past ``WATCH_TAIL_MAX_BYTES``, even if
+    fewer than ``n`` newlines have been found by then; a truncated scan
+    returns whatever lines were found within the cap rather than the full
+    tail. Reads through ``_watch_open_validated_log`` so this reader and
+    the log-facts reader cannot drift apart on what counts as a safe log."""
+    with _watch_open_validated_log(log) as f:
+        if f is None:
+            return []
+        try:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            chunks: List[bytes] = []
+            pos = end
+            newline_count = 0
+            bytes_read = 0
+            while pos > 0 and newline_count <= n and bytes_read < WATCH_TAIL_MAX_BYTES:
+                read_size = min(WATCH_TAIL_READ_BLOCK_BYTES, pos)
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                newline_count += chunk.count(b"\n")
+                bytes_read += len(chunk)
+                chunks.append(chunk)
+            data = b"".join(reversed(chunks))
+        except OSError:
+            return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    return lines[-n:]
+
+
+def _watch_normalize_lines(lines: List[str]) -> List[str]:
+    """ANSI-strip each tail line. The source is a raw PTY capture of a TUI,
+    so colour codes are otherwise indistinguishable from real content to a
+    line-oriented scan. Same-line ``\\r`` redraws are already separate lines
+    here: the tail scan splits with ``str.splitlines()``, which breaks on CR
+    as well as LF."""
+    return [_ANSI_ESCAPE_RE.sub("", line) for line in lines]
+
+
+def _watch_top_repeated(counts: dict) -> Optional[tuple[str, int]]:
+    """The most-repeated key and its count, or ``None`` unless it recurs at
+    least ``WATCH_REPEAT_THRESHOLD`` times. Shared by both "repeated"
+    signals so they answer the same question rather than one picking
+    encounter order and the other the loudest."""
+    top = max(counts, key=lambda key: counts[key], default=None)
+    if top is None or counts[top] < WATCH_REPEAT_THRESHOLD:
+        return None
+    return top, counts[top]
+
+
+def _watch_repeated_error(lines: List[str]) -> Optional[dict]:
+    """The most-repeated normalized tail line matching an error signature,
+    as ``{"line": ..., "count": ...}`` with the line truncated to
+    ``WATCH_ERROR_LINE_MAX_CHARS``, or ``None``. A description of what was
+    observed, not a verdict."""
+    counts: dict = {}
+    for line in lines:
+        trimmed = line.strip()
+        if not _WATCH_ERROR_LINE_RE.match(trimmed):
+            continue
+        if _WATCH_ERROR_ZERO_COUNT_RE.search(trimmed):
+            continue
+        counts[line] = counts.get(line, 0) + 1
+    top = _watch_top_repeated(counts)
+    if top is None:
+        return None
+    return {"line": top[0][:WATCH_ERROR_LINE_MAX_CHARS], "count": top[1]}
+
+
+def _watch_read_signals(lines: List[str]) -> tuple[int, Optional[dict]]:
+    """Distinct ``Read <path>`` targets in the normalized tail, and the
+    most-repeated one."""
+    counts: dict = {}
+    for line in lines:
+        m = _WATCH_READ_LINE_RE.search(line)
+        if not m:
+            continue
+        path = m.group(1)
+        if not _WATCH_READ_PATH_LIKE_RE.search(path):
+            continue
+        counts[path] = counts.get(path, 0) + 1
+    top = _watch_top_repeated(counts)
+    return len(counts), None if top is None else {"path": top[0], "count": top[1]}
+
+
+def _watch_validate_repo_arg(repo_arg: Optional[str]) -> Optional[str]:
+    """Validate and resolve an explicit ``--repo`` value before it is ever
+    used to locate git facts.
+
+    An empty/whitespace-only value is rejected rather than treated as
+    absent: ``--repo ""`` is a caller mistake (an unset shell variable
+    interpolated blank), and falling back to the run's recorded launch
+    ``cwd`` would hide it. Rejecting mutates nothing — this runs before any
+    file is touched.
+
+    Resolved so a relative ``--repo`` is echoed back as the absolute path
+    git actually read, matching the always-absolute recorded launch
+    ``cwd``."""
+    if repo_arg is None:
+        return None
+    if not repo_arg.strip():
+        sys.exit("agent-run: --repo must not be empty or whitespace-only")
+    return str(Path(repo_arg).resolve())
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Emit a stateless, read-only JSON fact snapshot for one run.
+
+    Pure observation: no escalation policy, no thresholds-as-actions, no
+    network, no model calls, no mutations. Exit codes carry three distinct
+    meanings a poller must be able to tell apart:
+
+        0  a valid contract was printed. This includes the case where
+           observation itself failed unexpectedly — the contract still came
+           out, with ``observation_error`` set instead of null.
+        1  the tool itself failed before it could print anything (e.g. an
+           invalid run name) — nothing observed, nothing printed.
+        2  the run name is unresolvable: no state dir and no log dir exist
+           for it, stdout empty. This is the one code a poller should treat
+           as "stop polling this name".
+
+    Every other failure mode (dead run, missing ``cwd`` file, git repo
+    unreadable, log unreadable) degrades individual fields to ``null``
+    rather than raising or exiting non-zero, so a poller can call this
+    every 30s forever. ``cmd_status`` is unaffected by this split — it
+    keeps exiting 1 for an unresolvable name.
+
+    ``status`` comes from ``_watch_effective_status``, which adds pid-
+    identity verification: an alive pid whose recorded launch identity does
+    not match the live process's is a recycled pid and reports "died"; an
+    alive pid whose identity cannot be confirmed at all reports
+    "unverified" rather than "running". ``terminal`` is exactly derivable
+    from ``status`` via ``_watch_is_terminal``.
+
+    ``observation_error`` is ``null`` on every normal path; when the
+    top-level guard fires it holds the exception class name plus a
+    truncated message, with every other field at its null/unknown value.
+
+    ``git_error`` is ``null`` whenever ``git`` is populated, and otherwise
+    exactly one of ``"no_repo_path"``, ``"not_a_repo"``, ``"no_commits"``,
+    ``"timeout"``, ``"git_missing"``, ``"git_failed"`` — a poller that fails
+    toward escalating on unknown state must be able to tell "cannot observe
+    this repo" (alarming) apart from "observed it, there is nothing there"
+    (benign), which a bare ``git: null`` cannot express on its own. See
+    ``_watch_git_facts_checked`` for the ``git`` object's keys.
+
+    ``signals.repeated_error`` and ``signals.top_repeated_read`` share one
+    winner rule: the most-repeated qualifying line/path in the log tail, or
+    ``null`` if nothing repeats at least ``WATCH_REPEAT_THRESHOLD`` times.
+    """
+    name = _validate_run_name(args.name)
+    repo_arg = _watch_validate_repo_arg(getattr(args, "repo", None))
+    as_json = bool(args.json)
+    state_dir = _state_dir(name)
+    log_dir = _log_dir(name)
+    if not _is_dir_safe(state_dir) and not _is_dir_safe(log_dir):
+        # Distinct from the never-raise guard below: nothing to observe, as
+        # opposed to observation breaking. Empty stdout, exit 2.
+        print(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}", file=sys.stderr)
+        return 2
+
+    # Everything below observes best-effort facts about a run this process
+    # does not control; an unanticipated failure must still print the full
+    # contract and exit 0, so a poller can never mistake "observation broke"
+    # for "no such run".
+    try:
+        return _cmd_watch_observe(name, state_dir, log_dir, repo_arg, as_json)
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"[:WATCH_ERROR_LINE_MAX_CHARS]
+        payload = _watch_payload(name, _now_iso(), "unknown", observation_error=message)
+        _watch_emit(
+            payload,
+            as_json,
+            f"name={name} status={payload['status']} observation_error={message!r}",
+        )
+        return 0
+
+
+def _watch_emit(payload: dict, as_json: bool, human: str) -> None:
+    """Print the contract as JSON, or *human* as the one-line form."""
+    print(json.dumps(payload) if as_json else human)
+
+
+def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
+    """Build the watch contract with every field at its null/unknown default,
+    overridden by *fields*. The key set is fixed here so it cannot vary
+    between the normal, missing-state-dir and observation-error branches, and
+    ``terminal`` is always derived from ``status`` rather than passed in."""
+    payload = {
+        "schema": "agent-run.watch.v1",
+        "name": name,
+        "observed_at": observed_at,
+        "status": status,
+        "exit_code": None,
+        "pid": None,
+        "interactive": None,
+        "started_at": None,
+        "ended_at": None,
+        "elapsed_s": None,
+        "terminal": _watch_is_terminal(status),
+        "launch_error": None,
+        "log": None,
+        "repo": None,
+        "git": None,
+        "git_error": None,
+        "signals": {
+            "repeated_error": None,
+            "distinct_files_read": 0,
+            "top_repeated_read": None,
+        },
+        "observation_error": None,
+    }
+    unknown = set(fields) - set(payload)
+    if unknown:
+        raise KeyError(f"not watch contract fields: {sorted(unknown)}")
+    payload.update(fields)
+    return payload
+
+
+def _watch_read_cwd_file(path: Path) -> str:
+    """Read the recorded launch ``cwd``, taking only the first line.
+    ``cmd_launch`` writes it as a single line, but by the time ``watch``
+    reads it a state file is untrusted input: a multi-line value must not be
+    echoed verbatim into the contract's ``repo`` field."""
+    raw = _read(path)
+    return raw.splitlines()[0] if raw else ""
+
+
+def _watch_repo_git(repo: Optional[str], launch_head: Optional[str]) -> _WatchGitFactsResult:
+    """Git facts for the run's repo, or the ``no_repo_path`` discriminator
+    when no repo path is known at all."""
+    if not repo:
+        return _WatchGitFactsResult(None, "no_repo_path")
+    return _watch_git_facts_checked(Path(repo), launch_head)
+
+
+def _cmd_watch_observe(
+    name: str, state_dir: Path, log_dir: Path, repo_arg: Optional[str], as_json: bool
+) -> int:
+    """Build and print the watch contract. May raise; ``cmd_watch`` is the
+    never-raise boundary that catches it."""
+    observed_at = _now_iso()
+    # Only the path is resolved here; regular-file validation happens on the
+    # open descriptor in _watch_open_validated_log, because the inode a path
+    # names can change between this line and the actual read.
+    log = _log_file_for(name)
+
+    def observed(repo: Optional[str], launch_head: Optional[str]) -> dict:
+        git, git_error = _watch_repo_git(repo, launch_head)
+        return {
+            "launch_error": (
+                _read(state_dir / "launch_error") or _read(log_dir / "launch_error") or None
+            ),
+            "log": _watch_log_facts(log),
+            "repo": repo,
+            "git": git,
+            "git_error": git_error,
+            "signals": _watch_signals(log),
+        }
+
+    if not state_dir.is_dir():
+        # State dir gone, log survived: cmd_status's "not running (log
+        # preserved)" case, usually a reboot. The `cwd` state file went with
+        # it, so git facts need an explicit --repo and every process fact is
+        # unknowable.
+        payload = _watch_payload(
+            name, observed_at, WATCH_STATUS_LOG_PRESERVED, **observed(repo_arg, None)
+        )
+        _watch_emit(
+            payload,
+            as_json,
+            f"name={name} status={payload['status']} lines={(payload['log'] or {}).get('lines')}",
+        )
+        return 0
+
+    status = _watch_effective_status(state_dir)
+    terminal = _watch_is_terminal(status)
+    pid = _safe_int(_read(state_dir / "pid"))
+    started_raw = _read(state_dir / "started_at") or None
+    ended_raw = _read(state_dir / "ended_at") or None
+    started_dt = _watch_parse_iso(started_raw)
+    ended_dt = _watch_parse_iso(ended_raw)
+    interactive_raw = _read(state_dir / "interactive")
+
+    elapsed_s: Optional[float] = None
+    if started_dt is not None:
+        end_ref = ended_dt if (terminal and ended_dt is not None) else datetime.now(timezone.utc)
+        elapsed_s = max(0.0, (end_ref - started_dt).total_seconds())
+
+    repo_str = repo_arg or (_watch_read_cwd_file(state_dir / "cwd") or None)
+    payload = _watch_payload(
+        name,
+        observed_at,
+        status,
+        exit_code=_safe_int(_read(state_dir / "exit_code")),
+        pid=pid,
+        interactive=interactive_raw == "1" if interactive_raw in {"0", "1"} else None,
+        started_at=started_raw,
+        ended_at=ended_raw,
+        elapsed_s=elapsed_s,
+        **observed(repo_str, _read(state_dir / "launch_head") or None),
+    )
+    _watch_emit(
+        payload,
+        as_json,
+        f"name={name} status={status} pid={pid} elapsed_s={elapsed_s} terminal={terminal} "
+        f"log_bytes={(payload['log'] or {}).get('bytes')} repo={repo_str}",
+    )
+    return 0
+
+
+def _watch_log_facts(log: Optional[Path]) -> Optional[dict]:
+    """Byte/line/freshness facts for the run's log, or ``None`` if it
+    cannot be opened and validated as a regular file (missing, permission
+    error, stale mount, or a non-regular file at that path).
+
+    Reads through ``_watch_open_validated_log`` so size/mtime/line-count all
+    come from the one fstat-validated descriptor, instead of a stat-by-name
+    followed by an open-by-name that could land on a different inode."""
+    with _watch_open_validated_log(log) as f:
+        if f is None:
+            return None
+        st = os.fstat(f.fileno())
+        delta = time.time() - st.st_mtime
+        if delta < -WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS:
+            # Clock skew, not freshness: a log claiming to be from the
+            # future is unobservable, not confidently growing.
+            mtime_age_s: Optional[float] = None
+            growing = False
+        else:
+            mtime_age_s = max(0.0, delta)
+            growing = mtime_age_s < WATCH_LOG_GROWING_MAX_AGE_SECONDS
+        lines = sum(1 for _ in f)
+        return {
+            "path": str(log),
+            "bytes": st.st_size,
+            "lines": lines,
+            "mtime_age_s": mtime_age_s,
+            "growing": growing,
+        }
+
+
+def _watch_signals(log: Optional[Path]) -> dict:
+    """Repeated-error and repeated-read signals over the log's last
+    ``WATCH_TAIL_LINES`` lines. Always returns a populated object — a
+    signals object with all-null fields when the log is unreadable is still
+    a valid, well-formed fact."""
+    lines = _watch_normalize_lines(_watch_tail_lines(log, WATCH_TAIL_LINES))
+    distinct_files_read, top_repeated_read = _watch_read_signals(lines)
+    return {
+        "repeated_error": _watch_repeated_error(lines),
+        "distinct_files_read": distinct_files_read,
+        "top_repeated_read": top_repeated_read,
+    }
 
 
 # Logs are raw PTY captures of the wrapped TUI agent, which routinely enable
@@ -2693,6 +3535,21 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     submit_mode = _persist_submit_mode(
         d, argv, getattr(args, "submit_mode", None)
     )
+    # Written before "starting" is published: Path.cwd() raises if the launch
+    # directory is gone, and that must not happen once the run already looks
+    # active with nothing behind it.
+    try:
+        cwd = str(Path.cwd())
+    except OSError:
+        cwd = None
+    if cwd is not None:
+        _write(d / "cwd", cwd + "\n")
+        # Best-effort, only when cwd is itself a git repo: `watch` counts
+        # commits from HEAD movement rather than commit timestamps, which
+        # the committing process controls and can backdate.
+        head_outcome = _watch_run_git_checked(Path(cwd), ["rev-parse", "HEAD"])
+        if head_outcome.stdout is not None:
+            _write(d / "launch_head", head_outcome.stdout.strip() + "\n")
     _write(d / "started_at", _now_iso() + "\n")
     _write(d / "status", "starting\n")
     _write(d / "interactive", "1\n" if args.interactive else "0\n")
@@ -3700,6 +4557,23 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_status.add_argument("name")
     sp_status.set_defaults(func=cmd_status)
 
+    sp_watch = sub.add_parser(
+        "watch",
+        help="print a stateless read-only JSON fact snapshot (log, git, "
+        "signals) for a poller to apply its own policy to",
+    )
+    sp_watch.add_argument("name")
+    sp_watch.add_argument(
+        "--json", action="store_true", help="emit the full JSON fact object"
+    )
+    sp_watch.add_argument(
+        "--repo",
+        default=None,
+        help="repo path for git facts; defaults to the run's recorded launch "
+        "cwd, else no git facts",
+    )
+    sp_watch.set_defaults(func=cmd_watch)
+
     sp_logs = sub.add_parser("logs", help="print last N lines of the log")
     sp_logs.add_argument("name")
     sp_logs.add_argument("n", nargs="?", type=_positive_int, default=50)
@@ -3916,7 +4790,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         break
 
     # Try to dispatch a known subcommand; otherwise treat as launch.
-    known_subcommands = {"status", "logs", "tail", "clean", "steer", "kill", "list", "reap", "help"}
+    known_subcommands = {"status", "watch", "logs", "tail", "clean", "steer", "kill", "list", "reap", "help"}
     if (
         raw
         and raw[0] in known_subcommands
