@@ -439,6 +439,391 @@ def _parse_log_min_age_seconds() -> float:
     return _positive_finite_hours(raw, "AGENT_RUN_LOG_MIN_AGE_HOURS", PRUNE_AFTER_DAYS * 24.0)
 
 
+# Orphan-process discovery threshold: minimum age for a process to be
+# considered a reap candidate.  Independent of the two thresholds above —
+# those govern state-dir and log-dir GC; this one governs live process
+# discovery and defaults to 24 h so recently started (possibly still
+# mid-launch) runners are never candidates.
+def _parse_orphan_min_age_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_ORPHAN_MIN_AGE_HOURS", "24")
+    return _positive_finite_hours(raw, "AGENT_RUN_ORPHAN_MIN_AGE_HOURS", 24.0)
+
+
+# ---------------------------------------------------------------------------
+# Orphan-process discovery helpers
+# ---------------------------------------------------------------------------
+
+class _ProcEntry(NamedTuple):
+    """Snapshot of one entry from the OS process table.
+
+    ``start_time`` is an epoch float (seconds since the Unix epoch) used
+    only for age comparisons — it does not need sub-second precision.
+    ``identity`` mirrors the format used by ``_process_identity``: a
+    stable platform-specific birth token that lets callers detect PID
+    recycling between discovery and any later action.
+    """
+    pid: int
+    ppid: int
+    uid: int
+    argv: List[str]
+    start_time: float   # epoch seconds
+    identity: str       # "linux:<starttime>" or "darwin:<lstart>"
+
+
+class _OrphanCandidate(NamedTuple):
+    """A runner process judged eligible for orphan handling."""
+    pid: int
+    name: str
+    start_time: float
+    identity: str
+
+
+class _OrphanSkip(NamedTuple):
+    """A process that was examined but excluded, with a machine-readable reason."""
+    pid: int
+    reason: str
+    detail: str = ""
+
+
+def _scan_process_table_linux() -> List[_ProcEntry]:
+    """Read /proc to build a process table of current-uid entries.
+
+    Tolerates races: a pid that vanishes between directory listing and
+    reading its files is silently skipped.  Only processes owned by the
+    current uid are returned.
+    """
+    my_uid = os.getuid()
+    entries: List[_ProcEntry] = []
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return entries
+    for pid in pids:
+        try:
+            st = os.stat(f"/proc/{pid}")
+            if st.st_uid != my_uid:
+                continue
+            # NUL-separated argv from /proc/<pid>/cmdline; empty means kernel thread.
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            if not raw:
+                continue
+            argv = raw.rstrip(b"\x00").split(b"\x00")
+            argv_str = [a.decode("utf-8", errors="replace") for a in argv]
+
+            # Parse /proc/<pid>/stat: ppid is field 4 (0-indexed 3),
+            # starttime is field 22 (0-indexed 21), both after the comm field.
+            fields = _proc_stat_fields(pid)
+            if fields is None or len(fields) <= 19:
+                continue
+            ppid = int(fields[1]) if fields[1].lstrip("-").isdigit() else 0
+            starttime_ticks = int(fields[19]) if fields[19].isdigit() else 0
+
+            # Convert kernel jiffies to epoch seconds via /proc/uptime.
+            try:
+                uptime_s = float(Path("/proc/uptime").read_text().split()[0])
+                boot_epoch = time.time() - uptime_s
+                hz = os.sysconf("SC_CLK_TCK")
+                start_time = boot_epoch + starttime_ticks / hz
+            except (OSError, ValueError, AttributeError):
+                start_time = 0.0
+
+            identity = f"linux:{starttime_ticks}"
+            entries.append(_ProcEntry(
+                pid=pid, ppid=ppid, uid=my_uid,
+                argv=argv_str, start_time=start_time, identity=identity,
+            ))
+        except (OSError, ValueError):
+            continue
+    return entries
+
+
+def _scan_process_table_darwin() -> List[_ProcEntry]:
+    """Query the macOS process table via ``ps``.
+
+    Uses ``ps -axo`` to enumerate all uid-visible processes, then filters
+    to the current uid.  The ``lstart`` field is the same token used by
+    ``_process_identity`` on Darwin, so identity values are comparable.
+    Tolerates ps failure: returns an empty list rather than raising.
+    """
+    my_uid = os.getuid()
+    entries: List[_ProcEntry] = []
+    try:
+        # pid, ppid, uid, lstart (24 chars fixed), and the full command.
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,uid=,lstart=,command="],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return entries
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parts = line.split(None, 3)
+            if len(parts) < 4:
+                continue
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            uid = int(parts[2])
+            if uid != my_uid:
+                continue
+            # lstart has a fixed format: "Www Mmm DD HH:MM:SS YYYY"
+            # We split off that 24-char field (5 whitespace-separated tokens)
+            # then parse the remainder as the command line.
+            rest = parts[3]
+            lstart_parts = rest.split(None, 5)
+            if len(lstart_parts) < 6:
+                continue
+            lstart = " ".join(lstart_parts[:5])
+            command_str = lstart_parts[5]
+        except (ValueError, IndexError):
+            continue
+
+        # Parse the command string into argv tokens.  ps reconstructs argv
+        # by joining with spaces, so we cannot perfectly recover arguments
+        # that contained spaces; shlex.split is the best available heuristic.
+        try:
+            argv_str = shlex.split(command_str)
+        except ValueError:
+            argv_str = command_str.split()
+        if not argv_str:
+            continue
+
+        # Convert lstart to an epoch float for age comparisons.
+        try:
+            # "Www Mmm DD HH:MM:SS YYYY" — strptime consumes leading zeros.
+            start_time = datetime.strptime(lstart, "%a %b %d %H:%M:%S %Y").replace(
+                tzinfo=timezone.utc
+            ).timestamp()
+        except ValueError:
+            start_time = 0.0
+
+        identity = f"darwin:{lstart}"
+        entries.append(_ProcEntry(
+            pid=pid, ppid=ppid, uid=uid,
+            argv=argv_str, start_time=start_time, identity=identity,
+        ))
+    return entries
+
+
+def _scan_process_table() -> List[_ProcEntry]:
+    """Return a snapshot of the OS process table, current uid only.
+
+    Platform dispatch: Linux reads /proc; Darwin uses ``ps``.  A pid that
+    vanishes mid-scan is silently skipped rather than raising.
+    """
+    system = platform.system()
+    if system == "Linux":
+        return _scan_process_table_linux()
+    if system == "Darwin":
+        return _scan_process_table_darwin()
+    return []
+
+
+def _argv_is_agent_run_runner(argv: Sequence[str]) -> bool:
+    """Return True only when ``argv`` invokes the agent-run entry point.
+
+    Matches two forms:
+      - A direct invocation where argv[0]'s basename is ``agent-run``.
+      - A Python-interpreter invocation where some argv element's basename
+        is ``agent-run`` (e.g. ``python /usr/local/bin/agent-run <args>``).
+
+    Matching is on path *components*, not substrings: a process whose argv
+    merely mentions ``agent-run`` in an argument value — the prototypical
+    false positive being ``bash -lc "cat /var/tmp/agent-runs/foo/log"`` —
+    returns False.  The basename check is the key gate: only a token whose
+    final path component is exactly ``agent-run`` qualifies, so ``grep
+    agent-run``, an editor with the file open, and shell commands that
+    expand the string as data are all excluded.
+    """
+    if not argv:
+        return False
+
+    # Direct invocation: the executable itself is agent-run.
+    if Path(argv[0]).name == "agent-run":
+        return True
+
+    # Python-interpreter invocation: skip interpreter and its own flags
+    # until the first non-flag positional is found; that positional is
+    # the script path.
+    interpreter_name = Path(argv[0]).name
+    if interpreter_name.startswith("python"):
+        i = 1
+        while i < len(argv):
+            token = argv[i]
+            if not token.startswith("-"):
+                # First positional: this is the script.
+                return Path(token).name == "agent-run"
+            # Python flags that consume their value as the next argv token.
+            # -W and -X each take one value argument; -c and -m end the
+            # flag sequence but their operands are not a script path.
+            if token in ("-W", "-X"):
+                i += 2
+                continue
+            if token in ("-c", "-m"):
+                # Command string or module name follows; no script path.
+                return False
+            # All other single-dash flags (-u, -O, -B, -d, -E, -i, …) are
+            # boolean; skip just this token.
+            i += 1
+        return False
+
+    return False
+
+
+def _run_name_from_argv(argv: Sequence[str]) -> Optional[str]:
+    """Extract the run name from a runner's argv, or None if indeterminate.
+
+    Calls ``_parse_launch_argv`` so this path and the launch path always
+    agree on flag parsing, including the ``--`` separator form.  Returns
+    None when:
+      - ``_parse_launch_argv`` raises ``_LaunchArgvError``
+      - the argv belongs to a subcommand (reap, list, …) rather than a launch
+      - the recovered name fails ``_validate_run_name``
+      - no name was found (too few arguments)
+    Never guesses.
+    """
+    # Strip the entry-point token(s) from argv before parsing.  A direct
+    # invocation has one leading token (agent-run); a python-wrapped
+    # invocation has two or more (python /path/agent-run).  We drop
+    # everything up to and including the agent-run token.
+    rest = list(argv)
+    found = False
+    for i, token in enumerate(rest):
+        if Path(token).name == "agent-run":
+            rest = rest[i + 1:]
+            found = True
+            break
+    if not found:
+        return None
+
+    try:
+        parsed = _parse_launch_argv(rest)
+    except _LaunchArgvError:
+        return None
+
+    # A subcommand invocation (agent-run reap, agent-run list, …) is not a
+    # launch; it has no run name to recover.
+    if parsed.subcommand_tokens is not None:
+        return None
+
+    name = parsed.name
+    if not name:
+        return None
+
+    # Guard against invalid names reaching filesystem paths.
+    try:
+        _validate_run_name(name)
+    except SystemExit:
+        return None
+
+    return name
+
+
+def _find_orphan_runners(
+    table: Sequence[_ProcEntry],
+    *,
+    min_age_seconds: float,
+    now: float,
+    self_pid: int,
+    self_pgid: int,
+    target_name: Optional[str] = None,
+) -> "tuple[List[_OrphanCandidate], List[_OrphanSkip]]":
+    """Classify each _ProcEntry as an orphan candidate or a skip.
+
+    A candidate satisfies all of:
+      - argv identifies it as an agent-run runner (_argv_is_agent_run_runner)
+      - run name recovers (_run_name_from_argv) and passes _validate_run_name
+      - no state dir exists for that name (_path_entry_exists returns False)
+      - process age >= min_age_seconds
+      - not self_pid, not any ancestor of self_pid, not in self_pgid, not pid 1
+      - uid matches the current uid (guaranteed by _scan_process_table, checked here too)
+      - matches target_name when given
+
+    Every rejected entry is returned as an _OrphanSkip with a distinct reason.
+    Processes that do not look like agent-run runners at all are silently
+    excluded (they are noise, not skips).
+    """
+    my_uid = os.getuid()
+
+    # Build a pid→ppid map for ancestor-chain traversal.
+    ppid_map: dict[int, int] = {e.pid: e.ppid for e in table}
+
+    def _ancestor_pids(pid: int) -> set[int]:
+        """Walk ppid chain up to pid 1 or a cycle; return all ancestor pids."""
+        seen: set[int] = set()
+        current = ppid_map.get(pid)
+        while current is not None and current not in seen and current > 1:
+            seen.add(current)
+            current = ppid_map.get(current)
+        return seen
+
+    ancestors = _ancestor_pids(self_pid)
+
+    candidates: List[_OrphanCandidate] = []
+    skips: List[_OrphanSkip] = []
+
+    for entry in table:
+        if not _argv_is_agent_run_runner(entry.argv):
+            continue  # not an agent-run runner — ignore entirely
+
+        pid = entry.pid
+
+        # Safety refusals — each gets its own skip reason.
+        if pid == 1:
+            skips.append(_OrphanSkip(pid=pid, reason="pid_1"))
+            continue
+        if entry.uid != my_uid:
+            skips.append(_OrphanSkip(pid=pid, reason="foreign_uid", detail=str(entry.uid)))
+            continue
+        if pid == self_pid:
+            skips.append(_OrphanSkip(pid=pid, reason="self"))
+            continue
+        if pid in ancestors:
+            skips.append(_OrphanSkip(pid=pid, reason="ancestor"))
+            continue
+        if entry.ppid == self_pgid or pid == self_pgid:
+            skips.append(_OrphanSkip(pid=pid, reason="same_pgid"))
+            continue
+
+        # Name recovery.
+        name = _run_name_from_argv(entry.argv)
+        if name is None:
+            skips.append(_OrphanSkip(pid=pid, reason="name_unrecoverable"))
+            continue
+
+        # target_name filter.
+        if target_name is not None and name != target_name:
+            skips.append(_OrphanSkip(pid=pid, reason="name_mismatch", detail=name))
+            continue
+
+        # State-dir check: a process with a live state dir is tracked by
+        # reap's existing passes, not this one.
+        if _path_entry_exists(_state_dir(name)):
+            skips.append(_OrphanSkip(pid=pid, reason="state_dir_exists", detail=name))
+            continue
+
+        # Age gate: too-young processes are excluded so a runner still
+        # mid-launch (state dir creation in progress) is not a candidate.
+        age = now - entry.start_time
+        if age < min_age_seconds:
+            skips.append(_OrphanSkip(
+                pid=pid, reason="too_young",
+                detail=f"age={age:.1f}s min={min_age_seconds:.1f}s",
+            ))
+            continue
+
+        candidates.append(_OrphanCandidate(
+            pid=pid, name=name,
+            start_time=entry.start_time,
+            identity=entry.identity,
+        ))
+
+    return candidates, skips
+
+
 # Launch-grace window: how many seconds after exec a non-zero exit still reads
 # as argv validation or a missing binary rather than work that ran and failed.
 def _positive_finite_seconds(raw: str, label: str, default_seconds: float) -> float:
