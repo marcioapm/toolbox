@@ -70,13 +70,14 @@ def _make_proc_entry(
     uid: int = MY_UID,
     start_time: float = FAR_PAST,
     identity: str = "",
+    pgid: int = 0,
 ) -> _ProcEntry:
     ident = identity or f"darwin:{pid}-test-identity"
     argv = ["agent-run", name, "claude"]
     return _ProcEntry(
         pid=pid, ppid=ppid, uid=uid,
         argv=argv, start_time=start_time,
-        identity=ident,
+        identity=ident, pgid=pgid,
     )
 
 
@@ -398,6 +399,45 @@ class TestStateDirReappeared:
         line = _extract_summary(capsys)
         assert _summary_field(line, "orphan_procs_skipped") == 1
 
+    def test_state_dir_reappeared_after_discovery_skipped(
+        self, isolated_runs_root, monkeypatch, capsys
+    ):
+        """State dir that appears between discovery and the in-lock re-check
+        causes the candidate to be skipped with the in-lock reason string.
+
+        _path_entry_exists returns False on the first call (discovery) so the
+        entry becomes a candidate, then True on the second call (inside the lock)
+        simulating a concurrent launch that created the state dir in the window
+        between discovery and the lock."""
+        pid = 9502
+        name = "reappeared3"
+        entry = _make_proc_entry(pid, name)
+
+        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
+        monkeypatch.setattr(agent_run, "_process_identity",
+                            lambda p: f"darwin:{p}-test-identity")
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+
+        call_count: List[int] = [0]
+        real_exists = agent_run._path_entry_exists
+
+        def patched_exists(path):
+            call_count[0] += 1
+            # First call: discovery — state dir absent, entry becomes a candidate.
+            # Second call: inside lock — state dir has appeared.
+            if call_count[0] == 1:
+                return False
+            return True
+
+        monkeypatch.setattr(agent_run, "_path_entry_exists", patched_exists)
+
+        cmd_reap(_reap_args(orphan_processes=True))
+        out = capsys.readouterr().out
+        line = next((l for l in out.splitlines() if "reap done:" in l), "")
+        assert _summary_field(line, "orphan_procs_killed") == 0
+        assert _summary_field(line, "orphan_procs_skipped") == 1
+        assert "state dir appeared after discovery" in out
+
 
 # ---------------------------------------------------------------------------
 # os.getpgid(pid) != pid → pid signalled, group not
@@ -436,7 +476,8 @@ class TestPgidMismatch:
         self, isolated_runs_root, monkeypatch, capsys
     ):
         pid = 9601
-        entry = _make_proc_entry(pid, "pgidsession")
+        # Set pgid=pid: the entry is a group leader (its own pgid != self_pgid=0).
+        entry = _make_proc_entry(pid, "pgidsession", pgid=pid)
         identity = f"darwin:{pid}-test-identity"
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
@@ -444,7 +485,7 @@ class TestPgidMismatch:
         monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
         monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
 
-        # pgid == pid → runner is a session leader, kill the group.
+        # pgid == pid at runtime → runner is a session leader, kill the group.
         monkeypatch.setattr(os, "getpgid", lambda p: p)
 
         kill_calls: List[Tuple[int, int]] = []
@@ -465,8 +506,15 @@ class TestPgidMismatch:
 # ---------------------------------------------------------------------------
 
 class TestSummaryCounters:
-    def test_existing_fields_before_orphan_fields(self, isolated_runs_root, capsys):
-        """orphan_procs_* must appear after all pre-existing summary fields."""
+    def test_existing_fields_before_orphan_fields(
+        self, isolated_runs_root, monkeypatch, capsys
+    ):
+        """orphan_procs_* must appear after all pre-existing summary fields.
+
+        An empty process table avoids any real scan; the ordering assertion is
+        independent of whether any orphan is found.
+        """
+        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [])
         cmd_reap(_reap_args(orphan_processes=True))
         line = _extract_summary(capsys)
         pre_existing = [
@@ -540,42 +588,57 @@ class TestDiscoveryRefusals:
         entry = _make_proc_entry(os.getpid(), "selfrun")
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(agent_run, "_process_identity",
+                            lambda p: f"darwin:{p}-test-identity")
 
-        signals_sent: List[Tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: signals_sent.append((p, sig)))
         cmd_reap(_reap_args(orphan_processes=True))
-        assert not signals_sent
+        out = capsys.readouterr().out
+        line = next((l for l in out.splitlines() if "reap done:" in l), "")
+        assert _summary_field(line, "orphan_procs_killed") == 0
+        assert _summary_field(line, "orphan_procs_skipped") == 1
+        assert "skipped: self" in out
 
     def test_pid_1_is_never_killed(self, isolated_runs_root, monkeypatch, capsys):
         entry = _make_proc_entry(1, "initrun")
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(agent_run, "_process_identity",
+                            lambda p: f"darwin:{p}-test-identity")
 
-        signals_sent: List[Tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: signals_sent.append((p, sig)))
         cmd_reap(_reap_args(orphan_processes=True))
-        assert not signals_sent
+        out = capsys.readouterr().out
+        line = next((l for l in out.splitlines() if "reap done:" in l), "")
+        assert _summary_field(line, "orphan_procs_killed") == 0
+        assert _summary_field(line, "orphan_procs_skipped") == 1
+        assert "skipped: pid_1" in out
 
     def test_bash_lc_false_positive_not_killed(
         self, isolated_runs_root, monkeypatch, capsys
     ):
-        """bash -lc 'cat /var/tmp/agent-runs/foo/log' must never be a candidate."""
+        """bash -lc 'cat /var/tmp/agent-runs/foo/log' must never be a candidate.
+
+        It must not even appear in the skip log — it is not an agent-run runner
+        and is excluded before any safety check runs.
+        """
         entry = _ProcEntry(
             pid=9900, ppid=999, uid=MY_UID,
             argv=["bash", "-lc", "cat /var/tmp/agent-runs/foo/log"],
             start_time=FAR_PAST,
             identity="darwin:9900-test",
+            pgid=0,
         )
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(agent_run, "_process_identity",
+                            lambda p: f"darwin:{p}-test-identity")
 
-        signals_sent: List[Tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: signals_sent.append((p, sig)))
         cmd_reap(_reap_args(orphan_processes=True))
-        assert not signals_sent
+        out = capsys.readouterr().out
+        line = next((l for l in out.splitlines() if "reap done:" in l), "")
+        # Not a runner: counts as neither killed nor skipped.
+        assert _summary_field(line, "orphan_procs_killed") == 0
+        assert _summary_field(line, "orphan_procs_skipped") == 0
+        assert "9900" not in out
 
     def test_state_dir_present_skips_process(
         self, isolated_runs_root, monkeypatch, capsys
@@ -587,12 +650,15 @@ class TestDiscoveryRefusals:
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(agent_run, "_process_identity",
+                            lambda p: f"darwin:{p}-test-identity")
 
-        signals_sent: List[Tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: signals_sent.append((p, sig)))
         cmd_reap(_reap_args(orphan_processes=True))
-        assert not signals_sent
+        out = capsys.readouterr().out
+        line = next((l for l in out.splitlines() if "reap done:" in l), "")
+        assert _summary_field(line, "orphan_procs_killed") == 0
+        assert _summary_field(line, "orphan_procs_skipped") == 1
+        assert "skipped: state_dir_exists" in out
 
 
 # ---------------------------------------------------------------------------

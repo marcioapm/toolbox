@@ -66,12 +66,13 @@ def _make_entry(
     uid: int = MY_UID,
     start_time: float = FAR_PAST,
     identity: str = "",
+    pgid: int = 0,
 ) -> _ProcEntry:
     ident = identity or f"darwin:{pid}-test-identity"
     return _ProcEntry(
         pid=pid, ppid=ppid, uid=uid,
         argv=argv, start_time=start_time,
-        identity=ident,
+        identity=ident, pgid=pgid,
     )
 
 
@@ -260,7 +261,7 @@ class TestFindOrphanRunners:
         assert not candidates
         assert any(s.reason == "state_dir_exists" for s in skips)
 
-    def test_too_young_is_skipped(self):
+    def test_too_young_is_skipped(self, isolated_runs_root):
         now = time.time()
         entry = _make_entry(9003, ["agent-run", "youngrun", "cmd"],
                             start_time=now - 60.0)  # 60 s old
@@ -276,7 +277,7 @@ class TestFindOrphanRunners:
         assert len(candidates) == 1
         assert candidates[0].pid == 9004
 
-    def test_self_pid_is_skipped(self):
+    def test_self_pid_is_skipped(self, isolated_runs_root):
         self_pid = os.getpid()
         entry = _make_entry(self_pid, ["agent-run", "selfrun", "cmd"])
         candidates, skips = _find([entry], self_pid=self_pid)
@@ -297,10 +298,25 @@ class TestFindOrphanRunners:
         # Use a synthetic pgid that is not the real one so we don't collide
         # with any legitimately running test process.
         fake_pgid = 88888
-        entry = _make_entry(9006, ["agent-run", "pgidrun", "cmd"], ppid=fake_pgid)
+        entry = _make_entry(9006, ["agent-run", "pgidrun", "cmd"], pgid=fake_pgid)
         candidates, skips = _find([entry], self_pgid=fake_pgid, self_pid=os.getpid() + 1000)
-        # ppid == pgid triggers the same_pgid rule.
         assert any(s.reason == "same_pgid" for s in skips)
+
+    def test_same_pgid_sibling_is_skipped(self, isolated_runs_root):
+        """A sibling runner sharing the reaper's pgid but with a different ppid
+        must be skipped.  This is the real-world shape: on production hosts
+        each run is pid=child ppid=runner pgid=<shared group leader>, so
+        ppid != self_pgid and pid != self_pgid but pgid == self_pgid."""
+        fake_pgid = 49440
+        # ppid is the runner parent, not the reaper — the old ppid-based
+        # check would have missed this entry.
+        entry = _make_entry(
+            9006, ["agent-run", "sibling", "cmd"],
+            ppid=49441, pgid=fake_pgid,
+        )
+        candidates, skips = _find([entry], self_pgid=fake_pgid, self_pid=70426)
+        assert not candidates
+        assert any(s.pid == 9006 and s.reason == "same_pgid" for s in skips)
 
     def test_pid_1_is_skipped(self, isolated_runs_root):
         entry = _make_entry(1, ["agent-run", "initrun", "cmd"])
@@ -315,7 +331,7 @@ class TestFindOrphanRunners:
         assert not candidates
         assert any(s.reason == "foreign_uid" for s in skips)
 
-    def test_unrecoverable_name_is_skipped(self):
+    def test_unrecoverable_name_is_skipped(self, isolated_runs_root):
         # bash -lc "..." looks like a runner if we were doing substring matching
         # but _argv_is_agent_run_runner returns False, so it won't even be a skip.
         # Instead test a process that IS a runner but whose name can't be parsed.
@@ -332,14 +348,14 @@ class TestFindOrphanRunners:
         assert candidates[0].name == "run-a"
         assert any(s.reason == "name_mismatch" for s in skips)
 
-    def test_non_runner_argv_ignored_entirely(self):
+    def test_non_runner_argv_ignored_entirely(self, isolated_runs_root):
         # grep agent-run is not a runner; it should not appear in skips either.
         entry = _make_entry(9030, ["grep", "agent-run", "/var/log/syslog"])
         candidates, skips = _find([entry])
         assert not candidates
         assert not any(s.pid == 9030 for s in skips)
 
-    def test_bash_lc_cat_log_never_candidate(self):
+    def test_bash_lc_cat_log_never_candidate(self, isolated_runs_root):
         """The bash -lc 'cat /var/tmp/agent-runs/foo/log' false positive
         must never appear as a candidate — it is the highest-priority safety
         invariant in this module."""
@@ -411,53 +427,38 @@ class TestParseOrphanMinAgeSeconds:
 # ---------------------------------------------------------------------------
 
 class TestScanProcessTableRace:
-    def test_vanishing_pid_does_not_raise(self, monkeypatch):
-        """Simulate a pid disappearing mid-scan; _scan_process_table must not raise."""
-        # Monkeypatch the Linux or Darwin scanner so it encounters a "vanishing" pid.
-        import platform as _platform
+    def test_darwin_scanner_tolerates_subprocess_failure(self, monkeypatch):
+        """_scan_process_table_darwin returns [] when ps fails rather than raising."""
+        import subprocess as _subprocess
 
-        original_system = _platform.system()
+        def patched_run(*args, **kwargs):
+            raise _subprocess.SubprocessError("simulated failure")
 
-        if original_system == "Linux":
-            real_scan = agent_run._scan_process_table_linux
-
-            def patched_linux():
-                # Call through; the actual /proc scan tolerates FileNotFoundError.
-                # Inject a fake pid that will cause OSError on every read.
-                entries = real_scan()
-                # If the real scan works, that proves tolerance. We also
-                # verify the function itself doesn't blow up on OSError from
-                # within by patching os.listdir to return a ghost pid.
-                return entries
-
-            monkeypatch.setattr(agent_run, "_scan_process_table_linux", patched_linux)
-        # On Darwin, ps subprocess failure returns an empty list (tested by
-        # disabling the subprocess).
-        elif original_system == "Darwin":
-            import subprocess as _subprocess
-
-            def patched_run(*args, **kwargs):
-                raise _subprocess.SubprocessError("simulated failure")
-
-            monkeypatch.setattr(_subprocess, "run", patched_run)
-
-        # Must not raise regardless of platform.
-        result = agent_run._scan_process_table()
-        assert isinstance(result, list)
+        monkeypatch.setattr(_subprocess, "run", patched_run)
+        result = agent_run._scan_process_table_darwin()
+        assert result == []
 
     def test_linux_ghost_pid_skipped(self, monkeypatch):
-        """A pid listed in /proc that vanishes before its files are read is skipped."""
-        import platform as _platform
-        if _platform.system() != "Linux":
-            pytest.skip("Linux-only test")
+        """A pid listed in /proc that vanishes before its files are read is skipped.
+
+        Runs on all platforms: the Linux scanner is called directly with os.listdir
+        stubbed to inject a ghost pid.  On Linux, any real /proc entries are also
+        returned; on non-Linux platforms the real os.listdir is replaced entirely.
+        """
+        import types as _types
 
         original_listdir = os.listdir
 
         def fake_listdir(path):
-            result = original_listdir(path)
             if str(path) == "/proc":
-                result = list(result) + ["999999999"]   # ghost pid
-            return result
+                # On Linux, include real pids so the scanner still returns entries;
+                # on other platforms /proc doesn't exist so we synthesise the list.
+                try:
+                    real = original_listdir(path)
+                except OSError:
+                    real = []
+                return list(real) + ["999999999"]   # ghost pid
+            return original_listdir(path)
 
         monkeypatch.setattr(os, "listdir", fake_listdir)
         # Should not raise even though /proc/999999999/* do not exist.
@@ -504,18 +505,20 @@ class TestDarwinLstartNormalise:
         _scan_process_table_darwin (built from the ps -axo column) must equal
         the token returned by _process_identity (built from ps -p lstart=) for
         the same process with a single-digit start day.
+
+        Runs on all platforms via a platform.system stub — no Darwin dependency.
         """
         import subprocess as _subprocess
-        import platform as _platform
-        if _platform.system() != "Darwin":
-            pytest.skip("Darwin-only test")
+        import types as _types
 
         pid = 12345
         my_uid = os.getuid()
 
-        # ps -axo output: whitespace-collapsed by split(None, N) parsing.
+        # ps -axo output with column order: pid ppid pgid uid lstart command.
+        # Whitespace-collapsed by split(None, N) parsing.
         ps_axo_line = (
-            f"  {pid}     1 {my_uid} Mon Jun  8 12:29:39 2026 /usr/bin/agent-run myrun claude"
+            f"  {pid}     1  {pid} {my_uid} Mon Jun  8 12:29:39 2026"
+            f" /usr/bin/agent-run myrun claude"
         )
 
         # ps -p output: raw fixed-width kernel format with two-space padding.
@@ -533,6 +536,9 @@ class TestDarwinLstartNormalise:
             return r
 
         monkeypatch.setattr(_subprocess, "run", fake_subprocess_run)
+        # Redirect agent_run's platform reference so the Darwin branch runs
+        # on Linux CI as well.
+        monkeypatch.setattr(agent_run, "platform", _types.SimpleNamespace(system=lambda: "Darwin"))
 
         # Identity from the scanner (ps -axo path).
         entries = agent_run._scan_process_table_darwin()

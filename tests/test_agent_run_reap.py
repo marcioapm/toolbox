@@ -2143,19 +2143,32 @@ class TestReapIncludeLogs:
         out = capsys.readouterr().out
         assert "logs_collected=0" in out
 
-    def test_symlinked_log_dir_is_refused(self, isolated_runs_root, isolated_log_root):
+    def test_symlinked_log_dir_is_refused(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
         outside = isolated_log_root.parent / "outside-log-target"
         outside.mkdir()
         (outside / "secret").write_text("must not be touched")
         link = isolated_log_root / "symlog"
         link.symlink_to(outside, target_is_directory=True)
 
-        rc = agent_run.cmd_reap(_reap_args(include_logs=True, log_min_age_hours=0.0001))
+        # Backdate both the target and the symlink past the collection threshold
+        # so the age gate cannot protect the target — only the S_ISDIR symlink
+        # refusal can.  With a fresh mtime the age gate fires first, making the
+        # test vacuous (the symlink guard is never reached).
+        old = time.time() - (agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        os.utime(outside / "secret", (old, old))
+        os.utime(outside, (old, old))
+        os.utime(link, (old, old), follow_symlinks=False)
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True))
 
         assert rc == 0
         assert outside.exists()
         assert (outside / "secret").exists()
         assert link.is_symlink()
+        out = capsys.readouterr().out
+        assert "logs_collected=0" in out
 
     def test_include_logs_works_when_state_root_absent(
         self, isolated_runs_root, isolated_log_root

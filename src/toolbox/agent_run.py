@@ -479,6 +479,8 @@ class _ProcEntry(NamedTuple):
     ``identity`` mirrors the format used by ``_process_identity``: a
     stable platform-specific birth token that lets callers detect PID
     recycling between discovery and any later action.
+    ``pgid`` is the process group ID, used to skip processes in the
+    reaper's own process group (``pgid == self_pgid``).
     """
     pid: int
     ppid: int
@@ -486,6 +488,7 @@ class _ProcEntry(NamedTuple):
     argv: List[str]
     start_time: float   # epoch seconds
     identity: str       # "linux:<starttime>" or "darwin:<lstart>"
+    pgid: int = 0       # process group ID; 0 means unknown
 
 
 class _OrphanCandidate(NamedTuple):
@@ -534,6 +537,7 @@ def _scan_process_table_linux() -> List[_ProcEntry]:
             if fields is None or len(fields) <= 19:
                 continue
             ppid = int(fields[1]) if fields[1].lstrip("-").isdigit() else 0
+            pgid = int(fields[2]) if fields[2].lstrip("-").isdigit() else 0
             starttime_ticks = int(fields[19]) if fields[19].isdigit() else 0
 
             # Convert kernel jiffies to epoch seconds via /proc/uptime.
@@ -549,6 +553,7 @@ def _scan_process_table_linux() -> List[_ProcEntry]:
             entries.append(_ProcEntry(
                 pid=pid, ppid=ppid, uid=my_uid,
                 argv=argv_str, start_time=start_time, identity=identity,
+                pgid=pgid,
             ))
         except (OSError, ValueError):
             continue
@@ -580,9 +585,9 @@ def _scan_process_table_darwin() -> List[_ProcEntry]:
     my_uid = os.getuid()
     entries: List[_ProcEntry] = []
     try:
-        # pid, ppid, uid, lstart (24 chars fixed), and the full command.
+        # pid, ppid, pgid, uid, lstart (24 chars fixed), and the full command.
         result = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,uid=,lstart=,command="],
+            ["ps", "-axo", "pid=,ppid=,pgid=,uid=,lstart=,command="],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
@@ -593,18 +598,19 @@ def _scan_process_table_darwin() -> List[_ProcEntry]:
         if not line:
             continue
         try:
-            parts = line.split(None, 3)
-            if len(parts) < 4:
+            parts = line.split(None, 4)
+            if len(parts) < 5:
                 continue
             pid = int(parts[0])
             ppid = int(parts[1])
-            uid = int(parts[2])
+            pgid = int(parts[2])
+            uid = int(parts[3])
             if uid != my_uid:
                 continue
             # lstart has a fixed format: "Www Mmm DD HH:MM:SS YYYY"
             # We split off that 24-char field (5 whitespace-separated tokens)
             # then parse the remainder as the command line.
-            rest = parts[3]
+            rest = parts[4]
             lstart_parts = rest.split(None, 5)
             if len(lstart_parts) < 6:
                 continue
@@ -636,6 +642,7 @@ def _scan_process_table_darwin() -> List[_ProcEntry]:
         entries.append(_ProcEntry(
             pid=pid, ppid=ppid, uid=uid,
             argv=argv_str, start_time=start_time, identity=identity,
+            pgid=pgid,
         ))
     return entries
 
@@ -816,7 +823,7 @@ def _find_orphan_runners(
         if pid in ancestors:
             skips.append(_OrphanSkip(pid=pid, reason="ancestor"))
             continue
-        if entry.ppid == self_pgid or pid == self_pgid:
+        if entry.pgid == self_pgid:
             skips.append(_OrphanSkip(pid=pid, reason="same_pgid"))
             continue
 
