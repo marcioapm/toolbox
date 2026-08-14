@@ -527,25 +527,30 @@ log even though the ephemeral process state is gone:
   unambiguously means "not running". Override with `AGENT_RUN_STATE_DIR`.
 - `/var/tmp/agent-runs/<name>/` — persistent log, cleaned transcript, a
   copy of the prompt file, and a per-run scratch dir (`tmp/`, mode 0700)
-  exported as `TMPDIR` into the launched command's environment. Survives
-  reboot/crash; the log fd is opened here from the start, so there's no
-  copy-on-exit step a crash could lose. Override with `AGENT_RUN_LOG_DIR`.
-  `log`/`log.clean`/`prompt` are pruned automatically after 21 days; the
-  `tmp/` scratch dir is instead cleaned up by `agent-run reap` (see below).
+  exported as `TMPDIR` and `BUN_TMPDIR` into the launched command's
+  environment. Survives reboot/crash; the log fd is opened here from the
+  start, so there's no copy-on-exit step a crash could lose. Override with
+  `AGENT_RUN_LOG_DIR`. `log`/`log.clean`/`prompt` are pruned automatically
+  after 21 days; the `tmp/` scratch dir is instead cleaned up by
+  `agent-run reap` (see below).
 
-### Scratch dir (`TMPDIR`)
+### Scratch dir (`TMPDIR`, `BUN_TMPDIR`)
 
 Every launch gets its own disk-backed scratch dir at
-`$AGENT_RUN_LOG_DIR/<name>/tmp/`, exported as `TMPDIR` into the launched
-command's environment (and therefore every descendant it forks/execs). The
-agent's argv is never modified — only the environment carries this. This
-exists to contain tools that dump large, un-cleaned scratch data into
-`$TMPDIR`: OpenCode's bundled JDTLS, for example, creates
+`$AGENT_RUN_LOG_DIR/<name>/tmp/`, exported as both `TMPDIR` and
+`BUN_TMPDIR` — same path, same value — into the launched command's
+environment (and therefore every descendant it forks/execs). `BUN_TMPDIR`
+is set because Bun (which OpenCode runs on) does not consult `TMPDIR` for
+its own scratch space; without it, a Bun-based agent would keep spilling
+into the shared system temp despite `TMPDIR` being redirected. The agent's
+argv is never modified — only the environment carries this. This exists to
+contain tools that dump large, un-cleaned scratch data into the ambient
+temp dir: OpenCode's bundled JDTLS, for example, creates
 `mkdtemp()`-based Eclipse workspaces (routinely hundreds of MB for a large
 Java repo) and never removes them. Left to land in the system `/tmp` —
 which is tmpfs (RAM) on most Linux hosts — enough leaked runs can consume
-tens of GB of RAM. Routing each run's `TMPDIR` into its own directory means
-reaping the run also reaps whatever it leaked.
+tens of GB of RAM. Routing each run's scratch space into its own directory
+means reaping the run also reaps whatever it leaked.
 
 The scratch dir is **not** deleted when the run ends — postmortem
 artifacts matter for debugging a crashed or misbehaving agent. `agent-run
@@ -556,12 +561,25 @@ name intentionally replaces the prior log directory, including its scratch.
 ### Launch
 
 ```bash
-# Non-interactive (one-shot, e.g. claude --print, codex exec):
-agent-run build claude --permission-mode bypassPermissions --print 'Build the thing'
+# Recommended: separate agent-run's own flags/name from the launch command
+# with `--`. Everything after it is taken verbatim, dashes and all.
+agent-run build -- claude --permission-mode bypassPermissions --print 'Build the thing'
 
 # Interactive (steerable via stdin FIFO):
-agent-run -i chat claude --permission-mode bypassPermissions
+agent-run -i chat -- claude --permission-mode bypassPermissions
+
+# Omitting `--` still works for a plain command with no leading-dash args:
+agent-run build claude --permission-mode bypassPermissions --print 'Build the thing'
 ```
+
+The run name must precede `--`; a bare `agent-run --` (no name yet) is
+rejected with an error showing the correct shape, rather than guessing.
+Everything after `--` — including a literal `--` — is passed through
+unmodified and never dispatched as a subcommand: `agent-run mytask -- list
+foo` launches the command `list foo`, it does not run `agent-run list`. A
+flag typed after the name without `--` (e.g. `agent-run build --foo`) is
+still rejected, since it would otherwise silently become `argv[0]`; the
+error now also suggests using `--`.
 
 ### Inspect / control
 
@@ -570,12 +588,15 @@ agent-run list                            # non-terminal runs only (default)
 AGENT_RUN_LIST_DEFAULT=all agent-run list # restore the pre-filter default for a caller
 agent-run list --all                      # every recognized run, including done/failed/died/killed
 agent-run list --status died,killed       # only runs whose status is in this set
+agent-run list --include-logs             # also show preserved-log-only runs
 agent-run status <name>                   # one-line status
 agent-run logs <name> [N]                 # last N lines (default 50)
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
+                [--include-logs] [--log-min-age-hours N]
+agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage; read-only
 ```
 
 `kill` sends TERM/INT/HUP straight to the identity-verified runner, which
@@ -597,10 +618,14 @@ terminal ones (`done`/`failed`/`died`/`killed`), or set
 `AGENT_RUN_LIST_DEFAULT=all` to restore the prior default without changing
 call sites. Unrecognized/legacy/corrupt statuses are always shown under an
 explicit `Unrecognized / needs attention` heading rather than as live runs;
-use `reap --force-unknown` only after operator review. Preserved-log-only runs
-(state dir already gone) appear separately. `logs`/`tail`/`clean` always read
-the persistent log, falling back to the old single-directory layout for runs
-launched before the state/log split.
+use `reap --force-unknown` only after operator review. Preserved-log-only
+runs (state dir already gone) are hidden by default — pass `--include-logs`
+(or set `AGENT_RUN_LIST_INCLUDE_LOGS=1`) to show them, orthogonal to
+`--all`/`--status`, which govern only the state-backed sections above it.
+When hidden preserved logs exist, a one-line hint is printed to stderr
+(never stdout, so `agent-run list | grep ...` stays honest). `logs`/`tail`/
+`clean` always read the persistent log, falling back to the old
+single-directory layout for runs launched before the state/log split.
 
 ### Reaping
 
@@ -617,21 +642,57 @@ launched before the state/log split.
     whose `ended_at` is older than `--min-age-hours` (or preferred
     `AGENT_RUN_MIN_AGE_HOURS`; compatible alias `AGENT_RUN_REAP_MIN_AGE_HOURS`,
     default 168h/7 days) have their ephemeral state dir *and* scratch dir
-    (`tmp/`, the `TMPDIR`) removed. Persistent `log`/`log.clean`/`prompt`
-    survive reap. A state-less `tmp/` left after a reboot is independently
-    collected once its contents have aged past the same threshold. A run
-    reconciled to `died`/`killed` in this invocation is never collected in
-    the same invocation. Unknown/legacy/corrupt statuses are left intact by
-    default and require `--force-unknown` to collect after review.
+    (`tmp/`, the `TMPDIR`/`BUN_TMPDIR` target) removed. A state-less `tmp/`
+    left after a reboot is independently collected once its contents have
+    aged past the same threshold. A run reconciled to `died`/`killed` in
+    this invocation is never collected in the same invocation. Unknown/
+    legacy/corrupt statuses are left intact by default and require
+    `--force-unknown` to collect after review.
+3. **Preserved-log garbage collection** (opt-in, `--include-logs`): whole
+    preserved-log-only run directories (state dir already gone) whose
+    newest recursive mtime is older than `--log-min-age-hours` (or
+    `AGENT_RUN_LOG_MIN_AGE_HOURS`, default 21 days — matching the existing
+    unconditional whole-log-dir prune) are removed entirely, including
+    `log`/`log.clean`/`prompt`/`tmp/`. **Deliberately independent of
+    `--min-age-hours`**: a preserved log is the artifact an operator wanted
+    to keep, not disposable state bookkeeping, so it defaults to a much
+    longer retention window and is never influenced by the state-dir
+    threshold. Off by default — without `--include-logs`, reap never
+    touches a preserved log, matching the persistent `log`/`log.clean`/
+    `prompt` behaviour of step 2. A run with a live state dir is never
+    touched by this step regardless of age. Runs after step 2 (so a state
+    dir step 2 just removed can become log-only and eligible in the same
+    invocation) and before the orphan-scratch sweep (so a log dir removed
+    whole here is never also probed for a leftover `tmp/`).
 
-Both steps only ever act after re-verifying a live pid belongs to the
+Every step only ever acts after re-verifying a live pid belongs to the
 recorded runner (`_pid_alive`/`_process_identity`) or an inode hasn't been
 swapped out from under the scan (`_safe_rmtree`'s root-contained,
 inode-reverified deletion, plus the same per-name launch lock used to
-serialize relaunches). State GC first atomically renames a directory to a
-reserved sentinel so an interrupted deletion is resumed by the next reap;
+serialize relaunches). State/log GC first atomically renames a directory to
+a reserved sentinel so an interrupted deletion is resumed by the next reap;
 `--dry-run` runs the same read-only eligibility checks and prints only actions
 a real reap would take, without mutating or deleting anything.
+
+### Disk usage (`du`)
+
+`agent-run du` reports apparent disk usage (`st_size`), by default one row
+per effective status (plus a `preserved-log-only` row) — pass `--by-run`
+for one row per run instead. Each row breaks down state-dir, log-dir
+(excluding `tmp/`), and scratch (`tmp/`) bytes, plus their total; rows sort
+by total descending, then name, with a `TOTAL` row last that always covers
+every run, even under `--top N`. `--bytes` prints exact integers instead of
+human-readable sizes (`1.2G`, `340M`, `12K`); `--json` emits a machine-
+readable object and always uses exact integers, so combining it with
+`--bytes` is rejected. `du` never mutates anything — no locks, no
+`_opportunistic_heal`, no `_prune_old_logs` — and tolerates races
+(`FileNotFoundError`/`PermissionError`) by skipping the affected entry.
+
+```bash
+agent-run du                    # per-status rollup, human-readable
+agent-run du --by-run --top 10  # 10 largest runs by total size
+agent-run du --json             # machine-readable, exact byte integers
+```
 
 ### Files
 
@@ -660,7 +721,7 @@ Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
 | `log` | combined stdout+stderr (PTY-captured in interactive mode) |
 | `log.clean` | rendered transcript (only when launched with `--echo`) |
 | `prompt` | copy of the `-f`/`--prompt-file` input, if one was given |
-| `tmp/` | per-run scratch dir exported as `TMPDIR`; removed only by `agent-run reap`, never on normal run exit |
+| `tmp/` | per-run scratch dir exported as `TMPDIR` and `BUN_TMPDIR`; removed only by `agent-run reap`, never on normal run exit |
 
 ### Design notes
 
@@ -693,13 +754,15 @@ Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
   spawned/exec'd for one-shot, or PTY/FIFO/keeper ready for interactive.
   Any setup failure before that point still resolves synchronously to
   `failed`, never leaving `starting` stranded with no process behind it.
-- `TMPDIR` is exported into `os.environ` inside the detached runner before
-  any child is forked/exec'd, so the launched agent — and anything it in
-  turn forks or execs — inherits it automatically; the launch argv itself
-  is never touched. This is deliberately environment-only rather than
-  argv-injected `env TMPDIR=...`, since some agents' own argument parsers
-  would otherwise need to understand and pass through an unrecognized
-  wrapper prefix.
+- `TMPDIR` and `BUN_TMPDIR` (same value: the run's scratch dir) are
+  exported into `os.environ` inside the detached runner before any child is
+  forked/exec'd, so the launched agent — and anything it in turn forks or
+  execs — inherits both automatically; the launch argv itself is never
+  touched. `BUN_TMPDIR` is set because Bun does not consult `TMPDIR` for
+  its own scratch space. This is deliberately environment-only rather than
+  argv-injected `env TMPDIR=... BUN_TMPDIR=...`, since some agents' own
+  argument parsers would otherwise need to understand and pass through an
+  unrecognized wrapper prefix.
 - `agent-run list`'s default view and `agent-run reap`'s garbage-collection
   eligibility share one definition of "terminal" (`done`/`failed`/`died`/
   `killed`) so they never disagree about which runs are "done with". A

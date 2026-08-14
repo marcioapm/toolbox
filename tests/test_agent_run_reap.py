@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -137,6 +138,8 @@ def _reap_args(
     min_age_hours: Optional[float] = None,
     name: Optional[str] = None,
     force_unknown: bool = False,
+    include_logs: bool = False,
+    log_min_age_hours: Optional[float] = None,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         dry_run=dry_run,
@@ -144,6 +147,8 @@ def _reap_args(
         min_age_hours=min_age_hours,
         name=name,
         force_unknown=force_unknown,
+        include_logs=include_logs,
+        log_min_age_hours=log_min_age_hours,
     )
 
 
@@ -1556,6 +1561,166 @@ class TestListFiltering:
 
 
 # ---------------------------------------------------------------------------
+# list --include-logs
+# ---------------------------------------------------------------------------
+
+def _list_args(*, all=False, status=None, include_logs=False) -> argparse.Namespace:
+    return argparse.Namespace(all=all, status=status, include_logs=include_logs)
+
+
+class TestListIncludeLogs:
+    def test_hidden_by_default(self, isolated_runs_root, isolated_log_root, capsys):
+        (isolated_log_root / "preservedrun").mkdir()
+        (isolated_log_root / "preservedrun" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args())
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "preservedrun" not in out
+        assert "Preserved logs" not in out
+
+    def test_shown_with_include_logs(self, isolated_runs_root, isolated_log_root, capsys):
+        (isolated_log_root / "preservedrun2").mkdir()
+        (isolated_log_root / "preservedrun2" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args(include_logs=True))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "preservedrun2" in out
+        assert "Preserved logs" in out
+
+    def test_combinable_with_all(self, isolated_runs_root, isolated_log_root, capsys):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "donerun3",
+            status="done", pid=None,
+        )
+        (isolated_log_root / "preservedrun3").mkdir()
+        (isolated_log_root / "preservedrun3" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args(all=True, include_logs=True))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "donerun3" in out
+        assert "preservedrun3" in out
+
+    def test_all_alone_still_hides_preserved_logs(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        (isolated_log_root / "preservedrun4").mkdir()
+        (isolated_log_root / "preservedrun4" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args(all=True, include_logs=False))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "preservedrun4" not in out
+
+    def test_combinable_with_status(self, isolated_runs_root, isolated_log_root, capsys):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "killedrun4",
+            status="killed", pid=None,
+        )
+        (isolated_log_root / "preservedrun5").mkdir()
+        (isolated_log_root / "preservedrun5" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args(status="killed", include_logs=True))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "killedrun4" in out
+        assert "preservedrun5" in out
+
+    def test_hint_on_stderr_only_when_hidden_logs_exist(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        (isolated_log_root / "hiddenpreserved").mkdir()
+        (isolated_log_root / "hiddenpreserved" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args())
+
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "preserved log(s) hidden" in err
+        assert "--include-logs" in err
+
+    def test_no_hint_when_no_preserved_logs(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        rc = agent_run.cmd_list(_list_args())
+
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "preserved log(s) hidden" not in err
+
+    def test_no_hint_printed_when_include_logs_shown(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        (isolated_log_root / "shownpreserved").mkdir()
+        (isolated_log_root / "shownpreserved" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args(include_logs=True))
+
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "preserved log(s) hidden" not in err
+
+    def test_env_var_opts_in_by_default(
+        self, isolated_runs_root, isolated_log_root, capsys, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_RUN_LIST_INCLUDE_LOGS", "1")
+        (isolated_log_root / "envshown").mkdir()
+        (isolated_log_root / "envshown" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args())
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "envshown" in out
+
+    @pytest.mark.parametrize("raw", ["true", "yes", "TRUE", "Yes"])
+    def test_env_var_accepts_true_yes_case_insensitive(
+        self, isolated_runs_root, isolated_log_root, capsys, monkeypatch, raw
+    ):
+        monkeypatch.setenv("AGENT_RUN_LIST_INCLUDE_LOGS", raw)
+        (isolated_log_root / "envshown2").mkdir()
+        (isolated_log_root / "envshown2" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args())
+
+        assert rc == 0
+        assert "envshown2" in capsys.readouterr().out
+
+    def test_explicit_flag_wins_over_env_false(
+        self, isolated_runs_root, isolated_log_root, capsys, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_RUN_LIST_INCLUDE_LOGS", "0")
+        (isolated_log_root / "explicitwins").mkdir()
+        (isolated_log_root / "explicitwins" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args(include_logs=True))
+
+        assert rc == 0
+        assert "explicitwins" in capsys.readouterr().out
+
+    def test_invalid_env_value_warns_and_defaults_to_hidden(
+        self, isolated_runs_root, isolated_log_root, capsys, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_RUN_LIST_INCLUDE_LOGS", "maybe")
+        (isolated_log_root / "invalidenvlog").mkdir()
+        (isolated_log_root / "invalidenvlog" / "log").write_text("x\n")
+
+        rc = agent_run.cmd_list(_list_args())
+
+        assert rc == 0
+        out, err = capsys.readouterr()
+        assert "invalidenvlog" not in out
+        assert "AGENT_RUN_LIST_INCLUDE_LOGS" in err
+
+
+# ---------------------------------------------------------------------------
 # reviewer regression coverage
 # ---------------------------------------------------------------------------
 
@@ -1852,3 +2017,232 @@ class TestGcLiveRunnerPidStrictRead:
         assert rc == 0
         assert not sd.exists()
         assert not (ld / "tmp").exists()
+
+
+# ---------------------------------------------------------------------------
+# reap --include-logs: preserved-log-only GC
+# ---------------------------------------------------------------------------
+
+def _make_preserved_log(
+    log_root: Path, name: str, *, age_secs: float, make_scratch: bool = False
+) -> Path:
+    """A log-only dir (no state dir) with every file backdated to age_secs."""
+    ld = log_root / name
+    ld.mkdir(parents=True, exist_ok=True)
+    (ld / "log").write_text("preserved output\n")
+    if make_scratch:
+        scratch = ld / "tmp"
+        scratch.mkdir(exist_ok=True)
+        (scratch / "leftover").write_text("x")
+    old = time.time() - age_secs
+    for p in ld.rglob("*"):
+        os.utime(p, (old, old))
+    os.utime(ld, (old, old))
+    return ld
+
+
+class TestReapIncludeLogs:
+    def test_old_log_removed_with_include_logs(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        ld = _make_preserved_log(
+            isolated_log_root, "oldlog", age_secs=(agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        )
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True))
+
+        assert rc == 0
+        assert not ld.exists()
+
+    def test_old_log_kept_without_include_logs(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        ld = _make_preserved_log(
+            isolated_log_root, "oldlog2", age_secs=(agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        )
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=False))
+
+        assert rc == 0
+        assert ld.exists()
+
+    def test_young_log_kept_with_include_logs(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        ld = _make_preserved_log(isolated_log_root, "younglog", age_secs=3600)
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True))
+
+        assert rc == 0
+        assert ld.exists()
+
+    def test_log_with_live_state_dir_is_never_touched(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "hasstate",
+            status="running", pid=os.getpid(),
+        )
+        old = time.time() - (agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        os.utime(ld / "log", (old, old))
+        os.utime(ld, (old, old))
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True))
+
+        assert rc == 0
+        assert ld.exists()
+        assert sd.exists()
+
+    def test_dry_run_mutates_nothing(self, isolated_runs_root, isolated_log_root, capsys):
+        ld = _make_preserved_log(
+            isolated_log_root, "dryrunlog", age_secs=(agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        )
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True, dry_run=True))
+
+        assert rc == 0
+        assert ld.exists()
+        out = capsys.readouterr().out
+        assert "dryrunlog" in out
+        assert "logs_collected=1" in out
+
+    def test_name_targeting_only_reaps_named_log(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        old_secs = (agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        ld1 = _make_preserved_log(isolated_log_root, "logtarget-a", age_secs=old_secs)
+        ld2 = _make_preserved_log(isolated_log_root, "logtarget-b", age_secs=old_secs)
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True, name="logtarget-a"))
+
+        assert rc == 0
+        assert not ld1.exists()
+        assert ld2.exists()
+
+    def test_counter_appears_in_summary(self, isolated_runs_root, isolated_log_root, capsys):
+        _make_preserved_log(
+            isolated_log_root, "countedlog", age_secs=(agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        )
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "logs_collected=1" in out
+
+    def test_counter_present_but_zero_without_include_logs(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        _make_preserved_log(
+            isolated_log_root, "nocountlog", age_secs=(agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        )
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=False))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "logs_collected=0" in out
+
+    def test_symlinked_log_dir_is_refused(self, isolated_runs_root, isolated_log_root):
+        outside = isolated_log_root.parent / "outside-log-target"
+        outside.mkdir()
+        (outside / "secret").write_text("must not be touched")
+        link = isolated_log_root / "symlog"
+        link.symlink_to(outside, target_is_directory=True)
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True, log_min_age_hours=0.0001))
+
+        assert rc == 0
+        assert outside.exists()
+        assert (outside / "secret").exists()
+        assert link.is_symlink()
+
+    def test_include_logs_works_when_state_root_absent(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """The `reap: no state or log root, nothing to do.` guard must not
+        short-circuit --include-logs when STATE_ROOT is gone but LOG_ROOT
+        has content."""
+        shutil.rmtree(isolated_runs_root)
+        ld = _make_preserved_log(
+            isolated_log_root, "noStateRoot", age_secs=(agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        )
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True))
+
+        assert rc == 0
+        assert not ld.exists()
+
+
+class TestReapLogMinAgeThreshold:
+    """--log-min-age-hours is independent of --min-age-hours, defaults to
+    PRUNE_AFTER_DAYS*24 (21d), and is resolved flag > env > default, exactly
+    like --min-age-hours/AGENT_RUN_MIN_AGE_HOURS."""
+
+    def test_default_is_21_days_not_7(self, isolated_runs_root, isolated_log_root):
+        ten_days = 10 * 86400
+        ld = _make_preserved_log(isolated_log_root, "tendays", age_secs=ten_days)
+
+        # 10 days old: kept by the 7-day (168h) state default were it (wrongly)
+        # reused, but the log default is 21 days, so it must survive.
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True))
+
+        assert rc == 0
+        assert ld.exists()
+
+    def test_flag_overrides_default_to_collect_10_day_old_log(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        ld = _make_preserved_log(isolated_log_root, "tendays2", age_secs=10 * 86400)
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True, log_min_age_hours=24))
+
+        assert rc == 0
+        assert not ld.exists()
+
+    def test_env_var_honoured(self, isolated_runs_root, isolated_log_root, monkeypatch):
+        monkeypatch.setenv("AGENT_RUN_LOG_MIN_AGE_HOURS", "24")
+        ld = _make_preserved_log(isolated_log_root, "envlog", age_secs=10 * 86400)
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True))
+
+        assert rc == 0
+        assert not ld.exists()
+
+    def test_flag_beats_env(self, isolated_runs_root, isolated_log_root, monkeypatch):
+        monkeypatch.setenv("AGENT_RUN_LOG_MIN_AGE_HOURS", "24")
+        ld = _make_preserved_log(isolated_log_root, "flagbeatsenv", age_secs=10 * 86400)
+
+        # Env would collect it (24h < 10d); the explicit flag raises the bar
+        # back above 10 days, so it must survive.
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True, log_min_age_hours=500))
+
+        assert rc == 0
+        assert ld.exists()
+
+    @pytest.mark.parametrize("raw", ["not-a-number", "-5", "0", "nan", "inf"])
+    def test_invalid_env_value_warns_and_falls_back_to_default(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys, raw
+    ):
+        monkeypatch.setenv("AGENT_RUN_LOG_MIN_AGE_HOURS", raw)
+        ld = _make_preserved_log(isolated_log_root, "badenvlog", age_secs=10 * 86400)
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True))
+
+        assert rc == 0
+        assert ld.exists(), "invalid env value must fall back to the 21d default, not 0"
+        assert "AGENT_RUN_LOG_MIN_AGE_HOURS" in capsys.readouterr().err
+
+    def test_min_age_hours_alone_does_not_affect_log_gc(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """--min-age-hours (state-dir threshold) must never influence
+        preserved-log GC eligibility."""
+        ld = _make_preserved_log(isolated_log_root, "stateThresholdOnly", age_secs=10 * 86400)
+
+        # A tiny --min-age-hours would collect state dirs almost instantly,
+        # but must have zero effect on this log-only run.
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True, min_age_hours=0.001))
+
+        assert rc == 0
+        assert ld.exists()

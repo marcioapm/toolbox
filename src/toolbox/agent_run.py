@@ -20,10 +20,13 @@ log even though the ephemeral process state is gone:
                                    that a crash could lose.
     /var/tmp/agent-runs/<name>/tmp/  per-run scratch dir (mode 0700), on the
                                    same persistent disk as the log. Exported
-                                   as TMPDIR into the launched command's
-                                   environment (and therefore all of its
-                                   descendants), so agents/tools that dump
-                                   large scratch data into $TMPDIR — e.g.
+                                   as both TMPDIR and BUN_TMPDIR into the
+                                   launched command's environment (and
+                                   therefore all of its descendants) —
+                                   BUN_TMPDIR because Bun (which OpenCode
+                                   runs on) does not consult TMPDIR for its
+                                   own scratch space — so agents/tools that
+                                   dump large scratch data into $TMPDIR — e.g.
                                    OpenCode's bundled JDTLS, which leaks
                                    multi-hundred-MB Eclipse workspaces under
                                    mkdtemp() and never cleans them up — land
@@ -41,18 +44,32 @@ log even though the ephemeral process state is gone:
 
 Usage::
 
+    agent-run [flags] <name> -- <cmd...>  # recommended: explicit separator
     agent-run <name> <cmd...>            # non-interactive (one-shot)
-    agent-run -i <name> <cmd...>         # interactive (PTY-wrapped, steerable)
-    agent-run --echo <name> <cmd...>     # also render a cleaned live transcript
-    agent-run --idle-timeout N <name> <cmd...>  # self-terminate after N idle seconds
+    agent-run -i <name> -- <cmd...>      # interactive (PTY-wrapped, steerable)
+    agent-run --echo <name> -- <cmd...>  # also render a cleaned live transcript
+    agent-run --idle-timeout N <name> -- <cmd...>  # self-terminate after N idle seconds
     agent-run tail <name>                # follow log in real time
     agent-run logs <name> [N]            # last N lines (default 50)
     agent-run status <name>              # one-line status
     agent-run watch <name> [--json] [--repo PATH]  # stateless fact snapshot for pollers
     agent-run steer <name> <msg...>      # send text to agent stdin (needs -i)
     agent-run kill <name> [SIGNAL]       # TERM by default; see "kill" below
-    agent-run list [--all] [--status S]  # list runs; defaults to non-terminal only
+    agent-run list [--all] [--status S] [--include-logs]  # list runs; defaults to non-terminal only
     agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--name NAME]
+                    [--include-logs] [--log-min-age-hours N]
+    agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage per status or per run
+
+Everything before "--" is an agent-run flag or the run name; everything
+after "--" is the launch command, taken verbatim (leading-dash tokens and
+further "--" tokens included) — no subcommand dispatch is ever attempted on
+tokens after it. The run name must precede "--"; a bare launch command that
+happens to start with "-" or reuse a subcommand's name (e.g. `agent-run
+mytask -- list foo` launches the literal command `list foo`) only works
+this way. Omitting "--" still works for a plain command with no leading-dash
+arguments, for backward compatibility, but a flag typed after the name
+without "--" is rejected with an error suggesting the separator, rather than
+silently becoming argv[0].
 
 `kill` sends TERM, INT, or HUP straight to the identity-verified runner
 process, which catches it and runs its own teardown (kill/reap the
@@ -123,8 +140,9 @@ Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs):
     log          captured stdout+stderr (PTY-captured when interactive)
     log.clean    rendered transcript (only when launched with --echo)
     prompt       copy of the -f/--prompt-file input, if one was given
-    tmp/         per-run scratch dir exported as TMPDIR (see above); removed
-                 only by `agent-run reap`, never on normal run exit
+    tmp/         per-run scratch dir exported as TMPDIR and BUN_TMPDIR (see
+                 above); removed only by `agent-run reap`, never on normal
+                 run exit
 
 `status` reports "not running (log preserved)" when the state dir is gone
 but the log dir survived. `logs`/`tail`/`clean` always read from the log
@@ -170,8 +188,9 @@ performed) in one invocation:
       ($AGENT_RUN_LOG_DIR/<name>/tmp) removed. State-less orphaned scratch
       dirs left after a reboot are independently collected once their own
       contents are old enough. The persistent `log`, `log.clean`, and
-      `prompt` files are never touched by reap — they have their own existing,
-      independent 21-day whole-log-dir prune. A `stalled` run (alive pid, idle
+      `prompt` files are never touched by this step — with `--include-logs`
+      (see below), preserved logs get their own separate, independently
+      thresholded pass instead. A `stalled` run (alive pid, idle
       log — see `_effective_status`) is not terminal and is never
       garbage-collected by this pass; only reconciliation in step 1 can
       eventually turn it into `killed`, which becomes GC-eligible only on a
@@ -189,6 +208,21 @@ performed) in one invocation:
       eligibility checks as a real reap and prints only actions it would take,
       without writing or deleting anything.
 
+`agent-run reap --include-logs` additionally garbage-collects whole
+preserved-log-only run directories under $AGENT_RUN_LOG_DIR (state dir
+already gone) once their newest recursive mtime is older than
+--log-min-age-hours (or AGENT_RUN_LOG_MIN_AGE_HOURS, default
+PRUNE_AFTER_DAYS*24 — 21 days, matching the existing unconditional
+whole-log-dir prune). This threshold is deliberately independent of
+--min-age-hours: a preserved log is the artifact an operator wanted to
+keep, not disposable state bookkeeping, so removing it needs its own,
+separate, and more conservative age gate. Off by default; a run with a
+live state dir is never touched by this pass regardless of age. Runs
+after terminal-state GC (step 2) so a run whose state dir step 2 just
+removed can become log-only and eligible in the same invocation, and
+before orphan-scratch GC so a log dir removed whole here is never also
+probed for a leftover `tmp/` (one deletion, one counter increment).
+
 `agent-run list` defaults to showing only runs whose effective status is
 *not* conclusively terminal (`starting`, `running`, `stalled`; a `died` or
 `killed` run is terminal and hidden by default, matching reap's own
@@ -197,7 +231,17 @@ any comma-separated subset of statuses) or `--all` to see terminal runs
 too. Scripts that previously scraped every line under "Live runs" should
 add `--all` if they relied on terminal runs being listed there; the
 heading text also now reflects the actual filter in effect rather than
-unconditionally claiming everything shown is live.
+unconditionally claiming everything shown is live. Preserved-log-only runs
+(state dir gone) are hidden by default; pass `--include-logs` (or set
+AGENT_RUN_LIST_INCLUDE_LOGS=1) to show them — orthogonal to `--all`/
+`--status`, which govern only the state-backed sections. When hidden logs
+exist and are not shown, a one-line hint is printed to stderr, never
+stdout, so `agent-run list | grep ...` stays honest.
+
+`agent-run du` reports disk usage per effective status (or per run with
+`--by-run`), including preserved logs, and never mutates anything — no
+locks, no heal, no prune. See its own `--help` for `--top`, `--bytes`, and
+`--json`.
 """
 
 from __future__ import annotations
@@ -381,6 +425,18 @@ def _parse_reap_min_age_seconds() -> float:
     )
     raw = os.environ.get(env_name, "168")
     return _positive_finite_hours(raw, env_name, 168.0)
+
+
+# Preserved-log GC age threshold for `reap --include-logs`, deliberately
+# independent of the state-dir threshold above: a log dir is the artifact an
+# operator wanted to keep, not disposable bookkeeping, so it defaults to the
+# same 21-day window `_prune_old_logs` already uses rather than the much
+# shorter 7-day state-dir default. Parsed at call time, like
+# `_parse_reap_min_age_seconds`, so `--log-min-age-hours` and the env var
+# both take effect per invocation.
+def _parse_log_min_age_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_LOG_MIN_AGE_HOURS", str(PRUNE_AFTER_DAYS * 24))
+    return _positive_finite_hours(raw, "AGENT_RUN_LOG_MIN_AGE_HOURS", PRUNE_AFTER_DAYS * 24.0)
 
 
 # Launch-grace window: how many seconds after exec a non-zero exit still reads
@@ -1073,6 +1129,57 @@ def _newest_mtime_recursive(d: Path) -> Optional[float]:
         return None
 
 
+def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
+    """Apparent size (sum of ``st_size``) of every regular file at or below
+    ``d``, in bytes, excluding anything at or below ``exclude`` (if given —
+    used to report a log dir's size without double-counting its ``tmp/``
+    scratch subdirectory). Read-only: uses ``os.scandir`` and never follows
+    symlinks (``entry.stat(follow_symlinks=False)``), so this cannot be
+    tricked into walking outside ``d`` and cannot count a symlink target's
+    size as if it were local. Tolerates races (a file vanishing between
+    scan and stat) by skipping the entry rather than raising; an unreadable
+    ``d`` itself returns 0.
+
+    Shared by `reap --include-logs` (per-candidate size in its report line)
+    and `du` (per-group/per-run totals), so both report the same notion of
+    "size" for a log directory.
+    """
+    total = 0
+    stack = [d]
+    while stack:
+        current = stack.pop()
+        if exclude is not None and current == exclude:
+            continue
+        try:
+            entries = list(os.scandir(current))
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            continue
+        for entry in entries:
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except (FileNotFoundError, PermissionError):
+                continue
+            if _stat_module.S_ISDIR(st.st_mode):
+                stack.append(Path(entry.path))
+            elif _stat_module.S_ISREG(st.st_mode):
+                total += st.st_size
+    return total
+
+
+_SIZE_UNITS = ("B", "K", "M", "G", "T", "P")
+
+
+def _human_size(n: int) -> str:
+    """Render a byte count as e.g. ``1.2G``, ``340M``, ``12K``, ``0B`` —
+    binary (1024-based) units, one decimal place above the byte unit."""
+    size = float(n)
+    for unit in _SIZE_UNITS:
+        if size < 1024 or unit == _SIZE_UNITS[-1]:
+            return f"{n}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}{_SIZE_UNITS[-1]}"  # unreachable, satisfies type checkers
+
+
 def _terminal_state_age_seconds(state_dir: Path) -> Optional[float]:
     """How long a conclusively-terminal run has been sitting idle, for the
     reap min-age GC threshold.
@@ -1497,6 +1604,30 @@ def _log_line_count(log: Optional[Path]) -> int:
 # free-text token.
 _VALID_LIST_STATUS_TOKENS = TERMINAL_STATUSES | KNOWN_NONTERMINAL_STATUSES | {"unknown"}
 
+_ENV_BOOL_TRUE = {"1", "true", "yes"}
+_ENV_BOOL_FALSE = {"0", "false", "no", ""}
+
+
+def _env_bool_default(env_name: str, default: bool = False) -> bool:
+    """Parse an opt-in boolean env var (``1``/``true``/``yes``, case-
+    insensitive; ``0``/``false``/``no``/unset for off), warning to stderr
+    and falling back to ``default`` on an unrecognized value — same pattern
+    as ``AGENT_RUN_LIST_DEFAULT``."""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _ENV_BOOL_TRUE:
+        return True
+    if normalized in _ENV_BOOL_FALSE:
+        return False
+    print(
+        f"agent-run: warning: {env_name}={raw!r} is not one of "
+        "1/true/yes/0/false/no; using default",
+        file=sys.stderr,
+    )
+    return default
+
 
 def cmd_list(args: argparse.Namespace) -> int:
     _prune_old_logs()
@@ -1504,6 +1635,13 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     show_all: bool = bool(getattr(args, "all", False))
     status_filter_raw: Optional[str] = getattr(args, "status", None)
+    # Explicit --include-logs always wins over the env default; the flag's
+    # own default is False, so falsy-but-explicit and unset are
+    # indistinguishable here — acceptable since the env var only ever raises
+    # the effective default, never lowers an explicit flag.
+    include_logs: bool = bool(getattr(args, "include_logs", False)) or _env_bool_default(
+        "AGENT_RUN_LIST_INCLUDE_LOGS"
+    )
     if not show_all and status_filter_raw is None:
         list_default = os.environ.get("AGENT_RUN_LIST_DEFAULT", "live").strip().lower()
         if list_default not in {"live", "all"}:
@@ -1608,16 +1746,25 @@ def cmd_list(args: argparse.Namespace) -> int:
     log_only_names = set()
     if LOG_ROOT.is_dir():
         log_only_names = {p.name for p in LOG_ROOT.iterdir() if p.is_dir()} - state_names
-    if log_only_names:
-        # Preserved-log-only runs (state dir already gone) are already
-        # unambiguously and correctly labeled as "not running" under their
-        # own heading — unlike the "Live runs" section above, this was
-        # never the misleading part, so it is always shown regardless of
-        # --status/--all.
-        print(f"Preserved logs, not running ({LOG_ROOT}):")
-        for name in sorted(log_only_names):
-            lines = _log_line_count(_log_file_for(name))
-            print(f"  {name}: lines={lines}")
+    if include_logs:
+        if log_only_names:
+            # Preserved-log-only runs (state dir already gone) are already
+            # unambiguously and correctly labeled as "not running" under
+            # their own heading. Shown only when requested — see the hint
+            # printed below when they're hidden.
+            print(f"Preserved logs, not running ({LOG_ROOT}):")
+            for name in sorted(log_only_names):
+                lines = _log_line_count(_log_file_for(name))
+                print(f"  {name}: lines={lines}")
+    elif log_only_names:
+        # Hint goes to stderr, same reasoning as the --all hint above: a
+        # count/word in a stdout heading would give `list | grep` a
+        # false-positive match even when nothing was actually shown.
+        print(
+            f"agent-run: {len(log_only_names)} preserved log(s) hidden; "
+            "pass --include-logs to show them",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -2634,19 +2781,22 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 def cmd_reap(args: argparse.Namespace) -> int:
     """Reconcile stale ``running`` state, idle-kill lingering processes, and
-    garbage-collect old terminal-state runs and state-less scratch dirs.
+    garbage-collect old terminal-state runs, state-less scratch dirs, and
+    (with ``--include-logs``) preserved log dirs.
 
-    The pass is deliberately split into reconciliation, state-backed GC, and
-    orphan-scratch GC. Every destructive state-backed action is guarded by a
-    name lock plus inode/status/pid revalidation; every scratch action also
-    requires lstat-confirmed real directory components so a symlink can
-    never redirect deletion outside LOG_ROOT.
+    The pass is deliberately split into reconciliation, state-backed GC,
+    preserved-log GC, and orphan-scratch GC. Every destructive state-backed
+    action is guarded by a name lock plus inode/status/pid revalidation;
+    every scratch/log action also requires lstat-confirmed real directory
+    components so a symlink can never redirect deletion outside LOG_ROOT.
     """
     dry_run: bool = args.dry_run
     idle_hours: Optional[float] = getattr(args, "idle_hours", None)
     min_age_hours: Optional[float] = getattr(args, "min_age_hours", None)
+    log_min_age_hours: Optional[float] = getattr(args, "log_min_age_hours", None)
     target_name: Optional[str] = getattr(args, "name", None)
     force_unknown: bool = bool(getattr(args, "force_unknown", False))
+    include_logs: bool = bool(getattr(args, "include_logs", False))
     if target_name is not None:
         target_name = _validate_run_name(target_name)
 
@@ -2656,6 +2806,16 @@ def cmd_reap(args: argparse.Namespace) -> int:
     )
     min_age_threshold: float = (
         min_age_hours * 3600 if min_age_hours is not None else _parse_reap_min_age_seconds()
+    )
+    # Independent of min_age_threshold: a preserved log is the artifact an
+    # operator wanted to keep, not disposable state bookkeeping, so it
+    # defaults to the same 21-day window _prune_old_logs already uses rather
+    # than the much shorter state-dir default. --min-age-hours/
+    # AGENT_RUN_MIN_AGE_HOURS never influence this threshold.
+    log_min_age_threshold: float = (
+        log_min_age_hours * 3600
+        if log_min_age_hours is not None
+        else _parse_log_min_age_seconds()
     )
 
     # A previous SIGKILL can leave a dot-prefixed deletion sentinel. Finish it
@@ -2684,6 +2844,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
     skipped_count = 0
     gc_count = 0
     orphaned_scratch_count = 0
+    logs_collected_count = 0
     gc_skipped_count = 0
     found_target = False
     reconciled_this_pass = set()
@@ -2927,10 +3088,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 continue
             gc_count += 1
 
-    # Pass 3: a reboot wipes STATE_ROOT (normally tmpfs) while persistent
-    # LOG_ROOT/<name>/tmp survives. Sweep those orphaned scratch dirs once
-    # their own recursive contents have been quiet for the GC threshold (H3).
-    # A targeted --name has one direct candidate; untargeted scans only LOG_ROOT.
+    # Log/scratch passes share one scan of LOG_ROOT. A targeted --name has
+    # one direct candidate; untargeted scans read LOG_ROOT once.
     log_candidates: List[Path] = []
     if LOG_ROOT.is_dir():
         if target_name is not None:
@@ -2941,6 +3100,60 @@ def cmd_reap(args: argparse.Namespace) -> int:
             except OSError as exc:
                 print(f"reap: cannot read log root: {exc}")
                 log_candidates = []
+
+    # Pass 2.5 (--include-logs only): whole-log-dir GC for preserved-log-only
+    # runs (state dir gone). Runs after pass 2 so a run whose state dir pass 2
+    # just removed in this same invocation can become log-only and eligible
+    # here too. Runs before pass 3 (orphan scratch): a log dir removed whole
+    # here makes log_d.lstat() in pass 3 raise FileNotFoundError, which that
+    # loop already treats as "nothing to do" — no double counting, no error
+    # spam over an already-gone path.
+    if include_logs:
+        for log_d in log_candidates:
+            name = log_d.name
+            if name.startswith("."):
+                continue
+            try:
+                _validate_run_name(name)
+                log_before = log_d.lstat()
+            except (OSError, SystemExit):
+                continue
+            if not _stat_module.S_ISDIR(log_before.st_mode):
+                continue
+            if _path_entry_exists(_state_dir(name)):
+                continue  # state-backed — pass 2 owns this run, never race it
+            newest = _newest_mtime_recursive(log_d)
+            if newest is None:
+                continue
+            age_secs = time.time() - newest
+            if age_secs < log_min_age_threshold:
+                continue
+            age_h = age_secs / 3600
+            size = _dir_size_bytes(log_d)
+            print(
+                f"  {name}: preserved log (age={age_h:.1f}h, size={_human_size(size)}) "
+                f"[{'dry-run' if dry_run else 'removing log'}]"
+            )
+            if dry_run:
+                logs_collected_count += 1
+                continue
+            with _launch_lock(name):
+                try:
+                    if _path_entry_exists(_state_dir(name)):
+                        continue
+                    log_current = log_d.lstat()
+                    if not _stat_module.S_ISDIR(log_current.st_mode):
+                        raise SystemExit("log path is not a real directory")
+                    _crash_safe_rmtree(log_d, LOG_ROOT, expected=log_current)
+                except (OSError, SystemExit) as exc:
+                    print(f"  {name}: gc skipped: {exc}")
+                    gc_skipped_count += 1
+                    continue
+                logs_collected_count += 1
+
+    # Pass 3: a reboot wipes STATE_ROOT (normally tmpfs) while persistent
+    # LOG_ROOT/<name>/tmp survives. Sweep those orphaned scratch dirs once
+    # their own recursive contents have been quiet for the GC threshold (H3).
     for log_d in log_candidates:
         name = log_d.name
         if name.startswith("."):
@@ -3009,7 +3222,233 @@ def cmd_reap(args: argparse.Namespace) -> int:
         f"{prefix}reap done: died={died_count} killed={killed_count} "
         f"skipped={skipped_count} collected={gc_count} "
         f"orphaned_scratch={orphaned_scratch_count} gc_skipped={gc_skipped_count} "
-        f"resumed={resumed_count}"
+        f"resumed={resumed_count} logs_collected={logs_collected_count}"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# du
+# ---------------------------------------------------------------------------
+
+# Rollup group keys, in display order. A state-backed run whose effective
+# status is not one of these (and not one of KNOWN_NONTERMINAL_STATUSES's
+# other members) falls into "unrecognized" rather than silently inventing a
+# new bucket per legacy/corrupt value.
+_DU_STATUS_GROUPS = ("running", "starting", "stalled", "done", "failed", "launch_failed", "died", "killed")
+_DU_UNRECOGNIZED_GROUP = "unrecognized"
+_DU_PRESERVED_LOG_GROUP = "preserved-log-only"
+
+
+class _DuRow(NamedTuple):
+    """One accounting row: a single run (``--by-run``) or an aggregated
+    group. ``count`` is the number of runs folded into the row (1 for a
+    per-run row). Log bytes exclude the ``tmp/`` scratch subtree — total is
+    state + log + scratch, so nothing is double-counted."""
+
+    key: str  # run name (--by-run) or group/status label (rollup)
+    count: int
+    state_bytes: int
+    log_bytes: int
+    scratch_bytes: int
+
+    @property
+    def total_bytes(self) -> int:
+        return self.state_bytes + self.log_bytes + self.scratch_bytes
+
+
+def _du_collect_rows() -> List[_DuRow]:
+    """One row per run, read-only: no locks, no heal, no prune, no mutation.
+
+    Sizes are apparent size (sum of ``st_size``), matching ``_dir_size_bytes``
+    used elsewhere for the same reason (`reap --include-logs`'s report
+    line) — labelled explicitly in ``cmd_du``'s own header so the number's
+    meaning isn't ambiguous with on-disk block usage.
+    """
+    state_names: set = set()
+    if STATE_ROOT.is_dir():
+        try:
+            state_names = {
+                p.name for p in STATE_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")
+            }
+        except OSError:
+            state_names = set()
+    log_names: set = set()
+    if LOG_ROOT.is_dir():
+        try:
+            log_names = {
+                p.name for p in LOG_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")
+            }
+        except OSError:
+            log_names = set()
+
+    rows: List[_DuRow] = []
+    for name in sorted(state_names | log_names):
+        try:
+            _validate_run_name(name)
+        except SystemExit:
+            continue
+        has_state = name in state_names
+        has_log = name in log_names
+        state_bytes = _dir_size_bytes(_state_dir(name)) if has_state else 0
+        scratch_dir = _log_dir(name) / "tmp"
+        scratch_bytes = _dir_size_bytes(scratch_dir) if has_log else 0
+        log_bytes = _dir_size_bytes(_log_dir(name), exclude=scratch_dir) if has_log else 0
+        rows.append(_DuRow(name, 1, state_bytes, log_bytes, scratch_bytes))
+    return rows
+
+
+def _du_run_group(name: str) -> str:
+    """Rollup group key for run ``name`` — its effective status, or
+    ``preserved-log-only`` if no state dir remains."""
+    state_dir = _state_dir(name)
+    if not _is_dir_safe(state_dir):
+        return _DU_PRESERVED_LOG_GROUP
+    status = _effective_status(state_dir)
+    return status if status in _DU_STATUS_GROUPS else _DU_UNRECOGNIZED_GROUP
+
+
+def _du_aggregate_groups(run_rows: List[_DuRow]) -> List[_DuRow]:
+    """Fold per-run rows into one row per rollup group."""
+    totals: dict = {}
+    for row in run_rows:
+        group = _du_run_group(row.key)
+        state_b, log_b, scratch_b, n = totals.get(group, (0, 0, 0, 0))
+        totals[group] = (
+            state_b + row.state_bytes,
+            log_b + row.log_bytes,
+            scratch_b + row.scratch_bytes,
+            n + 1,
+        )
+    return [
+        _DuRow(group, n, state_b, log_b, scratch_b)
+        for group, (state_b, log_b, scratch_b, n) in totals.items()
+    ]
+
+
+def _du_sort_rows(rows: List[_DuRow]) -> List[_DuRow]:
+    return sorted(rows, key=lambda r: (-r.total_bytes, r.key))
+
+
+def _du_fmt(n: int, *, as_bytes: bool) -> str:
+    return str(n) if as_bytes else _human_size(n)
+
+
+def _du_print_table(
+    rows: List[_DuRow],
+    total: _DuRow,
+    *,
+    label_header: str,
+    count_header: str,
+    as_bytes: bool,
+    top: Optional[int],
+) -> None:
+    """Print one plain-aligned-columns table (no Markdown) plus a TOTAL row.
+    ``total`` is passed in rather than recomputed so it always reflects
+    every run even when ``rows`` was truncated by ``--top``."""
+    shown = _du_sort_rows(rows)
+    omitted: List[_DuRow] = []
+    if top is not None and len(shown) > top:
+        omitted = shown[top:]
+        shown = shown[:top]
+
+    columns = [label_header, count_header, "STATE", "LOG", "SCRATCH", "TOTAL"]
+    widths = [max(len(columns[0]), *(len(r.key) for r in shown)) if shown else len(columns[0]), len(columns[1])]
+    print(f"{columns[0]:<{widths[0]}}  {columns[1]:>{widths[1]}}  {columns[2]:>10}  {columns[3]:>10}  {columns[4]:>10}  {columns[5]:>10}")
+    for r in shown:
+        print(
+            f"{r.key:<{widths[0]}}  {r.count:>{widths[1]}}  "
+            f"{_du_fmt(r.state_bytes, as_bytes=as_bytes):>10}  "
+            f"{_du_fmt(r.log_bytes, as_bytes=as_bytes):>10}  "
+            f"{_du_fmt(r.scratch_bytes, as_bytes=as_bytes):>10}  "
+            f"{_du_fmt(r.total_bytes, as_bytes=as_bytes):>10}"
+        )
+    if omitted:
+        omitted_total = sum(r.total_bytes for r in omitted)
+        print(
+            f"... {len(omitted)} more row(s) omitted by --top "
+            f"(sum {_du_fmt(omitted_total, as_bytes=as_bytes)}; TOTAL below covers all runs)"
+        )
+    print(
+        f"{total.key:<{widths[0]}}  {total.count:>{widths[1]}}  "
+        f"{_du_fmt(total.state_bytes, as_bytes=as_bytes):>10}  "
+        f"{_du_fmt(total.log_bytes, as_bytes=as_bytes):>10}  "
+        f"{_du_fmt(total.scratch_bytes, as_bytes=as_bytes):>10}  "
+        f"{_du_fmt(total.total_bytes, as_bytes=as_bytes):>10}"
+    )
+
+
+def _du_row_to_dict(r: _DuRow) -> dict:
+    return {
+        "runs": r.count,
+        "state_bytes": r.state_bytes,
+        "log_bytes": r.log_bytes,
+        "scratch_bytes": r.scratch_bytes,
+        "total_bytes": r.total_bytes,
+    }
+
+
+def cmd_du(args: argparse.Namespace) -> int:
+    """Disk usage per effective status (default) or per run (``--by-run``),
+    including preserved logs. Strictly read-only: no locks, no
+    ``_opportunistic_heal``, no ``_prune_old_logs``, no mutation of any kind
+    — only ``os.scandir``/``stat`` reads via ``_dir_size_bytes``.
+    """
+    as_bytes: bool = bool(getattr(args, "bytes", False))
+    as_json: bool = bool(getattr(args, "json", False))
+    by_run: bool = bool(getattr(args, "by_run", False))
+    top: Optional[int] = getattr(args, "top", None)
+    if as_bytes and as_json:
+        # --json already emits exact integers; combining with --bytes would
+        # either be a silent no-op or need to change --json's shape, both
+        # confusing. Reject rather than guess which the caller meant.
+        sys.exit("agent-run: --bytes has no effect with --json, which always emits exact integers")
+
+    run_rows = _du_collect_rows()
+    all_rows = run_rows if by_run else _du_aggregate_groups(run_rows)
+    total = _DuRow(
+        "TOTAL",
+        sum(r.count for r in all_rows),
+        sum(r.state_bytes for r in all_rows),
+        sum(r.log_bytes for r in all_rows),
+        sum(r.scratch_bytes for r in all_rows),
+    )
+
+    if as_json:
+        shown = _du_sort_rows(all_rows)
+        omitted: List[_DuRow] = []
+        if top is not None and len(shown) > top:
+            omitted = shown[top:]
+            shown = shown[:top]
+        payload = {
+            "state_root": str(STATE_ROOT),
+            "log_root": str(LOG_ROOT),
+            "total": _du_row_to_dict(total),
+        }
+        if by_run:
+            payload["runs"] = [{"name": r.key, **_du_row_to_dict(r)} for r in shown]
+        else:
+            payload["groups"] = {r.key: _du_row_to_dict(r) for r in shown}
+        if omitted:
+            payload["omitted"] = {
+                "count": len(omitted),
+                "total_bytes": sum(r.total_bytes for r in omitted),
+            }
+        print(json.dumps(payload))
+        return 0
+
+    size_label = "bytes" if as_bytes else "human-readable (binary, 1024-based)"
+    print(
+        f"agent-run du: apparent size (st_size), {size_label}, "
+        f"STATE_ROOT={STATE_ROOT} LOG_ROOT={LOG_ROOT}"
+    )
+    _du_print_table(
+        all_rows,
+        total,
+        label_header="NAME" if by_run else "STATUS",
+        count_header="RUNS",
+        as_bytes=as_bytes,
+        top=top,
     )
     return 0
 
@@ -4025,9 +4464,16 @@ def _runner(
             # Export before any child is forked/exec'd below: os.environ is
             # process-wide, so every subsequent fork/exec — including the
             # Darwin _process_identity() implementation's `ps` subprocess —
-            # inherits this run's disk-backed TMPDIR. Argv is intentionally
-            # left untouched; only the environment carries this.
+            # inherits this run's disk-backed scratch dir. Argv is
+            # intentionally left untouched; only the environment carries
+            # this. BUN_TMPDIR is set alongside TMPDIR, same value, same
+            # condition: Bun (which OpenCode runs on) does not consult
+            # TMPDIR for its own scratch space, so a Bun-based agent would
+            # otherwise still spill into the shared system temp despite
+            # TMPDIR being redirected. Both point at the same one scratch
+            # dir — no second directory is created.
             os.environ["TMPDIR"] = str(tmp_dir)
+            os.environ["BUN_TMPDIR"] = str(tmp_dir)
 
         runner_pgid = os.getpgid(my_pid)
         identity = _process_identity(my_pid)
@@ -4662,6 +5108,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="show only runs whose effective status is in this comma-separated "
         "list (e.g. --status running,stalled); overrides the default filter",
     )
+    # Deliberately not in group_list: orthogonal to --all/--status, both of
+    # which govern only the state-backed "Live runs"/"Unrecognized" sections.
+    # --all alone must still hide preserved logs.
+    sp_list.add_argument(
+        "--include-logs",
+        action="store_true",
+        default=False,
+        help="also show preserved-log-only runs (state dir gone); hidden by "
+        "default, or set AGENT_RUN_LIST_INCLUDE_LOGS=1",
+    )
     sp_list.set_defaults(func=cmd_list)
 
     sp_reap = sub.add_parser(
@@ -4707,7 +5163,60 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="reap only this specific run",
     )
+    sp_reap.add_argument(
+        "--include-logs",
+        action="store_true",
+        default=False,
+        help="also garbage-collect preserved log directories (state dir "
+        "already gone) once older than --log-min-age-hours; without this "
+        "flag preserved logs are never touched by reap",
+    )
+    sp_reap.add_argument(
+        "--log-min-age-hours",
+        type=_positive_finite_float,
+        default=None,
+        metavar="N",
+        help="override the preserved-log GC age threshold used by "
+        "--include-logs (hours, float, must be finite and > 0); independent "
+        "of --min-age-hours, since a preserved log is the artifact an "
+        "operator wanted to keep, not disposable state bookkeeping; default "
+        "from AGENT_RUN_LOG_MIN_AGE_HOURS, or PRUNE_AFTER_DAYS*24 "
+        "(21 days), matching the existing whole-log-dir prune",
+    )
     sp_reap.set_defaults(func=cmd_reap)
+
+    sp_du = sub.add_parser(
+        "du",
+        help="disk usage per effective status (or per run with --by-run), "
+        "including preserved logs; strictly read-only",
+    )
+    sp_du.add_argument(
+        "--by-run",
+        action="store_true",
+        default=False,
+        help="one row per run instead of the per-status rollup",
+    )
+    sp_du.add_argument(
+        "--top",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="show only the N largest rows; TOTAL still covers every run",
+    )
+    sp_du.add_argument(
+        "--bytes",
+        action="store_true",
+        default=False,
+        help="print exact integer byte counts instead of human-readable sizes",
+    )
+    sp_du.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="emit a machine-readable object instead of a table; always uses "
+        "exact integers, so --bytes is rejected alongside it",
+    )
+    sp_du.set_defaults(func=cmd_du)
 
     sp_help = sub.add_parser("help", help="show this help")
     sp_help.set_defaults(func=lambda _a: (p.print_help() or 0))
@@ -4789,8 +5298,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         break
 
+    # An explicit "--" with no preceding run name has nothing to attach the
+    # command to; catch it here with a specific, actionable message rather
+    # than falling through to the generic "missing command" help below.
+    if raw and raw[0] == "--":
+        sys.exit(
+            "agent-run: the run name must appear before '--'; shape is "
+            "'agent-run [flags] NAME -- <command> [args...]'"
+        )
+
     # Try to dispatch a known subcommand; otherwise treat as launch.
-    known_subcommands = {"status", "watch", "logs", "tail", "clean", "steer", "kill", "list", "reap", "help"}
+    known_subcommands = {
+        "status", "watch", "logs", "tail", "clean", "steer", "kill",
+        "list", "reap", "du", "help",
+    }
     if (
         raw
         and raw[0] in known_subcommands
@@ -4808,20 +5329,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if len(raw) < 2:
         _build_parser().print_help()
         return 2
-    name, *command = raw
+    name, *rest = raw
     # Basic validation of the name.
     if "/" in name or name.startswith("-"):
         sys.exit(f"agent-run: invalid name '{name}'")
-    if command and command[0].startswith("-"):
-        # A flag typed after the run name is never part of the launch
-        # command — it silently becomes argv[0] and exec fails with an
-        # opaque ENOENT. Reject it here with the actual offending token
-        # instead of letting the fork/exec path produce that confusion.
-        sys.exit(
-            f"agent-run: {command[0]!r} looks like an agent-run flag, not part "
-            "of the launch command; agent-run flags (-i, -f, --echo, "
-            "--submit-mode, --idle-timeout) must precede the run name"
-        )
+    if rest and rest[0] == "--":
+        # Everything after the separator is the launch command, taken
+        # verbatim — leading-dash tokens and further "--" tokens included.
+        # The "looks like an agent-run flag" rejection below never applies
+        # here, and no subcommand dispatch is attempted on these tokens.
+        command = rest[1:]
+        if not command:
+            sys.exit(
+                "agent-run: empty command after '--'; provide a command to "
+                "launch: 'agent-run [flags] NAME -- <command> [args...]'"
+            )
+    else:
+        command = rest
+        if command and command[0].startswith("-"):
+            # A flag typed after the run name is never part of the launch
+            # command — it silently becomes argv[0] and exec fails with an
+            # opaque ENOENT. Reject it here with the actual offending token
+            # instead of letting the fork/exec path produce that confusion.
+            sys.exit(
+                f"agent-run: {command[0]!r} looks like an agent-run flag, not "
+                "part of the launch command; agent-run flags (-i, -f, --echo, "
+                "--submit-mode, --idle-timeout) must precede the run name, or "
+                "separate them from the launch command with '--': "
+                "'agent-run [flags] NAME -- <command> [args...]'"
+            )
     ns = argparse.Namespace(
         name=name,
         command=command,
