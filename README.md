@@ -596,6 +596,7 @@ agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
                 [--include-logs] [--log-min-age-hours N]
+                [--orphan-processes] [--orphan-min-age-hours N]
 agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage; read-only
 ```
 
@@ -664,6 +665,26 @@ single-directory layout for runs launched before the state/log split.
     dir step 2 just removed can become log-only and eligible in the same
     invocation) and before the orphan-scratch sweep (so a log dir removed
     whole here is never also probed for a leftover `tmp/`).
+4. **Orphan-process termination** (opt-in, `--orphan-processes`): find and
+    terminate live agent-run runner processes that have **no state directory**
+    — invisible to passes 1-3 because they hold no entry in
+    `$AGENT_RUN_STATE_DIR`. This kills processes agent-run has **no state
+    record for**, selected by argv parsing, and is opt-in for that reason.
+    Candidates are identified by strict argv matching (basename check, not a
+    substring — `bash -lc "cat /var/tmp/agent-runs/foo/log"` is explicitly
+    not a runner), then filtered by age (`--orphan-min-age-hours` or
+    `AGENT_RUN_ORPHAN_MIN_AGE_HOURS`, default 24h — independent of all GC
+    thresholds), self/ancestor/process-group/pid-1/uid safety rules, and a
+    state-dir check. Identity captured at discovery is re-verified
+    immediately before every signal; any ambiguity aborts the candidate
+    rather than sending a signal (PID reuse is the central hazard with no
+    state dir to cross-check against). SIGTERM with a bounded grace window,
+    then SIGKILL for anything still alive. The summary line always includes
+    `orphan_procs_killed=N orphan_procs_skipped=N`; skipped discovery
+    candidates are printed with their skip reason so declined processes are
+    visible rather than silently ignored. **Never run without `--dry-run`
+    until you have reviewed its output.** A missed orphan costs a process
+    slot; a wrong kill destroys someone's running work.
 
 Every step only ever acts after re-verifying a live pid belongs to the
 recorded runner (`_pid_alive`/`_process_identity`) or an inode hasn't been

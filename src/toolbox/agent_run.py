@@ -58,6 +58,7 @@ Usage::
     agent-run list [--all] [--status S] [--include-logs]  # list runs; defaults to non-terminal only
     agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--name NAME]
                     [--include-logs] [--log-min-age-hours N]
+                    [--orphan-processes] [--orphan-min-age-hours N]
     agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage per status or per run
 
 Everything before "--" is an agent-run flag or the run name; everything
@@ -197,8 +198,8 @@ performed) in one invocation:
       later reap. Unknown/legacy/corrupt statuses are shown separately by
       `list`, left untouched by default, and can only be collected with the
       explicit `reap --force-unknown` opt-in.
-   3. Every destructive action re-verifies identity/inode state immediately
-      before mutation (per-name `_launch_lock`, `_safe_rmtree`'s
+   3. Every destructive state-backed action re-verifies identity/inode state
+      immediately before mutation (per-name `_launch_lock`, `_safe_rmtree`'s
       root-contained, inode-reverified deletion, `_pid_alive`/
       `_process_identity`), so a run that raced into life or was replaced
       between listing and action is never touched. State deletion first
@@ -207,6 +208,23 @@ performed) in one invocation:
       stranding a partially-deleted run. --dry-run performs the same read-only
       eligibility checks as a real reap and prints only actions it would take,
       without writing or deleting anything.
+   4. Orphan-process termination (--orphan-processes, off by default): find
+      and terminate live agent-run runner processes that have no state
+      directory — processes invisible to passes 1-3 because they hold no
+      entry in STATE_ROOT.  Candidates are identified by argv parsing
+      (strict basename check, not a substring match), then filtered by the
+      same safety rules as `_find_orphan_runners` (not self, not ancestor,
+      not same process group, not pid 1, uid match, age >= --orphan-min-age-hours
+      or AGENT_RUN_ORPHAN_MIN_AGE_HOURS, default 24h).  Runs after all GC
+      passes so a run whose state dir was just collected in this invocation is
+      correctly seen as state-less by discovery.  Identity captured at
+      discovery is re-verified immediately before every signal; a mismatch
+      aborts the candidate rather than sending a signal (PID reuse is the
+      central hazard with no state dir to cross-check against).  SIGTERM with
+      a bounded grace window, then SIGKILL for anything still alive.  This
+      pass kills processes agent-run has no state record for and is opt-in
+      for that reason; a missed orphan costs a process slot, a wrong kill
+      destroys someone's running work.
 
 `agent-run reap --include-logs` additionally garbage-collects whole
 preserved-log-only run directories under $AGENT_RUN_LOG_DIR (state dir
@@ -3182,6 +3200,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
     target_name: Optional[str] = getattr(args, "name", None)
     force_unknown: bool = bool(getattr(args, "force_unknown", False))
     include_logs: bool = bool(getattr(args, "include_logs", False))
+    orphan_processes: bool = bool(getattr(args, "orphan_processes", False))
+    orphan_min_age_hours: Optional[float] = getattr(args, "orphan_min_age_hours", None)
     if target_name is not None:
         target_name = _validate_run_name(target_name)
 
@@ -3201,6 +3221,15 @@ def cmd_reap(args: argparse.Namespace) -> int:
         log_min_age_hours * 3600
         if log_min_age_hours is not None
         else _parse_log_min_age_seconds()
+    )
+    # Independent of all GC thresholds: governs live process age, not artifact
+    # retention.  --orphan-min-age-hours / AGENT_RUN_ORPHAN_MIN_AGE_HOURS;
+    # parsed even when --orphan-processes is absent so the flag is always
+    # validated.
+    orphan_min_age_threshold: float = (
+        orphan_min_age_hours * 3600
+        if orphan_min_age_hours is not None
+        else _parse_orphan_min_age_seconds()
     )
 
     # A previous SIGKILL can leave a dot-prefixed deletion sentinel. Finish it
@@ -3231,6 +3260,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
     orphaned_scratch_count = 0
     logs_collected_count = 0
     gc_skipped_count = 0
+    orphan_procs_killed = 0
+    orphan_procs_skipped = 0
     found_target = False
     reconciled_this_pass = set()
 
@@ -3596,6 +3627,139 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 continue
             orphaned_scratch_count += 1
 
+    # Pass 4 (--orphan-processes only): find and terminate live agent-run runner
+    # processes that have no state dir — invisible to all prior passes because
+    # they hold no entry in STATE_ROOT.  Runs last so a state dir removed in
+    # pass 2 of this same invocation is correctly seen as absent by discovery.
+    if orphan_processes:
+        now = time.time()
+        proc_table = _scan_process_table()
+        orphan_candidates, orphan_skips = _find_orphan_runners(
+            proc_table,
+            min_age_seconds=orphan_min_age_threshold,
+            now=now,
+            self_pid=os.getpid(),
+            self_pgid=os.getpgid(0),
+            target_name=target_name,
+        )
+
+        for skip in orphan_skips:
+            reason = skip.reason
+            detail = f" ({skip.detail})" if skip.detail else ""
+            print(f"  [orphan] pid={skip.pid}: skipped: {reason}{detail}")
+            orphan_procs_skipped += 1
+
+        for cand in orphan_candidates:
+            age_h = (now - cand.start_time) / 3600
+            # Re-verify under the per-name lock: serializes with a concurrent
+            # launch that may have just created a state dir for this name.
+            with _launch_lock(cand.name):
+                # State dir may have reappeared since discovery (race with launch).
+                if _path_entry_exists(_state_dir(cand.name)):
+                    reason = "state dir appeared after discovery"
+                    print(
+                        f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
+                        f"skipped: {reason}"
+                    )
+                    orphan_procs_skipped += 1
+                    continue
+
+                # PID-reuse is the central hazard: there is no state dir, so there
+                # is no recorded process_identity to compare against — the identity
+                # captured at discovery is the only compensating control.  Re-read
+                # it immediately before signalling and abort on any mismatch.
+                live_identity = _process_identity(cand.pid)
+                if live_identity is None or live_identity != cand.identity:
+                    reason = (
+                        f"identity changed (expected={cand.identity!r}, "
+                        f"live={live_identity!r})"
+                    )
+                    print(
+                        f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
+                        f"skipped: {reason}"
+                    )
+                    orphan_procs_skipped += 1
+                    continue
+
+                if not _pid_alive(cand.pid):
+                    print(
+                        f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
+                        "skipped: process gone before action"
+                    )
+                    orphan_procs_skipped += 1
+                    continue
+
+                # Determine process-group scope.  The runner calls setsid() so its
+                # pid == pgid when it is a session leader.  Only kill the group when
+                # getpgid confirms this; otherwise signal the pid alone.
+                try:
+                    pgid = os.getpgid(cand.pid)
+                    use_group = pgid == cand.pid
+                except OSError:
+                    use_group = False
+                    pgid = None
+
+                pgid_note = f" pgid={pgid}" if use_group and pgid is not None else " (pid only — pgid mismatch)"
+
+                if dry_run:
+                    print(
+                        f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
+                        f"dry-run (would TERM{pgid_note})"
+                    )
+                    orphan_procs_killed += 1
+                    continue
+
+                # SIGTERM, then bounded grace, then SIGKILL.
+                print(
+                    f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
+                    f"TERM{pgid_note}"
+                )
+                try:
+                    if use_group and pgid is not None:
+                        os.killpg(pgid, signal.SIGTERM)
+                    else:
+                        os.kill(cand.pid, signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    orphan_procs_skipped += 1
+                    continue
+
+                # Wait grace period; escalate to SIGKILL if process survives.
+                deadline = time.time() + ORPHAN_KILL_GRACE_SECONDS
+                while time.time() < deadline:
+                    if not _pid_alive(cand.pid):
+                        break
+                    time.sleep(KILL_POLL_INTERVAL_SECONDS)
+
+                if not _pid_alive(cand.pid):
+                    print(
+                        f"  [orphan] {cand.name} pid={cand.pid}: terminated after TERM"
+                    )
+                    orphan_procs_killed += 1
+                    continue
+
+                # Process survived grace — re-verify identity before SIGKILL.
+                current = _process_identity(cand.pid)
+                if current is None or current != cand.identity:
+                    print(
+                        f"  [orphan] {cand.name} pid={cand.pid}: "
+                        "skipped KILL: identity changed after TERM"
+                    )
+                    orphan_procs_skipped += 1
+                    continue
+
+                print(
+                    f"  [orphan] {cand.name} pid={cand.pid}: "
+                    f"KILL after grace{pgid_note}"
+                )
+                try:
+                    if use_group and pgid is not None:
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        os.kill(cand.pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                orphan_procs_killed += 1
+
     if target_name and not found_target:
         if _known(target_name):
             print(f"reap: '{target_name}' has no ephemeral state (log preserved); nothing to reconcile")
@@ -3607,7 +3771,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
         f"{prefix}reap done: died={died_count} killed={killed_count} "
         f"skipped={skipped_count} collected={gc_count} "
         f"orphaned_scratch={orphaned_scratch_count} gc_skipped={gc_skipped_count} "
-        f"resumed={resumed_count} logs_collected={logs_collected_count}"
+        f"resumed={resumed_count} logs_collected={logs_collected_count} "
+        f"orphan_procs_killed={orphan_procs_killed} orphan_procs_skipped={orphan_procs_skipped}"
     )
     return 0
 
@@ -4025,6 +4190,12 @@ KILL_ESCALATION_TIMEOUT_SECONDS = 8.0
 KILL_POLL_INTERVAL_SECONDS = 0.2
 KILL_CHILD_REAP_TIMEOUT_SECONDS = 3.0
 
+# Grace period for orphan-process SIGTERM before escalating to SIGKILL.
+# Shorter than KILL_ESCALATION_TIMEOUT_SECONDS (8 s) because orphan runners
+# have no state dir — there is no teardown work to protect, and a hanging
+# process denies a slot indefinitely.
+ORPHAN_KILL_GRACE_SECONDS = 5.0
+
 
 def _force_kill(name: str, state_dir: Path, pid: int, expected_identity: str) -> None:
     """Force-terminate a run without orphaning its workload or leaving a
@@ -4188,6 +4359,101 @@ def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
     print(
         f"agent-run: force-killed '{name}' (pid={pid}, {_FORCED_UNVERIFIED_NOTE})"
     )
+
+
+def _terminate_orphan_process(
+    candidate: "_OrphanCandidate",
+    *,
+    dry_run: bool,
+    signal_sender=None,
+    pgid_getter=None,
+) -> str:
+    """Send SIGTERM then, after ORPHAN_KILL_GRACE_SECONDS, SIGKILL to an orphan runner.
+
+    Returns one of: "dry-run", "killed", "KILL after grace", "skipped: <reason>".
+
+    ``signal_sender`` and ``pgid_getter`` are injected by tests to assert on
+    what would have been signalled without touching real processes; production
+    callers pass None to use the real os.kill / os.killpg / os.getpgid.
+
+    PID-reuse is the central hazard: there is no state dir, so there is no
+    recorded process_identity to compare against — the identity captured at
+    discovery is the only compensating control.  Re-read the identity
+    immediately before every signal and abort the candidate on any mismatch.
+    """
+    pid = candidate.pid
+    expected_identity = candidate.identity
+
+    if signal_sender is None:
+        def signal_sender(target_pid: int, sig: int) -> None:  # type: ignore[misc]
+            os.kill(target_pid, sig)
+
+    if pgid_getter is None:
+        pgid_getter = os.getpgid
+
+    if dry_run:
+        return "dry-run"
+
+    # Re-verify identity immediately before signalling.  This is the
+    # compensating control for the missing state dir: identity captured at
+    # discovery time is the only record binding this pid to the run we found.
+    live_identity = _process_identity(pid)
+    if live_identity is None or live_identity != expected_identity:
+        return f"skipped: identity changed (expected={expected_identity!r}, live={live_identity!r})"
+
+    # Determine whether to signal the process group.  The runner calls
+    # setsid(), so pid == pgid when it is a session leader.  Only kill the
+    # group when getpgid confirms pid is its own leader; otherwise signal the
+    # pid alone to avoid hitting an unrelated group.
+    try:
+        pgid = pgid_getter(pid)
+        use_group = pgid == pid
+    except OSError:
+        use_group = False
+        pgid = None
+
+    def _send_term() -> bool:
+        """Send SIGTERM; return True if process is already gone."""
+        current = _process_identity(pid)
+        if current is None or current != expected_identity:
+            return True  # process already gone or replaced — no signal needed
+        try:
+            if use_group and pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                signal_sender(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            return True
+        return False
+
+    already_gone = _send_term()
+    if already_gone:
+        return "skipped: process gone before TERM"
+
+    # Wait the grace window; if the process exits we are done.
+    deadline = time.time() + ORPHAN_KILL_GRACE_SECONDS
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return "killed"
+        time.sleep(KILL_POLL_INTERVAL_SECONDS)
+
+    if not _pid_alive(pid):
+        return "killed"
+
+    # Grace expired and process is still alive — re-verify identity before SIGKILL.
+    current = _process_identity(pid)
+    if current is None or current != expected_identity:
+        return "skipped: identity changed before KILL"
+
+    try:
+        if use_group and pgid is not None:
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            signal_sender(pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+
+    return "KILL after grace"
 
 
 def cmd_kill(args: argparse.Namespace) -> int:
@@ -5567,6 +5833,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "operator wanted to keep, not disposable state bookkeeping; default "
         "from AGENT_RUN_LOG_MIN_AGE_HOURS, or PRUNE_AFTER_DAYS*24 "
         "(21 days), matching the existing whole-log-dir prune",
+    )
+    sp_reap.add_argument(
+        "--orphan-processes",
+        action="store_true",
+        default=False,
+        dest="orphan_processes",
+        help="terminate live agent-run runner processes that have no state "
+        "directory — i.e. runs that exist as live processes but whose "
+        "ephemeral state record (in $AGENT_RUN_STATE_DIR) is gone.  This "
+        "kills processes agent-run has no state record for, selected by "
+        "argv parsing; it is opt-in for that reason.  Identity captured at "
+        "discovery is re-verified immediately before every signal; any "
+        "ambiguity aborts the candidate instead of sending a signal.  Only "
+        "processes older than --orphan-min-age-hours are eligible.",
+    )
+    sp_reap.add_argument(
+        "--orphan-min-age-hours",
+        type=_positive_finite_float,
+        default=None,
+        metavar="N",
+        dest="orphan_min_age_hours",
+        help="minimum process age for --orphan-processes candidates (hours, "
+        "float, must be finite and > 0); independent of --min-age-hours and "
+        "--log-min-age-hours; default from AGENT_RUN_ORPHAN_MIN_AGE_HOURS "
+        "or 24h.  Parsed and validated even when --orphan-processes is absent.",
     )
     sp_reap.set_defaults(func=cmd_reap)
 
