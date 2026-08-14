@@ -1769,17 +1769,24 @@ class TestReapReviewerRegressions:
 # ---------------------------------------------------------------------------
 
 class TestGcLiveRunnerPidStrictRead:
-    """`c569da2` widened the shared `_read` helper to swallow OSError/
-    UnicodeError, which is correct for lenient read-only paths (watch/
-    status) but silently turned "pid file unreadable" into "pid absent" for
-    reap's destructive GC decision. GC's fail-safe direction is a spurious
-    skip, never a spurious delete, so an unreadable pid file must report as
-    still-live (refusing GC), not as no-pid-recorded (permitting it)."""
+    """The pid file is read strictly on the GC path, not through the lenient
+    shared `_read`. GC's fail-safe direction is a spurious skip, never a
+    spurious delete, so an unreadable pid file must report as still-live
+    (refusing GC) rather than as no-pid-recorded (permitting it)."""
 
     ROOT_SKIP = pytest.mark.skipif(
         hasattr(os, "geteuid") and os.geteuid() == 0,
         reason="root ignores permission bits",
     )
+
+    # Ways the pid file can be present but unreadable. `pid=99999999` would
+    # otherwise resolve to a dead pid, so a lenient read would permit GC.
+    UNREADABLE_PID = [
+        pytest.param(
+            lambda p: p.chmod(0o000), 99999999, id="mode_000", marks=ROOT_SKIP,
+        ),
+        pytest.param(lambda p: p.mkdir(), None, id="directory_in_place"),
+    ]
 
     def test_readable_pid_file_with_a_live_pid_returns_that_pid(
         self, isolated_runs_root, isolated_log_root, monkeypatch
@@ -1800,59 +1807,37 @@ class TestGcLiveRunnerPidStrictRead:
         assert not (sd / "pid").exists()
         assert agent_run._gc_live_runner_pid(sd) is None
 
-    @ROOT_SKIP
-    def test_pid_file_at_mode_000_reports_live_and_blocks_gc(
-        self, isolated_runs_root, isolated_log_root
+    @pytest.mark.parametrize("damage, pid", UNREADABLE_PID)
+    def test_unreadable_pid_file_reports_live(
+        self, isolated_runs_root, isolated_log_root, damage, pid
     ):
         sd, ld = _make_run(
             isolated_runs_root, isolated_log_root, "unreadable", status="done",
-            pid=99999999,  # would otherwise resolve to a dead/nonexistent pid
+            pid=pid,
         )
-        (sd / "pid").chmod(0o000)
+        damage(sd / "pid")
         try:
-            result = agent_run._gc_live_runner_pid(sd)
+            assert agent_run._gc_live_runner_pid(sd) is not None
         finally:
-            (sd / "pid").chmod(0o644)
-        assert result is not None
+            if (sd / "pid").is_file():
+                (sd / "pid").chmod(0o644)
 
-    def test_directory_in_place_of_pid_file_reports_live_and_blocks_gc(
-        self, isolated_runs_root, isolated_log_root
-    ):
-        sd, ld = _make_run(
-            isolated_runs_root, isolated_log_root, "dirpid", status="done",
-        )
-        (sd / "pid").mkdir()
-        result = agent_run._gc_live_runner_pid(sd)
-        assert result is not None
-
-    @ROOT_SKIP
+    @pytest.mark.parametrize("damage, pid", UNREADABLE_PID)
     def test_reap_refuses_to_collect_when_pid_file_is_unreadable(
-        self, isolated_runs_root, isolated_log_root
+        self, isolated_runs_root, isolated_log_root, damage, pid
     ):
         sd, ld = _make_run(
             isolated_runs_root, isolated_log_root, "unreadablereap", status="done",
-            pid=99999999, ended_at_age_secs=200 * 3600, make_scratch=True,
+            pid=pid, ended_at_age_secs=200 * 3600, make_scratch=True,
         )
-        (sd / "pid").chmod(0o000)
+        damage(sd / "pid")
         try:
             rc = agent_run.cmd_reap(_reap_args(min_age_hours=168))
         finally:
-            (sd / "pid").chmod(0o644)
+            if (sd / "pid").is_file():
+                (sd / "pid").chmod(0o644)
         assert rc == 0
         assert sd.exists(), "an unreadable pid file must block GC, not permit it"
-        assert (ld / "tmp").exists()
-
-    def test_reap_refuses_to_collect_when_directory_replaces_pid_file(
-        self, isolated_runs_root, isolated_log_root
-    ):
-        sd, ld = _make_run(
-            isolated_runs_root, isolated_log_root, "dirpidreap", status="done",
-            ended_at_age_secs=200 * 3600, make_scratch=True,
-        )
-        (sd / "pid").mkdir()
-        rc = agent_run.cmd_reap(_reap_args(min_age_hours=168))
-        assert rc == 0
-        assert sd.exists()
         assert (ld / "tmp").exists()
 
     def test_reap_still_collects_when_pid_is_genuinely_absent(
