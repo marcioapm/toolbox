@@ -1,5 +1,6 @@
 """Tests for the agent-run CLI ergonomics feature set:
 
+- `_parse_launch_argv`: the pure top-level flag/name/command parser.
 - `agent-run du` (per-status rollup and --by-run, --top, --bytes, --json).
 - The `--` separator between agent-run's own flags/name and the launch
   command, including its interaction with the pre-existing "flag typed
@@ -609,3 +610,273 @@ class TestBunTmpdirExport:
         expected_scratch = str(isolated_log_root / name / "tmp")
         assert content.strip() == expected_scratch
         assert content.strip() != "/some/ambient/bun/tmpdir"
+
+
+# ---------------------------------------------------------------------------
+# _parse_launch_argv — pure helper unit tests
+# ---------------------------------------------------------------------------
+
+class TestParseLaunchArgv:
+    """Direct unit tests for _parse_launch_argv: flags, --, errors, and a
+    table-driven comparison against the pre-refactor main() behaviour."""
+
+    def _parse(self, argv):
+        return agent_run._parse_launch_argv(argv)
+
+    # --- individual flag forms ---
+
+    def test_interactive_short(self):
+        r = self._parse(["-i", "myrun", "cmd"])
+        assert r.interactive is True
+        assert r.name == "myrun"
+        assert r.command == ["cmd"]
+
+    def test_interactive_long(self):
+        r = self._parse(["--interactive", "myrun", "cmd"])
+        assert r.interactive is True
+
+    def test_prompt_file_short_space(self):
+        r = self._parse(["-f", "/path/to/p.md", "myrun", "cmd"])
+        assert r.prompt_file == "/path/to/p.md"
+
+    def test_prompt_file_long_space(self):
+        r = self._parse(["--prompt-file", "/path.md", "myrun", "cmd"])
+        assert r.prompt_file == "/path.md"
+
+    def test_prompt_file_equals(self):
+        r = self._parse(["--prompt-file=/path.md", "myrun", "cmd"])
+        assert r.prompt_file == "/path.md"
+
+    def test_echo_bare(self):
+        r = self._parse(["--echo", "myrun", "cmd"])
+        assert r.echo is True
+        assert r.echo_interval == 2.0
+
+    def test_echo_with_interval(self):
+        r = self._parse(["--echo=5.0", "myrun", "cmd"])
+        assert r.echo is True
+        assert r.echo_interval == 5.0
+
+    def test_submit_mode_cr(self):
+        r = self._parse(["--submit-mode=cr", "myrun", "cmd"])
+        assert r.submit_mode == "cr"
+
+    def test_submit_mode_crlf(self):
+        r = self._parse(["--submit-mode=crlf", "myrun", "cmd"])
+        assert r.submit_mode == "crlf"
+
+    def test_idle_timeout_space(self):
+        r = self._parse(["--idle-timeout", "60", "myrun", "cmd"])
+        assert r.idle_timeout == 60.0
+
+    def test_idle_timeout_equals(self):
+        r = self._parse(["--idle-timeout=120", "myrun", "cmd"])
+        assert r.idle_timeout == 120.0
+
+    # --- combined and varied order ---
+
+    def test_all_flags_combined_any_order(self):
+        r = self._parse([
+            "--echo=3", "-i", "--submit-mode=crlf",
+            "-f", "/p.md", "--idle-timeout=90",
+            "myrun", "--", "opencode",
+        ])
+        assert r.interactive is True
+        assert r.prompt_file == "/p.md"
+        assert r.echo is True
+        assert r.echo_interval == 3.0
+        assert r.submit_mode == "crlf"
+        assert r.idle_timeout == 90.0
+        assert r.name == "myrun"
+        assert r.command == ["opencode"]
+
+    def test_flags_interleaved_order(self):
+        r = self._parse([
+            "--idle-timeout", "45", "--interactive",
+            "myrun", "--", "cmd", "arg",
+        ])
+        assert r.idle_timeout == 45.0
+        assert r.interactive is True
+        assert r.command == ["cmd", "arg"]
+
+    # --- -- separator semantics ---
+
+    def test_dashdash_passes_leading_dash_tokens_verbatim(self):
+        r = self._parse(["myrun", "--", "-not-a-flag", "--also-not"])
+        assert r.command == ["-not-a-flag", "--also-not"]
+        assert r.subcommand_tokens is None
+
+    def test_dashdash_passes_second_dashdash_verbatim(self):
+        r = self._parse(["myrun", "--", "foo", "--", "bar"])
+        assert r.command == ["foo", "--", "bar"]
+
+    def test_dashdash_no_subcommand_dispatch(self):
+        r = self._parse(["myrun", "--", "list", "foo"])
+        assert r.name == "myrun"
+        assert r.command == ["list", "foo"]
+        assert r.subcommand_tokens is None
+
+    def test_dashdash_flags_before_name(self):
+        r = self._parse(["--echo", "--idle-timeout", "30", "myrun", "--", "some-cmd", "--flag"])
+        assert r.echo is True
+        assert r.idle_timeout == 30.0
+        assert r.name == "myrun"
+        assert r.command == ["some-cmd", "--flag"]
+
+    # --- error cases with exact message strings ---
+
+    def test_error_prompt_file_missing_path(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["-f"])
+        assert str(exc.value) == "agent-run: -f/--prompt-file requires a path"
+
+    def test_error_prompt_file_long_missing_path(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["--prompt-file"])
+        assert str(exc.value) == "agent-run: -f/--prompt-file requires a path"
+
+    def test_error_idle_timeout_missing_value(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["--idle-timeout"])
+        assert str(exc.value) == "agent-run: --idle-timeout requires a value in seconds"
+
+    def test_error_submit_mode_invalid_value(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["--submit-mode=lf", "myrun", "cmd"])
+        assert str(exc.value) == "agent-run: --submit-mode must be cr or crlf"
+
+    def test_error_name_missing_before_dashdash(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["--", "echo", "hi"])
+        msg = str(exc.value)
+        assert "before" in msg
+        assert "--" in msg
+
+    def test_error_name_missing_before_dashdash_exact(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["--", "echo"])
+        assert str(exc.value) == (
+            "agent-run: the run name must appear before '--'; shape is "
+            "'agent-run [flags] NAME -- <command> [args...]'"
+        )
+
+    def test_error_empty_command_after_dashdash(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["myrun", "--"])
+        msg = str(exc.value)
+        assert "empty command" in msg
+
+    def test_error_empty_command_after_dashdash_exact(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["myrun", "--"])
+        assert str(exc.value) == (
+            "agent-run: empty command after '--'; provide a command to "
+            "launch: 'agent-run [flags] NAME -- <command> [args...]'"
+        )
+
+    def test_error_flag_after_name_without_dashdash(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["myrun", "--foo"])
+        msg = str(exc.value)
+        assert "looks like an agent-run flag" in msg
+        assert "--" in msg
+
+    def test_error_flag_after_name_contains_offending_token(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["myrun", "--unknown-flag"])
+        assert "'--unknown-flag'" in str(exc.value)
+
+    def test_error_invalid_name_with_slash(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["my/run", "cmd"])
+        assert "invalid name" in str(exc.value)
+
+    def test_error_invalid_name_leading_dash(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse(["-myrun", "cmd"])
+        assert "invalid name" in str(exc.value)
+
+    # --- subcommand dispatch signal ---
+
+    def test_subcommand_returns_subcommand_tokens(self):
+        r = self._parse(["status", "myrun"])
+        assert r.subcommand_tokens == ["status", "myrun"]
+
+    def test_subcommand_with_launch_flag_not_dispatched(self):
+        r = self._parse(["-i", "status", "myrun"])
+        # -i was consumed; "status" becomes the name, "myrun" the command
+        assert r.subcommand_tokens is None
+        assert r.name == "status"
+        assert r.command == ["myrun"]
+        assert r.interactive is True
+
+    def test_all_known_subcommands_dispatched(self):
+        for sub in ["status", "watch", "logs", "tail", "clean", "steer",
+                    "kill", "list", "reap", "du", "help"]:
+            r = self._parse([sub])
+            assert r.subcommand_tokens is not None, f"{sub!r} did not dispatch"
+            assert r.subcommand_tokens[0] == sub
+
+    # --- insufficient args ---
+
+    def test_too_few_args_returns_empty_name(self):
+        r = self._parse(["myrun"])
+        assert r.name == ""
+        assert r.subcommand_tokens is None
+
+    # --- table-driven match against main() ---
+
+    @pytest.mark.parametrize("argv,expected", [
+        (
+            ["-i", "myrun", "--", "claude", "--print"],
+            dict(interactive=True, name="myrun", command=["claude", "--print"],
+                 echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+                 prompt_file=None),
+        ),
+        (
+            ["--echo", "--idle-timeout", "30", "myrun", "--", "cmd", "--flag"],
+            dict(interactive=False, name="myrun", command=["cmd", "--flag"],
+                 echo=True, echo_interval=2.0, submit_mode=None, idle_timeout=30.0,
+                 prompt_file=None),
+        ),
+        (
+            ["-f", "/some/prompt.md", "myrun", "cmd"],
+            dict(interactive=False, prompt_file="/some/prompt.md", name="myrun",
+                 command=["cmd"], echo=False, echo_interval=2.0,
+                 submit_mode=None, idle_timeout=None),
+        ),
+        (
+            ["--submit-mode=crlf", "myrun", "--", "opencode"],
+            dict(interactive=False, submit_mode="crlf", name="myrun",
+                 command=["opencode"], echo=False, echo_interval=2.0,
+                 idle_timeout=None, prompt_file=None),
+        ),
+        (
+            ["myrun", "echo", "hello"],
+            dict(interactive=False, name="myrun", command=["echo", "hello"],
+                 echo=False, echo_interval=2.0, submit_mode=None,
+                 idle_timeout=None, prompt_file=None),
+        ),
+        (
+            ["myrun", "--", "list", "foo"],
+            dict(interactive=False, name="myrun", command=["list", "foo"],
+                 echo=False, echo_interval=2.0, submit_mode=None,
+                 idle_timeout=None, prompt_file=None),
+        ),
+    ])
+    def test_table_driven_matches_captured_main(self, argv, expected, monkeypatch):
+        """_parse_launch_argv output matches what main() forwarded to cmd_launch."""
+        captured = {}
+        monkeypatch.setattr(
+            agent_run, "cmd_launch", lambda args: captured.update(vars(args)) or 0
+        )
+        agent_run.main(argv)
+        r = self._parse(argv)
+        assert r.subcommand_tokens is None
+        for key, val in expected.items():
+            assert getattr(r, key) == val, f"{key}: expected {val!r}, got {getattr(r, key)!r}"
+            if key in captured:
+                assert captured[key] == val, (
+                    f"main() produced {captured[key]!r} for {key!r}, "
+                    f"helper produced {val!r}"
+                )

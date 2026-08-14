@@ -5224,6 +5224,189 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+class _LaunchArgvError(ValueError):
+    """Raised by _parse_launch_argv for any argv-level parse failure.
+
+    Carries the exact message string main() should pass to sys.exit, preserving
+    byte-identical error text without coupling the pure parser to sys.exit.
+    """
+
+
+class _LaunchArgv(NamedTuple):
+    """Parsed result of agent-run's top-level argv — flags, name, and command.
+
+    ``subcommand_tokens`` is non-None when the first non-flag token is a known
+    subcommand and no launch flags were supplied; main() delegates to argparse
+    in that case and ignores all other fields.
+    """
+    interactive: bool
+    prompt_file: Optional[str]
+    echo: bool
+    echo_interval: float
+    submit_mode: Optional[str]
+    idle_timeout: Optional[float]
+    name: str
+    command: List[str]
+    subcommand_tokens: Optional[List[str]]
+
+
+_KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
+    "status", "watch", "logs", "tail", "clean", "steer", "kill",
+    "list", "reap", "du", "help",
+})
+
+
+def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
+    """Parse agent-run's own flags, the run name, and the launch command.
+
+    Pure: no sys.exit, no printing, no env reads, no filesystem access, no
+    globals.  All parse failures raise _LaunchArgvError with the verbatim
+    message main() should pass to sys.exit.
+
+    Handles all current flag forms in any order before the name:
+      -i / --interactive
+      -f X / --prompt-file X / --prompt-file=X
+      --echo / --echo=N
+      --submit-mode=cr|crlf
+      --idle-timeout N / --idle-timeout=N
+
+    Preserves the -- separator semantics: name must precede --, everything
+    after -- is taken verbatim.  Without --, a leading-dash token immediately
+    after the name is rejected.
+
+    When the first non-flag token is a known subcommand and no launch flags
+    were set, returns with subcommand_tokens set to the remaining argv so
+    main() can delegate to argparse; all other fields hold zero values in that
+    case.
+    """
+    tokens = list(raw)
+    interactive = False
+    prompt_file: Optional[str] = None
+    echo: bool = False
+    echo_interval: float = 2.0
+    submit_mode: Optional[str] = None
+    idle_timeout: Optional[float] = None
+
+    # Consume flags in any order before the name.
+    while tokens:
+        if tokens[0] in ("-i", "--interactive"):
+            interactive = True
+            tokens = tokens[1:]
+            continue
+        if tokens[0] in ("-f", "--prompt-file"):
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: -f/--prompt-file requires a path")
+            prompt_file = tokens[1]
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--prompt-file="):
+            prompt_file = tokens[0].split("=", 1)[1]
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--echo":
+            echo = True
+            tokens = tokens[1:]
+            continue
+        if tokens[0].startswith("--echo="):
+            echo = True
+            value = tokens[0].split("=", 1)[1]
+            try:
+                echo_interval = _positive_finite_float(value)
+            except argparse.ArgumentTypeError as exc:
+                raise _LaunchArgvError(f"agent-run: --echo interval {exc}") from exc
+            tokens = tokens[1:]
+            continue
+        if tokens[0].startswith("--submit-mode="):
+            submit_mode = tokens[0].split("=", 1)[1]
+            if submit_mode not in {SUBMIT_MODE_CR, SUBMIT_MODE_CRLF}:
+                raise _LaunchArgvError("agent-run: --submit-mode must be cr or crlf")
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--idle-timeout":
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: --idle-timeout requires a value in seconds")
+            try:
+                idle_timeout = _parse_idle_timeout_flag(tokens[1])
+            except argparse.ArgumentTypeError as exc:
+                raise _LaunchArgvError(f"agent-run: --idle-timeout {exc}") from exc
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--idle-timeout="):
+            try:
+                idle_timeout = _parse_idle_timeout_flag(tokens[0].split("=", 1)[1])
+            except argparse.ArgumentTypeError as exc:
+                raise _LaunchArgvError(f"agent-run: --idle-timeout {exc}") from exc
+            tokens = tokens[1:]
+            continue
+        break
+
+    # A bare "--" before any name has no run to attach the command to.
+    if tokens and tokens[0] == "--":
+        raise _LaunchArgvError(
+            "agent-run: the run name must appear before '--'; shape is "
+            "'agent-run [flags] NAME -- <command> [args...]'"
+        )
+
+    # No launch flags set and first token is a known subcommand: delegate to
+    # argparse.  Returning here keeps the subcommand check out of main()'s
+    # own conditional chain without duplicating the flag-state test.
+    any_launch_flag = interactive or prompt_file or echo or submit_mode is not None or idle_timeout is not None
+    if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
+        return _LaunchArgv(
+            interactive=False, prompt_file=None, echo=False, echo_interval=2.0,
+            submit_mode=None, idle_timeout=None, name="", command=[],
+            subcommand_tokens=tokens,
+        )
+
+    if len(tokens) < 2:
+        # Signal main() to print help; name/command are meaningless here.
+        return _LaunchArgv(
+            interactive=interactive, prompt_file=prompt_file, echo=echo,
+            echo_interval=echo_interval, submit_mode=submit_mode,
+            idle_timeout=idle_timeout, name="", command=[],
+            subcommand_tokens=None,
+        )
+
+    name, *rest = tokens
+    # Basic name validation: no path separators and no leading dash.
+    if "/" in name or name.startswith("-"):
+        raise _LaunchArgvError(f"agent-run: invalid name '{name}'")
+
+    if rest and rest[0] == "--":
+        # Everything after "--" is the launch command verbatim — leading-dash
+        # tokens and further "--" tokens included; no subcommand dispatch.
+        command = rest[1:]
+        if not command:
+            raise _LaunchArgvError(
+                "agent-run: empty command after '--'; provide a command to "
+                "launch: 'agent-run [flags] NAME -- <command> [args...]'"
+            )
+    else:
+        command = rest
+        if command and command[0].startswith("-"):
+            # A flag-like token after the name without "--" would silently
+            # become argv[0] and exec would fail with an opaque ENOENT.
+            raise _LaunchArgvError(
+                f"agent-run: {command[0]!r} looks like an agent-run flag, not "
+                "part of the launch command; agent-run flags (-i, -f, --echo, "
+                "--submit-mode, --idle-timeout) must precede the run name, or "
+                "separate them from the launch command with '--': "
+                "'agent-run [flags] NAME -- <command> [args...]'"
+            )
+
+    return _LaunchArgv(
+        interactive=interactive,
+        prompt_file=prompt_file,
+        echo=echo,
+        echo_interval=echo_interval,
+        submit_mode=submit_mode,
+        idle_timeout=idle_timeout,
+        name=name,
+        command=command,
+        subcommand_tokens=None,
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
 
@@ -5236,137 +5419,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _build_parser().print_help()
         return 0
 
-    # Interactive flag consumed explicitly (may be before name).
-    interactive = False
-    prompt_file: Optional[str] = None
-    echo: bool = False
-    echo_interval: float = 2.0
-    submit_mode: Optional[str] = None
-    idle_timeout: Optional[float] = None
-    # Consume top-level flags (`-i`, `-f <path>`, `--echo[=interval]`,
-    # `--submit-mode=cr|crlf`, `--idle-timeout <seconds>`) in any order
-    # before the name.
-    while raw:
-        if raw[0] in ("-i", "--interactive"):
-            interactive = True
-            raw = raw[1:]
-            continue
-        if raw[0] in ("-f", "--prompt-file"):
-            if len(raw) < 2:
-                sys.exit("agent-run: -f/--prompt-file requires a path")
-            prompt_file = raw[1]
-            raw = raw[2:]
-            continue
-        if raw[0].startswith("--prompt-file="):
-            prompt_file = raw[0].split("=", 1)[1]
-            raw = raw[1:]
-            continue
-        if raw[0] == "--echo":
-            echo = True
-            raw = raw[1:]
-            continue
-        if raw[0].startswith("--echo="):
-            echo = True
-            value = raw[0].split("=", 1)[1]
-            try:
-                echo_interval = _positive_finite_float(value)
-            except argparse.ArgumentTypeError as exc:
-                sys.exit(f"agent-run: --echo interval {exc}")
-            raw = raw[1:]
-            continue
-        if raw[0].startswith("--submit-mode="):
-            submit_mode = raw[0].split("=", 1)[1]
-            if submit_mode not in {SUBMIT_MODE_CR, SUBMIT_MODE_CRLF}:
-                sys.exit("agent-run: --submit-mode must be cr or crlf")
-            raw = raw[1:]
-            continue
-        if raw[0] == "--idle-timeout":
-            if len(raw) < 2:
-                sys.exit("agent-run: --idle-timeout requires a value in seconds")
-            try:
-                idle_timeout = _parse_idle_timeout_flag(raw[1])
-            except argparse.ArgumentTypeError as exc:
-                sys.exit(f"agent-run: --idle-timeout {exc}")
-            raw = raw[2:]
-            continue
-        if raw[0].startswith("--idle-timeout="):
-            try:
-                idle_timeout = _parse_idle_timeout_flag(raw[0].split("=", 1)[1])
-            except argparse.ArgumentTypeError as exc:
-                sys.exit(f"agent-run: --idle-timeout {exc}")
-            raw = raw[1:]
-            continue
-        break
+    try:
+        parsed = _parse_launch_argv(raw)
+    except _LaunchArgvError as exc:
+        sys.exit(str(exc))
 
-    # An explicit "--" with no preceding run name has nothing to attach the
-    # command to; catch it here with a specific, actionable message rather
-    # than falling through to the generic "missing command" help below.
-    if raw and raw[0] == "--":
-        sys.exit(
-            "agent-run: the run name must appear before '--'; shape is "
-            "'agent-run [flags] NAME -- <command> [args...]'"
-        )
-
-    # Try to dispatch a known subcommand; otherwise treat as launch.
-    known_subcommands = {
-        "status", "watch", "logs", "tail", "clean", "steer", "kill",
-        "list", "reap", "du", "help",
-    }
-    if (
-        raw
-        and raw[0] in known_subcommands
-        and not interactive
-        and not prompt_file
-        and not echo
-        and submit_mode is None
-        and idle_timeout is None
-    ):
-        # argparse handles these, including their own -h/--help.
+    # Subcommand dispatch: argparse handles help for each subcommand.
+    if parsed.subcommand_tokens is not None:
         parser = _build_parser()
-        args = parser.parse_args(raw)
+        args = parser.parse_args(parsed.subcommand_tokens)
         return int(args.func(args) or 0)
 
-    if len(raw) < 2:
+    # Insufficient arguments: show help.
+    if not parsed.name:
         _build_parser().print_help()
         return 2
-    name, *rest = raw
-    # Basic validation of the name.
-    if "/" in name or name.startswith("-"):
-        sys.exit(f"agent-run: invalid name '{name}'")
-    if rest and rest[0] == "--":
-        # Everything after the separator is the launch command, taken
-        # verbatim — leading-dash tokens and further "--" tokens included.
-        # The "looks like an agent-run flag" rejection below never applies
-        # here, and no subcommand dispatch is attempted on these tokens.
-        command = rest[1:]
-        if not command:
-            sys.exit(
-                "agent-run: empty command after '--'; provide a command to "
-                "launch: 'agent-run [flags] NAME -- <command> [args...]'"
-            )
-    else:
-        command = rest
-        if command and command[0].startswith("-"):
-            # A flag typed after the run name is never part of the launch
-            # command — it silently becomes argv[0] and exec fails with an
-            # opaque ENOENT. Reject it here with the actual offending token
-            # instead of letting the fork/exec path produce that confusion.
-            sys.exit(
-                f"agent-run: {command[0]!r} looks like an agent-run flag, not "
-                "part of the launch command; agent-run flags (-i, -f, --echo, "
-                "--submit-mode, --idle-timeout) must precede the run name, or "
-                "separate them from the launch command with '--': "
-                "'agent-run [flags] NAME -- <command> [args...]'"
-            )
+
     ns = argparse.Namespace(
-        name=name,
-        command=command,
-        interactive=interactive,
-        prompt_file=prompt_file,
-        echo=echo,
-        echo_interval=echo_interval,
-        submit_mode=submit_mode,
-        idle_timeout=idle_timeout if idle_timeout is not None else _idle_timeout_env_seconds(),
+        name=parsed.name,
+        command=parsed.command,
+        interactive=parsed.interactive,
+        prompt_file=parsed.prompt_file,
+        echo=parsed.echo,
+        echo_interval=parsed.echo_interval,
+        submit_mode=parsed.submit_mode,
+        idle_timeout=parsed.idle_timeout if parsed.idle_timeout is not None else _idle_timeout_env_seconds(),
     )
     return cmd_launch(ns)
 
