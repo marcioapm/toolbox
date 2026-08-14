@@ -555,6 +555,20 @@ def _scan_process_table_linux() -> List[_ProcEntry]:
     return entries
 
 
+def _darwin_lstart_normalise(raw: str) -> str:
+    """Collapse internal whitespace runs in a Darwin ``lstart`` string to a
+    single space.
+
+    ``ps -axo lstart=`` collapses whitespace when splitting columns (single
+    space between tokens), while ``ps -p PID -o lstart=`` preserves the
+    fixed-width right-padding that the kernel uses for single-digit days
+    (e.g. ``Mon Jun  8`` — two spaces between month and day).  Calling this
+    on both sides before building the ``darwin:<lstart>`` identity token
+    makes the two forms compare equal regardless of day width.
+    """
+    return " ".join(raw.split())
+
+
 def _scan_process_table_darwin() -> List[_ProcEntry]:
     """Query the macOS process table via ``ps``.
 
@@ -618,7 +632,7 @@ def _scan_process_table_darwin() -> List[_ProcEntry]:
         except ValueError:
             start_time = 0.0
 
-        identity = f"darwin:{lstart}"
+        identity = f"darwin:{_darwin_lstart_normalise(lstart)}"
         entries.append(_ProcEntry(
             pid=pid, ppid=ppid, uid=uid,
             argv=argv_str, start_time=start_time, identity=identity,
@@ -1420,7 +1434,7 @@ def _process_identity(pid: int) -> Optional[str]:
         return f"linux:{fields[19]}"
     if system == "Darwin":
         start = _ps_field(pid, "lstart")
-        return f"darwin:{start}" if start else None
+        return f"darwin:{_darwin_lstart_normalise(start)}" if start else None
     return None
 
 

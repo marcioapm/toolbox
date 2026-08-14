@@ -154,7 +154,7 @@ def test_darwin_process_identity_uses_ps_start_token(monkeypatch):
         lambda command, **kwargs: captured.update(command=command, **kwargs) or Result(),
     )
 
-    assert agent_run._process_identity(42) == "darwin:Mon Jan  1 00:00:00 2024"
+    assert agent_run._process_identity(42) == "darwin:Mon Jan 1 00:00:00 2024"
     assert captured["command"] == ["ps", "-p", "42", "-o", "lstart="]
 
 

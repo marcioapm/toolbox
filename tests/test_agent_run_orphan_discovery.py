@@ -7,6 +7,7 @@ or killed.  The helpers under test:
   _find_orphan_runners
   _parse_orphan_min_age_seconds
   _scan_process_table (pid-vanishing race only)
+  _darwin_lstart_normalise
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from toolbox.agent_run import (
     _OrphanCandidate,
     _OrphanSkip,
     _argv_is_agent_run_runner,
+    _darwin_lstart_normalise,
     _run_name_from_argv,
     _find_orphan_runners,
     _parse_orphan_min_age_seconds,
@@ -443,3 +445,85 @@ class TestScanProcessTableRace:
         entries = agent_run._scan_process_table_linux()
         assert isinstance(entries, list)
         assert not any(e.pid == 999999999 for e in entries)
+
+
+# ---------------------------------------------------------------------------
+# _darwin_lstart_normalise — whitespace canonicalisation
+# ---------------------------------------------------------------------------
+
+class TestDarwinLstartNormalise:
+    """Regression for the single-digit-day whitespace mismatch.
+
+    ``ps -axo lstart=`` collapses the fixed-width kernel date format to a
+    single space between tokens, while ``ps -p PID -o lstart=`` preserves the
+    right-padding used for days 1-9 (e.g. ``Mon Jun  8`` — two spaces).
+    Both call sites now run through ``_darwin_lstart_normalise`` so the
+    identity tokens they produce compare equal.
+    """
+
+    def test_single_digit_day_with_double_space_normalised(self):
+        """The ps -p form (double-space before single-digit day) must equal the
+        ps -axo form (single space) after normalisation."""
+        ps_p_form = "Mon Jun  8 12:29:39 2026"   # right-padded, from ps -p
+        ps_axo_form = "Mon Jun 8 12:29:39 2026"   # collapsed, from ps -axo split
+        assert _darwin_lstart_normalise(ps_p_form) == _darwin_lstart_normalise(ps_axo_form)
+
+    def test_double_digit_day_unchanged(self):
+        """Days 10-31 have no extra padding; normalisation must be a no-op."""
+        lstart = "Mon Jun 12 14:00:00 2026"
+        assert _darwin_lstart_normalise(lstart) == lstart
+
+    def test_already_normalised_idempotent(self):
+        """Calling normalise on already-normalised output is idempotent."""
+        lstart = "Mon Jun 8 12:29:39 2026"
+        assert _darwin_lstart_normalise(_darwin_lstart_normalise(lstart)) == lstart
+
+    def test_identity_token_equality_across_ps_forms(self, monkeypatch):
+        """Simulate the two ps call paths and assert identity tokens compare equal.
+
+        This is the end-to-end regression: the token stored by
+        _scan_process_table_darwin (built from the ps -axo column) must equal
+        the token returned by _process_identity (built from ps -p lstart=) for
+        the same process with a single-digit start day.
+        """
+        import subprocess as _subprocess
+        import platform as _platform
+        if _platform.system() != "Darwin":
+            pytest.skip("Darwin-only test")
+
+        pid = 12345
+        my_uid = os.getuid()
+
+        # ps -axo output: whitespace-collapsed by split(None, N) parsing.
+        ps_axo_line = (
+            f"  {pid}     1 {my_uid} Mon Jun  8 12:29:39 2026 /usr/bin/agent-run myrun claude"
+        )
+
+        # ps -p output: raw fixed-width kernel format with two-space padding.
+        ps_p_output = "Mon Jun  8 12:29:39 2026"
+
+        def fake_subprocess_run(cmd, **kwargs):
+            class R:
+                stdout = ""
+                returncode = 0
+            r = R()
+            if cmd[:2] == ["ps", "-axo"]:
+                r.stdout = ps_axo_line + "\n"
+            elif cmd[:2] == ["ps", "-p"] and "lstart=" in " ".join(cmd):
+                r.stdout = ps_p_output + "\n"
+            return r
+
+        monkeypatch.setattr(_subprocess, "run", fake_subprocess_run)
+
+        # Identity from the scanner (ps -axo path).
+        entries = agent_run._scan_process_table_darwin()
+        assert entries, "scanner returned no entries from fake ps"
+        scanner_identity = entries[0].identity
+
+        # Identity from _process_identity (ps -p path).
+        verify_identity = agent_run._process_identity(pid)
+
+        assert scanner_identity == verify_identity, (
+            f"scanner identity {scanner_identity!r} != "
+            f"verify identity {verify_identity!r}"
+        )
