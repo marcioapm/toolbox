@@ -476,6 +476,9 @@ class _ProcEntry(NamedTuple):
 
     ``start_time`` is an epoch float (seconds since the Unix epoch) used
     only for age comparisons — it does not need sub-second precision.
+    ``None`` means the start time could not be determined; such entries are
+    skipped by ``_find_orphan_runners`` with reason ``start_time_unknown``
+    rather than being treated as ancient (fail-closed, not fail-open).
     ``identity`` mirrors the format used by ``_process_identity``: a
     stable platform-specific birth token that lets callers detect PID
     recycling between discovery and any later action.
@@ -486,16 +489,16 @@ class _ProcEntry(NamedTuple):
     ppid: int
     uid: int
     argv: List[str]
-    start_time: float   # epoch seconds
-    identity: str       # "linux:<starttime>" or "darwin:<lstart>"
-    pgid: int = 0       # process group ID; 0 means unknown
+    start_time: Optional[float]  # epoch seconds; None = unknown
+    identity: str                # "linux:<starttime>" or "darwin:<lstart>"
+    pgid: int = 0                # process group ID; 0 means unknown
 
 
 class _OrphanCandidate(NamedTuple):
     """A runner process judged eligible for orphan handling."""
     pid: int
     name: str
-    start_time: float
+    start_time: Optional[float]  # epoch seconds; None if indeterminate
     identity: str
 
 
@@ -586,9 +589,13 @@ def _scan_process_table_darwin() -> List[_ProcEntry]:
     entries: List[_ProcEntry] = []
     try:
         # pid, ppid, pgid, uid, lstart (24 chars fixed), and the full command.
+        # LC_ALL=C forces ASCII month/day names regardless of the operator's
+        # locale; a non-C locale (e.g. fr_FR.UTF-8) causes ps to emit localised
+        # month names that strptime cannot parse with the fixed "%b" directive.
+        env_c = {**os.environ, "LC_ALL": "C"}
         result = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,pgid=,uid=,lstart=,command="],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=env_c,
         )
     except (OSError, subprocess.SubprocessError):
         return entries
@@ -630,13 +637,18 @@ def _scan_process_table_darwin() -> List[_ProcEntry]:
             continue
 
         # Convert lstart to an epoch float for age comparisons.
+        # lstart is wall-clock local time; a naive datetime.timestamp()
+        # interprets it in the host's local timezone, matching what ps printed.
+        # LC_ALL=C on the ps invocation guarantees ASCII day/month names, so
+        # strptime always matches "%a %b %d %H:%M:%S %Y" regardless of locale.
+        # A parse failure leaves start_time as None; _find_orphan_runners treats
+        # None as unknown and emits start_time_unknown (fail-closed, not open).
+        start_time: Optional[float]
         try:
             # "Www Mmm DD HH:MM:SS YYYY" — strptime consumes leading zeros.
-            start_time = datetime.strptime(lstart, "%a %b %d %H:%M:%S %Y").replace(
-                tzinfo=timezone.utc
-            ).timestamp()
+            start_time = datetime.strptime(lstart, "%a %b %d %H:%M:%S %Y").timestamp()
         except ValueError:
-            start_time = 0.0
+            start_time = None
 
         identity = f"darwin:{_darwin_lstart_normalise(lstart)}"
         entries.append(_ProcEntry(
@@ -846,6 +858,11 @@ def _find_orphan_runners(
 
         # Age gate: too-young processes are excluded so a runner still
         # mid-launch (state dir creation in progress) is not a candidate.
+        # start_time=None means the parse failed; treat as unknown rather than
+        # as infinitely old — any uncertainty skips the candidate (fail-closed).
+        if entry.start_time is None:
+            skips.append(_OrphanSkip(pid=pid, reason="start_time_unknown"))
+            continue
         age = now - entry.start_time
         if age < min_age_seconds:
             skips.append(_OrphanSkip(
