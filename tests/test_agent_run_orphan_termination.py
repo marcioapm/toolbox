@@ -62,6 +62,16 @@ MY_UID = os.getuid()
 FAR_PAST = time.time() - 100_000   # ~28 h ago — always older than any threshold
 
 
+def _make_log_dir(name: str) -> None:
+    """Create LOG_ROOT/<name> so the log-dir corroboration check passes.
+
+    Every real agent-run runner creates this directory on launch, so any
+    entry expected to survive past the log_dir_missing skip must have it.
+    """
+    agent_run.LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    (agent_run.LOG_ROOT / name).mkdir(exist_ok=True)
+
+
 def _make_proc_entry(
     pid: int,
     name: str,
@@ -172,6 +182,7 @@ class TestOrphanProcessesAbsent:
 class TestDryRun:
     def test_dry_run_sends_no_signals(self, isolated_runs_root, monkeypatch, capsys):
         entry = _make_proc_entry(9100, "dryrun")
+        _make_log_dir("dryrun")
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_process_identity",
                             lambda pid: f"darwin:{pid}-test-identity")
@@ -186,6 +197,7 @@ class TestDryRun:
 
     def test_dry_run_counter_increments(self, isolated_runs_root, monkeypatch, capsys):
         entry = _make_proc_entry(9101, "drycount")
+        _make_log_dir("drycount")
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_process_identity",
                             lambda pid: f"darwin:{pid}-test-identity")
@@ -209,6 +221,7 @@ class TestTermGrace:
     ):
         pid = 9200
         entry = _make_proc_entry(pid, "gracerun")
+        _make_log_dir("gracerun")
         identity = f"darwin:{pid}-test-identity"
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
@@ -238,6 +251,7 @@ class TestTermGrace:
     def test_term_killed_counter(self, isolated_runs_root, monkeypatch, capsys):
         pid = 9201
         entry = _make_proc_entry(pid, "gracecount")
+        _make_log_dir("gracecount")
         identity = f"darwin:{pid}-test-identity"
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
@@ -271,6 +285,7 @@ class TestTermKillEscalation:
     ):
         pid = 9300
         entry = _make_proc_entry(pid, "stubborn")
+        _make_log_dir("stubborn")
         identity = f"darwin:{pid}-test-identity"
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
@@ -294,6 +309,7 @@ class TestTermKillEscalation:
     def test_kill_after_grace_counted(self, isolated_runs_root, monkeypatch, capsys):
         pid = 9301
         entry = _make_proc_entry(pid, "stubborn2")
+        _make_log_dir("stubborn2")
         identity = f"darwin:{pid}-test-identity"
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
@@ -323,6 +339,7 @@ class TestIdentityChanged:
         original_identity = f"darwin:{pid}-original"
         new_identity = f"darwin:{pid}-recycled"
         entry = _make_proc_entry(pid, "recycled", identity=original_identity)
+        _make_log_dir("recycled")
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         # _process_identity returns a different token every call (PID recycled).
@@ -342,6 +359,7 @@ class TestIdentityChanged:
     ):
         pid = 9401
         entry = _make_proc_entry(pid, "recycled2", identity=f"darwin:{pid}-orig")
+        _make_log_dir("recycled2")
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_process_identity", lambda p: f"darwin:{p}-new")
@@ -365,6 +383,7 @@ class TestStateDirReappeared:
         pid = 9500
         name = "reappeared"
         entry = _make_proc_entry(pid, name)
+        _make_log_dir(name)
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_process_identity",
@@ -387,6 +406,7 @@ class TestStateDirReappeared:
         pid = 9501
         name = "reappeared2"
         entry = _make_proc_entry(pid, name)
+        _make_log_dir(name)
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_process_identity",
@@ -412,6 +432,7 @@ class TestStateDirReappeared:
         pid = 9502
         name = "reappeared3"
         entry = _make_proc_entry(pid, name)
+        _make_log_dir(name)
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_process_identity",
@@ -449,6 +470,7 @@ class TestPgidMismatch:
     ):
         pid = 9600
         entry = _make_proc_entry(pid, "pgidrun")
+        _make_log_dir("pgidrun")
         identity = f"darwin:{pid}-test-identity"
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
@@ -478,6 +500,7 @@ class TestPgidMismatch:
         pid = 9601
         # Set pgid=pid: the entry is a group leader (its own pgid != self_pgid=0).
         entry = _make_proc_entry(pid, "pgidsession", pgid=pid)
+        _make_log_dir("pgidsession")
         identity = f"darwin:{pid}-test-identity"
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
@@ -535,6 +558,8 @@ class TestSummaryCounters:
         self, isolated_runs_root, monkeypatch, capsys
     ):
         entries = [_make_proc_entry(9700 + i, f"multi{i}") for i in range(3)]
+        for i in range(3):
+            _make_log_dir(f"multi{i}")
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: entries)
         monkeypatch.setattr(agent_run, "_process_identity",
                             lambda pid: f"darwin:{pid}-test-identity")
@@ -562,6 +587,8 @@ class TestNameTargeting:
             _make_proc_entry(9800, "run-a"),
             _make_proc_entry(9801, "run-b"),
         ]
+        _make_log_dir("run-a")
+        # run-b is filtered by name_mismatch before log-dir check, so no log_dir needed.
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: entries)
         monkeypatch.setattr(agent_run, "_process_identity",
                             lambda pid: f"darwin:{pid}-test-identity")
@@ -646,6 +673,8 @@ class TestDiscoveryRefusals:
         """A process whose state dir exists is tracked by other passes — skip."""
         name = "tracked"
         entry = _make_proc_entry(9901, name)
+        # Log dir must exist so the entry reaches the state_dir_exists check.
+        _make_log_dir(name)
         (isolated_runs_root / name).mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
@@ -684,6 +713,7 @@ class TestOrphanMinAgeHours:
             start_time=now - 7200.0,  # 2 h old
             identity="darwin:9990-test",
         )
+        _make_log_dir("agetest")
         monkeypatch.setenv("AGENT_RUN_ORPHAN_MIN_AGE_HOURS", "3")
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_process_identity", lambda p: "darwin:9990-test")
@@ -707,6 +737,8 @@ class TestOrphanMinAgeHours:
             start_time=now - 60.0,   # 1 min old
             identity="darwin:9991-test",
         )
+        # Log dir must exist so the entry reaches the age gate.
+        _make_log_dir("youngrun")
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         monkeypatch.setattr(os, "kill", lambda *_a: None)

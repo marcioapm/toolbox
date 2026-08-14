@@ -850,6 +850,38 @@ def _find_orphan_runners(
             skips.append(_OrphanSkip(pid=pid, reason="name_mismatch", detail=name))
             continue
 
+        # Ambiguity guard: ps joins argv with spaces, so shlex.split and plain
+        # str.split() may recover different names when the command string contains
+        # shell metacharacters (quotes, backslashes).  Differing results indicate
+        # that the recovered name is not unique and the candidate is unsafe to act on.
+        # (Space-in-path mis-parses are caught below by _log_dir corroboration.)
+        command_str = " ".join(entry.argv)
+        try:
+            plain_argv = command_str.split()
+        except Exception:
+            plain_argv = []
+        plain_name = _run_name_from_argv(plain_argv)
+        if plain_name != name:
+            skips.append(_OrphanSkip(pid=pid, reason="argv_ambiguous", detail=name))
+            continue
+
+        # Log-dir corroboration: every real agent-run runner creates LOG_ROOT/<name>
+        # before writing any state.  Requiring the directory to exist — and to be a
+        # real directory, not a symlink — rejects the entire mis-parse class from S1:
+        # a shifted name like "prompt.md" has no LOG_ROOT entry, so it is never a
+        # candidate regardless of the state-dir outcome.
+        # ps argv reconstruction is lossy; the log dir is the filesystem artefact
+        # that corroborates the recovered name without re-parsing the command string.
+        log_d = _log_dir(name)
+        try:
+            lst = log_d.lstat()
+            if not _stat_module.S_ISDIR(lst.st_mode):
+                skips.append(_OrphanSkip(pid=pid, reason="log_dir_missing", detail=name))
+                continue
+        except FileNotFoundError:
+            skips.append(_OrphanSkip(pid=pid, reason="log_dir_missing", detail=name))
+            continue
+
         # State-dir check: a process with a live state dir is tracked by
         # reap's existing passes, not this one.
         if _path_entry_exists(_state_dir(name)):

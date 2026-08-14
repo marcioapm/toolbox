@@ -58,6 +58,14 @@ MY_UID = os.getuid()
 FAR_PAST = time.time() - 100_000   # ~28 h ago — always older than any threshold
 
 
+def _make_log_dir(name: str) -> None:
+    """Create LOG_ROOT/<name> as a real directory so the log-dir corroboration
+    check in _find_orphan_runners passes for tests that expect a candidate or
+    a skip reason other than log_dir_missing."""
+    agent_run.LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    (agent_run.LOG_ROOT / name).mkdir(exist_ok=True)
+
+
 def _make_entry(
     pid: int,
     argv: List[str],
@@ -247,6 +255,7 @@ class TestFindOrphanRunners:
     """Verify candidate selection and every skip-reason path."""
 
     def test_basic_candidate(self, isolated_runs_root):
+        _make_log_dir("myrun")
         entry = _make_entry(9001, ["agent-run", "myrun", "claude"])
         candidates, skips = _find([entry])
         assert len(candidates) == 1
@@ -254,7 +263,9 @@ class TestFindOrphanRunners:
         assert candidates[0].name == "myrun"
 
     def test_state_dir_present_is_skipped(self, isolated_runs_root):
-        # Create the state dir so _path_entry_exists returns True.
+        # Create both the log dir (corroboration) and the state dir (the guard
+        # being tested) so the entry reaches the state_dir_exists check.
+        _make_log_dir("myrun")
         (isolated_runs_root / "myrun").mkdir(parents=True, exist_ok=True)
         entry = _make_entry(9002, ["agent-run", "myrun", "claude"])
         candidates, skips = _find([entry])
@@ -262,6 +273,8 @@ class TestFindOrphanRunners:
         assert any(s.reason == "state_dir_exists" for s in skips)
 
     def test_too_young_is_skipped(self, isolated_runs_root):
+        # Log dir must exist so the entry reaches the age gate.
+        _make_log_dir("youngrun")
         now = time.time()
         entry = _make_entry(9003, ["agent-run", "youngrun", "cmd"],
                             start_time=now - 60.0)  # 60 s old
@@ -270,6 +283,7 @@ class TestFindOrphanRunners:
         assert any(s.reason == "too_young" for s in skips)
 
     def test_old_enough_is_candidate(self, isolated_runs_root):
+        _make_log_dir("oldrun")
         now = time.time()
         entry = _make_entry(9004, ["agent-run", "oldrun", "cmd"],
                             start_time=now - 7200.0)  # 2 h old
@@ -341,6 +355,8 @@ class TestFindOrphanRunners:
         # name_unrecoverable or skipped silently (no runner match at all)
 
     def test_target_name_filters_others(self, isolated_runs_root):
+        # run-a becomes a candidate; run-b gets name_mismatch before log-dir check.
+        _make_log_dir("run-a")
         e1 = _make_entry(9020, ["agent-run", "run-a", "cmd"])
         e2 = _make_entry(9021, ["agent-run", "run-b", "cmd"])
         candidates, skips = _find([e1, e2], target_name="run-a")
@@ -365,6 +381,7 @@ class TestFindOrphanRunners:
         assert not any(s.pid == 9031 for s in skips)
 
     def test_candidates_carry_identity(self, isolated_runs_root):
+        _make_log_dir("idrun")
         entry = _make_entry(9040, ["agent-run", "idrun", "cmd"],
                             identity="darwin:Wed Jan 01 00:00:00 2025")
         candidates, _ = _find([entry])
@@ -375,6 +392,8 @@ class TestFindOrphanRunners:
             _make_entry(9050 + i, ["agent-run", f"run{i}", "cmd"])
             for i in range(5)
         ]
+        for i in range(5):
+            _make_log_dir(f"run{i}")
         candidates, _ = _find(entries)
         assert len(candidates) == 5
 
