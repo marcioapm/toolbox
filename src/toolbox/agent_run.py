@@ -1509,11 +1509,21 @@ def _runner_state_root(pid: int) -> Optional[Path]:
     On Linux the process's NUL-separated ``/proc/<pid>/environ`` is parsed
     directly.  If ``AGENT_RUN_STATE_DIR`` is absent the runner uses the same
     default as the reaper (``STATE_ROOT``), so ``STATE_ROOT`` is returned.
+    ``/proc/<pid>/environ`` takes the target's ``mmap_lock`` (the same
+    uninterruptible-read hazard as ``/proc/<pid>/cmdline``; see P5 in
+    ``findings-performance.md``).  This read runs inside ``_find_orphan_runners``
+    during discovery — before the per-candidate budget checks in the orphan
+    processing loop — so a single process stuck in D state can block discovery
+    for the duration of its stall.  The overall ``reap_budget`` enforced in
+    ``cmd_reap`` covers only the post-discovery action phase and does not bound
+    this read.
 
-    On Darwin we cannot read another process's environment without a privileged
-    API; ``STATE_ROOT`` is returned unconditionally so the caller applies the
-    state-dir check against the reaper's root, accepting the residual S3 risk
-    for non-default-root runners on that platform.
+    On Darwin reading another process's environment requires a privileged API;
+    ``STATE_ROOT`` is returned unconditionally.  This means a runner launched
+    with a non-default ``AGENT_RUN_STATE_DIR`` on macOS is still evaluated
+    against the reaper's root (residual S3 exposure).  The log-dir corroboration
+    check upstream rejects any process whose recovered name has no ``LOG_ROOT``
+    entry, limiting but not eliminating that exposure.
     """
     if platform.system() != "Linux":
         # Conservative fallback: assume the runner shares our root.  The

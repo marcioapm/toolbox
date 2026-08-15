@@ -50,6 +50,17 @@ def _no_real_scan(monkeypatch):
     monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [])
 
 
+@pytest.fixture(autouse=True)
+def _stub_runner_state_root(monkeypatch):
+    """Return STATE_ROOT for every fabricated pid so tests are not platform-
+    dependent.  On Linux, _runner_state_root reads /proc/<pid>/environ and
+    returns None on OSError; fabricated pids (9100, 9200, …) do not exist, so
+    every candidate would be skipped as state_root_unreadable on Linux CI.
+    Tests that need a different return value install their own stub."""
+    monkeypatch.setattr(agent_run, "_runner_state_root",
+                        lambda _pid: agent_run.STATE_ROOT)
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------

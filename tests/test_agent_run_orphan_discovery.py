@@ -30,6 +30,7 @@ from toolbox.agent_run import (
     _run_name_from_argv,
     _find_orphan_runners,
     _parse_orphan_min_age_seconds,
+    _runner_state_root as _runner_state_root_real,
     cmd_reap,
 )
 
@@ -51,6 +52,18 @@ def _no_real_scan(monkeypatch):
     """Prevent accidental enumeration of the host process table.  Tests that
     exercise the scanner directly install their own subprocess stub."""
     monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [])
+
+
+@pytest.fixture(autouse=True)
+def _stub_runner_state_root(monkeypatch):
+    """Return STATE_ROOT for every fabricated pid so tests are not platform-
+    dependent.  On Linux, _runner_state_root reads /proc/<pid>/environ and
+    returns None on OSError; fabricated pids (9001, 9002, …) do not exist, so
+    every candidate would be skipped as state_root_unreadable on Linux CI.
+    Tests that specifically exercise the state-root guard (TestStateRootGuard)
+    install their own stub via monkeypatch, overriding this default."""
+    monkeypatch.setattr(agent_run, "_runner_state_root",
+                        lambda _pid: agent_run.STATE_ROOT)
 
 
 # ---------------------------------------------------------------------------
@@ -919,3 +932,115 @@ class TestStateRootGuard:
 
         assert len(candidates) == 1
         assert candidates[0].name == "samerootrun"
+
+
+# ---------------------------------------------------------------------------
+# Linux path proof: _runner_state_root with forced Linux branch
+# ---------------------------------------------------------------------------
+
+class TestRunnerStateRootLinuxBranch:
+    """Directly exercise the Linux branch of _runner_state_root with the
+    platform check forced.  These tests run on every platform via a
+    platform.system stub so Linux CI behaviour is verifiable on macOS.
+
+    Tests call _runner_state_root_real (the function object imported before any
+    monkeypatching) so the _stub_runner_state_root autouse fixture — which
+    replaces the module attribute — does not interfere.  monkeypatch controls
+    both the platform branch and the /proc read.
+    """
+
+    def test_linux_branch_returns_state_root_when_var_absent(
+        self, isolated_runs_root, monkeypatch
+    ):
+        """When AGENT_RUN_STATE_DIR is absent from the process environ, the
+        Linux branch returns STATE_ROOT (the compiled-in default)."""
+        import pathlib
+        import types as _types
+
+        monkeypatch.setattr(agent_run, "platform",
+                            _types.SimpleNamespace(system=lambda: "Linux"))
+        # NUL-separated environ with no AGENT_RUN_STATE_DIR key.
+        fake_environ = b"PATH=/usr/bin\x00HOME=/root\x00"
+        monkeypatch.setattr(pathlib.Path, "read_bytes", lambda _self: fake_environ)
+
+        result = _runner_state_root_real(99999)
+        assert result == agent_run.STATE_ROOT, (
+            f"expected STATE_ROOT when AGENT_RUN_STATE_DIR absent, got {result!r}"
+        )
+
+    def test_linux_branch_returns_custom_root_when_var_present(
+        self, isolated_runs_root, monkeypatch
+    ):
+        """When AGENT_RUN_STATE_DIR is set in the process environ, the Linux
+        branch returns that path rather than STATE_ROOT."""
+        import pathlib
+        from pathlib import Path
+        import types as _types
+
+        custom_root = "/custom/state/root"
+        monkeypatch.setattr(agent_run, "platform",
+                            _types.SimpleNamespace(system=lambda: "Linux"))
+        fake_environ = (
+            b"PATH=/usr/bin\x00"
+            + b"AGENT_RUN_STATE_DIR=" + custom_root.encode() + b"\x00"
+            + b"HOME=/root\x00"
+        )
+        monkeypatch.setattr(pathlib.Path, "read_bytes", lambda _self: fake_environ)
+
+        result = _runner_state_root_real(99999)
+        assert result == Path(custom_root), (
+            f"expected custom root {custom_root!r}, got {result!r}"
+        )
+
+    def test_linux_branch_returns_none_on_oserror(self, monkeypatch):
+        """An OSError reading /proc/<pid>/environ causes the Linux branch to
+        return None (fail-closed: unreadable env → skip the candidate)."""
+        import pathlib
+        import types as _types
+
+        monkeypatch.setattr(agent_run, "platform",
+                            _types.SimpleNamespace(system=lambda: "Linux"))
+
+        def _raise_oserror(self):
+            raise OSError("No such file or directory")
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", _raise_oserror)
+
+        result = _runner_state_root_real(99999)
+        assert result is None, (
+            f"expected None on OSError (fail-closed), got {result!r}"
+        )
+
+    def test_state_root_unreadable_printed_not_swallowed(
+        self, isolated_runs_root, monkeypatch, capsys
+    ):
+        """When _runner_state_root returns None, _find_orphan_runners emits
+        state_root_unreadable and cmd_reap prints it — the skip is visible
+        to the operator, not silently absorbed."""
+        import argparse
+
+        entry = _make_entry(
+            pid=7910,
+            argv=["agent-run", "unreadrun", "claude"],
+            start_time=FAR_PAST,
+        )
+        _make_log_dir("unreadrun")
+
+        # Override the autouse stub: None simulates an unreadable /proc entry.
+        monkeypatch.setattr(agent_run, "_runner_state_root", lambda _pid: None)
+        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(agent_run, "_process_identity",
+                            lambda p: f"darwin:{p}-test-identity")
+
+        agent_run.cmd_reap(argparse.Namespace(
+            dry_run=False, idle_hours=None, min_age_hours=None,
+            name=None, force_unknown=False, include_logs=False,
+            log_min_age_hours=None, orphan_processes=True,
+            orphan_min_age_hours=None,
+        ))
+
+        out = capsys.readouterr().out
+        assert "state_root_unreadable" in out, (
+            f"state_root_unreadable must appear in reap output; got:\n{out}"
+        )
