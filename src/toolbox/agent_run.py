@@ -286,7 +286,7 @@ import traceback
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, NamedTuple, Optional, Sequence
+from typing import Any, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
@@ -467,6 +467,18 @@ def _parse_orphan_min_age_seconds() -> float:
     return _positive_finite_hours(raw, "AGENT_RUN_ORPHAN_MIN_AGE_HOURS", 24.0)
 
 
+def _parse_reap_max_seconds() -> float:
+    """Wall-clock budget for one reap invocation; default 600 s (10 min)."""
+    raw = os.environ.get("AGENT_RUN_REAP_MAX_SECONDS", "600")
+    try:
+        v = float(raw)
+        if v > 0 and math.isfinite(v):
+            return v
+    except (ValueError, TypeError):
+        pass
+    return 600.0
+
+
 # ---------------------------------------------------------------------------
 # Orphan-process discovery helpers
 # ---------------------------------------------------------------------------
@@ -522,6 +534,19 @@ def _scan_process_table_linux() -> List[_ProcEntry]:
         pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
     except OSError:
         return entries
+
+    # /proc/uptime and SC_CLK_TCK are the same for every pid in the snapshot;
+    # read them once so the per-pid loop does not pay repeated open/read/close
+    # and sysconf calls (~1000 on a loaded host).  A failure degrades every
+    # entry to start_time=None (fail-closed).
+    try:
+        uptime_s = float(Path("/proc/uptime").read_text().split()[0])
+        boot_epoch: Optional[float] = time.time() - uptime_s
+        hz: Optional[float] = float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, AttributeError):
+        boot_epoch = None
+        hz = None
+
     for pid in pids:
         try:
             st = os.stat(f"/proc/{pid}")
@@ -543,14 +568,11 @@ def _scan_process_table_linux() -> List[_ProcEntry]:
             pgid = int(fields[2]) if fields[2].lstrip("-").isdigit() else 0
             starttime_ticks = int(fields[19]) if fields[19].isdigit() else 0
 
-            # Convert kernel jiffies to epoch seconds via /proc/uptime.
-            try:
-                uptime_s = float(Path("/proc/uptime").read_text().split()[0])
-                boot_epoch = time.time() - uptime_s
-                hz = os.sysconf("SC_CLK_TCK")
-                start_time = boot_epoch + starttime_ticks / hz
-            except (OSError, ValueError, AttributeError):
-                start_time = 0.0
+            # Convert kernel jiffies to epoch seconds using the pre-read boot_epoch.
+            if boot_epoch is not None and hz is not None:
+                start_time: Optional[float] = boot_epoch + starttime_ticks / hz
+            else:
+                start_time = None
 
             identity = f"linux:{starttime_ticks}"
             entries.append(_ProcEntry(
@@ -1578,28 +1600,49 @@ def _newest_mtime(d: Path) -> Optional[float]:
         return None
 
 
-def _newest_mtime_recursive(d: Path) -> Optional[float]:
-    """Newest mtime anywhere below a real directory ``d`` (including ``d``).
+def _newest_mtime_recursive(d: Path, cutoff: Optional[float] = None) -> Optional[float]:
+    """Newest mtime anywhere below ``d`` (including ``d`` itself), without
+    following symlinks.
 
-    Used only for a state-less orphaned scratch directory: unlike terminal
-    state dirs, which are deliberately flat, an agent's TMPDIR commonly
-    contains nested JDTLS workspaces. The full recursive walk means reap's
-    min-age threshold starts after the last actual scratch write, not merely
-    after the top-level ``tmp/`` directory was created. Symlinks are never
-    followed (``lstat`` + ``S_ISDIR``), so a malicious scratch tree cannot
-    make an age scan walk outside its own log directory.
+    When ``cutoff`` is given, returns as soon as any entry's mtime exceeds it
+    — the exact maximum is irrelevant to the caller once it is known that
+    something is newer than ``cutoff``.  At steady state (almost every
+    candidate is younger than the reap threshold) this reduces an O(N-entries)
+    walk to O(1).  When the directory is genuinely old the full walk runs,
+    which is correct — that directory is about to be deleted anyway.
+
+    Symlinks are never followed (``entry.stat(follow_symlinks=False)``), so a
+    malicious scratch tree cannot redirect the walk outside its log directory.
     """
     try:
-        newest = d.stat().st_mtime
-        for root, dirs, files in os.walk(d, followlinks=False):
-            root_path = Path(root)
-            for entry in [*dirs, *files]:
-                path = root_path / entry
-                st = path.lstat()
-                newest = max(newest, st.st_mtime)
-        return newest
+        top_st = os.stat(d, follow_symlinks=False)
+        newest = top_st.st_mtime
+        if cutoff is not None and newest > cutoff:
+            return newest
     except OSError:
         return None
+
+    stack: List[str] = [str(d)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            mtime = st.st_mtime
+            if mtime > newest:
+                newest = mtime
+            if cutoff is not None and newest > cutoff:
+                return newest
+            if _stat_module.S_ISDIR(st.st_mode):
+                stack.append(entry.path)
+    return newest
 
 
 def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
@@ -1629,13 +1672,13 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
             continue
         for entry in entries:
             try:
-                st = entry.stat(follow_symlinks=False)
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    st = entry.stat(follow_symlinks=False)
+                    total += st.st_size
             except (FileNotFoundError, PermissionError):
                 continue
-            if _stat_module.S_ISDIR(st.st_mode):
-                stack.append(Path(entry.path))
-            elif _stat_module.S_ISREG(st.st_mode):
-                total += st.st_size
     return total
 
 
@@ -3304,6 +3347,11 @@ def cmd_reap(args: argparse.Namespace) -> int:
         if orphan_min_age_hours is not None
         else _parse_orphan_min_age_seconds()
     )
+    max_seconds_arg: Optional[float] = getattr(args, "max_seconds", None)
+    reap_budget: float = (
+        max_seconds_arg if max_seconds_arg is not None else _parse_reap_max_seconds()
+    )
+    reap_start = time.time()
 
     # A previous SIGKILL can leave a dot-prefixed deletion sentinel. Finish it
     # before scanning named runs; each failure remains per-sentinel so one
@@ -3337,6 +3385,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
     gc_skipped_count = 0
     orphan_procs_killed = 0
     orphan_procs_skipped = 0
+    deferred_count = 0
     found_target = False
     reconciled_this_pass = set()
 
@@ -3359,6 +3408,9 @@ def cmd_reap(args: argparse.Namespace) -> int:
 
     # Pass 1: stale-running reconciliation and identity-verified idle kill.
     for d in state_candidates:
+        if time.time() - reap_start > reap_budget:
+            deferred_count += 1
+            continue
         name = d.name
         raw_status = _read(d / "status")
         if raw_status != "running":
@@ -3453,6 +3505,9 @@ def cmd_reap(args: argparse.Namespace) -> int:
     # crash between finalization writes cannot make a run reconciled in pass 1
     # eligible for deletion in pass 2 of the same invocation.
     for d in state_candidates:
+        if time.time() - reap_start > reap_budget:
+            deferred_count += 1
+            continue
         name = d.name
         if name in reconciled_this_pass:
             continue
@@ -3601,6 +3656,9 @@ def cmd_reap(args: argparse.Namespace) -> int:
     # spam over an already-gone path.
     if include_logs:
         for log_d in log_candidates:
+            if time.time() - reap_start > reap_budget:
+                deferred_count += 1
+                continue
             name = log_d.name
             if name.startswith("."):
                 continue
@@ -3613,21 +3671,25 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 continue
             if _path_entry_exists(_state_dir(name)):
                 continue  # state-backed — pass 2 owns this run, never race it
-            newest = _newest_mtime_recursive(log_d)
+            newest = _newest_mtime_recursive(log_d, cutoff=time.time() - log_min_age_threshold)
             if newest is None:
                 continue
             age_secs = time.time() - newest
             if age_secs < log_min_age_threshold:
                 continue
             age_h = age_secs / 3600
+            if dry_run:
+                print(
+                    f"  {name}: preserved log (age={age_h:.1f}h) "
+                    "[dry-run]"
+                )
+                logs_collected_count += 1
+                continue
             size = _dir_size_bytes(log_d)
             print(
                 f"  {name}: preserved log (age={age_h:.1f}h, size={_human_size(size)}) "
-                f"[{'dry-run' if dry_run else 'removing log'}]"
+                "[removing log]"
             )
-            if dry_run:
-                logs_collected_count += 1
-                continue
             with _launch_lock(name):
                 try:
                     if _path_entry_exists(_state_dir(name)):
@@ -3646,6 +3708,9 @@ def cmd_reap(args: argparse.Namespace) -> int:
     # LOG_ROOT/<name>/tmp survives. Sweep those orphaned scratch dirs once
     # their own recursive contents have been quiet for the GC threshold (H3).
     for log_d in log_candidates:
+        if time.time() - reap_start > reap_budget:
+            deferred_count += 1
+            continue
         name = log_d.name
         if name.startswith("."):
             continue
@@ -3674,7 +3739,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         # conservatively rather than following it.
         if _path_entry_exists(_state_dir(name)):
             continue
-        newest = _newest_mtime_recursive(scratch_dir)
+        newest = _newest_mtime_recursive(scratch_dir, cutoff=time.time() - min_age_threshold)
         if newest is None or time.time() - newest < min_age_threshold:
             continue
         age_h = (time.time() - newest) / 3600
@@ -3724,7 +3789,14 @@ def cmd_reap(args: argparse.Namespace) -> int:
             print(f"  [orphan] pid={skip.pid}: skipped: {reason}{detail}")
             orphan_procs_skipped += 1
 
+        # Collects (cand, pgid, use_group, age_h) for every candidate that
+        # received SIGTERM, for phases 2 and 3 below.
+        _term_targets: List[Tuple[Any, Optional[int], bool, float]] = []
+
         for cand in orphan_candidates:
+            if time.time() - reap_start > reap_budget:
+                deferred_count += 1
+                continue
             age_h = (now - cand.start_time) / 3600
             # Re-verify under the per-name lock: serializes with a concurrent
             # launch that may have just created a state dir for this name.
@@ -3784,7 +3856,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     orphan_procs_killed += 1
                     continue
 
-                # SIGTERM, then bounded grace, then SIGKILL.
+                # Phase 1: SIGTERM under the lock, then release to let grace run
+                # concurrently with other candidates.
                 print(
                     f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
                     f"TERM{pgid_note}"
@@ -3798,21 +3871,30 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     orphan_procs_skipped += 1
                     continue
 
-                # Wait grace period; escalate to SIGKILL if process survives.
-                deadline = time.time() + ORPHAN_KILL_GRACE_SECONDS
-                while time.time() < deadline:
-                    if not _pid_alive(cand.pid):
-                        break
-                    time.sleep(KILL_POLL_INTERVAL_SECONDS)
+                # Record enough to complete phases 2 and 3.
+                _term_targets.append((cand, pgid, use_group, age_h))
 
-                if not _pid_alive(cand.pid):
-                    print(
-                        f"  [orphan] {cand.name} pid={cand.pid}: terminated after TERM"
-                    )
-                    orphan_procs_killed += 1
-                    continue
+        # Phase 2: one shared grace window covering all candidates that received
+        # SIGTERM.  O(5 s) total instead of O(5 s × N).
+        if _term_targets:
+            deadline = time.time() + ORPHAN_KILL_GRACE_SECONDS
+            while time.time() < deadline:
+                if all(not _pid_alive(c.pid) for c, *_ in _term_targets):
+                    break
+                time.sleep(KILL_POLL_INTERVAL_SECONDS)
 
-                # Process survived grace — re-verify identity before SIGKILL.
+        # Phase 3: re-verify identity and SIGKILL whoever survived the grace window.
+        for cand, pgid, use_group, age_h in _term_targets:
+            pgid_note = f" pgid={pgid}" if use_group and pgid is not None else " (pid only — pgid mismatch)"
+            if not _pid_alive(cand.pid):
+                print(f"  [orphan] {cand.name} pid={cand.pid}: terminated after TERM")
+                orphan_procs_killed += 1
+                continue
+            # Re-take the per-name lock before KILL; mirrors the phase-1 lock so
+            # a concurrent launch between TERM and KILL cannot create a state dir
+            # undetected.  Re-verify identity here too — PID reuse can happen in
+            # the grace window, and we must not kill an unrelated process.
+            with _launch_lock(cand.name):
                 current = _process_identity(cand.pid)
                 if current is None or current != cand.identity:
                     print(
@@ -3841,13 +3923,20 @@ def cmd_reap(args: argparse.Namespace) -> int:
         else:
             print(f"reap: no such run '{target_name}' in {STATE_ROOT}")
 
+    if deferred_count:
+        print(
+            f"reap: budget exhausted ({reap_budget:.0f}s); deferred {deferred_count} candidate(s) — "
+            "next invocation resumes"
+        )
+
     prefix = "[dry-run] " if dry_run else ""
     print(
         f"{prefix}reap done: died={died_count} killed={killed_count} "
         f"skipped={skipped_count} collected={gc_count} "
         f"orphaned_scratch={orphaned_scratch_count} gc_skipped={gc_skipped_count} "
         f"resumed={resumed_count} logs_collected={logs_collected_count} "
-        f"orphan_procs_killed={orphan_procs_killed} orphan_procs_skipped={orphan_procs_skipped}"
+        f"orphan_procs_killed={orphan_procs_killed} orphan_procs_skipped={orphan_procs_skipped} "
+        f"deferred={deferred_count}"
     )
     return 0
 
@@ -5838,6 +5927,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "float, must be finite and > 0); independent of --min-age-hours and "
         "--log-min-age-hours; default from AGENT_RUN_ORPHAN_MIN_AGE_HOURS "
         "or 24h.  Parsed and validated even when --orphan-processes is absent.",
+    )
+    sp_reap.add_argument(
+        "--max-seconds",
+        type=_positive_finite_float,
+        default=None,
+        metavar="N",
+        dest="max_seconds",
+        help="wall-clock budget for the entire reap invocation (seconds, float, "
+        "must be finite and > 0); when exceeded, remaining candidates in any pass "
+        "are deferred and a count is printed; exit 0 so the next timer tick resumes. "
+        "Default from AGENT_RUN_REAP_MAX_SECONDS, or 600 s (10 min, comfortably "
+        "under the 30-minute systemd timer period).",
     )
     sp_reap.set_defaults(func=cmd_reap)
 
