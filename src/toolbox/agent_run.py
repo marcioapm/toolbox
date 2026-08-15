@@ -3763,6 +3763,19 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 deferred_count += 1
                 continue
             age_h = (now - cand.start_time) / 3600
+
+            # Dry-run: report the action without acquiring the lock or creating
+            # any files under STATE_ROOT.  All other passes skip on dry_run before
+            # locking; pass 4 must do the same so a preview run neither serialises
+            # against a concurrent launch nor creates .locks entries.
+            if dry_run:
+                print(
+                    f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
+                    "dry-run (would TERM)"
+                )
+                orphan_procs_killed += 1
+                continue
+
             # Re-verify under the per-name lock: serializes with a concurrent
             # launch that may have just created a state dir for this name.
             with _launch_lock(cand.name):
@@ -3798,14 +3811,6 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     pgid = None
 
                 pgid_note = f" pgid={pgid}" if use_group and pgid is not None else " (pid only — pgid mismatch)"
-
-                if dry_run:
-                    print(
-                        f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
-                        f"dry-run (would TERM{pgid_note})"
-                    )
-                    orphan_procs_killed += 1
-                    continue
 
                 # Phase 1: SIGTERM under the lock, then release to let grace run
                 # concurrently with other candidates.

@@ -205,6 +205,36 @@ class TestDryRun:
         assert _summary_field(line, "orphan_procs_killed") == 1
         assert _summary_field(line, "orphan_procs_skipped") == 0
 
+    def test_dry_run_leaves_state_root_unchanged(
+        self, isolated_runs_root, orphan_harness, capsys
+    ):
+        """--dry-run must not create any files or directories under STATE_ROOT.
+
+        _launch_lock creates STATE_ROOT/.locks/<name>.lock; the dry-run branch
+        must skip lock acquisition entirely so a preview run mutates nothing."""
+        entry = _make_proc_entry(9101, "dryrootprobe")
+        _make_log_dir("dryrootprobe")
+        orphan_harness([entry])
+
+        def _tree(root):
+            """Sorted relative paths of everything under root."""
+            paths = []
+            for p in sorted(root.rglob("*")):
+                paths.append(str(p.relative_to(root)))
+            return paths
+
+        before = _tree(isolated_runs_root)
+        cmd_reap(_reap_args(dry_run=True, orphan_processes=True))
+        after = _tree(isolated_runs_root)
+
+        assert before == after, (
+            f"STATE_ROOT changed during --dry-run:\n"
+            f"  before: {before}\n"
+            f"  after:  {after}"
+        )
+        line = _extract_summary(capsys)
+        assert _summary_field(line, "orphan_procs_killed") == 1
+
 
 # ---------------------------------------------------------------------------
 # TERM sent, process dies within grace → no KILL
