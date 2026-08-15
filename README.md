@@ -579,7 +579,7 @@ unmodified and never dispatched as a subcommand: `agent-run mytask -- list
 foo` launches the command `list foo`, it does not run `agent-run list`. A
 flag typed after the name without `--` (e.g. `agent-run build --foo`) is
 still rejected, since it would otherwise silently become `argv[0]`; the
-error now also suggests using `--`.
+error names the offending token and points at `--`.
 
 ### Inspect / control
 
