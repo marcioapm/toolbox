@@ -591,12 +591,18 @@ class TestOrphanMinAgeHours:
         _make_log_dir("youngrun")
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        monkeypatch.setattr(os, "kill", lambda *_a: None)
+        # Patch identity so the entry would be signalled if it reached pass 4;
+        # only the too_young skip in _find_orphan_runners keeps it safe.
+        monkeypatch.setattr(agent_run, "_process_identity",
+                            lambda p: f"darwin:{p}-test-identity")
 
         # threshold=1h, process is only 60s old → skip
         cmd_reap(_reap_args(orphan_processes=True, orphan_min_age_hours=1.0))
-        line = _extract_summary(capsys)
+        out = capsys.readouterr().out
+        line = next((l for l in out.splitlines() if "reap done:" in l), "")
         assert _summary_field(line, "orphan_procs_killed") == 0
+        assert _summary_field(line, "orphan_procs_skipped") == 1
+        assert "skipped: too_young" in out
 
     def test_orphan_min_age_hours_flag_parsed_without_orphan_processes(
         self, isolated_runs_root, monkeypatch, capsys
