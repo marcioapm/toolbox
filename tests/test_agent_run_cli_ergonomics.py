@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -410,23 +411,6 @@ class TestDuJson:
 # ---------------------------------------------------------------------------
 
 class TestDashDashSeparator:
-    def test_flags_name_dashdash_command_with_dash_laden_args(self, monkeypatch):
-        captured = {}
-        monkeypatch.setattr(
-            agent_run, "cmd_launch", lambda args: captured.update(vars(args)) or 0
-        )
-
-        rc = agent_run.main(
-            ["-i", "mytask", "--", "claude", "--permission-mode", "bypassPermissions", "--print"]
-        )
-
-        assert rc == 0
-        assert captured["name"] == "mytask"
-        assert captured["command"] == [
-            "claude", "--permission-mode", "bypassPermissions", "--print",
-        ]
-        assert captured["interactive"] is True
-
     def test_error_when_name_missing_before_dashdash(self):
         with pytest.raises(SystemExit) as exc:
             agent_run.main(["--", "echo", "hi"])
@@ -438,127 +422,73 @@ class TestDashDashSeparator:
             agent_run.main(["mytask", "--"])
         assert "empty command" in str(exc.value)
 
-    def test_no_subcommand_dispatch_after_dashdash(self, monkeypatch):
-        captured = {}
-        monkeypatch.setattr(
-            agent_run, "cmd_launch", lambda args: captured.update(vars(args)) or 0
-        )
-
-        rc = agent_run.main(["mytask", "--", "list", "foo"])
-
-        assert rc == 0
-        assert captured["name"] == "mytask"
-        assert captured["command"] == ["list", "foo"]
-
-    def test_literal_dashdash_expressible_after_separator(self, monkeypatch):
-        captured = {}
-        monkeypatch.setattr(
-            agent_run, "cmd_launch", lambda args: captured.update(vars(args)) or 0
-        )
-
-        rc = agent_run.main(["mytask", "--", "foo", "--", "bar"])
-
-        assert rc == 0
-        assert captured["command"] == ["foo", "--", "bar"]
-
-    def test_existing_no_dashdash_behavior_unchanged_plain_command(self, monkeypatch):
-        captured = {}
-        monkeypatch.setattr(
-            agent_run, "cmd_launch", lambda args: captured.update(vars(args)) or 0
-        )
-
-        rc = agent_run.main(["mytask", "echo", "hi"])
-
-        assert rc == 0
-        assert captured["name"] == "mytask"
-        assert captured["command"] == ["echo", "hi"]
-
     def test_existing_flag_after_name_without_dashdash_still_rejected(self):
         with pytest.raises(SystemExit) as exc:
             agent_run.main(["mytask", "--foo"])
         msg = str(exc.value)
         assert "looks like an agent-run flag" in msg
-        assert "--" in msg  # now also suggests the separator
-
-    def test_dashdash_command_leading_dash_token_not_rejected(self, monkeypatch):
-        """Before `--`, a leading-dash command token is rejected; after it,
-        it must be accepted verbatim."""
-        captured = {}
-        monkeypatch.setattr(
-            agent_run, "cmd_launch", lambda args: captured.update(vars(args)) or 0
-        )
-
-        rc = agent_run.main(["mytask", "--", "-not-a-flag", "--also-not"])
-
-        assert rc == 0
-        assert captured["command"] == ["-not-a-flag", "--also-not"]
-
-    def test_agent_run_flags_before_name_still_consumed_with_dashdash(self, monkeypatch):
-        captured = {}
-        monkeypatch.setattr(
-            agent_run, "cmd_launch", lambda args: captured.update(vars(args)) or 0
-        )
-
-        rc = agent_run.main(
-            ["--echo", "--idle-timeout", "30", "mytask", "--", "some-cmd", "--flag"]
-        )
-
-        assert rc == 0
-        assert captured["echo"] is True
-        assert captured["idle_timeout"] == 30.0
-        assert captured["name"] == "mytask"
-        assert captured["command"] == ["some-cmd", "--flag"]
+        assert "--" in msg
 
 
 # ---------------------------------------------------------------------------
 # BUN_TMPDIR export alongside TMPDIR
 # ---------------------------------------------------------------------------
 
+def _run_and_read_log(
+    state_root: Path,
+    log_root: Path,
+    name: str,
+    script: str,
+    timeout: float = 10.0,
+) -> str:
+    """Launch ``python -c script`` as ``name``, wait for a terminal status,
+    and return the captured log contents."""
+    args = argparse.Namespace(
+        name=name,
+        command=[sys.executable, "-c", script],
+        interactive=False,
+        prompt_file=None,
+        echo=False,
+        echo_interval=2.0,
+        submit_mode=None,
+    )
+    rc = agent_run.cmd_launch(args)
+    assert rc == 0
+
+    state_dir = state_root / name
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            status = (state_dir / "status").read_text().strip()
+        except FileNotFoundError:
+            status = ""
+        if status in {"done", "failed"}:
+            break
+        time.sleep(0.05)
+
+    log_path = log_root / name / "log"
+    deadline = time.monotonic() + timeout
+    content = ""
+    while time.monotonic() < deadline:
+        if log_path.exists():
+            content = log_path.read_text()
+            if content:
+                break
+        time.sleep(0.05)
+    return content
+
+
 class TestBunTmpdirExport:
     def test_bun_tmpdir_equals_tmpdir_equals_scratch_dir(
         self, isolated_runs_root, isolated_log_root
     ):
         name = "buntmpdirrun"
-        args = argparse.Namespace(
-            name=name,
-            command=[
-                sys.executable, "-c",
-                "import os, sys; sys.stdout.write(os.environ.get('TMPDIR', '<unset>') + "
-                "'|' + os.environ.get('BUN_TMPDIR', '<unset>'))",
-            ],
-            interactive=False,
-            prompt_file=None,
-            echo=False,
-            echo_interval=2.0,
-            submit_mode=None,
+        script = (
+            "import os, sys; sys.stdout.write("
+            "os.environ.get('TMPDIR', '<unset>') + '|' + "
+            "os.environ.get('BUN_TMPDIR', '<unset>'))"
         )
-        rc = agent_run.cmd_launch(args)
-        assert rc == 0
-
-        state_dir = isolated_runs_root / name
-        deadline_ok = False
-        import time as _time
-        deadline = _time.monotonic() + 10
-        while _time.monotonic() < deadline:
-            try:
-                status = (state_dir / "status").read_text().strip()
-            except FileNotFoundError:
-                status = ""
-            if status in {"done", "failed"}:
-                deadline_ok = True
-                break
-            _time.sleep(0.05)
-        assert deadline_ok
-
-        log_path = isolated_log_root / name / "log"
-        deadline = _time.monotonic() + 10
-        content = ""
-        while _time.monotonic() < deadline:
-            if log_path.exists():
-                content = log_path.read_text()
-                if content:
-                    break
-            _time.sleep(0.05)
+        content = _run_and_read_log(isolated_runs_root, isolated_log_root, name, script)
 
         expected_scratch = str(isolated_log_root / name / "tmp")
         tmpdir_seen, bun_tmpdir_seen = content.strip().split("|")
@@ -570,42 +500,8 @@ class TestBunTmpdirExport:
     ):
         monkeypatch.setenv("BUN_TMPDIR", "/some/ambient/bun/tmpdir")
         name = "buntmpdiroverride"
-        args = argparse.Namespace(
-            name=name,
-            command=[
-                sys.executable, "-c",
-                "import os, sys; sys.stdout.write(os.environ.get('BUN_TMPDIR', '<unset>'))",
-            ],
-            interactive=False,
-            prompt_file=None,
-            echo=False,
-            echo_interval=2.0,
-            submit_mode=None,
-        )
-        rc = agent_run.cmd_launch(args)
-        assert rc == 0
-
-        state_dir = isolated_runs_root / name
-        import time as _time
-        deadline = _time.monotonic() + 10
-        while _time.monotonic() < deadline:
-            try:
-                status = (state_dir / "status").read_text().strip()
-            except FileNotFoundError:
-                status = ""
-            if status in {"done", "failed"}:
-                break
-            _time.sleep(0.05)
-
-        log_path = isolated_log_root / name / "log"
-        deadline = _time.monotonic() + 10
-        content = ""
-        while _time.monotonic() < deadline:
-            if log_path.exists():
-                content = log_path.read_text()
-                if content:
-                    break
-            _time.sleep(0.05)
+        script = "import os, sys; sys.stdout.write(os.environ.get('BUN_TMPDIR', '<unset>'))"
+        content = _run_and_read_log(isolated_runs_root, isolated_log_root, name, script)
 
         expected_scratch = str(isolated_log_root / name / "tmp")
         assert content.strip() == expected_scratch
@@ -745,13 +641,6 @@ class TestParseLaunchArgv:
             self._parse(["--submit-mode=lf", "myrun", "cmd"])
         assert str(exc.value) == "agent-run: --submit-mode must be cr or crlf"
 
-    def test_error_name_missing_before_dashdash(self):
-        with pytest.raises(agent_run._LaunchArgvError) as exc:
-            self._parse(["--", "echo", "hi"])
-        msg = str(exc.value)
-        assert "before" in msg
-        assert "--" in msg
-
     def test_error_name_missing_before_dashdash_exact(self):
         with pytest.raises(agent_run._LaunchArgvError) as exc:
             self._parse(["--", "echo"])
@@ -759,12 +648,6 @@ class TestParseLaunchArgv:
             "agent-run: the run name must appear before '--'; shape is "
             "'agent-run [flags] NAME -- <command> [args...]'"
         )
-
-    def test_error_empty_command_after_dashdash(self):
-        with pytest.raises(agent_run._LaunchArgvError) as exc:
-            self._parse(["myrun", "--"])
-        msg = str(exc.value)
-        assert "empty command" in msg
 
     def test_error_empty_command_after_dashdash_exact(self):
         with pytest.raises(agent_run._LaunchArgvError) as exc:
@@ -869,6 +752,25 @@ class TestParseLaunchArgv:
         (
             ["myrun", "--", "list", "foo"],
             dict(interactive=False, name="myrun", command=["list", "foo"],
+                 echo=False, echo_interval=2.0, submit_mode=None,
+                 idle_timeout=None, prompt_file=None),
+        ),
+        (
+            ["myrun", "--", "foo", "--", "bar"],
+            dict(interactive=False, name="myrun", command=["foo", "--", "bar"],
+                 echo=False, echo_interval=2.0, submit_mode=None,
+                 idle_timeout=None, prompt_file=None),
+        ),
+        (
+            ["myrun", "--", "-not-a-flag", "--also-not"],
+            dict(interactive=False, name="myrun", command=["-not-a-flag", "--also-not"],
+                 echo=False, echo_interval=2.0, submit_mode=None,
+                 idle_timeout=None, prompt_file=None),
+        ),
+        (
+            ["-i", "mytask", "--", "claude", "--permission-mode", "bypassPermissions", "--print"],
+            dict(interactive=True, name="mytask",
+                 command=["claude", "--permission-mode", "bypassPermissions", "--print"],
                  echo=False, echo_interval=2.0, submit_mode=None,
                  idle_timeout=None, prompt_file=None),
         ),

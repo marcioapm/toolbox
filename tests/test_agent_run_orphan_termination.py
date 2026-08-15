@@ -129,6 +129,42 @@ def _summary_field(line: str, field: str) -> int:
     raise KeyError(f"field {field!r} not found in: {line!r}")
 
 
+@pytest.fixture
+def orphan_harness(monkeypatch):
+    """Return a setup callable that installs the standard orphan-test stubs.
+
+    Usage::
+
+        def test_something(isolated_runs_root, orphan_harness, capsys):
+            entry = _make_proc_entry(...)
+            signals = orphan_harness([entry])
+            cmd_reap(_reap_args(orphan_processes=True))
+            assert (pid, signal.SIGTERM) in signals
+
+    ``alive`` may be a bool (constant) or a zero-argument callable returning
+    bool (stateful).  ``pgid_offset`` controls ``getpgid`` return value.
+    """
+    def setup(entries, *, identity=None, alive=True, pgid_offset=1):
+        sent: List[Tuple[int, int]] = []
+        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: entries)
+        monkeypatch.setattr(
+            agent_run, "_process_identity",
+            identity if identity is not None
+            else (lambda p: f"darwin:{p}-test-identity"),
+        )
+        monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
+        monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
+        monkeypatch.setattr(
+            agent_run, "_pid_alive",
+            lambda _p: (alive() if callable(alive) else alive),
+        )
+        monkeypatch.setattr(os, "getpgid", lambda p: p + pgid_offset)
+        monkeypatch.setattr(os, "kill", lambda p, s: sent.append((p, s)))
+        monkeypatch.setattr(os, "killpg", lambda g, s: sent.append((-g, s)))
+        return sent
+    return setup
+
+
 # ---------------------------------------------------------------------------
 # --orphan-processes absent → behaviour byte-identical to today
 # ---------------------------------------------------------------------------
@@ -155,32 +191,16 @@ class TestOrphanProcessesAbsent:
 # ---------------------------------------------------------------------------
 
 class TestDryRun:
-    def test_dry_run_sends_no_signals(self, isolated_runs_root, monkeypatch, capsys):
+    def test_dry_run_sends_no_signals_and_increments_killed(
+        self, isolated_runs_root, orphan_harness, capsys
+    ):
         entry = _make_proc_entry(9100, "dryrun")
         _make_log_dir("dryrun")
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity",
-                            lambda pid: f"darwin:{pid}-test-identity")
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-
-        signals_sent: List[Tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill", lambda pid, sig: signals_sent.append((pid, sig)))
-        monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals_sent.append((-pgid, sig)))
+        signals = orphan_harness([entry])
 
         cmd_reap(_reap_args(dry_run=True, orphan_processes=True))
-        assert not signals_sent
 
-    def test_dry_run_counter_increments(self, isolated_runs_root, monkeypatch, capsys):
-        entry = _make_proc_entry(9101, "drycount")
-        _make_log_dir("drycount")
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity",
-                            lambda pid: f"darwin:{pid}-test-identity")
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        monkeypatch.setattr(os, "kill", lambda *_a: None)
-        monkeypatch.setattr(os, "killpg", lambda *_a: None)
-
-        cmd_reap(_reap_args(dry_run=True, orphan_processes=True))
+        assert not signals
         line = _extract_summary(capsys)
         assert _summary_field(line, "orphan_procs_killed") == 1
         assert _summary_field(line, "orphan_procs_skipped") == 0
@@ -192,60 +212,32 @@ class TestDryRun:
 
 class TestTermGrace:
     def test_term_sent_dies_within_grace_no_kill(
-        self, isolated_runs_root, monkeypatch, capsys
+        self, isolated_runs_root, monkeypatch, orphan_harness, capsys
     ):
         pid = 9200
         entry = _make_proc_entry(pid, "gracerun")
         _make_log_dir("gracerun")
         identity = f"darwin:{pid}-test-identity"
 
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity", lambda p: identity)
-        monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.1)
-        monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-
-        signals_sent: List[Tuple[int, int]] = []
-        alive = [True]  # mutable so the closure can set it
+        alive = [True]
 
         def fake_kill(p, sig):
             signals_sent.append((p, sig))
             if sig == signal.SIGTERM:
                 alive[0] = False  # process "dies" immediately on TERM
 
+        signals_sent = orphan_harness(
+            [entry],
+            identity=lambda p: identity,
+            alive=lambda: alive[0],
+        )
+        # Re-patch kill after harness to also flip alive on SIGTERM.
         monkeypatch.setattr(os, "kill", fake_kill)
-        monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals_sent.append((-pgid, sig)))
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: alive[0])
-        # pgid != pid → signal pid only
-        monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
 
         cmd_reap(_reap_args(orphan_processes=True))
         sigs = [sig for _p, sig in signals_sent]
         assert signal.SIGTERM in sigs
         assert signal.SIGKILL not in sigs
-
-    def test_term_killed_counter(self, isolated_runs_root, monkeypatch, capsys):
-        pid = 9201
-        entry = _make_proc_entry(pid, "gracecount")
-        _make_log_dir("gracecount")
-        identity = f"darwin:{pid}-test-identity"
-
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity", lambda p: identity)
-        monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.1)
-        monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-
-        alive = [True]
-
-        def fake_kill(p, sig):
-            if sig == signal.SIGTERM:
-                alive[0] = False
-
-        monkeypatch.setattr(os, "kill", fake_kill)
-        monkeypatch.setattr(os, "killpg", lambda *_a: None)
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: alive[0])
-        monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
-
-        cmd_reap(_reap_args(orphan_processes=True))
         line = _extract_summary(capsys)
         assert _summary_field(line, "orphan_procs_killed") == 1
 
@@ -256,48 +248,22 @@ class TestTermGrace:
 
 class TestTermKillEscalation:
     def test_term_survives_grace_kill_follows(
-        self, isolated_runs_root, monkeypatch, capsys
+        self, isolated_runs_root, orphan_harness, capsys
     ):
         pid = 9300
         entry = _make_proc_entry(pid, "stubborn")
         _make_log_dir("stubborn")
         identity = f"darwin:{pid}-test-identity"
 
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity", lambda p: identity)
-        monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
-        monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-
-        signals_sent: List[Tuple[int, int]] = []
-
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: signals_sent.append((p, sig)))
-        monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals_sent.append((-pgid, sig)))
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)  # never dies
-        monkeypatch.setattr(os, "getpgid", lambda p: p + 1)  # pgid != pid
-
+        signals = orphan_harness(
+            [entry],
+            identity=lambda p: identity,
+            alive=True,  # never dies
+        )
         cmd_reap(_reap_args(orphan_processes=True))
-        sigs = [sig for _p, sig in signals_sent]
+        sigs = [sig for _p, sig in signals]
         assert signal.SIGTERM in sigs
         assert signal.SIGKILL in sigs
-
-    def test_kill_after_grace_counted(self, isolated_runs_root, monkeypatch, capsys):
-        pid = 9301
-        entry = _make_proc_entry(pid, "stubborn2")
-        _make_log_dir("stubborn2")
-        identity = f"darwin:{pid}-test-identity"
-
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity", lambda p: identity)
-        monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
-        monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-
-        monkeypatch.setattr(os, "kill", lambda *_a: None)
-        monkeypatch.setattr(os, "killpg", lambda *_a: None)
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
-
-        cmd_reap(_reap_args(orphan_processes=True))
         line = _extract_summary(capsys)
         assert _summary_field(line, "orphan_procs_killed") == 1
 
@@ -308,7 +274,7 @@ class TestTermKillEscalation:
 
 class TestIdentityChanged:
     def test_identity_changed_aborts_candidate(
-        self, isolated_runs_root, monkeypatch, capsys
+        self, isolated_runs_root, orphan_harness, capsys
     ):
         pid = 9400
         original_identity = f"darwin:{pid}-original"
@@ -316,32 +282,14 @@ class TestIdentityChanged:
         entry = _make_proc_entry(pid, "recycled", identity=original_identity)
         _make_log_dir("recycled")
 
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
         # _process_identity returns a different token every call (PID recycled).
-        monkeypatch.setattr(agent_run, "_process_identity", lambda p: new_identity)
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-
-        signals_sent: List[Tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: signals_sent.append((p, sig)))
-        monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals_sent.append((-pgid, sig)))
-
+        signals = orphan_harness(
+            [entry],
+            identity=lambda p: new_identity,
+            alive=True,
+        )
         cmd_reap(_reap_args(orphan_processes=True))
-        assert not signals_sent
-
-    def test_identity_changed_counted_skipped(
-        self, isolated_runs_root, monkeypatch, capsys
-    ):
-        pid = 9401
-        entry = _make_proc_entry(pid, "recycled2", identity=f"darwin:{pid}-orig")
-        _make_log_dir("recycled2")
-
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity", lambda p: f"darwin:{p}-new")
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        monkeypatch.setattr(os, "kill", lambda *_a: None)
-
-        cmd_reap(_reap_args(orphan_processes=True))
+        assert not signals
         line = _extract_summary(capsys)
         assert _summary_field(line, "orphan_procs_skipped") == 1
         assert _summary_field(line, "orphan_procs_killed") == 0
@@ -353,44 +301,20 @@ class TestIdentityChanged:
 
 class TestStateDirReappeared:
     def test_state_dir_reappeared_skipped(
-        self, isolated_runs_root, monkeypatch, capsys
+        self, isolated_runs_root, orphan_harness, capsys
     ):
         pid = 9500
         name = "reappeared"
         entry = _make_proc_entry(pid, name)
         _make_log_dir(name)
 
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity",
-                            lambda p: f"darwin:{p}-test-identity")
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        signals = orphan_harness([entry], alive=True)
 
         # Create the state dir so it "reappears" before the lock.
         (isolated_runs_root / name).mkdir(parents=True, exist_ok=True)
 
-        signals_sent: List[Tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: signals_sent.append((p, sig)))
-
         cmd_reap(_reap_args(orphan_processes=True))
-        assert not signals_sent
-
-    def test_state_dir_reappeared_counted_skipped(
-        self, isolated_runs_root, monkeypatch, capsys
-    ):
-        pid = 9501
-        name = "reappeared2"
-        entry = _make_proc_entry(pid, name)
-        _make_log_dir(name)
-
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity",
-                            lambda p: f"darwin:{p}-test-identity")
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        (isolated_runs_root / name).mkdir(parents=True, exist_ok=True)
-        monkeypatch.setattr(os, "kill", lambda *_a: None)
-
-        cmd_reap(_reap_args(orphan_processes=True))
+        assert not signals
         line = _extract_summary(capsys)
         assert _summary_field(line, "orphan_procs_skipped") == 1
 
@@ -441,62 +365,37 @@ class TestStateDirReappeared:
 
 class TestPgidMismatch:
     def test_pgid_ne_pid_signals_pid_only(
-        self, isolated_runs_root, monkeypatch, capsys
+        self, isolated_runs_root, monkeypatch, orphan_harness, capsys
     ):
         pid = 9600
         entry = _make_proc_entry(pid, "pgidrun")
         _make_log_dir("pgidrun")
         identity = f"darwin:{pid}-test-identity"
 
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity", lambda p: identity)
-        monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
-        monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-
-        # pgid != pid → must not kill group.
-        monkeypatch.setattr(os, "getpgid", lambda p: p + 99)
-
-        kill_calls: List[Tuple[int, int]] = []
-        killpg_calls: List[Tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: kill_calls.append((p, sig)))
-        monkeypatch.setattr(os, "killpg",
-                            lambda pgid, sig: killpg_calls.append((pgid, sig)))
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        # harness installs pgid_offset=1 (pgid != pid); override to +99 to be explicit.
+        signals = orphan_harness([entry], identity=lambda p: identity, alive=True, pgid_offset=99)
 
         cmd_reap(_reap_args(orphan_processes=True))
         # Signals must go to the pid, not a process group.
-        assert any(p == pid for p, _ in kill_calls)
-        assert not killpg_calls
+        # harness encodes kill(p, s) as (p, s) and killpg(g, s) as (-g, s).
+        assert any(p == pid for p, _ in signals)
+        assert all(p >= 0 for p, _ in signals), "no killpg calls expected"
 
     def test_pgid_eq_pid_signals_group(
-        self, isolated_runs_root, monkeypatch, capsys
+        self, isolated_runs_root, monkeypatch, orphan_harness, capsys
     ):
         pid = 9601
-        # Set pgid=pid: the entry is a group leader (its own pgid != self_pgid=0).
+        # Set pgid=pid in entry: the entry is a group leader.
         entry = _make_proc_entry(pid, "pgidsession", pgid=pid)
         _make_log_dir("pgidsession")
         identity = f"darwin:{pid}-test-identity"
 
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
-        monkeypatch.setattr(agent_run, "_process_identity", lambda p: identity)
-        monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
-        monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-
-        # pgid == pid at runtime → runner is a session leader, kill the group.
-        monkeypatch.setattr(os, "getpgid", lambda p: p)
-
-        kill_calls: List[Tuple[int, int]] = []
-        killpg_calls: List[Tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: kill_calls.append((p, sig)))
-        monkeypatch.setattr(os, "killpg",
-                            lambda pgid, sig: killpg_calls.append((pgid, sig)))
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        # harness pgid_offset=0 means getpgid returns p + 0 == p.
+        signals = orphan_harness([entry], identity=lambda p: identity, alive=True, pgid_offset=0)
 
         cmd_reap(_reap_args(orphan_processes=True))
-        # killpg must have been used, not bare kill, for the group.
-        assert any(pgid == pid for pgid, _ in killpg_calls)
+        # killpg must have been used (encoded as (-g, s) where g>0).
+        assert any(p < 0 for p, _ in signals), "killpg call expected"
 
 
 # ---------------------------------------------------------------------------
@@ -530,20 +429,12 @@ class TestSummaryCounters:
                 )
 
     def test_multiple_candidates_counted_correctly(
-        self, isolated_runs_root, monkeypatch, capsys
+        self, isolated_runs_root, orphan_harness, capsys
     ):
         entries = [_make_proc_entry(9700 + i, f"multi{i}") for i in range(3)]
         for i in range(3):
             _make_log_dir(f"multi{i}")
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: entries)
-        monkeypatch.setattr(agent_run, "_process_identity",
-                            lambda pid: f"darwin:{pid}-test-identity")
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
-        monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-        monkeypatch.setattr(os, "kill", lambda *_a: None)
-        monkeypatch.setattr(os, "killpg", lambda *_a: None)
-        monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
+        orphan_harness(entries)
 
         cmd_reap(_reap_args(orphan_processes=True))
         line = _extract_summary(capsys)
@@ -556,7 +447,7 @@ class TestSummaryCounters:
 
 class TestNameTargeting:
     def test_name_targets_only_matching_run(
-        self, isolated_runs_root, monkeypatch, capsys
+        self, isolated_runs_root, orphan_harness, capsys
     ):
         entries = [
             _make_proc_entry(9800, "run-a"),
@@ -564,15 +455,7 @@ class TestNameTargeting:
         ]
         _make_log_dir("run-a")
         # run-b is filtered by name_mismatch before log-dir check, so no log_dir needed.
-        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: entries)
-        monkeypatch.setattr(agent_run, "_process_identity",
-                            lambda pid: f"darwin:{pid}-test-identity")
-        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
-        monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-        monkeypatch.setattr(os, "kill", lambda *_a: None)
-        monkeypatch.setattr(os, "killpg", lambda *_a: None)
-        monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
+        orphan_harness(entries)
 
         cmd_reap(_reap_args(orphan_processes=True, name="run-a"))
         line = _extract_summary(capsys)
@@ -670,14 +553,6 @@ class TestDiscoveryRefusals:
 # ---------------------------------------------------------------------------
 
 class TestOrphanMinAgeHours:
-    def test_default_is_24h(self, monkeypatch):
-        monkeypatch.delenv("AGENT_RUN_ORPHAN_MIN_AGE_HOURS", raising=False)
-        assert _parse_orphan_min_age_seconds() == pytest.approx(24 * 3600)
-
-    def test_env_override(self, monkeypatch):
-        monkeypatch.setenv("AGENT_RUN_ORPHAN_MIN_AGE_HOURS", "48")
-        assert _parse_orphan_min_age_seconds() == pytest.approx(48 * 3600)
-
     def test_flag_overrides_env(self, isolated_runs_root, monkeypatch, capsys):
         """--orphan-min-age-hours flag takes precedence over the env var."""
         now = time.time()
@@ -722,18 +597,6 @@ class TestOrphanMinAgeHours:
         cmd_reap(_reap_args(orphan_processes=True, orphan_min_age_hours=1.0))
         line = _extract_summary(capsys)
         assert _summary_field(line, "orphan_procs_killed") == 0
-
-    def test_independent_of_min_age_hours(self, monkeypatch):
-        """Changing AGENT_RUN_MIN_AGE_HOURS must not affect the orphan threshold."""
-        monkeypatch.setenv("AGENT_RUN_MIN_AGE_HOURS", "1")
-        monkeypatch.delenv("AGENT_RUN_ORPHAN_MIN_AGE_HOURS", raising=False)
-        assert _parse_orphan_min_age_seconds() == pytest.approx(24 * 3600)
-
-    def test_independent_of_log_min_age_hours(self, monkeypatch):
-        """Changing AGENT_RUN_LOG_MIN_AGE_HOURS must not affect the orphan threshold."""
-        monkeypatch.setenv("AGENT_RUN_LOG_MIN_AGE_HOURS", "1")
-        monkeypatch.delenv("AGENT_RUN_ORPHAN_MIN_AGE_HOURS", raising=False)
-        assert _parse_orphan_min_age_seconds() == pytest.approx(24 * 3600)
 
     def test_orphan_min_age_hours_flag_parsed_without_orphan_processes(
         self, isolated_runs_root, monkeypatch, capsys

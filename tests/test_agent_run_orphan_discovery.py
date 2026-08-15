@@ -7,7 +7,7 @@ or killed.  The helpers under test:
   _find_orphan_runners
   _parse_orphan_min_age_seconds
   _scan_process_table (pid-vanishing race only)
-  _darwin_lstart_normalise
+  _darwin_lstart_normalize
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from toolbox.agent_run import (
     _OrphanCandidate,
     _OrphanSkip,
     _argv_is_agent_run_runner,
-    _darwin_lstart_normalise,
+    _darwin_lstart_normalize,
     _run_name_from_argv,
     _find_orphan_runners,
     _parse_orphan_min_age_seconds,
@@ -110,144 +110,69 @@ def _find(
 # _argv_is_agent_run_runner — identification
 # ---------------------------------------------------------------------------
 
-class TestArgvIsAgentRunRunner:
-    def test_bare_agent_run(self):
-        assert _argv_is_agent_run_runner(["agent-run", "myrun", "cmd"]) is True
+# ---------------------------------------------------------------------------
+# _argv_is_agent_run_runner — identification
+# ---------------------------------------------------------------------------
 
-    def test_absolute_path_agent_run(self):
-        assert _argv_is_agent_run_runner(["/usr/local/bin/agent-run", "myrun", "cmd"]) is True
+@pytest.mark.parametrize("argv,expected", [
+    (["agent-run", "myrun", "cmd"], True),
+    (["/usr/local/bin/agent-run", "myrun", "cmd"], True),
+    (["python3", "/usr/local/bin/agent-run", "myrun", "cmd"], True),
+    (["python", "/opt/bin/agent-run", "myrun"], True),
+    (["python3", "-u", "/path/agent-run", "myrun", "cmd"], True),
+    (["/bin/bash", "-lc", "cat /var/tmp/agent-runs/myrun/log false"], False),
+    (["grep", "agent-run", "/var/log/syslog"], False),
+    (["vim", "/var/tmp/agent-runs/myrun/log"], False),
+    ([], False),
+    (["tail", "-f", "/var/tmp/agent-runs/something/log"], False),
+    (["sh", "-c", "echo agent-run"], False),
+    (["/usr/bin/agent-runner"], False),
+    (["python3", "-u", "-O"], False),
+])
+def test_argv_is_agent_run_runner(argv, expected):
+    assert _argv_is_agent_run_runner(argv) is expected
 
-    def test_python_wrapped(self):
-        assert _argv_is_agent_run_runner(
-            ["python3", "/usr/local/bin/agent-run", "myrun", "cmd"]
-        ) is True
 
-    def test_python_wrapped_no_suffix(self):
-        assert _argv_is_agent_run_runner(
-            ["python", "/opt/bin/agent-run", "myrun"]
-        ) is True
+def test_bash_lc_cat_log_is_not_runner():
+    """bash -lc 'cat /var/tmp/agent-runs/foo/log' must return False.
 
-    def test_python_with_dash_u_flag(self):
-        assert _argv_is_agent_run_runner(
-            ["python3", "-u", "/path/agent-run", "myrun", "cmd"]
-        ) is True
-
-    # The false-positive that must never match.
-    def test_bash_lc_cat_log_is_not_runner(self):
-        """bash -lc 'cat /var/tmp/agent-runs/foo/log' must return False.
-
-        This exact argv exists on production hosts and must never be treated
-        as a runner — killing it would destroy unrelated work.
-        """
-        argv = ["bash", "-lc", "cat /var/tmp/agent-runs/foo/log"]
-        assert _argv_is_agent_run_runner(argv) is False
-
-    def test_bash_lc_cat_log_false(self):
-        # Variant with double quotes rendered as a single token.
-        assert _argv_is_agent_run_runner(
-            ["/bin/bash", "-lc", "cat /var/tmp/agent-runs/myrun/log false"]
-        ) is False
-
-    def test_grep_agent_run_is_not_runner(self):
-        assert _argv_is_agent_run_runner(["grep", "agent-run", "/var/log/syslog"]) is False
-
-    def test_editor_with_agent_run_file_open(self):
-        assert _argv_is_agent_run_runner(
-            ["vim", "/var/tmp/agent-runs/myrun/log"]
-        ) is False
-
-    def test_empty_argv(self):
-        assert _argv_is_agent_run_runner([]) is False
-
-    def test_tail_agent_run_log_is_not_runner(self):
-        assert _argv_is_agent_run_runner(
-            ["tail", "-f", "/var/tmp/agent-runs/something/log"]
-        ) is False
-
-    def test_agent_run_as_argument_value_is_not_runner(self):
-        # The string "agent-run" appears only inside a flag value.
-        assert _argv_is_agent_run_runner(
-            ["sh", "-c", "echo agent-run"]
-        ) is False
-
-    def test_unrelated_script_named_not_agent_run(self):
-        assert _argv_is_agent_run_runner(["/usr/bin/agent-runner"]) is False
-
-    def test_python_no_script_returns_false(self):
-        # Only flags after python, no positional script.
-        assert _argv_is_agent_run_runner(["python3", "-u", "-O"]) is False
+    This exact argv exists on production hosts and must never be treated
+    as a runner — killing it would destroy unrelated work.
+    """
+    argv = ["bash", "-lc", "cat /var/tmp/agent-runs/foo/log"]
+    assert _argv_is_agent_run_runner(argv) is False
 
 
 # ---------------------------------------------------------------------------
 # _run_name_from_argv — name recovery
 # ---------------------------------------------------------------------------
 
-class TestRunNameFromArgv:
-    def _name(self, argv):
-        return _run_name_from_argv(argv)
-
-    def test_bare_invocation(self):
-        assert self._name(["agent-run", "myrun", "claude"]) == "myrun"
-
-    def test_short_interactive_flag(self):
-        assert self._name(["agent-run", "-i", "myrun", "cmd"]) == "myrun"
-
-    def test_prompt_file_short_space(self):
-        assert self._name(["agent-run", "-f", "/p.md", "myrun", "cmd"]) == "myrun"
-
-    def test_prompt_file_long_equals(self):
-        assert self._name(["agent-run", "--prompt-file=/p.md", "myrun", "cmd"]) == "myrun"
-
-    def test_echo_bare(self):
-        assert self._name(["agent-run", "--echo", "myrun", "cmd"]) == "myrun"
-
-    def test_echo_with_interval(self):
-        assert self._name(["agent-run", "--echo=2", "myrun", "cmd"]) == "myrun"
-
-    def test_submit_mode_cr(self):
-        assert self._name(["agent-run", "--submit-mode=cr", "myrun", "cmd"]) == "myrun"
-
-    def test_submit_mode_crlf(self):
-        assert self._name(["agent-run", "--submit-mode=crlf", "myrun", "cmd"]) == "myrun"
-
-    def test_idle_timeout_space(self):
-        assert self._name(["agent-run", "--idle-timeout", "30", "myrun", "cmd"]) == "myrun"
-
-    def test_dashdash_separator(self):
-        assert self._name(["agent-run", "myrun", "--", "opencode", "--print"]) == "myrun"
-
-    def test_all_flags_combined(self):
-        assert self._name([
-            "agent-run", "-i", "-f", "/p.md", "--echo=3",
-            "--submit-mode=crlf", "--idle-timeout", "60",
-            "myrun", "--", "cmd",
-        ]) == "myrun"
-
-    def test_subcommand_reap_yields_none(self):
-        # agent-run reap --dry-run is a subcommand, not a launch.
-        assert self._name(["agent-run", "reap", "--dry-run"]) is None
-
-    def test_subcommand_list_yields_none(self):
-        assert self._name(["agent-run", "list"]) is None
-
-    def test_subcommand_status_yields_none(self):
-        assert self._name(["agent-run", "status", "myrun"]) is None
-
-    def test_too_few_args_yields_none(self):
-        # Only the entry-point, no name.
-        assert self._name(["agent-run"]) is None
-
-    def test_invalid_name_slash_yields_none(self):
-        assert self._name(["agent-run", "my/run", "cmd"]) is None
-
-    def test_python_wrapped_name_recovery(self):
-        assert self._name([
-            "python3", "/usr/local/bin/agent-run", "myrun", "cmd"
-        ]) == "myrun"
-
-    def test_no_agent_run_token_yields_none(self):
-        # Not a runner at all — no agent-run token in argv.
-        assert self._name(["bash", "-lc", "cat /var/tmp/agent-runs/foo/log"]) is None
+@pytest.mark.parametrize("argv,expected_name", [
+    (["agent-run", "myrun", "claude"], "myrun"),
+    (["agent-run", "-i", "myrun", "cmd"], "myrun"),
+    (["agent-run", "-f", "/p.md", "myrun", "cmd"], "myrun"),
+    (["agent-run", "--prompt-file=/p.md", "myrun", "cmd"], "myrun"),
+    (["agent-run", "--echo", "myrun", "cmd"], "myrun"),
+    (["agent-run", "--echo=2", "myrun", "cmd"], "myrun"),
+    (["agent-run", "--submit-mode=cr", "myrun", "cmd"], "myrun"),
+    (["agent-run", "--submit-mode=crlf", "myrun", "cmd"], "myrun"),
+    (["agent-run", "--idle-timeout", "30", "myrun", "cmd"], "myrun"),
+    (["agent-run", "myrun", "--", "opencode", "--print"], "myrun"),
+    ([
+        "agent-run", "-i", "-f", "/p.md", "--echo=3",
+        "--submit-mode=crlf", "--idle-timeout", "60",
+        "myrun", "--", "cmd",
+    ], "myrun"),
+    (["agent-run", "reap", "--dry-run"], None),
+    (["agent-run", "list"], None),
+    (["agent-run", "status", "myrun"], None),
+    (["agent-run"], None),
+    (["agent-run", "my/run", "cmd"], None),
+    (["python3", "/usr/local/bin/agent-run", "myrun", "cmd"], "myrun"),
+    (["bash", "-lc", "cat /var/tmp/agent-runs/foo/log"], None),
+])
+def test_run_name_from_argv(argv, expected_name):
+    assert _run_name_from_argv(argv) == expected_name
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +415,7 @@ class TestScanProcessTableRace:
 
 
 # ---------------------------------------------------------------------------
-# _darwin_lstart_normalise — whitespace canonicalisation
+# _darwin_lstart_normalize — whitespace canonicalisation
 # ---------------------------------------------------------------------------
 
 class TestDarwinLstartNormalise:
@@ -499,7 +424,7 @@ class TestDarwinLstartNormalise:
     ``ps -axo lstart=`` collapses the fixed-width kernel date format to a
     single space between tokens, while ``ps -p PID -o lstart=`` preserves the
     right-padding used for days 1-9 (e.g. ``Mon Jun  8`` — two spaces).
-    Both call sites now run through ``_darwin_lstart_normalise`` so the
+    Both call sites now run through ``_darwin_lstart_normalize`` so the
     identity tokens they produce compare equal.
     """
 
@@ -508,17 +433,17 @@ class TestDarwinLstartNormalise:
         ps -axo form (single space) after normalisation."""
         ps_p_form = "Mon Jun  8 12:29:39 2026"   # right-padded, from ps -p
         ps_axo_form = "Mon Jun 8 12:29:39 2026"   # collapsed, from ps -axo split
-        assert _darwin_lstart_normalise(ps_p_form) == _darwin_lstart_normalise(ps_axo_form)
+        assert _darwin_lstart_normalize(ps_p_form) == _darwin_lstart_normalize(ps_axo_form)
 
     def test_double_digit_day_unchanged(self):
         """Days 10-31 have no extra padding; normalisation must be a no-op."""
         lstart = "Mon Jun 12 14:00:00 2026"
-        assert _darwin_lstart_normalise(lstart) == lstart
+        assert _darwin_lstart_normalize(lstart) == lstart
 
     def test_already_normalised_idempotent(self):
         """Calling normalise on already-normalised output is idempotent."""
         lstart = "Mon Jun 8 12:29:39 2026"
-        assert _darwin_lstart_normalise(_darwin_lstart_normalise(lstart)) == lstart
+        assert _darwin_lstart_normalize(_darwin_lstart_normalize(lstart)) == lstart
 
     def test_identity_token_equality_across_ps_forms(self, monkeypatch):
         """Simulate the two ps call paths and assert identity tokens compare equal.
