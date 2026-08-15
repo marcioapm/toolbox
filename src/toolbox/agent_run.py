@@ -1619,9 +1619,22 @@ def _newest_mtime(d: Path) -> Optional[float]:
         return None
 
 
-def _newest_mtime_recursive(d: Path, cutoff: Optional[float] = None) -> Optional[float]:
-    """Newest mtime anywhere below ``d`` (including ``d`` itself), without
-    following symlinks.
+def _newest_mtime_recursive(
+    d: Path,
+    cutoff: Optional[float] = None,
+    *,
+    skip_top_dir_mtime: bool = False,
+) -> Optional[float]:
+    """Newest mtime anywhere below ``d`` (including ``d`` itself unless
+    ``skip_top_dir_mtime`` is set), without following symlinks.
+
+    When ``skip_top_dir_mtime`` is ``True`` the root directory's own mtime
+    is excluded from the result.  Pass 2.5 uses this when checking a log dir
+    immediately after pass 2 may have deleted its ``tmp/`` subdirectory:
+    removing ``tmp/`` bumps ``log_d``'s mtime to now, which would make a
+    30-day-old log appear brand-new and defer its collection by another
+    ``log_min_age_threshold``.  Ignoring the container's own mtime breaks
+    that cycle; children's mtimes still reflect actual content age.
 
     When ``cutoff`` is given, returns as soon as any entry's mtime exceeds it
     — the exact maximum is irrelevant to the caller once it is known that
@@ -1635,9 +1648,15 @@ def _newest_mtime_recursive(d: Path, cutoff: Optional[float] = None) -> Optional
     """
     try:
         top_st = os.stat(d, follow_symlinks=False)
-        newest = top_st.st_mtime
-        if cutoff is not None and newest > cutoff:
-            return newest
+        if skip_top_dir_mtime:
+            # Sentinel: any real child mtime beats this value; replaced on
+            # the first entry seen so that an empty directory still returns
+            # None (caller treats None as "cannot determine age → skip").
+            newest: Optional[float] = None
+        else:
+            newest = top_st.st_mtime
+            if cutoff is not None and newest > cutoff:
+                return newest
     except OSError:
         return None
 
@@ -1655,7 +1674,7 @@ def _newest_mtime_recursive(d: Path, cutoff: Optional[float] = None) -> Optional
             except OSError:
                 continue
             mtime = st.st_mtime
-            if mtime > newest:
+            if newest is None or mtime > newest:
                 newest = mtime
             if cutoff is not None and newest > cutoff:
                 return newest
@@ -3690,7 +3709,11 @@ def cmd_reap(args: argparse.Namespace) -> int:
             name = log_d.name
             if _path_entry_exists(_state_dir(name)):
                 continue  # state-backed — pass 2 owns this run, never race it
-            newest = _newest_mtime_recursive(log_d, cutoff=time.time() - log_min_age_threshold)
+            newest = _newest_mtime_recursive(
+                log_d,
+                cutoff=time.time() - log_min_age_threshold,
+                skip_top_dir_mtime=True,
+            )
             if newest is None:
                 continue
             age_secs = time.time() - newest

@@ -2362,3 +2362,59 @@ class TestDirSizeBytesOSError:
         # reap must complete normally; the good log is collected.
         assert rc == 0
         assert not good.exists(), "goodlog must be collected despite bad neighbour"
+
+
+# ---------------------------------------------------------------------------
+# C7: pass 2 scratch deletion must not defer same-invocation log GC
+# ---------------------------------------------------------------------------
+
+class TestLogGCAfterScratchDeletion:
+    """Deleting tmp/ in pass 2 bumps log_d's mtime to now.
+
+    _newest_mtime_recursive for pass 2.5 must ignore the top-level
+    directory's own mtime so a 30-day-old log is still eligible in the
+    same invocation as the state-dir GC that removed tmp/."""
+
+    def test_log_collected_same_invocation_as_state_with_scratch(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """A terminal run with a tmp/ scratch dir: both state and log are
+        collected in one reap --include-logs invocation."""
+        old_secs = (agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        log_age_secs = old_secs  # log older than log_min_age_threshold
+
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "c7scratch",
+            status="done",
+            ended_at_age_secs=old_secs,
+            make_scratch=True,
+        )
+        # Backdate log file and log dir to old_secs ago.
+        old_ts = time.time() - old_secs
+        for p in [ld / "log"]:
+            if p.exists():
+                os.utime(p, (old_ts, old_ts))
+        os.utime(ld, (old_ts, old_ts))
+        # Also backdate the scratch dir contents.
+        scratch = ld / "tmp"
+        for p in scratch.rglob("*"):
+            try:
+                os.utime(p, (old_ts, old_ts))
+            except OSError:
+                pass
+        os.utime(scratch, (old_ts, old_ts))
+
+        rc = agent_run.cmd_reap(_reap_args(
+            include_logs=True,
+            min_age_hours=0.001,          # state threshold: collect immediately
+            log_min_age_hours=old_secs / 3600 * 0.9,  # just under old_secs
+        ))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert not sd.exists(), "state dir must be collected by pass 2"
+        assert not ld.exists(), (
+            "log dir must be collected by pass 2.5 in the same invocation; "
+            f"output was:\n{out}"
+        )
+        assert "logs_collected=1" in out
