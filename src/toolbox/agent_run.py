@@ -20,10 +20,13 @@ log even though the ephemeral process state is gone:
                                    that a crash could lose.
     /var/tmp/agent-runs/<name>/tmp/  per-run scratch dir (mode 0700), on the
                                    same persistent disk as the log. Exported
-                                   as TMPDIR into the launched command's
-                                   environment (and therefore all of its
-                                   descendants), so agents/tools that dump
-                                   large scratch data into $TMPDIR — e.g.
+                                   as both TMPDIR and BUN_TMPDIR into the
+                                   launched command's environment (and
+                                   therefore all of its descendants) —
+                                   BUN_TMPDIR because Bun (which OpenCode
+                                   runs on) does not consult TMPDIR for its
+                                   own scratch space — so agents/tools that
+                                   dump large scratch data into $TMPDIR — e.g.
                                    OpenCode's bundled JDTLS, which leaks
                                    multi-hundred-MB Eclipse workspaces under
                                    mkdtemp() and never cleans them up — land
@@ -41,18 +44,27 @@ log even though the ephemeral process state is gone:
 
 Usage::
 
+    agent-run [flags] <name> -- <cmd...>  # recommended: explicit separator
     agent-run <name> <cmd...>            # non-interactive (one-shot)
-    agent-run -i <name> <cmd...>         # interactive (PTY-wrapped, steerable)
-    agent-run --echo <name> <cmd...>     # also render a cleaned live transcript
-    agent-run --idle-timeout N <name> <cmd...>  # self-terminate after N idle seconds
+    agent-run -i <name> -- <cmd...>      # interactive (PTY-wrapped, steerable)
+    agent-run --echo <name> -- <cmd...>  # also render a cleaned live transcript
+    agent-run --idle-timeout N <name> -- <cmd...>  # self-terminate after N idle seconds
     agent-run tail <name>                # follow log in real time
     agent-run logs <name> [N]            # last N lines (default 50)
     agent-run status <name>              # one-line status
     agent-run watch <name> [--json] [--repo PATH]  # stateless fact snapshot for pollers
     agent-run steer <name> <msg...>      # send text to agent stdin (needs -i)
     agent-run kill <name> [SIGNAL]       # TERM by default; see "kill" below
-    agent-run list [--all] [--status S]  # list runs; defaults to non-terminal only
+    agent-run list [--all] [--status S] [--include-logs]  # list runs; defaults to non-terminal only
     agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--name NAME]
+                    [--include-logs] [--log-min-age-hours N]
+                    [--orphan-processes] [--orphan-min-age-hours N]
+    agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage per status or per run
+
+Everything before "--" is an agent-run flag or the run name; everything
+after "--" is the launch command verbatim — no subcommand dispatch,
+leading-dash tokens accepted. Omitting "--" works for plain commands;
+a flag typed after the name is rejected with an error naming "--".
 
 `kill` sends TERM, INT, or HUP straight to the identity-verified runner
 process, which catches it and runs its own teardown (kill/reap the
@@ -123,8 +135,9 @@ Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs):
     log          captured stdout+stderr (PTY-captured when interactive)
     log.clean    rendered transcript (only when launched with --echo)
     prompt       copy of the -f/--prompt-file input, if one was given
-    tmp/         per-run scratch dir exported as TMPDIR (see above); removed
-                 only by `agent-run reap`, never on normal run exit
+    tmp/         per-run scratch dir exported as TMPDIR and BUN_TMPDIR (see
+                 above); removed only by `agent-run reap`, never on normal
+                 run exit
 
 `status` reports "not running (log preserved)" when the state dir is gone
 but the log dir survived. `logs`/`tail`/`clean` always read from the log
@@ -170,16 +183,17 @@ performed) in one invocation:
       ($AGENT_RUN_LOG_DIR/<name>/tmp) removed. State-less orphaned scratch
       dirs left after a reboot are independently collected once their own
       contents are old enough. The persistent `log`, `log.clean`, and
-      `prompt` files are never touched by reap — they have their own existing,
-      independent 21-day whole-log-dir prune. A `stalled` run (alive pid, idle
+      `prompt` files are never touched by this step — with `--include-logs`
+      (see below), preserved logs get their own separate, independently
+      thresholded pass instead. A `stalled` run (alive pid, idle
       log — see `_effective_status`) is not terminal and is never
       garbage-collected by this pass; only reconciliation in step 1 can
       eventually turn it into `killed`, which becomes GC-eligible only on a
       later reap. Unknown/legacy/corrupt statuses are shown separately by
       `list`, left untouched by default, and can only be collected with the
       explicit `reap --force-unknown` opt-in.
-   3. Every destructive action re-verifies identity/inode state immediately
-      before mutation (per-name `_launch_lock`, `_safe_rmtree`'s
+   3. Every destructive state-backed action re-verifies identity/inode state
+      immediately before mutation (per-name `_launch_lock`, `_safe_rmtree`'s
       root-contained, inode-reverified deletion, `_pid_alive`/
       `_process_identity`), so a run that raced into life or was replaced
       between listing and action is never touched. State deletion first
@@ -188,6 +202,19 @@ performed) in one invocation:
       stranding a partially-deleted run. --dry-run performs the same read-only
       eligibility checks as a real reap and prints only actions it would take,
       without writing or deleting anything.
+   4. Orphan-process termination (--orphan-processes, off by default):
+      terminate live runners with no state dir — invisible to passes 1-3.
+      Candidates come from argv parsing (strict basename match) filtered by
+      _find_orphan_runners' safety rules; identity captured at discovery is
+      re-verified immediately before every signal, since with no state dir
+      PID reuse is the only hazard left to defend against. See README.
+
+`agent-run reap --include-logs` additionally garbage-collects whole
+preserved-log-only run directories under $AGENT_RUN_LOG_DIR (state dir
+already gone) once their newest recursive mtime is older than
+--log-min-age-hours (default 21 days). Deliberately independent of
+--min-age-hours; see ``--log-min-age-hours`` help. Off by default; a run
+with a live state dir is never touched regardless of age.
 
 `agent-run list` defaults to showing only runs whose effective status is
 *not* conclusively terminal (`starting`, `running`, `stalled`; a `died` or
@@ -197,7 +224,17 @@ any comma-separated subset of statuses) or `--all` to see terminal runs
 too. Scripts that previously scraped every line under "Live runs" should
 add `--all` if they relied on terminal runs being listed there; the
 heading text also now reflects the actual filter in effect rather than
-unconditionally claiming everything shown is live.
+unconditionally claiming everything shown is live. Preserved-log-only runs
+(state dir gone) are hidden by default; pass `--include-logs` (or set
+AGENT_RUN_LIST_INCLUDE_LOGS=1) to show them — orthogonal to `--all`/
+`--status`, which govern only the state-backed sections. When hidden logs
+exist and are not shown, a one-line hint is printed to stderr, never
+stdout, so `agent-run list | grep ...` stays honest.
+
+`agent-run du` reports disk usage per effective status (or per run with
+`--by-run`), including preserved logs, and never mutates anything — no
+locks, no heal, no prune. See its own `--help` for `--top`, `--bytes`, and
+`--json`.
 """
 
 from __future__ import annotations
@@ -224,7 +261,7 @@ import traceback
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, NamedTuple, Optional, Sequence
+from typing import Any, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
@@ -381,6 +418,499 @@ def _parse_reap_min_age_seconds() -> float:
     )
     raw = os.environ.get(env_name, "168")
     return _positive_finite_hours(raw, env_name, 168.0)
+
+
+# Preserved-log GC threshold; deliberately independent of the state-dir
+# threshold (see --log-min-age-hours help). Parsed per call so flag and env
+# both take effect per invocation.
+def _parse_log_min_age_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_LOG_MIN_AGE_HOURS", str(PRUNE_AFTER_DAYS * 24))
+    return _positive_finite_hours(raw, "AGENT_RUN_LOG_MIN_AGE_HOURS", PRUNE_AFTER_DAYS * 24.0)
+
+
+# Orphan-process discovery threshold: minimum age for a process to be
+# considered a reap candidate.  Independent of the two thresholds above —
+# those govern state-dir and log-dir GC; this one governs live process
+# discovery and defaults to 24 h so recently started (possibly still
+# mid-launch) runners are never candidates.
+def _parse_orphan_min_age_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_ORPHAN_MIN_AGE_HOURS", "24")
+    return _positive_finite_hours(raw, "AGENT_RUN_ORPHAN_MIN_AGE_HOURS", 24.0)
+
+
+def _parse_reap_max_seconds() -> float:
+    """Wall-clock budget for one reap invocation; default 600 s (10 min)."""
+    raw = os.environ.get("AGENT_RUN_REAP_MAX_SECONDS", "600")
+    try:
+        v = float(raw)
+        if v > 0 and math.isfinite(v):
+            return v
+    except (ValueError, TypeError):
+        pass
+    return 600.0
+
+
+# ---------------------------------------------------------------------------
+# Orphan-process discovery helpers
+# ---------------------------------------------------------------------------
+
+class _ProcEntry(NamedTuple):
+    """Snapshot of one entry from the OS process table.
+
+    ``start_time`` is an epoch float (seconds since the Unix epoch) used
+    only for age comparisons — it does not need sub-second precision.
+    ``None`` means the start time could not be determined; such entries are
+    skipped by ``_find_orphan_runners`` with reason ``start_time_unknown``
+    rather than being treated as ancient (fail-closed, not fail-open).
+    ``identity`` mirrors the format used by ``_process_identity``: a
+    stable platform-specific birth token that lets callers detect PID
+    recycling between discovery and any later action.
+    ``pgid`` is the process group ID, used to skip processes in the
+    reaper's own process group (``pgid == self_pgid``).
+    """
+    pid: int
+    ppid: int
+    uid: int
+    argv: List[str]
+    start_time: Optional[float]  # epoch seconds; None = unknown
+    identity: str                # "linux:<starttime>" or "darwin:<lstart>"
+    pgid: int = 0                # process group ID; 0 means unknown
+
+
+class _OrphanCandidate(NamedTuple):
+    """A runner process judged eligible for orphan handling."""
+    pid: int
+    name: str
+    start_time: Optional[float]  # epoch seconds; None if indeterminate
+    identity: str
+
+
+class _OrphanSkip(NamedTuple):
+    """A process that was examined but excluded, with a machine-readable reason."""
+    pid: int
+    reason: str
+    detail: str = ""
+
+
+def _scan_process_table_linux() -> List[_ProcEntry]:
+    """Read /proc to build a process table of current-uid entries.
+
+    Tolerates races: a pid that vanishes between directory listing and
+    reading its files is silently skipped.  Only processes owned by the
+    current uid are returned.
+    """
+    my_uid = os.getuid()
+    entries: List[_ProcEntry] = []
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return entries
+
+    # /proc/uptime and SC_CLK_TCK are the same for every pid in the snapshot;
+    # read them once so the per-pid loop does not pay repeated open/read/close
+    # and sysconf calls (~1000 on a loaded host).  A failure degrades every
+    # entry to start_time=None (fail-closed).
+    try:
+        uptime_s = float(Path("/proc/uptime").read_text().split()[0])
+        boot_epoch: Optional[float] = time.time() - uptime_s
+        hz: Optional[float] = float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, AttributeError):
+        boot_epoch = None
+        hz = None
+
+    for pid in pids:
+        try:
+            st = os.stat(f"/proc/{pid}")
+            if st.st_uid != my_uid:
+                continue
+            # NUL-separated argv from /proc/<pid>/cmdline; empty means kernel thread.
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            if not raw:
+                continue
+            argv = raw.rstrip(b"\x00").split(b"\x00")
+            argv_str = [a.decode("utf-8", errors="replace") for a in argv]
+
+            # Parse /proc/<pid>/stat: ppid is field 4 (0-indexed 3),
+            # starttime is field 22 (0-indexed 21), both after the comm field.
+            fields = _proc_stat_fields(pid)
+            if fields is None or len(fields) <= 19:
+                continue
+            ppid = int(fields[1]) if fields[1].lstrip("-").isdigit() else 0
+            pgid = int(fields[2]) if fields[2].lstrip("-").isdigit() else 0
+            starttime_ticks = int(fields[19]) if fields[19].isdigit() else 0
+
+            # Convert kernel jiffies to epoch seconds using the pre-read boot_epoch.
+            if boot_epoch is not None and hz is not None:
+                start_time: Optional[float] = boot_epoch + starttime_ticks / hz
+            else:
+                start_time = None
+
+            identity = f"linux:{starttime_ticks}"
+            entries.append(_ProcEntry(
+                pid=pid, ppid=ppid, uid=my_uid,
+                argv=argv_str, start_time=start_time, identity=identity,
+                pgid=pgid,
+            ))
+        except (OSError, ValueError):
+            continue
+    return entries
+
+
+def _darwin_lstart_normalize(raw: str) -> str:
+    """Collapse internal whitespace runs in a Darwin ``lstart`` string to a
+    single space.
+
+    ``ps -axo lstart=`` collapses whitespace when splitting columns (single
+    space between tokens), while ``ps -p PID -o lstart=`` preserves the
+    fixed-width right-padding that the kernel uses for single-digit days
+    (e.g. ``Mon Jun  8`` — two spaces between month and day).  Calling this
+    on both sides before building the ``darwin:<lstart>`` identity token
+    makes the two forms compare equal regardless of day width.
+    """
+    return " ".join(raw.split())
+
+
+def _scan_process_table_darwin() -> List[_ProcEntry]:
+    """Query the macOS process table via ``ps``.
+
+    Uses ``ps -axo`` to enumerate all uid-visible processes, then filters
+    to the current uid.  The ``lstart`` field is the same token used by
+    ``_process_identity`` on Darwin, so identity values are comparable.
+    Tolerates ps failure: returns an empty list rather than raising.
+    """
+    my_uid = os.getuid()
+    entries: List[_ProcEntry] = []
+    try:
+        # pid, ppid, pgid, uid, lstart (5 whitespace-separated tokens), and the full command.
+        # LC_ALL=C forces ASCII month/day names regardless of the operator's
+        # locale; a non-C locale (e.g. fr_FR.UTF-8) causes ps to emit localised
+        # month names that strptime cannot parse with the fixed "%b" directive.
+        env_c = {**os.environ, "LC_ALL": "C"}
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,uid=,lstart=,command="],
+            capture_output=True, text=True, timeout=10, env=env_c,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return entries
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parts = line.split(None, 4)
+            if len(parts) < 5:
+                continue
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            pgid = int(parts[2])
+            uid = int(parts[3])
+            if uid != my_uid:
+                continue
+            # lstart: 5 whitespace-separated tokens "Www Mmm DD HH:MM:SS YYYY".
+            # split(None, 5) separates these 5 tokens from the command.
+            rest = parts[4]
+            lstart_parts = rest.split(None, 5)
+            if len(lstart_parts) < 6:
+                continue
+            lstart = " ".join(lstart_parts[:5])
+            command_str = lstart_parts[5]
+        except (ValueError, IndexError):
+            continue
+
+        # Parse the command string into argv tokens.  ps reconstructs argv
+        # by joining with spaces, so we cannot perfectly recover arguments
+        # that contained spaces; shlex.split is the best available heuristic.
+        try:
+            argv_str = shlex.split(command_str)
+        except ValueError:
+            argv_str = command_str.split()
+        if not argv_str:
+            continue
+
+        # Convert lstart to an epoch float for age comparisons.
+        # lstart is wall-clock local time; a naive datetime.timestamp()
+        # interprets it in the host's local timezone, matching what ps printed.
+        # LC_ALL=C on the ps invocation guarantees ASCII day/month names, so
+        # strptime always matches "%a %b %d %H:%M:%S %Y" regardless of locale.
+        # A parse failure leaves start_time as None; _find_orphan_runners treats
+        # None as unknown and emits start_time_unknown (fail-closed, not open).
+        start_time: Optional[float]
+        try:
+            # "Www Mmm DD HH:MM:SS YYYY" — strptime consumes leading zeros.
+            start_time = datetime.strptime(lstart, "%a %b %d %H:%M:%S %Y").timestamp()
+        except ValueError:
+            start_time = None
+
+        identity = f"darwin:{_darwin_lstart_normalize(lstart)}"
+        entries.append(_ProcEntry(
+            pid=pid, ppid=ppid, uid=uid,
+            argv=argv_str, start_time=start_time, identity=identity,
+            pgid=pgid,
+        ))
+    return entries
+
+
+def _scan_process_table() -> List[_ProcEntry]:
+    """Return a snapshot of the OS process table, current uid only.
+
+    Platform dispatch: Linux reads /proc; Darwin uses ``ps``.  A pid that
+    vanishes mid-scan is silently skipped rather than raising.
+    """
+    system = platform.system()
+    if system == "Linux":
+        return _scan_process_table_linux()
+    if system == "Darwin":
+        return _scan_process_table_darwin()
+    return []
+
+
+def _argv_is_agent_run_runner(argv: Sequence[str]) -> bool:
+    """Return True only when ``argv`` invokes the agent-run entry point.
+
+    Matches two forms:
+      - A direct invocation where argv[0]'s basename is ``agent-run``.
+      - A Python-interpreter invocation where some argv element's basename
+        is ``agent-run`` (e.g. ``python /usr/local/bin/agent-run <args>``).
+
+    Matching is on path *components*, not substrings: a process whose argv
+    merely mentions ``agent-run`` in an argument value — the prototypical
+    false positive being ``bash -lc "cat /var/tmp/agent-runs/foo/log"`` —
+    returns False.  The basename check is the key gate: only a token whose
+    final path component is exactly ``agent-run`` qualifies, so ``grep
+    agent-run``, an editor with the file open, and shell commands that
+    expand the string as data are all excluded.
+    """
+    if not argv:
+        return False
+
+    if Path(argv[0]).name == "agent-run":
+        return True
+
+    # Python-interpreter invocation: skip interpreter and its own flags
+    # until the first non-flag positional is found; that positional is
+    # the script path.
+    interpreter_name = Path(argv[0]).name
+    if interpreter_name.startswith("python"):
+        i = 1
+        while i < len(argv):
+            token = argv[i]
+            if not token.startswith("-"):
+                # First positional: this is the script.
+                return Path(token).name == "agent-run"
+            # Python flags that consume their value as the next argv token.
+            # -W and -X each take one value argument; -c and -m end the
+            # flag sequence but their operands are not a script path.
+            if token in ("-W", "-X"):
+                i += 2
+                continue
+            if token in ("-c", "-m"):
+                # Command string or module name follows; no script path.
+                return False
+            # All other single-dash flags (-u, -O, -B, -d, -E, -i, …) are
+            # boolean; skip just this token.
+            i += 1
+        return False
+
+    return False
+
+
+def _run_name_from_argv(argv: Sequence[str]) -> Optional[str]:
+    """Extract the run name from a runner's argv, or None if indeterminate.
+
+    Calls ``_parse_launch_argv`` so this path and the launch path always
+    agree on flag parsing, including the ``--`` separator form.  Returns
+    None when:
+      - ``_parse_launch_argv`` raises ``_LaunchArgvError``
+      - the argv belongs to a subcommand (reap, list, …) rather than a launch
+      - the recovered name fails ``_validate_run_name``
+      - no name was found (too few arguments)
+    Never guesses.
+    """
+    # Strip the entry-point token(s) from argv before parsing.  A direct
+    # invocation has one leading token (agent-run); a python-wrapped
+    # invocation has two or more (python /path/agent-run).  We drop
+    # everything up to and including the agent-run token.
+    rest = list(argv)
+    found = False
+    for i, token in enumerate(rest):
+        if Path(token).name == "agent-run":
+            rest = rest[i + 1:]
+            found = True
+            break
+    if not found:
+        return None
+
+    try:
+        parsed = _parse_launch_argv(rest)
+    except _LaunchArgvError:
+        return None
+
+    # A subcommand invocation (agent-run reap, agent-run list, …) is not a
+    # launch; it has no run name to recover.
+    if parsed.subcommand_tokens is not None:
+        return None
+
+    name = parsed.name
+    if not name:
+        return None
+
+    # Guard against invalid names reaching filesystem paths.
+    try:
+        _validate_run_name(name)
+    except SystemExit:
+        return None
+
+    return name
+
+
+def _find_orphan_runners(
+    table: Sequence[_ProcEntry],
+    *,
+    min_age_seconds: float,
+    now: float,
+    self_pid: int,
+    self_pgid: int,
+    target_name: Optional[str] = None,
+) -> tuple[List[_OrphanCandidate], List[_OrphanSkip]]:
+    """Classify each _ProcEntry as an orphan candidate or a skip.
+
+    A candidate satisfies all of:
+      - argv identifies it as an agent-run runner (_argv_is_agent_run_runner)
+      - run name recovers (_run_name_from_argv) and passes _validate_run_name
+      - no state dir exists for that name (_path_entry_exists returns False)
+      - process age >= min_age_seconds
+      - not self_pid, not any ancestor of self_pid, not in self_pgid, not pid 1
+      - uid matches the current uid (guaranteed by _scan_process_table, checked here too)
+      - matches target_name when given
+
+    Every rejected entry is returned as an _OrphanSkip with a distinct reason.
+    Processes that do not look like agent-run runners at all are silently
+    excluded (they are noise, not skips).
+    """
+    my_uid = os.getuid()
+
+    # Build a pid→ppid map for ancestor-chain traversal.
+    ppid_map: dict[int, int] = {e.pid: e.ppid for e in table}
+
+    def _ancestor_pids(pid: int) -> set[int]:
+        """Walk ppid chain up to pid 1 or a cycle; return all ancestor pids."""
+        seen: set[int] = set()
+        current = ppid_map.get(pid)
+        while current is not None and current not in seen and current > 1:
+            seen.add(current)
+            current = ppid_map.get(current)
+        return seen
+
+    ancestors = _ancestor_pids(self_pid)
+
+    candidates: List[_OrphanCandidate] = []
+    skips: List[_OrphanSkip] = []
+
+    for entry in table:
+        if not _argv_is_agent_run_runner(entry.argv):
+            continue  # not an agent-run runner — ignore entirely
+
+        pid = entry.pid
+
+        if pid == 1:
+            skips.append(_OrphanSkip(pid=pid, reason="pid_1"))
+            continue
+        if entry.uid != my_uid:
+            skips.append(_OrphanSkip(pid=pid, reason="foreign_uid", detail=str(entry.uid)))
+            continue
+        if pid == self_pid:
+            skips.append(_OrphanSkip(pid=pid, reason="self"))
+            continue
+        if pid in ancestors:
+            skips.append(_OrphanSkip(pid=pid, reason="ancestor"))
+            continue
+        if entry.pgid == self_pgid:
+            skips.append(_OrphanSkip(pid=pid, reason="same_pgid"))
+            continue
+
+        name = _run_name_from_argv(entry.argv)
+        if name is None:
+            skips.append(_OrphanSkip(pid=pid, reason="name_unrecoverable"))
+            continue
+
+        if target_name is not None and name != target_name:
+            skips.append(_OrphanSkip(pid=pid, reason="name_mismatch", detail=name))
+            continue
+
+        # Ambiguity guard: ps joins argv with spaces, so shlex.split and plain
+        # str.split() may recover different names when the command string contains
+        # shell metacharacters (quotes, backslashes).  Differing results indicate
+        # that the recovered name is not unique and the candidate is unsafe to act on.
+        # (Space-in-path mis-parses are caught below by _log_dir corroboration.)
+        command_str = " ".join(entry.argv)
+        try:
+            plain_argv = command_str.split()
+        except Exception:
+            plain_argv = []
+        plain_name = _run_name_from_argv(plain_argv)
+        if plain_name != name:
+            skips.append(_OrphanSkip(pid=pid, reason="argv_ambiguous", detail=name))
+            continue
+
+        # Log-dir corroboration: every real agent-run runner creates LOG_ROOT/<name>
+        # before writing any state.  Requiring the directory to exist — and to be a
+        # real directory, not a symlink — rejects the entire mis-parse class from S1:
+        # a shifted name like "prompt.md" has no LOG_ROOT entry, so it is never a
+        # candidate regardless of the state-dir outcome.
+        # ps argv reconstruction is lossy; the log dir is the filesystem artefact
+        # that corroborates the recovered name without re-parsing the command string.
+        log_d = _log_dir(name)
+        try:
+            lst = log_d.lstat()
+            if not _stat_module.S_ISDIR(lst.st_mode):
+                skips.append(_OrphanSkip(pid=pid, reason="log_dir_missing", detail=name))
+                continue
+        except FileNotFoundError:
+            skips.append(_OrphanSkip(pid=pid, reason="log_dir_missing", detail=name))
+            continue
+
+        # State-root guard: a runner started with AGENT_RUN_STATE_DIR=/other/path
+        # records state there, not under our STATE_ROOT.  The state-dir check below
+        # asks the wrong question unless both roots agree.  Read the process env
+        # to verify; if unreadable (or not Linux), skip conservatively.
+        runner_root = _runner_state_root(pid)
+        if runner_root is None:
+            skips.append(_OrphanSkip(pid=pid, reason="state_root_unreadable"))
+            continue
+        if runner_root.resolve() != STATE_ROOT.resolve():
+            skips.append(_OrphanSkip(pid=pid, reason="foreign_state_root",
+                                     detail=str(runner_root)))
+            continue
+
+        # State-dir check: a process with a live state dir is tracked by
+        # reap's existing passes, not this one.
+        if _path_entry_exists(_state_dir(name)):
+            skips.append(_OrphanSkip(pid=pid, reason="state_dir_exists", detail=name))
+            continue
+
+        # Age gate: too-young processes are excluded so a runner still
+        # mid-launch (state dir creation in progress) is not a candidate.
+        # start_time=None means the parse failed; treat as unknown rather than
+        # as infinitely old — any uncertainty skips the candidate (fail-closed).
+        if entry.start_time is None:
+            skips.append(_OrphanSkip(pid=pid, reason="start_time_unknown"))
+            continue
+        age = now - entry.start_time
+        if age < min_age_seconds:
+            skips.append(_OrphanSkip(
+                pid=pid, reason="too_young",
+                detail=f"age={age:.1f}s min={min_age_seconds:.1f}s",
+            ))
+            continue
+
+        candidates.append(_OrphanCandidate(
+            pid=pid, name=name,
+            start_time=entry.start_time,
+            identity=entry.identity,
+        ))
+
+    return candidates, skips
 
 
 # Launch-grace window: how many seconds after exec a non-zero exit still reads
@@ -961,8 +1491,58 @@ def _process_identity(pid: int) -> Optional[str]:
         return f"linux:{fields[19]}"
     if system == "Darwin":
         start = _ps_field(pid, "lstart")
-        return f"darwin:{start}" if start else None
+        return f"darwin:{_darwin_lstart_normalize(start)}" if start else None
     return None
+
+
+def _runner_state_root(pid: int) -> Optional[Path]:
+    """Read ``AGENT_RUN_STATE_DIR`` from the environment of ``pid``.
+
+    A runner started with a non-default state root records state there, not
+    under the reaper's ``STATE_ROOT``.  Requiring the two to match before
+    treating a process as an orphan prevents the reaper from killing a live,
+    tracked run just because it used a different root.
+
+    Returns the resolved ``Path`` of the runner's state root, or ``None`` if
+    the environment cannot be read (caller must skip the candidate — fail-closed).
+
+    On Linux the process's NUL-separated ``/proc/<pid>/environ`` is parsed
+    directly.  If ``AGENT_RUN_STATE_DIR`` is absent the runner uses the same
+    default as the reaper (``STATE_ROOT``), so ``STATE_ROOT`` is returned.
+    ``/proc/<pid>/environ`` takes the target's ``mmap_lock`` (the same
+    uninterruptible-read hazard as ``/proc/<pid>/cmdline``; see P5 in
+    ``findings-performance.md``).  This read runs inside ``_find_orphan_runners``
+    during discovery — before the per-candidate budget checks in the orphan
+    processing loop — so a single process stuck in D state can block discovery
+    for the duration of its stall.  The overall ``reap_budget`` enforced in
+    ``cmd_reap`` covers only the post-discovery action phase and does not bound
+    this read.
+
+    On Darwin reading another process's environment requires a privileged API;
+    ``STATE_ROOT`` is returned unconditionally.  This means a runner launched
+    with a non-default ``AGENT_RUN_STATE_DIR`` on macOS is still evaluated
+    against the reaper's root (residual S3 exposure).  The log-dir corroboration
+    check upstream rejects any process whose recovered name has no ``LOG_ROOT``
+    entry, limiting but not eliminating that exposure.
+    """
+    if platform.system() != "Linux":
+        # Conservative fallback: assume the runner shares our root.  The
+        # log-dir corroboration upstream already rejects any process whose
+        # recovered name has no LOG_ROOT entry, limiting the exposure.
+        return STATE_ROOT
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    for kv in raw.split(b"\x00"):
+        if kv.startswith(b"AGENT_RUN_STATE_DIR="):
+            val = kv[len(b"AGENT_RUN_STATE_DIR="):]
+            try:
+                return Path(val.decode("utf-8", errors="strict"))
+            except (UnicodeDecodeError, ValueError):
+                return None
+    # Variable absent: runner uses the compiled-in default.
+    return STATE_ROOT
 
 
 def _watch_pid_is_zombie(pid: int) -> bool:
@@ -1049,28 +1629,118 @@ def _newest_mtime(d: Path) -> Optional[float]:
         return None
 
 
-def _newest_mtime_recursive(d: Path) -> Optional[float]:
-    """Newest mtime anywhere below a real directory ``d`` (including ``d``).
+def _newest_mtime_recursive(
+    d: Path,
+    cutoff: Optional[float] = None,
+    *,
+    skip_top_dir_mtime: bool = False,
+) -> Optional[float]:
+    """Newest mtime anywhere below ``d`` (including ``d`` itself unless
+    ``skip_top_dir_mtime`` is set), without following symlinks.
 
-    Used only for a state-less orphaned scratch directory: unlike terminal
-    state dirs, which are deliberately flat, an agent's TMPDIR commonly
-    contains nested JDTLS workspaces. The full recursive walk means reap's
-    min-age threshold starts after the last actual scratch write, not merely
-    after the top-level ``tmp/`` directory was created. Symlinks are never
-    followed (``lstat`` + ``S_ISDIR``), so a malicious scratch tree cannot
-    make an age scan walk outside its own log directory.
+    When ``skip_top_dir_mtime`` is ``True`` the root directory's own mtime
+    is excluded from the result.  Pass 2.5 uses this when checking a log dir
+    immediately after pass 2 may have deleted its ``tmp/`` subdirectory:
+    removing ``tmp/`` bumps ``log_d``'s mtime to now, which would make a
+    30-day-old log appear brand-new and defer its collection by another
+    ``log_min_age_threshold``.  Ignoring the container's own mtime breaks
+    that cycle; children's mtimes still reflect actual content age.
+
+    When ``cutoff`` is given, returns as soon as any entry's mtime exceeds it
+    — the exact maximum is irrelevant to the caller once it is known that
+    something is newer than ``cutoff``.  At steady state (almost every
+    candidate is younger than the reap threshold) this reduces an O(N-entries)
+    walk to O(1).  When the directory is genuinely old the full walk runs,
+    which is correct — that directory is about to be deleted anyway.
+
+    Symlinks are never followed (``entry.stat(follow_symlinks=False)``), so a
+    malicious scratch tree cannot redirect the walk outside its log directory.
     """
     try:
-        newest = d.stat().st_mtime
-        for root, dirs, files in os.walk(d, followlinks=False):
-            root_path = Path(root)
-            for entry in [*dirs, *files]:
-                path = root_path / entry
-                st = path.lstat()
-                newest = max(newest, st.st_mtime)
-        return newest
+        top_st = os.stat(d, follow_symlinks=False)
+        if skip_top_dir_mtime:
+            # Sentinel: any real child mtime beats this value; replaced on
+            # the first entry seen so that an empty directory still returns
+            # None (caller treats None as "cannot determine age → skip").
+            newest: Optional[float] = None
+        else:
+            newest = top_st.st_mtime
+            if cutoff is not None and newest > cutoff:
+                return newest
     except OSError:
         return None
+
+    stack: List[str] = [str(d)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            mtime = st.st_mtime
+            if newest is None or mtime > newest:
+                newest = mtime
+            if cutoff is not None and newest > cutoff:
+                return newest
+            if _stat_module.S_ISDIR(st.st_mode):
+                stack.append(entry.path)
+    return newest
+
+
+def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
+    """Apparent size (sum of ``st_size``) of every regular file at or below
+    ``d``, in bytes, excluding anything at or below ``exclude`` (if given —
+    used to report a log dir's size without double-counting its ``tmp/``
+    scratch subdirectory). Read-only: uses ``os.scandir`` and never follows
+    symlinks (``entry.stat(follow_symlinks=False)``), so this cannot be
+    tricked into walking outside ``d`` and cannot count a symlink target's
+    size as if it were local. Tolerates races (a file vanishing between
+    scan and stat) by skipping the entry rather than raising; an unreadable
+    ``d`` itself returns 0.
+
+    Shared by `reap --include-logs` (per-candidate size in its report line)
+    and `du` (per-group/per-run totals), so both report the same notion of
+    "size" for a log directory.
+    """
+    total = 0
+    stack = [d]
+    while stack:
+        current = stack.pop()
+        if exclude is not None and current == exclude:
+            continue
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    st = entry.stat(follow_symlinks=False)
+                    total += st.st_size
+            except OSError:
+                continue
+    return total
+
+
+_SIZE_UNITS = ("B", "K", "M", "G", "T", "P")
+
+
+def _human_size(n: int) -> str:
+    """Render a byte count as e.g. ``1.2G``, ``340M``, ``12K``, ``0B`` —
+    binary (1024-based) units, one decimal place above the byte unit."""
+    size = float(n)
+    for unit in _SIZE_UNITS:
+        if size < 1024 or unit == _SIZE_UNITS[-1]:
+            return f"{n}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
 
 
 def _terminal_state_age_seconds(state_dir: Path) -> Optional[float]:
@@ -1497,6 +2167,29 @@ def _log_line_count(log: Optional[Path]) -> int:
 # free-text token.
 _VALID_LIST_STATUS_TOKENS = TERMINAL_STATUSES | KNOWN_NONTERMINAL_STATUSES | {"unknown"}
 
+_ENV_BOOL_TRUE = {"1", "true", "yes"}
+_ENV_BOOL_FALSE = {"0", "false", "no", ""}
+
+
+def _env_bool_default(env_name: str) -> bool:
+    """Parse an opt-in boolean env var (``1``/``true``/``yes``, case-
+    insensitive; ``0``/``false``/``no``/unset for off), warning to stderr
+    on an unrecognized value and falling back to False."""
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return False
+    normalized = raw.strip().lower()
+    if normalized in _ENV_BOOL_TRUE:
+        return True
+    if normalized in _ENV_BOOL_FALSE:
+        return False
+    print(
+        f"agent-run: warning: {env_name}={raw!r} is not one of "
+        "1/true/yes/0/false/no; using default",
+        file=sys.stderr,
+    )
+    return False
+
 
 def cmd_list(args: argparse.Namespace) -> int:
     _prune_old_logs()
@@ -1504,6 +2197,13 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     show_all: bool = bool(getattr(args, "all", False))
     status_filter_raw: Optional[str] = getattr(args, "status", None)
+    # Explicit --include-logs always wins over the env default; the flag's
+    # own default is False, so falsy-but-explicit and unset are
+    # indistinguishable here — acceptable since the env var only ever raises
+    # the effective default, never lowers an explicit flag.
+    include_logs: bool = bool(getattr(args, "include_logs", False)) or _env_bool_default(
+        "AGENT_RUN_LIST_INCLUDE_LOGS"
+    )
     if not show_all and status_filter_raw is None:
         list_default = os.environ.get("AGENT_RUN_LIST_DEFAULT", "live").strip().lower()
         if list_default not in {"live", "all"}:
@@ -1607,17 +2307,29 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     log_only_names = set()
     if LOG_ROOT.is_dir():
-        log_only_names = {p.name for p in LOG_ROOT.iterdir() if p.is_dir()} - state_names
-    if log_only_names:
-        # Preserved-log-only runs (state dir already gone) are already
-        # unambiguously and correctly labeled as "not running" under their
-        # own heading — unlike the "Live runs" section above, this was
-        # never the misleading part, so it is always shown regardless of
-        # --status/--all.
-        print(f"Preserved logs, not running ({LOG_ROOT}):")
-        for name in sorted(log_only_names):
-            lines = _log_line_count(_log_file_for(name))
-            print(f"  {name}: lines={lines}")
+        log_only_names = {
+            p.name for p in LOG_ROOT.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        } - state_names
+    if include_logs:
+        if log_only_names:
+            # Preserved-log-only runs (state dir already gone) are already
+            # unambiguously and correctly labeled as "not running" under
+            # their own heading. Shown only when requested — see the hint
+            # printed below when they're hidden.
+            print(f"Preserved logs, not running ({LOG_ROOT}):")
+            for name in sorted(log_only_names):
+                lines = _log_line_count(_log_file_for(name))
+                print(f"  {name}: lines={lines}")
+    elif log_only_names:
+        # Hint goes to stderr, same reasoning as the --all hint above: a
+        # count/word in a stdout heading would give `list | grep` a
+        # false-positive match even when nothing was actually shown.
+        print(
+            f"agent-run: {len(log_only_names)} preserved log(s) hidden; "
+            "pass --include-logs to show them",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -2634,19 +3346,24 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 def cmd_reap(args: argparse.Namespace) -> int:
     """Reconcile stale ``running`` state, idle-kill lingering processes, and
-    garbage-collect old terminal-state runs and state-less scratch dirs.
+    garbage-collect old terminal-state runs, state-less scratch dirs, and
+    (with ``--include-logs``) preserved log dirs.
 
-    The pass is deliberately split into reconciliation, state-backed GC, and
-    orphan-scratch GC. Every destructive state-backed action is guarded by a
-    name lock plus inode/status/pid revalidation; every scratch action also
-    requires lstat-confirmed real directory components so a symlink can
-    never redirect deletion outside LOG_ROOT.
+    The pass is deliberately split into reconciliation, state-backed GC,
+    preserved-log GC, and orphan-scratch GC. Every destructive state-backed
+    action is guarded by a name lock plus inode/status/pid revalidation;
+    every scratch/log action also requires lstat-confirmed real directory
+    components so a symlink can never redirect deletion outside LOG_ROOT.
     """
     dry_run: bool = args.dry_run
     idle_hours: Optional[float] = getattr(args, "idle_hours", None)
     min_age_hours: Optional[float] = getattr(args, "min_age_hours", None)
+    log_min_age_hours: Optional[float] = getattr(args, "log_min_age_hours", None)
     target_name: Optional[str] = getattr(args, "name", None)
     force_unknown: bool = bool(getattr(args, "force_unknown", False))
+    include_logs: bool = bool(getattr(args, "include_logs", False))
+    orphan_processes: bool = bool(getattr(args, "orphan_processes", False))
+    orphan_min_age_hours: Optional[float] = getattr(args, "orphan_min_age_hours", None)
     if target_name is not None:
         target_name = _validate_run_name(target_name)
 
@@ -2657,6 +3374,25 @@ def cmd_reap(args: argparse.Namespace) -> int:
     min_age_threshold: float = (
         min_age_hours * 3600 if min_age_hours is not None else _parse_reap_min_age_seconds()
     )
+    # Independent of min_age_threshold by design; see --log-min-age-hours help.
+    log_min_age_threshold: float = (
+        log_min_age_hours * 3600
+        if log_min_age_hours is not None
+        else _parse_log_min_age_seconds()
+    )
+    # Independent of GC thresholds: governs live process age, not artifact
+    # retention. Parsed even when --orphan-processes is absent so the flag
+    # is always validated; see --orphan-min-age-hours help.
+    orphan_min_age_threshold: float = (
+        orphan_min_age_hours * 3600
+        if orphan_min_age_hours is not None
+        else _parse_orphan_min_age_seconds()
+    )
+    max_seconds_arg: Optional[float] = getattr(args, "max_seconds", None)
+    reap_budget: float = (
+        max_seconds_arg if max_seconds_arg is not None else _parse_reap_max_seconds()
+    )
+    reap_start = time.time()
 
     # A previous SIGKILL can leave a dot-prefixed deletion sentinel. Finish it
     # before scanning named runs; each failure remains per-sentinel so one
@@ -2664,6 +3400,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
     resumed_count = 0
     if not dry_run:
         resumed_count = _reap_stale_sentinels(STATE_ROOT)
+        if LOG_ROOT.is_dir():
+            resumed_count += _reap_stale_sentinels(LOG_ROOT)
 
     candidates: List[Path] = []
     if STATE_ROOT.is_dir():
@@ -2684,9 +3422,17 @@ def cmd_reap(args: argparse.Namespace) -> int:
     skipped_count = 0
     gc_count = 0
     orphaned_scratch_count = 0
+    logs_collected_count = 0
     gc_skipped_count = 0
+    orphan_procs_killed = 0
+    orphan_procs_skipped = 0
+    deferred_count = 0
     found_target = False
     reconciled_this_pass = set()
+    # Names whose whole log dir was collected (or reported under --dry-run) by
+    # pass 2.5 in this invocation.  Pass 3 skips these to avoid counting the
+    # same run's scratch as both a collected log and an orphaned scratch dir.
+    logs_acted_on: set[str] = set()
 
     # Filter the state candidates once for both passes (quality F2/C5), and
     # validate names before *any* path construction/mutation (M2). A targeted
@@ -2707,6 +3453,9 @@ def cmd_reap(args: argparse.Namespace) -> int:
 
     # Pass 1: stale-running reconciliation and identity-verified idle kill.
     for d in state_candidates:
+        if time.time() - reap_start > reap_budget:
+            deferred_count += 1
+            continue
         name = d.name
         raw_status = _read(d / "status")
         if raw_status != "running":
@@ -2801,6 +3550,9 @@ def cmd_reap(args: argparse.Namespace) -> int:
     # crash between finalization writes cannot make a run reconciled in pass 1
     # eligible for deletion in pass 2 of the same invocation.
     for d in state_candidates:
+        if time.time() - reap_start > reap_budget:
+            deferred_count += 1
+            continue
         name = d.name
         if name in reconciled_this_pass:
             continue
@@ -2927,10 +3679,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 continue
             gc_count += 1
 
-    # Pass 3: a reboot wipes STATE_ROOT (normally tmpfs) while persistent
-    # LOG_ROOT/<name>/tmp survives. Sweep those orphaned scratch dirs once
-    # their own recursive contents have been quiet for the GC threshold (H3).
-    # A targeted --name has one direct candidate; untargeted scans only LOG_ROOT.
+    # Log/scratch passes share one scan of LOG_ROOT. A targeted --name has
+    # one direct candidate; untargeted scans read LOG_ROOT once.
     log_candidates: List[Path] = []
     if LOG_ROOT.is_dir():
         if target_name is not None:
@@ -2941,16 +3691,90 @@ def cmd_reap(args: argparse.Namespace) -> int:
             except OSError as exc:
                 print(f"reap: cannot read log root: {exc}")
                 log_candidates = []
-    for log_d in log_candidates:
-        name = log_d.name
-        if name.startswith("."):
+
+    # Pre-validate log candidates: filter out dot-prefix names, invalid names,
+    # non-directories, and entries that cannot be stat'd.  The lstat snapshot
+    # here is a pre-scan only; both pass 2.5 and pass 3 re-lstat under their
+    # own per-name lock before any deletion.
+    validated_logs: List[Path] = []
+    for _ld in log_candidates:
+        if _ld.name.startswith("."):
             continue
         try:
-            _validate_run_name(name)
-            log_before = log_d.lstat()
+            _validate_run_name(_ld.name)
+            _ld_st = _ld.lstat()
         except (OSError, SystemExit):
             continue
-        if not _stat_module.S_ISDIR(log_before.st_mode):
+        if _stat_module.S_ISDIR(_ld_st.st_mode):
+            validated_logs.append(_ld)
+
+    # Pass 2.5 (--include-logs only): whole-log-dir GC for preserved-log-only
+    # runs (state dir gone). Runs after pass 2 so a run whose state dir pass 2
+    # just removed in this same invocation can become log-only and eligible
+    # here too. Runs before pass 3 (orphan scratch): a log dir removed whole
+    # here makes log_d.lstat() in pass 3 raise FileNotFoundError, which that
+    # loop already treats as "nothing to do" — no double counting, no error
+    # spam over an already-gone path.
+    if include_logs:
+        for log_d in validated_logs:
+            if time.time() - reap_start > reap_budget:
+                deferred_count += 1
+                continue
+            name = log_d.name
+            if _path_entry_exists(_state_dir(name)):
+                continue  # state-backed — pass 2 owns this run, never race it
+            newest = _newest_mtime_recursive(
+                log_d,
+                cutoff=time.time() - log_min_age_threshold,
+                skip_top_dir_mtime=True,
+            )
+            if newest is None:
+                continue
+            age_secs = time.time() - newest
+            if age_secs < log_min_age_threshold:
+                continue
+            age_h = age_secs / 3600
+            if dry_run:
+                print(
+                    f"  {name}: preserved log (age={age_h:.1f}h) "
+                    "[dry-run]"
+                )
+                logs_collected_count += 1
+                logs_acted_on.add(name)
+                continue
+            size = _dir_size_bytes(log_d)
+            print(
+                f"  {name}: preserved log (age={age_h:.1f}h, size={_human_size(size)}) "
+                "[removing log]"
+            )
+            with _launch_lock(name):
+                try:
+                    if _path_entry_exists(_state_dir(name)):
+                        continue
+                    log_current = log_d.lstat()
+                    if not _stat_module.S_ISDIR(log_current.st_mode):
+                        raise SystemExit("log path is not a real directory")
+                    _crash_safe_rmtree(log_d, LOG_ROOT, expected=log_current)
+                except (OSError, SystemExit) as exc:
+                    print(f"  {name}: gc skipped: {exc}")
+                    gc_skipped_count += 1
+                    continue
+                logs_collected_count += 1
+                logs_acted_on.add(name)
+
+    # Pass 3: a reboot wipes STATE_ROOT (normally tmpfs) while persistent
+    # LOG_ROOT/<name>/tmp survives. Sweep those orphaned scratch dirs once
+    # their own recursive contents have been quiet for the GC threshold (H3).
+    for log_d in validated_logs:
+        if time.time() - reap_start > reap_budget:
+            deferred_count += 1
+            continue
+        name = log_d.name
+        # Skip names pass 2.5 already acted on (or reported under --dry-run):
+        # the whole log dir was collected, so its scratch is no longer orphaned.
+        # Without this guard, --dry-run double-counts the same run as both a
+        # collected log and an orphaned scratch.
+        if name in logs_acted_on:
             continue
         scratch_dir = log_d / "tmp"
         try:
@@ -2970,7 +3794,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         # conservatively rather than following it.
         if _path_entry_exists(_state_dir(name)):
             continue
-        newest = _newest_mtime_recursive(scratch_dir)
+        newest = _newest_mtime_recursive(scratch_dir, cutoff=time.time() - min_age_threshold)
         if newest is None or time.time() - newest < min_age_threshold:
             continue
         age_h = (time.time() - newest) / 3600
@@ -2998,18 +3822,405 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 continue
             orphaned_scratch_count += 1
 
+    # Pass 4 (--orphan-processes only): find and terminate live agent-run runner
+    # processes that have no state dir — invisible to all prior passes because
+    # they hold no entry in STATE_ROOT.  Runs last so a state dir removed in
+    # pass 2 of this same invocation is correctly seen as absent by discovery.
+    if orphan_processes:
+        now = time.time()
+        proc_table = _scan_process_table()
+        orphan_candidates, orphan_skips = _find_orphan_runners(
+            proc_table,
+            min_age_seconds=orphan_min_age_threshold,
+            now=now,
+            self_pid=os.getpid(),
+            self_pgid=os.getpgid(0),
+            target_name=target_name,
+        )
+
+        for skip in orphan_skips:
+            reason = skip.reason
+            detail = f" ({skip.detail})" if skip.detail else ""
+            print(f"  [orphan] pid={skip.pid}: skipped: {reason}{detail}")
+            orphan_procs_skipped += 1
+
+        # Collects (cand, pgid, use_group, age_h) for every candidate that
+        # received SIGTERM, for phases 2 and 3 below.
+        _term_targets: List[Tuple[Any, Optional[int], bool, float]] = []
+
+        def _orphan_skip(cand, age_h: float, why: str) -> None:
+            nonlocal orphan_procs_skipped
+            print(
+                f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
+                f"skipped: {why}"
+            )
+            orphan_procs_skipped += 1
+
+        for cand in orphan_candidates:
+            if time.time() - reap_start > reap_budget:
+                deferred_count += 1
+                continue
+            age_h = (now - cand.start_time) / 3600
+
+            # Dry-run: report the action without acquiring the lock or creating
+            # any files under STATE_ROOT.  All other passes skip on dry_run before
+            # locking; pass 4 must do the same so a preview run neither serialises
+            # against a concurrent launch nor creates .locks entries.
+            if dry_run:
+                print(
+                    f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
+                    "dry-run (would TERM)"
+                )
+                orphan_procs_killed += 1
+                continue
+
+            # Re-verify under the per-name lock: serializes with a concurrent
+            # launch that may have just created a state dir for this name.
+            with _launch_lock(cand.name):
+                if _path_entry_exists(_state_dir(cand.name)):
+                    _orphan_skip(cand, age_h, "state dir appeared after discovery")
+                    continue
+
+                # PID-reuse is the central hazard: there is no state dir, so there
+                # is no recorded process_identity to compare against — the identity
+                # captured at discovery is the only compensating control.  Re-read
+                # it immediately before signalling and abort on any mismatch.
+                live_identity = _process_identity(cand.pid)
+                if live_identity is None or live_identity != cand.identity:
+                    _orphan_skip(
+                        cand, age_h,
+                        f"identity changed (expected={cand.identity!r}, "
+                        f"live={live_identity!r})",
+                    )
+                    continue
+
+                if not _pid_alive(cand.pid):
+                    _orphan_skip(cand, age_h, "process gone before action")
+                    continue
+
+                # Determine process-group scope.  The runner calls setsid() so its
+                # pid == pgid when it is a session leader.  Only kill the group when
+                # getpgid confirms this; otherwise signal the pid alone.
+                try:
+                    pgid = os.getpgid(cand.pid)
+                    use_group = pgid == cand.pid
+                except OSError:
+                    use_group = False
+                    pgid = None
+
+                pgid_note = f" pgid={pgid}" if use_group and pgid is not None else " (pid only — pgid mismatch)"
+
+                # Phase 1: SIGTERM under the lock, then release to let grace run
+                # concurrently with other candidates.  For the pid-only case,
+                # route through _send_signal_to_verified_pid so Linux gets the
+                # pidfd guarantee (signal bound before identity re-read, eliminating
+                # the PID-reuse window for that platform).  Group signals have no
+                # pidfd equivalent; use os.killpg directly for those.
+                print(
+                    f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
+                    f"TERM{pgid_note}"
+                )
+                try:
+                    if use_group and pgid is not None:
+                        os.killpg(pgid, signal.SIGTERM)
+                    else:
+                        _send_signal_to_verified_pid(cand.pid, signal.SIGTERM, cand.identity)
+                except (ProcessLookupError, OSError, RuntimeError):
+                    orphan_procs_skipped += 1
+                    continue
+
+                # Record enough to complete phases 2 and 3.
+                _term_targets.append((cand, pgid, use_group, age_h))
+
+        # Phase 2: one shared grace window covering all candidates that received
+        # SIGTERM.  O(5 s) total instead of O(5 s × N).
+        if _term_targets:
+            deadline = time.time() + ORPHAN_KILL_GRACE_SECONDS
+            while time.time() < deadline:
+                if all(not _pid_alive(c.pid) for c, *_ in _term_targets):
+                    break
+                time.sleep(KILL_POLL_INTERVAL_SECONDS)
+
+        # Phase 3: re-verify identity and SIGKILL whoever survived the grace window.
+        for cand, pgid, use_group, age_h in _term_targets:
+            pgid_note = f" pgid={pgid}" if use_group and pgid is not None else " (pid only — pgid mismatch)"
+            if not _pid_alive(cand.pid):
+                print(f"  [orphan] {cand.name} pid={cand.pid}: terminated after TERM")
+                orphan_procs_killed += 1
+                continue
+            # Re-take the per-name lock before KILL; mirrors the phase-1 lock so
+            # a concurrent launch between TERM and KILL cannot create a state dir
+            # undetected.  Re-verify identity here too — PID reuse can happen in
+            # the grace window, and we must not kill an unrelated process.
+            with _launch_lock(cand.name):
+                current = _process_identity(cand.pid)
+                if current is None or current != cand.identity:
+                    print(
+                        f"  [orphan] {cand.name} pid={cand.pid}: "
+                        "skipped KILL: identity changed after TERM"
+                    )
+                    orphan_procs_skipped += 1
+                    continue
+
+                print(
+                    f"  [orphan] {cand.name} pid={cand.pid}: "
+                    f"KILL after grace{pgid_note}"
+                )
+                try:
+                    if use_group and pgid is not None:
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        _send_signal_to_verified_pid(cand.pid, signal.SIGKILL, cand.identity)
+                except (ProcessLookupError, OSError, RuntimeError):
+                    pass
+                orphan_procs_killed += 1
+
     if target_name and not found_target:
         if _known(target_name):
             print(f"reap: '{target_name}' has no ephemeral state (log preserved); nothing to reconcile")
         else:
             print(f"reap: no such run '{target_name}' in {STATE_ROOT}")
 
+    if deferred_count:
+        print(
+            f"reap: budget exhausted ({reap_budget:.0f}s); deferred {deferred_count} candidate(s) — "
+            "next invocation resumes"
+        )
+
     prefix = "[dry-run] " if dry_run else ""
     print(
         f"{prefix}reap done: died={died_count} killed={killed_count} "
         f"skipped={skipped_count} collected={gc_count} "
         f"orphaned_scratch={orphaned_scratch_count} gc_skipped={gc_skipped_count} "
-        f"resumed={resumed_count}"
+        f"resumed={resumed_count} logs_collected={logs_collected_count} "
+        f"orphan_procs_killed={orphan_procs_killed} orphan_procs_skipped={orphan_procs_skipped} "
+        f"deferred={deferred_count}"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# du
+# ---------------------------------------------------------------------------
+
+# Recognized rollup group keys. A state-backed run whose effective status is
+# not one of these falls into "unrecognized" rather than silently inventing a
+# new bucket per legacy/corrupt value.
+_DU_STATUS_GROUPS = frozenset({"running", "starting", "stalled", "done",
+                               "failed", "launch_failed", "died", "killed"})
+_DU_UNRECOGNIZED_GROUP = "unrecognized"
+_DU_PRESERVED_LOG_GROUP = "preserved-log-only"
+
+
+class _DuRow(NamedTuple):
+    """One accounting row: a single run (``--by-run``) or an aggregated
+    group. ``count`` is the number of runs folded into the row (1 for a
+    per-run row). Log bytes exclude the ``tmp/`` scratch subtree — total is
+    state + log + scratch, so nothing is double-counted."""
+
+    key: str  # run name (--by-run) or group/status label (rollup)
+    count: int
+    state_bytes: int
+    log_bytes: int
+    scratch_bytes: int
+
+    @property
+    def total_bytes(self) -> int:
+        return self.state_bytes + self.log_bytes + self.scratch_bytes
+
+
+def _du_collect_rows() -> List[_DuRow]:
+    """One row per run, read-only: no locks, no heal, no prune, no mutation.
+
+    Sizes are apparent size (sum of ``st_size``), matching ``_dir_size_bytes``
+    used elsewhere for the same reason (`reap --include-logs`'s report
+    line) — labelled explicitly in ``cmd_du``'s own header so the number's
+    meaning isn't ambiguous with on-disk block usage.
+    """
+    state_names: set = set()
+    if STATE_ROOT.is_dir():
+        try:
+            state_names = {
+                p.name for p in STATE_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")
+            }
+        except OSError:
+            state_names = set()
+    log_names: set = set()
+    if LOG_ROOT.is_dir():
+        try:
+            log_names = {
+                p.name for p in LOG_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")
+            }
+        except OSError:
+            log_names = set()
+
+    rows: List[_DuRow] = []
+    for name in sorted(state_names | log_names):
+        try:
+            _validate_run_name(name)
+        except SystemExit:
+            continue
+        has_state = name in state_names
+        has_log = name in log_names
+        state_bytes = _dir_size_bytes(_state_dir(name)) if has_state else 0
+        scratch_dir = _log_dir(name) / "tmp"
+        scratch_bytes = _dir_size_bytes(scratch_dir) if has_log else 0
+        log_bytes = _dir_size_bytes(_log_dir(name), exclude=scratch_dir) if has_log else 0
+        rows.append(_DuRow(name, 1, state_bytes, log_bytes, scratch_bytes))
+    return rows
+
+
+def _du_run_group(name: str) -> str:
+    """Rollup group key for run ``name`` — its effective status, or
+    ``preserved-log-only`` if no state dir remains."""
+    state_dir = _state_dir(name)
+    if not _is_dir_safe(state_dir):
+        return _DU_PRESERVED_LOG_GROUP
+    status = _effective_status(state_dir)
+    return status if status in _DU_STATUS_GROUPS else _DU_UNRECOGNIZED_GROUP
+
+
+def _du_aggregate_groups(run_rows: List[_DuRow]) -> List[_DuRow]:
+    """Fold per-run rows into one row per rollup group."""
+    totals: dict = {}
+    for row in run_rows:
+        group = _du_run_group(row.key)
+        state_b, log_b, scratch_b, n = totals.get(group, (0, 0, 0, 0))
+        totals[group] = (
+            state_b + row.state_bytes,
+            log_b + row.log_bytes,
+            scratch_b + row.scratch_bytes,
+            n + 1,
+        )
+    return [
+        _DuRow(group, n, state_b, log_b, scratch_b)
+        for group, (state_b, log_b, scratch_b, n) in totals.items()
+    ]
+
+
+def _du_sort_rows(rows: List[_DuRow]) -> List[_DuRow]:
+    return sorted(rows, key=lambda r: (-r.total_bytes, r.key))
+
+
+def _du_split_top(rows: List[_DuRow], top: Optional[int]) -> tuple[List[_DuRow], List[_DuRow]]:
+    """Sort ``rows`` and split at ``top``, returning (shown, omitted).
+    When ``top`` is None or covers all rows, omitted is empty."""
+    sorted_rows = _du_sort_rows(rows)
+    if top is not None and len(sorted_rows) > top:
+        return sorted_rows[:top], sorted_rows[top:]
+    return sorted_rows, []
+
+
+def _du_fmt(n: int, *, as_bytes: bool) -> str:
+    return str(n) if as_bytes else _human_size(n)
+
+
+def _du_print_table(
+    rows: List[_DuRow],
+    total: _DuRow,
+    *,
+    label_header: str,
+    as_bytes: bool,
+    top: Optional[int],
+) -> None:
+    """Print one plain-aligned-columns table (no Markdown) plus a TOTAL row.
+    ``total`` is passed in rather than recomputed so it always reflects
+    every run even when ``rows`` was truncated by ``--top``."""
+    count_header = "RUNS"
+    shown, omitted = _du_split_top(rows, top)
+
+    columns = [label_header, count_header, "STATE", "LOG", "SCRATCH", "TOTAL"]
+    widths = [max(len(columns[0]), *(len(r.key) for r in shown)) if shown else len(columns[0]), len(columns[1])]
+    print(f"{columns[0]:<{widths[0]}}  {columns[1]:>{widths[1]}}  {columns[2]:>10}  {columns[3]:>10}  {columns[4]:>10}  {columns[5]:>10}")
+    for r in shown:
+        print(
+            f"{r.key:<{widths[0]}}  {r.count:>{widths[1]}}  "
+            f"{_du_fmt(r.state_bytes, as_bytes=as_bytes):>10}  "
+            f"{_du_fmt(r.log_bytes, as_bytes=as_bytes):>10}  "
+            f"{_du_fmt(r.scratch_bytes, as_bytes=as_bytes):>10}  "
+            f"{_du_fmt(r.total_bytes, as_bytes=as_bytes):>10}"
+        )
+    if omitted:
+        omitted_total = sum(r.total_bytes for r in omitted)
+        print(
+            f"... {len(omitted)} more row(s) omitted by --top "
+            f"(sum {_du_fmt(omitted_total, as_bytes=as_bytes)}; TOTAL below covers all runs)"
+        )
+    print(
+        f"{total.key:<{widths[0]}}  {total.count:>{widths[1]}}  "
+        f"{_du_fmt(total.state_bytes, as_bytes=as_bytes):>10}  "
+        f"{_du_fmt(total.log_bytes, as_bytes=as_bytes):>10}  "
+        f"{_du_fmt(total.scratch_bytes, as_bytes=as_bytes):>10}  "
+        f"{_du_fmt(total.total_bytes, as_bytes=as_bytes):>10}"
+    )
+
+
+def _du_row_to_dict(r: _DuRow) -> dict:
+    return {
+        "runs": r.count,
+        "state_bytes": r.state_bytes,
+        "log_bytes": r.log_bytes,
+        "scratch_bytes": r.scratch_bytes,
+        "total_bytes": r.total_bytes,
+    }
+
+
+def cmd_du(args: argparse.Namespace) -> int:
+    """Disk usage per effective status (default) or per run (``--by-run``),
+    including preserved logs. Strictly read-only: no locks, no
+    ``_opportunistic_heal``, no ``_prune_old_logs``, no mutation of any kind
+    — only ``os.scandir``/``stat`` reads via ``_dir_size_bytes``.
+    """
+    as_bytes: bool = bool(getattr(args, "bytes", False))
+    as_json: bool = bool(getattr(args, "json", False))
+    by_run: bool = bool(getattr(args, "by_run", False))
+    top: Optional[int] = getattr(args, "top", None)
+    if as_bytes and as_json:
+        # --json already emits exact integers; combining with --bytes would
+        # either be a silent no-op or need to change --json's shape, both
+        # confusing. Reject rather than guess which the caller meant.
+        sys.exit("agent-run: --bytes has no effect with --json, which always emits exact integers")
+
+    run_rows = _du_collect_rows()
+    all_rows = run_rows if by_run else _du_aggregate_groups(run_rows)
+    total = _DuRow(
+        "TOTAL",
+        sum(r.count for r in all_rows),
+        sum(r.state_bytes for r in all_rows),
+        sum(r.log_bytes for r in all_rows),
+        sum(r.scratch_bytes for r in all_rows),
+    )
+
+    if as_json:
+        shown, omitted = _du_split_top(all_rows, top)
+        payload = {
+            "state_root": str(STATE_ROOT),
+            "log_root": str(LOG_ROOT),
+            "total": _du_row_to_dict(total),
+        }
+        if by_run:
+            payload["runs"] = [{"name": r.key, **_du_row_to_dict(r)} for r in shown]
+        else:
+            payload["groups"] = {r.key: _du_row_to_dict(r) for r in shown}
+        if omitted:
+            payload["omitted"] = {
+                "count": len(omitted),
+                "total_bytes": sum(r.total_bytes for r in omitted),
+            }
+        print(json.dumps(payload))
+        return 0
+
+    size_label = "bytes" if as_bytes else "human-readable (binary, 1024-based)"
+    print(
+        f"agent-run du: apparent size (st_size), {size_label}, "
+        f"STATE_ROOT={STATE_ROOT} LOG_ROOT={LOG_ROOT}"
+    )
+    _du_print_table(
+        all_rows,
+        total,
+        label_header="NAME" if by_run else "STATUS",
+        as_bytes=as_bytes,
+        top=top,
     )
     return 0
 
@@ -3200,6 +4411,12 @@ def _run_is_terminal(state_dir: Path) -> bool:
 KILL_ESCALATION_TIMEOUT_SECONDS = 8.0
 KILL_POLL_INTERVAL_SECONDS = 0.2
 KILL_CHILD_REAP_TIMEOUT_SECONDS = 3.0
+
+# Grace period for orphan-process SIGTERM before escalating to SIGKILL.
+# Shorter than KILL_ESCALATION_TIMEOUT_SECONDS (8 s) because orphan runners
+# have no state dir — there is no teardown work to protect, and a hanging
+# process denies a slot indefinitely.
+ORPHAN_KILL_GRACE_SECONDS = 5.0
 
 
 def _force_kill(name: str, state_dir: Path, pid: int, expected_identity: str) -> None:
@@ -4025,9 +5242,16 @@ def _runner(
             # Export before any child is forked/exec'd below: os.environ is
             # process-wide, so every subsequent fork/exec — including the
             # Darwin _process_identity() implementation's `ps` subprocess —
-            # inherits this run's disk-backed TMPDIR. Argv is intentionally
-            # left untouched; only the environment carries this.
+            # inherits this run's disk-backed scratch dir. Argv is
+            # intentionally left untouched; only the environment carries
+            # this. BUN_TMPDIR is set alongside TMPDIR, same value, same
+            # condition: Bun (which OpenCode runs on) does not consult
+            # TMPDIR for its own scratch space, so a Bun-based agent would
+            # otherwise still spill into the shared system temp despite
+            # TMPDIR being redirected. Both point at the same one scratch
+            # dir — no second directory is created.
             os.environ["TMPDIR"] = str(tmp_dir)
+            os.environ["BUN_TMPDIR"] = str(tmp_dir)
 
         runner_pgid = os.getpgid(my_pid)
         identity = _process_identity(my_pid)
@@ -4662,12 +5886,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="show only runs whose effective status is in this comma-separated "
         "list (e.g. --status running,stalled); overrides the default filter",
     )
+    # Deliberately not in group_list: orthogonal to --all/--status, both of
+    # which govern only the state-backed "Live runs"/"Unrecognized" sections.
+    # --all alone must still hide preserved logs.
+    sp_list.add_argument(
+        "--include-logs",
+        action="store_true",
+        default=False,
+        help="also show preserved-log-only runs (state dir gone); hidden by "
+        "default, or set AGENT_RUN_LIST_INCLUDE_LOGS=1",
+    )
     sp_list.set_defaults(func=cmd_list)
 
     sp_reap = sub.add_parser(
         "reap",
-        help="reconcile stale status, idle-kill lingering runs, and garbage-"
-        "collect old terminal-state run dirs",
+        help="reconcile stale status, idle-kill lingering runs, "
+        "garbage-collect old terminal-state run dirs, collect preserved logs "
+        "(--include-logs), and terminate orphan processes (--orphan-processes)",
     )
     sp_reap.add_argument(
         "--dry-run",
@@ -4707,12 +5942,282 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="reap only this specific run",
     )
+    sp_reap.add_argument(
+        "--include-logs",
+        action="store_true",
+        default=False,
+        help="also garbage-collect preserved log directories (state dir "
+        "already gone) once older than --log-min-age-hours; without this "
+        "flag preserved logs are never touched by reap",
+    )
+    sp_reap.add_argument(
+        "--log-min-age-hours",
+        type=_positive_finite_float,
+        default=None,
+        metavar="N",
+        help="override the preserved-log GC age threshold used by "
+        "--include-logs (hours, float, must be finite and > 0); independent "
+        "of --min-age-hours, since a preserved log is the artifact an "
+        "operator wanted to keep, not disposable state bookkeeping; default "
+        "from AGENT_RUN_LOG_MIN_AGE_HOURS, or PRUNE_AFTER_DAYS*24 "
+        "(21 days), matching the existing whole-log-dir prune",
+    )
+    sp_reap.add_argument(
+        "--orphan-processes",
+        action="store_true",
+        default=False,
+        help="terminate live agent-run runner processes that have no state "
+        "directory — i.e. runs that exist as live processes but whose "
+        "ephemeral state record (in $AGENT_RUN_STATE_DIR) is gone.  This "
+        "kills processes agent-run has no state record for, selected by "
+        "argv parsing; it is opt-in for that reason.  Identity captured at "
+        "discovery is re-verified immediately before every signal; any "
+        "ambiguity aborts the candidate instead of sending a signal.  Only "
+        "processes older than --orphan-min-age-hours are eligible.",
+    )
+    sp_reap.add_argument(
+        "--orphan-min-age-hours",
+        type=_positive_finite_float,
+        default=None,
+        metavar="N",
+        help="minimum process age for --orphan-processes candidates (hours, "
+        "float, must be finite and > 0); independent of --min-age-hours and "
+        "--log-min-age-hours; default from AGENT_RUN_ORPHAN_MIN_AGE_HOURS "
+        "or 24h.  Parsed and validated even when --orphan-processes is absent.",
+    )
+    sp_reap.add_argument(
+        "--max-seconds",
+        type=_positive_finite_float,
+        default=None,
+        metavar="N",
+        dest="max_seconds",
+        help="wall-clock budget for the entire reap invocation (seconds, float, "
+        "must be finite and > 0); when exceeded, remaining candidates in any pass "
+        "are deferred and a count is printed; exit 0 so the next timer tick resumes. "
+        "Default from AGENT_RUN_REAP_MAX_SECONDS, or 600 s (10 min, comfortably "
+        "under the 30-minute systemd timer period).",
+    )
     sp_reap.set_defaults(func=cmd_reap)
+
+    sp_du = sub.add_parser(
+        "du",
+        help="disk usage per effective status (or per run with --by-run), "
+        "including preserved logs; strictly read-only",
+    )
+    sp_du.add_argument(
+        "--by-run",
+        action="store_true",
+        default=False,
+        help="one row per run instead of the per-status rollup",
+    )
+    sp_du.add_argument(
+        "--top",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="show only the N largest rows; TOTAL still covers every run",
+    )
+    sp_du.add_argument(
+        "--bytes",
+        action="store_true",
+        default=False,
+        help="print exact integer byte counts instead of human-readable sizes",
+    )
+    sp_du.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="emit a machine-readable object instead of a table; always uses "
+        "exact integers, so --bytes is rejected alongside it",
+    )
+    sp_du.set_defaults(func=cmd_du)
 
     sp_help = sub.add_parser("help", help="show this help")
     sp_help.set_defaults(func=lambda _a: (p.print_help() or 0))
 
     return p
+
+
+class _LaunchArgvError(ValueError):
+    """Raised by _parse_launch_argv for any argv-level parse failure.
+
+    Carries the exact message string main() should pass to sys.exit, preserving
+    byte-identical error text without coupling the pure parser to sys.exit.
+    """
+
+
+class _LaunchArgv(NamedTuple):
+    """Parsed result of agent-run's top-level argv — flags, name, and command.
+
+    ``subcommand_tokens`` is non-None when the first non-flag token is a known
+    subcommand and no launch flags were supplied; main() delegates to argparse
+    in that case and ignores all other fields.
+    """
+    interactive: bool
+    prompt_file: Optional[str]
+    echo: bool
+    echo_interval: float
+    submit_mode: Optional[str]
+    idle_timeout: Optional[float]
+    name: str
+    command: List[str]
+    subcommand_tokens: Optional[List[str]]
+
+
+_KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
+    "status", "watch", "logs", "tail", "clean", "steer", "kill",
+    "list", "reap", "du", "help",
+})
+
+
+def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
+    """Parse agent-run's own flags, the run name, and the launch command.
+
+    Pure: no sys.exit, no printing, no env reads, no filesystem access, no
+    globals.  All parse failures raise _LaunchArgvError with the verbatim
+    message main() should pass to sys.exit.
+
+    Handles all current flag forms in any order before the name:
+      -i / --interactive
+      -f X / --prompt-file X / --prompt-file=X
+      --echo / --echo=N
+      --submit-mode=cr|crlf
+      --idle-timeout N / --idle-timeout=N
+
+    Preserves the -- separator semantics: name must precede --, everything
+    after -- is taken verbatim.  Without --, a leading-dash token immediately
+    after the name is rejected.
+
+    When the first non-flag token is a known subcommand and no launch flags
+    were set, returns with subcommand_tokens set to the remaining argv so
+    main() can delegate to argparse; all other fields hold zero values in that
+    case.
+    """
+    tokens = list(raw)
+    interactive = False
+    prompt_file: Optional[str] = None
+    echo: bool = False
+    echo_interval: float = 2.0
+    submit_mode: Optional[str] = None
+    idle_timeout: Optional[float] = None
+
+    # Consume flags in any order before the name.
+    while tokens:
+        if tokens[0] in ("-i", "--interactive"):
+            interactive = True
+            tokens = tokens[1:]
+            continue
+        if tokens[0] in ("-f", "--prompt-file"):
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: -f/--prompt-file requires a path")
+            prompt_file = tokens[1]
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--prompt-file="):
+            prompt_file = tokens[0].split("=", 1)[1]
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--echo":
+            echo = True
+            tokens = tokens[1:]
+            continue
+        if tokens[0].startswith("--echo="):
+            echo = True
+            value = tokens[0].split("=", 1)[1]
+            try:
+                echo_interval = _positive_finite_float(value)
+            except argparse.ArgumentTypeError as exc:
+                raise _LaunchArgvError(f"agent-run: --echo interval {exc}") from exc
+            tokens = tokens[1:]
+            continue
+        if tokens[0].startswith("--submit-mode="):
+            submit_mode = tokens[0].split("=", 1)[1]
+            if submit_mode not in {SUBMIT_MODE_CR, SUBMIT_MODE_CRLF}:
+                raise _LaunchArgvError("agent-run: --submit-mode must be cr or crlf")
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--idle-timeout":
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: --idle-timeout requires a value in seconds")
+            try:
+                idle_timeout = _parse_idle_timeout_flag(tokens[1])
+            except argparse.ArgumentTypeError as exc:
+                raise _LaunchArgvError(f"agent-run: --idle-timeout {exc}") from exc
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--idle-timeout="):
+            try:
+                idle_timeout = _parse_idle_timeout_flag(tokens[0].split("=", 1)[1])
+            except argparse.ArgumentTypeError as exc:
+                raise _LaunchArgvError(f"agent-run: --idle-timeout {exc}") from exc
+            tokens = tokens[1:]
+            continue
+        break
+
+    # A bare "--" before any name has no run to attach the command to.
+    if tokens and tokens[0] == "--":
+        raise _LaunchArgvError(
+            "agent-run: the run name must appear before '--'; shape is "
+            "'agent-run [flags] NAME -- <command> [args...]'"
+        )
+
+    # No launch flags set and first token is a known subcommand: delegate to
+    # argparse.  Returning here keeps the subcommand check out of main()'s
+    # own conditional chain without duplicating the flag-state test.
+    any_launch_flag = interactive or prompt_file or echo or submit_mode is not None or idle_timeout is not None
+    if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
+        return _LaunchArgv(
+            interactive=False, prompt_file=None, echo=False, echo_interval=2.0,
+            submit_mode=None, idle_timeout=None, name="", command=[],
+            subcommand_tokens=tokens,
+        )
+
+    if len(tokens) < 2:
+        # Signal main() to print help; name/command are meaningless here.
+        return _LaunchArgv(
+            interactive=interactive, prompt_file=prompt_file, echo=echo,
+            echo_interval=echo_interval, submit_mode=submit_mode,
+            idle_timeout=idle_timeout, name="", command=[],
+            subcommand_tokens=None,
+        )
+
+    name, *rest = tokens
+    if not name or "/" in name or name.startswith("-"):
+        raise _LaunchArgvError(f"agent-run: invalid name '{name}'")
+
+    if rest and rest[0] == "--":
+        # Everything after "--" is the launch command verbatim — leading-dash
+        # tokens and further "--" tokens included; no subcommand dispatch.
+        command = rest[1:]
+        if not command:
+            raise _LaunchArgvError(
+                "agent-run: empty command after '--'; provide a command to "
+                "launch: 'agent-run [flags] NAME -- <command> [args...]'"
+            )
+    else:
+        command = rest
+        if command and command[0].startswith("-"):
+            # A flag-like token after the name without "--" would silently
+            # become argv[0] and exec would fail with an opaque ENOENT.
+            raise _LaunchArgvError(
+                f"agent-run: {command[0]!r} looks like an agent-run flag, not "
+                "part of the launch command; agent-run flags (-i, -f, --echo, "
+                "--submit-mode, --idle-timeout) must precede the run name, or "
+                "separate them from the launch command with '--': "
+                "'agent-run [flags] NAME -- <command> [args...]'"
+            )
+
+    return _LaunchArgv(
+        interactive=interactive,
+        prompt_file=prompt_file,
+        echo=echo,
+        echo_interval=echo_interval,
+        submit_mode=submit_mode,
+        idle_timeout=idle_timeout,
+        name=name,
+        command=command,
+        subcommand_tokens=None,
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -4727,110 +6232,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _build_parser().print_help()
         return 0
 
-    # Interactive flag consumed explicitly (may be before name).
-    interactive = False
-    prompt_file: Optional[str] = None
-    echo: bool = False
-    echo_interval: float = 2.0
-    submit_mode: Optional[str] = None
-    idle_timeout: Optional[float] = None
-    # Consume top-level flags (`-i`, `-f <path>`, `--echo[=interval]`,
-    # `--submit-mode=cr|crlf`, `--idle-timeout <seconds>`) in any order
-    # before the name.
-    while raw:
-        if raw[0] in ("-i", "--interactive"):
-            interactive = True
-            raw = raw[1:]
-            continue
-        if raw[0] in ("-f", "--prompt-file"):
-            if len(raw) < 2:
-                sys.exit("agent-run: -f/--prompt-file requires a path")
-            prompt_file = raw[1]
-            raw = raw[2:]
-            continue
-        if raw[0].startswith("--prompt-file="):
-            prompt_file = raw[0].split("=", 1)[1]
-            raw = raw[1:]
-            continue
-        if raw[0] == "--echo":
-            echo = True
-            raw = raw[1:]
-            continue
-        if raw[0].startswith("--echo="):
-            echo = True
-            value = raw[0].split("=", 1)[1]
-            try:
-                echo_interval = _positive_finite_float(value)
-            except argparse.ArgumentTypeError as exc:
-                sys.exit(f"agent-run: --echo interval {exc}")
-            raw = raw[1:]
-            continue
-        if raw[0].startswith("--submit-mode="):
-            submit_mode = raw[0].split("=", 1)[1]
-            if submit_mode not in {SUBMIT_MODE_CR, SUBMIT_MODE_CRLF}:
-                sys.exit("agent-run: --submit-mode must be cr or crlf")
-            raw = raw[1:]
-            continue
-        if raw[0] == "--idle-timeout":
-            if len(raw) < 2:
-                sys.exit("agent-run: --idle-timeout requires a value in seconds")
-            try:
-                idle_timeout = _parse_idle_timeout_flag(raw[1])
-            except argparse.ArgumentTypeError as exc:
-                sys.exit(f"agent-run: --idle-timeout {exc}")
-            raw = raw[2:]
-            continue
-        if raw[0].startswith("--idle-timeout="):
-            try:
-                idle_timeout = _parse_idle_timeout_flag(raw[0].split("=", 1)[1])
-            except argparse.ArgumentTypeError as exc:
-                sys.exit(f"agent-run: --idle-timeout {exc}")
-            raw = raw[1:]
-            continue
-        break
+    try:
+        parsed = _parse_launch_argv(raw)
+    except _LaunchArgvError as exc:
+        sys.exit(str(exc))
 
-    # Try to dispatch a known subcommand; otherwise treat as launch.
-    known_subcommands = {"status", "watch", "logs", "tail", "clean", "steer", "kill", "list", "reap", "help"}
-    if (
-        raw
-        and raw[0] in known_subcommands
-        and not interactive
-        and not prompt_file
-        and not echo
-        and submit_mode is None
-        and idle_timeout is None
-    ):
-        # argparse handles these, including their own -h/--help.
+    # Subcommand dispatch: argparse handles help for each subcommand.
+    if parsed.subcommand_tokens is not None:
         parser = _build_parser()
-        args = parser.parse_args(raw)
+        args = parser.parse_args(parsed.subcommand_tokens)
         return int(args.func(args) or 0)
 
-    if len(raw) < 2:
+    if not parsed.name:
         _build_parser().print_help()
         return 2
-    name, *command = raw
-    # Basic validation of the name.
-    if "/" in name or name.startswith("-"):
-        sys.exit(f"agent-run: invalid name '{name}'")
-    if command and command[0].startswith("-"):
-        # A flag typed after the run name is never part of the launch
-        # command — it silently becomes argv[0] and exec fails with an
-        # opaque ENOENT. Reject it here with the actual offending token
-        # instead of letting the fork/exec path produce that confusion.
-        sys.exit(
-            f"agent-run: {command[0]!r} looks like an agent-run flag, not part "
-            "of the launch command; agent-run flags (-i, -f, --echo, "
-            "--submit-mode, --idle-timeout) must precede the run name"
-        )
+
     ns = argparse.Namespace(
-        name=name,
-        command=command,
-        interactive=interactive,
-        prompt_file=prompt_file,
-        echo=echo,
-        echo_interval=echo_interval,
-        submit_mode=submit_mode,
-        idle_timeout=idle_timeout if idle_timeout is not None else _idle_timeout_env_seconds(),
+        name=parsed.name,
+        command=parsed.command,
+        interactive=parsed.interactive,
+        prompt_file=parsed.prompt_file,
+        echo=parsed.echo,
+        echo_interval=parsed.echo_interval,
+        submit_mode=parsed.submit_mode,
+        idle_timeout=parsed.idle_timeout if parsed.idle_timeout is not None else _idle_timeout_env_seconds(),
     )
     return cmd_launch(ns)
 

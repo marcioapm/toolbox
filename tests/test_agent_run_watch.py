@@ -378,6 +378,49 @@ class TestZombieDetection:
         assert payload["status"] == "running"
         assert payload["terminal"] is False
 
+    def test_linux_zombie_detected_via_proc_stat(self, monkeypatch):
+        """With platform forced to Linux, _watch_pid_is_zombie reads
+        /proc/<pid>/stat and returns True when the state field is 'Z'.
+
+        Runs on all platforms via a platform stub; no real zombie needed."""
+        monkeypatch.setattr(agent_run.platform, "system", lambda: "Linux")
+        # Minimal /proc/stat line: fields[0] after the comm field is the state.
+        # Format: "<pid> (<comm>) <state> ..."
+        fake_stat = "222 (myproc) Z 1 222 222 0\n"
+        monkeypatch.setattr(Path, "read_text", lambda _self: fake_stat)
+        assert agent_run._watch_pid_is_zombie(222) is True
+
+    def test_darwin_zombie_detected_via_ps(self, monkeypatch):
+        """With platform forced to Darwin, _watch_pid_is_zombie uses
+        _ps_field(pid, 'stat') and returns True when the first character is 'Z'.
+
+        Runs on all platforms via a platform stub and subprocess.run stub."""
+        monkeypatch.setattr(agent_run.platform, "system", lambda: "Darwin")
+
+        class PsResult:
+            stdout = "Z+\n"
+            returncode = 0
+
+        monkeypatch.setattr(
+            agent_run.subprocess, "run",
+            lambda cmd, **kwargs: PsResult(),
+        )
+        assert agent_run._watch_pid_is_zombie(222) is True
+
+    def test_darwin_non_zombie_returns_false(self, monkeypatch):
+        """A running process (state 'S') must not be mistaken for a zombie."""
+        monkeypatch.setattr(agent_run.platform, "system", lambda: "Darwin")
+
+        class PsResult:
+            stdout = "S\n"
+            returncode = 0
+
+        monkeypatch.setattr(
+            agent_run.subprocess, "run",
+            lambda cmd, **kwargs: PsResult(),
+        )
+        assert agent_run._watch_pid_is_zombie(222) is False
+
 
 # ---------------------------------------------------------------------------
 # terminal / status derivability
