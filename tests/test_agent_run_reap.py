@@ -2186,6 +2186,38 @@ class TestReapIncludeLogs:
         assert rc == 0
         assert not ld.exists()
 
+    def test_log_root_sentinel_reaped_by_next_invocation(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """A .reaping-* sentinel left under LOG_ROOT by an interrupted reap
+        must be cleaned up by the next reap invocation and must never appear
+        in list output."""
+        # Simulate a crash-safe-rmtree sentinel: the directory was renamed
+        # to .reaping-<name>.<pid>.<ns> but not yet emptied.
+        sentinel_name = ".reaping-oldrun.9999.123456789000000000"
+        sentinel = isolated_log_root / sentinel_name
+        sentinel.mkdir()
+        (sentinel / "log").write_text("leftover\n")
+
+        rc = agent_run.cmd_reap(_reap_args())
+
+        assert rc == 0
+        assert not sentinel.exists(), "stale LOG_ROOT sentinel was not cleaned up"
+
+    def test_list_does_not_show_log_root_sentinel(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """A .reaping-* sentinel under LOG_ROOT must be invisible to list,
+        even with --include-logs."""
+        sentinel = isolated_log_root / ".reaping-badrun.9999.123456789000000000"
+        sentinel.mkdir()
+        (sentinel / "log").write_text("leftover\n")
+
+        agent_run.cmd_list(_list_args(include_logs=True))
+
+        out = capsys.readouterr().out
+        assert ".reaping-" not in out
+
 
 class TestReapLogMinAgeThreshold:
     """--log-min-age-hours is independent of --min-age-hours, defaults to

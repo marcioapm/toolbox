@@ -796,6 +796,15 @@ class TestParseLaunchArgv:
             self._parse(["-myrun", "cmd"])
         assert "invalid name" in str(exc.value)
 
+    def test_error_empty_name_raises_not_help(self):
+        # agent-run "" echo hi — empty name must reject with "invalid name",
+        # not silently signal the help path.  Old main() reached _validate_run_name
+        # and exited with the same message; _parse_launch_argv must match.
+        for argv in [["", "echo", "hi"], ["", "--", "echo"], ["-i", "", "cmd"]]:
+            with pytest.raises(agent_run._LaunchArgvError) as exc:
+                self._parse(argv)
+            assert "invalid name" in str(exc.value), argv
+
     # --- subcommand dispatch signal ---
 
     def test_subcommand_returns_subcommand_tokens(self):

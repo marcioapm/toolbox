@@ -2218,7 +2218,10 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     log_only_names = set()
     if LOG_ROOT.is_dir():
-        log_only_names = {p.name for p in LOG_ROOT.iterdir() if p.is_dir()} - state_names
+        log_only_names = {
+            p.name for p in LOG_ROOT.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        } - state_names
     if include_logs:
         if log_only_names:
             # Preserved-log-only runs (state dir already gone) are already
@@ -3308,6 +3311,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
     resumed_count = 0
     if not dry_run:
         resumed_count = _reap_stale_sentinels(STATE_ROOT)
+        if LOG_ROOT.is_dir():
+            resumed_count += _reap_stale_sentinels(LOG_ROOT)
 
     candidates: List[Path] = []
     if STATE_ROOT.is_dir():
@@ -6019,8 +6024,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         )
 
     name, *rest = tokens
-    # Basic name validation: no path separators and no leading dash.
-    if "/" in name or name.startswith("-"):
+    if not name or "/" in name or name.startswith("-"):
         raise _LaunchArgvError(f"agent-run: invalid name '{name}'")
 
     if rest and rest[0] == "--":
