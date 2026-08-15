@@ -16,7 +16,7 @@ import argparse
 import os
 import signal
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 
@@ -40,6 +40,28 @@ def _no_real_signals(monkeypatch):
     install their own recording stubs via monkeypatch, which override these."""
     monkeypatch.setattr(os, "kill", lambda *a, **k: pytest.fail(f"real os.kill{a}"))
     monkeypatch.setattr(os, "killpg", lambda *a, **k: pytest.fail(f"real os.killpg{a}"))
+
+
+@pytest.fixture(autouse=True)
+def _no_real_pidfd(monkeypatch):
+    """Block the pidfd signal path so no real signal is sent to a fabricated pid.
+
+    On Linux, _send_signal_to_verified_pid uses os.pidfd_open +
+    signal.pidfd_send_signal before falling back to os.kill.  Fabricated pids
+    (9100, 9200, …) do not exist: a real os.pidfd_open call would raise
+    ProcessLookupError, causing the candidate to be counted skipped rather than
+    killed.  Tests that assert on signal delivery install recording stubs via
+    _install_signal_stubs(), which override this guard."""
+    monkeypatch.setattr(
+        agent_run.os, "pidfd_open",
+        lambda *a, **k: pytest.fail(f"real os.pidfd_open{a}"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent_run.signal, "pidfd_send_signal",
+        lambda *a, **k: pytest.fail(f"real signal.pidfd_send_signal{a}"),
+        raising=False,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -140,6 +162,55 @@ def _summary_field(line: str, field: str) -> int:
     raise KeyError(f"field {field!r} not found in: {line!r}")
 
 
+def _install_signal_stubs(
+    monkeypatch,
+    sent: List[Tuple[int, int]],
+    *,
+    on_kill: Optional[object] = None,
+) -> None:
+    """Install recording stubs for both the Darwin (os.kill/killpg) and Linux
+    (os.pidfd_open + signal.pidfd_send_signal) signal paths.
+
+    All signals recorded as (pid, sig); killpg signals encoded as (-pgid, sig).
+    ``on_kill`` may be a callable(pid, sig) called after recording, used to
+    drive stateful fake-alive flags.  Both paths write to the same ``sent``
+    list so assertions work regardless of which platform branch runs.
+
+    This overrides both the _no_real_signals and _no_real_pidfd autouse guards.
+    """
+    fd_counter: List[int] = [100]
+    fd_to_pid: Dict[int, int] = {}
+
+    def fake_pidfd_open(pid: int, flags: int) -> int:
+        fd = fd_counter[0]
+        fd_counter[0] += 1
+        fd_to_pid[fd] = pid
+        return fd
+
+    def fake_pidfd_send_signal(fd: int, sig: int, info: object, flags: int) -> None:
+        pid = fd_to_pid.get(fd)
+        if pid is not None:
+            sent.append((pid, sig))
+            if on_kill is not None and callable(on_kill):
+                on_kill(pid, sig)
+
+    def fake_kill(pid: int, sig: int) -> None:
+        sent.append((pid, sig))
+        if on_kill is not None and callable(on_kill):
+            on_kill(pid, sig)
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    monkeypatch.setattr(os, "killpg", lambda g, s: sent.append((-g, s)))
+    monkeypatch.setattr(agent_run.os, "pidfd_open", fake_pidfd_open, raising=False)
+    monkeypatch.setattr(agent_run.signal, "pidfd_send_signal",
+                        fake_pidfd_send_signal, raising=False)
+    # Prevent os.close from receiving our synthetic fds; real fds pass through.
+    real_close = os.close
+    monkeypatch.setattr(
+        agent_run.os, "close",
+        lambda fd: (None if fd in fd_to_pid else real_close(fd)),
+    )
+
 @pytest.fixture
 def orphan_harness(monkeypatch):
     """Return a setup callable that installs the standard orphan-test stubs.
@@ -154,6 +225,10 @@ def orphan_harness(monkeypatch):
 
     ``alive`` may be a bool (constant) or a zero-argument callable returning
     bool (stateful).  ``pgid_offset`` controls ``getpgid`` return value.
+
+    Signal recording covers both the Darwin path (os.kill / os.killpg) and the
+    Linux pidfd path (os.pidfd_open + signal.pidfd_send_signal), so assertions
+    on ``signals`` work regardless of which platform branch runs.
     """
     def setup(entries, *, identity=None, alive=True, pgid_offset=1):
         sent: List[Tuple[int, int]] = []
@@ -170,8 +245,7 @@ def orphan_harness(monkeypatch):
             lambda _p: (alive() if callable(alive) else alive),
         )
         monkeypatch.setattr(os, "getpgid", lambda p: p + pgid_offset)
-        monkeypatch.setattr(os, "kill", lambda p, s: sent.append((p, s)))
-        monkeypatch.setattr(os, "killpg", lambda g, s: sent.append((-g, s)))
+        _install_signal_stubs(monkeypatch, sent)
         return sent
     return setup
 
@@ -262,8 +336,7 @@ class TestTermGrace:
 
         alive = [True]
 
-        def fake_kill(p, sig):
-            signals_sent.append((p, sig))
+        def _on_kill(p: int, sig: int) -> None:
             if sig == signal.SIGTERM:
                 alive[0] = False  # process "dies" immediately on TERM
 
@@ -272,8 +345,10 @@ class TestTermGrace:
             identity=lambda p: identity,
             alive=lambda: alive[0],
         )
-        # Re-patch kill after harness to also flip alive on SIGTERM.
-        monkeypatch.setattr(os, "kill", fake_kill)
+        # Replace the harness's signal stubs with ones that also flip alive;
+        # _install_signal_stubs' on_kill hook drives the stateful alive flag on
+        # both the Darwin (os.kill) and Linux (pidfd_send_signal) branches.
+        _install_signal_stubs(monkeypatch, signals_sent, on_kill=_on_kill)
 
         cmd_reap(_reap_args(orphan_processes=True))
         sigs = [sig for _p, sig in signals_sent]
@@ -611,9 +686,10 @@ class TestOrphanMinAgeHours:
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
         monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-        monkeypatch.setattr(os, "kill", lambda *_a: None)
-        monkeypatch.setattr(os, "killpg", lambda *_a: None)
         monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
+        # Stub both signal paths so neither reaches a real process.
+        sent: List[Tuple[int, int]] = []
+        _install_signal_stubs(monkeypatch, sent)
 
         # With --orphan-min-age-hours 1, the 2 h old process IS a candidate.
         cmd_reap(_reap_args(orphan_processes=True, orphan_min_age_hours=1.0))
@@ -692,22 +768,22 @@ class TestThreePhaseOrphan:
 
         alive: dict = {p: True for p in pids}
 
-        def fake_kill(p, sig):
+        def _on_kill(p: int, sig: int) -> None:
             if sig == signal.SIGTERM:
                 alive[p] = False
 
         def fake_pid_alive(p):
             return alive.get(p, False)
 
+        sent: List[Tuple[int, int]] = []
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: entries)
         monkeypatch.setattr(agent_run, "_process_identity",
                             lambda p: f"darwin:{p}-test-identity")
         monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", grace)
         monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.02)
-        monkeypatch.setattr(os, "kill", fake_kill)
-        monkeypatch.setattr(os, "killpg", lambda *_a: None)
         monkeypatch.setattr(agent_run, "_pid_alive", fake_pid_alive)
         monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
+        _install_signal_stubs(monkeypatch, sent, on_kill=_on_kill)
 
         t0 = _time.time()
         cmd_reap(_reap_args(orphan_processes=True))
@@ -742,10 +818,7 @@ class TestThreePhaseOrphan:
         # _process_identity always returns the recycled token, simulating PID reuse.
         monkeypatch.setattr(agent_run, "_process_identity", lambda p: recycled_identity)
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: signals_sent.append((p, sig)))
-        monkeypatch.setattr(os, "killpg",
-                            lambda pgid, sig: signals_sent.append((-pgid, sig)))
+        _install_signal_stubs(monkeypatch, signals_sent)
 
         cmd_reap(_reap_args(orphan_processes=True))
         assert not signals_sent, "TERM must not be sent when identity mismatches at phase 1"
@@ -788,11 +861,8 @@ class TestThreePhaseOrphan:
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
         monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: signals_sent.append((p, sig)))
-        monkeypatch.setattr(os, "killpg",
-                            lambda pgid, sig: signals_sent.append((-pgid, sig)))
         monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
+        _install_signal_stubs(monkeypatch, signals_sent)
 
         cmd_reap(_reap_args(orphan_processes=True))
 
@@ -836,11 +906,8 @@ class TestThreePhaseOrphan:
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
         monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-        monkeypatch.setattr(os, "kill",
-                            lambda p, sig: signals_sent.append((p, sig)))
-        monkeypatch.setattr(os, "killpg",
-                            lambda pgid, sig: signals_sent.append((-pgid, sig)))
         monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
+        _install_signal_stubs(monkeypatch, signals_sent)
 
         cmd_reap(_reap_args(orphan_processes=True))
 
@@ -862,31 +929,27 @@ class TestThreePhaseOrphan:
 
         alive: dict = {p: True for p in pids}
 
-        def fake_kill(p, sig):
+        def _on_kill(p: int, sig: int) -> None:
             if sig == signal.SIGTERM:
                 alive[p] = False
 
+        sent: List[Tuple[int, int]] = []
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: entries)
         monkeypatch.setattr(agent_run, "_process_identity",
                             lambda p: f"darwin:{p}-test-identity")
         monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.1)
         monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
-        monkeypatch.setattr(os, "kill", fake_kill)
-        monkeypatch.setattr(os, "killpg", lambda *_a: None)
         monkeypatch.setattr(agent_run, "_pid_alive", lambda p: alive.get(p, False))
         monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
+        _install_signal_stubs(monkeypatch, sent, on_kill=_on_kill)
 
         cmd_reap(_reap_args(orphan_processes=True))
 
-        # All killed via TERM; KILL never sent.
-        signals = [sig for _p, sig in [(None, signal.SIGKILL)]]  # placeholder
-        # Re-capture from fake_kill: SIGKILL has value 9, check no kill call used it.
-        kill_calls: List[Tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill", lambda p, sig: kill_calls.append((p, sig)))
-        # (kill_calls already captured above via fake_kill closure; check the summary instead)
         line = _extract_summary(capsys)
         assert _summary_field(line, "orphan_procs_killed") == n
         assert _summary_field(line, "orphan_procs_skipped") == 0
+        sigs_sent = [sig for _p, sig in sent]
+        assert signal.SIGKILL not in sigs_sent, "SIGKILL must not be sent when all die on TERM"
 
     def test_deferred_field_present_in_summary(
         self, isolated_runs_root, monkeypatch, capsys
@@ -979,3 +1042,92 @@ class TestReapBudget:
         line = _extract_summary(capsys)
         deferred = _summary_field(line, "deferred")
         assert deferred > 0
+
+
+# ---------------------------------------------------------------------------
+# Linux signal-path proof: pidfd branch used and recorded end-to-end
+# ---------------------------------------------------------------------------
+
+class TestLinuxSignalPath:
+    """Prove that the Linux pidfd branch of _send_signal_to_verified_pid is
+    exercised end-to-end through cmd_reap.
+
+    platform.system is forced to "Linux" and os.pidfd_open +
+    signal.pidfd_send_signal are replaced by recording stubs.  The test
+    asserts that signals arrive via the pidfd stubs, not via os.kill, which
+    would indicate the Darwin fallback had been taken instead.
+
+    This is the cross-platform check that was missing and caused 21 CI
+    failures: on Linux the pidfd path bypasses os.kill, so tests that only
+    patched os.kill saw signals_sent=[] and failed.
+    """
+
+    def test_linux_pidfd_path_used_for_pid_signal(
+        self, isolated_runs_root, monkeypatch, capsys
+    ):
+        """With platform forced to Linux, SIGTERM and SIGKILL reach the target
+        via pidfd_send_signal, not os.kill.  kill_calls stays empty while
+        pidfd_calls records both signals."""
+        import types as _types
+
+        pid = 9850
+        identity = f"linux:{pid}-test-identity"
+        # Use an entry whose identity matches what _process_identity will return.
+        entry = _make_proc_entry(pid, "linuxrun", identity=identity)
+        _make_log_dir("linuxrun")
+
+        # Force the Linux platform branch in _send_signal_to_verified_pid.
+        monkeypatch.setattr(agent_run, "platform",
+                            _types.SimpleNamespace(system=lambda: "Linux"))
+
+        kill_calls: List[Tuple[int, int]] = []
+        pidfd_calls: List[Tuple[int, int]] = []
+        fd_counter: List[int] = [200]
+        fd_to_pid: Dict[int, int] = {}
+
+        def fake_pidfd_open(p: int, flags: int) -> int:
+            fd = fd_counter[0]
+            fd_counter[0] += 1
+            fd_to_pid[fd] = p
+            return fd
+
+        def fake_pidfd_send_signal(fd: int, sig: int, info: object, flags: int) -> None:
+            p = fd_to_pid.get(fd)
+            if p is not None:
+                pidfd_calls.append((p, sig))
+
+        # Capture real os.close before patching to avoid infinite recursion when
+        # _launch_lock calls os.close on its own real fds.
+        real_os_close = os.close
+
+        monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])
+        monkeypatch.setattr(agent_run, "_process_identity", lambda p: identity)
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(agent_run, "ORPHAN_KILL_GRACE_SECONDS", 0.05)
+        monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.01)
+        monkeypatch.setattr(os, "getpgid", lambda p: p + 1)
+        # Record os.kill to prove it is NOT called when pidfd succeeds.
+        monkeypatch.setattr(os, "kill", lambda p, s: kill_calls.append((p, s)))
+        monkeypatch.setattr(os, "killpg", lambda g, s: None)
+        monkeypatch.setattr(agent_run.os, "pidfd_open", fake_pidfd_open, raising=False)
+        monkeypatch.setattr(agent_run.signal, "pidfd_send_signal",
+                            fake_pidfd_send_signal, raising=False)
+        # Intercept os.close: skip synthetic fds, pass real fds to real_os_close.
+        monkeypatch.setattr(agent_run.os, "close",
+                            lambda fd: (None if fd in fd_to_pid else real_os_close(fd)))
+
+        cmd_reap(_reap_args(orphan_processes=True))
+
+        # Signals must have arrived via pidfd, not os.kill.
+        sigs_via_pidfd = [sig for _p, sig in pidfd_calls]
+        assert signal.SIGTERM in sigs_via_pidfd, (
+            f"SIGTERM must be sent via pidfd on Linux; pidfd_calls={pidfd_calls}"
+        )
+        assert signal.SIGKILL in sigs_via_pidfd, (
+            f"SIGKILL must be sent via pidfd on Linux; pidfd_calls={pidfd_calls}"
+        )
+        assert not kill_calls, (
+            f"os.kill must not be called when pidfd path succeeds; kill_calls={kill_calls}"
+        )
+        line = _extract_summary(capsys)
+        assert _summary_field(line, "orphan_procs_killed") == 1

@@ -163,3 +163,51 @@ def test_current_process_identity_is_stable():
     first = agent_run._process_identity(os.getpid())
     assert first is not None
     assert agent_run._process_identity(os.getpid()) == first
+
+
+# ---------------------------------------------------------------------------
+# _pid_parent_pid — platform branch coverage
+# ---------------------------------------------------------------------------
+
+def test_linux_pid_parent_pid_reads_proc_stat(monkeypatch):
+    """_pid_parent_pid on Linux parses the ppid field from /proc/<pid>/stat.
+
+    The real format is: "<pid> (<comm>) <state> <ppid> ...".  The function
+    must correctly strip the comm field (which may contain spaces and
+    parentheses) via rsplit on the last ')'.
+    """
+    monkeypatch.setattr(agent_run.platform, "system", lambda: "Linux")
+    # Stat line with a comm field containing spaces and a closing paren.
+    fake_stat = "42 (my (tricky) proc) S 7 42 42 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 100\n"
+    monkeypatch.setattr(
+        agent_run.Path, "read_text",
+        lambda _self: fake_stat,
+    )
+    assert agent_run._pid_parent_pid(42) == 7
+
+
+def test_darwin_pid_parent_pid_reads_ps(monkeypatch):
+    """_pid_parent_pid on Darwin calls ps -p <pid> -o ppid= and parses the result."""
+    monkeypatch.setattr(agent_run.platform, "system", lambda: "Darwin")
+
+    class Result:
+        stdout = "  99\n"
+        returncode = 0
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        agent_run.subprocess, "run",
+        lambda cmd, **kwargs: captured.update(cmd=cmd) or Result(),
+    )
+    assert agent_run._pid_parent_pid(42) == 99
+    assert captured["cmd"] == ["ps", "-p", "42", "-o", "ppid="]
+
+
+def test_linux_pid_parent_pid_returns_none_on_oserror(monkeypatch):
+    """An OSError reading /proc/<pid>/stat returns None (best-effort)."""
+    monkeypatch.setattr(agent_run.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        agent_run.Path, "read_text",
+        lambda _self: (_ for _ in ()).throw(OSError("no proc")),
+    )
+    assert agent_run._pid_parent_pid(99999) is None
