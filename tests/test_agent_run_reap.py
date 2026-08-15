@@ -2291,3 +2291,74 @@ class TestReapLogMinAgeThreshold:
 
         assert rc == 0
         assert ld.exists()
+
+
+# ---------------------------------------------------------------------------
+# S5: _dir_size_bytes tolerates OSError beyond the original caught set
+# ---------------------------------------------------------------------------
+
+class TestDirSizeBytesOSError:
+    """_dir_size_bytes must not raise when os.scandir returns an OSError
+    outside the original (FileNotFoundError, NotADirectoryError,
+    PermissionError) set — e.g. ENAMETOOLONG (errno 63) from a deeply
+    nested scratch tree.  It must return a partial count and allow
+    reap --include-logs to complete normally."""
+
+    def test_enametoolong_returns_partial_count_not_raises(
+        self, tmp_path, monkeypatch
+    ):
+        """Simulate ENAMETOOLONG from os.scandir on a nested directory.
+
+        The outer directory has one countable file and one subdirectory
+        whose scan raises ENAMETOOLONG.  _dir_size_bytes must return the
+        outer file's size (not raise) and continue past the bad entry."""
+        import errno as _errno
+
+        d = tmp_path / "log"
+        d.mkdir()
+        (d / "outer.txt").write_bytes(b"hello")  # 5 bytes, always countable
+        deep = d / "deep"
+        deep.mkdir()
+
+        real_scandir = os.scandir
+
+        def fake_scandir(path):
+            path_str = str(path)
+            if path_str == str(deep):
+                raise OSError(_errno.ENAMETOOLONG, "File name too long", path_str)
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", fake_scandir)
+
+        result = agent_run._dir_size_bytes(d)
+
+        # Must return the outer file size without raising.
+        assert result == 5
+
+    def test_enametoolong_does_not_abort_reap_include_logs(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """An ENAMETOOLONG on os.scandir inside a log dir must not abort
+        reap --include-logs for other candidates."""
+        import errno as _errno
+
+        old_secs = (agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        good = _make_preserved_log(isolated_log_root, "goodlog", age_secs=old_secs)
+        bad = _make_preserved_log(isolated_log_root, "badlog", age_secs=old_secs)
+        deep = bad / "deep"
+        deep.mkdir(exist_ok=True)
+
+        real_scandir = os.scandir
+
+        def fake_scandir(path):
+            if str(path) == str(deep):
+                raise OSError(_errno.ENAMETOOLONG, "File name too long", str(path))
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", fake_scandir)
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True))
+
+        # reap must complete normally; the good log is collected.
+        assert rc == 0
+        assert not good.exists(), "goodlog must be collected despite bad neighbour"

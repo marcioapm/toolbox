@@ -1634,7 +1634,7 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
             continue
         try:
             entries = list(os.scandir(current))
-        except (FileNotFoundError, NotADirectoryError, PermissionError):
+        except OSError:
             continue
         for entry in entries:
             try:
@@ -1643,7 +1643,7 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
                 elif entry.is_file(follow_symlinks=False):
                     st = entry.stat(follow_symlinks=False)
                     total += st.st_size
-            except (FileNotFoundError, PermissionError):
+            except OSError:
                 continue
     return total
 
