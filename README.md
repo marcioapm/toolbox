@@ -597,6 +597,7 @@ agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
                 [--include-logs] [--log-min-age-hours N]
                 [--orphan-processes] [--orphan-min-age-hours N]
+                [--max-seconds N]
 agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage; read-only
 ```
 
@@ -694,6 +695,189 @@ serialize relaunches). State/log GC first atomically renames a directory to
 a reserved sentinel so an interrupted deletion is resumed by the next reap;
 `--dry-run` runs the same read-only eligibility checks and prints only actions
 a real reap would take, without mutating or deleting anything.
+
+`--max-seconds N` sets an overall wall-clock budget for the entire invocation.
+The budget is checked between candidates in every pass — not mid-operation —
+so any action already in progress completes normally before the limit is
+enforced. When the budget expires, the remaining candidates in all passes are
+skipped; the summary line reports them as `deferred=N` and the process exits 0,
+so the next scheduled tick picks up where this one left off. This matters in
+practice because a process stuck in uninterruptible `D` state can block a
+`/proc` read (or equivalent) indefinitely. Without a budget, a single stalled
+candidate can cause the entire reap to overrun its own scheduling interval,
+which then causes the next scheduled invocation to start while the previous one
+is still running. Use a value comfortably below the scheduling interval; a 30-
+minute interval pairs naturally with `--max-seconds 600`.
+
+### Scheduling
+
+Running `agent-run reap` once by hand is useful for immediate cleanup; the
+feature is designed to run periodically and unattended so orphaned processes and
+accumulated state are reclaimed automatically without operator intervention.
+The units below are ready to copy and adapt for the two common platforms.
+
+**Before enabling any timer, run the exact scheduled command with `--dry-run`
+by hand and read the output.** This is especially important the first time
+`--orphan-processes` is used on a host: the candidate list and skip reasons are
+printed, making it straightforward to confirm that nothing unexpected would be
+killed before committing to a live run.
+
+The flag set used throughout this section:
+
+```
+--idle-hours 96 --orphan-processes --orphan-min-age-hours 72 \
+--include-logs --log-min-age-hours 336 --max-seconds 600
+```
+
+#### Choosing thresholds
+
+The retention knobs are deliberately independent so each can be tuned without
+affecting the others:
+
+- **`--idle-hours N`** — a *running* agent whose log has been idle for this
+  long is idle-killed (TERM then escalating to KILL). Controls live-run
+  timeout. Default 24 h.
+- **`--min-age-hours N`** — terminal-state run directories (`done`, `failed`,
+  `died`, `killed`) are removed once `ended_at` is older than this. Controls
+  how long bookkeeping state is retained after a run finishes. Default 168 h
+  (7 days).
+- **`--log-min-age-hours N`** — preserved-log-only directories (state dir
+  already gone) are removed once their newest mtime is older than this.
+  Deliberately longer than `--min-age-hours` because preserved logs are an
+  artifact an operator chose to keep, not disposable state bookkeeping.
+  Default 504 h (21 days).
+- **`--orphan-min-age-hours N`** — live processes with no state directory
+  must have been running for at least this long before they are eligible for
+  orphan termination. Independent of all GC thresholds. Default 24 h.
+
+On disk, `--log-min-age-hours` mainly affects the long tail of old logs: on a
+busy host, most bytes are in *recent* logs, and PTY-captured `--echo` runs are
+by far the largest individual directories (potentially hundreds of MB each
+from the captured transcript). A long retention window may free very little on
+a host whose volume is dominated by the last few days. Run
+`agent-run du --by-run --top 20` to see where the bytes actually are before
+tuning retention thresholds.
+
+#### Interval vs. budget
+
+Keep `--max-seconds` comfortably under the scheduling interval so a slow
+invocation cannot overlap the next one. Overlapping reap invocations contend
+on the same per-name locks, which serializes work and defeats the point of
+running on a short interval. A 30-minute interval with `--max-seconds 600`
+leaves a generous margin; adjust proportionally for longer intervals.
+
+#### systemd (Linux, user units)
+
+`~/.config/systemd/user/agent-run-reap.service`:
+
+```ini
+[Unit]
+Description=agent-run reap (reconcile stale status, idle-kill lingering runs, GC terminal run dirs, reap orphan processes and old logs)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-run reap --idle-hours 96 --orphan-processes --orphan-min-age-hours 72 --include-logs --log-min-age-hours 336 --max-seconds 600
+```
+
+`~/.config/systemd/user/agent-run-reap.timer`:
+
+```ini
+[Unit]
+Description=Run agent-run reap every 30 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now agent-run-reap.timer
+```
+
+Inspect:
+
+```bash
+systemctl --user list-timers agent-run-reap.timer
+journalctl --user -u agent-run-reap.service -n 20
+```
+
+User units only run while the user has an active login session. On a headless
+box where the user account has no persistent session, set
+`loginctl enable-linger <user>` so the user's systemd instance starts at boot
+and the timer fires regardless of whether anyone is logged in.
+
+#### launchd (macOS)
+
+`~/Library/LaunchAgents/com.example.agent-run-reap.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.agent-run-reap</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/.local/bin/agent-run</string>
+    <string>reap</string>
+    <string>--idle-hours</string>
+    <string>96</string>
+    <string>--orphan-processes</string>
+    <string>--orphan-min-age-hours</string>
+    <string>72</string>
+    <string>--include-logs</string>
+    <string>--log-min-age-hours</string>
+    <string>336</string>
+    <string>--max-seconds</string>
+    <string>600</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>1800</integer>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/you/Library/Logs/agent-run-reap.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/you/Library/Logs/agent-run-reap.log</string>
+</dict>
+</plist>
+```
+
+Replace `com.example.agent-run-reap` with your own reverse-DNS label and
+`/Users/you` with the absolute path to your home directory. launchd does not
+inherit a login shell's `PATH`, so the path to `agent-run` must be absolute;
+launchd also does not parse a shell command line, so each flag and its value
+must be a separate `<string>` element in `ProgramArguments`.
+
+Load and manage:
+
+```bash
+# Validate the plist before loading
+plutil -lint ~/Library/LaunchAgents/com.example.agent-run-reap.plist
+
+# Load the agent
+launchctl load ~/Library/LaunchAgents/com.example.agent-run-reap.plist
+
+# Confirm it is registered
+launchctl list | grep agent-run-reap
+
+# Trigger a manual run immediately (without waiting for the interval)
+launchctl start com.example.agent-run-reap
+```
 
 ### Disk usage (`du`)
 
