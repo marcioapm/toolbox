@@ -756,14 +756,19 @@ class TestThreePhaseOrphan:
         entry = _make_proc_entry(pid, "p3-id-check", identity=original_identity)
         _make_log_dir("p3-id-check")
 
-        # term_count tracks how many times _process_identity has been called;
-        # it returns the original token on the first call (phase 1) and the
-        # recycled token on all subsequent calls (phase 3).
+        # identity_call_count tracks all _process_identity invocations for pid.
+        # Both the outer pre-signal check and _send_signal_to_verified_pid's
+        # internal re-read must see the original token for SIGTERM to be sent;
+        # any subsequent call (phase-3 re-verify) sees the recycled token so
+        # SIGKILL is refused.
         call_count: List[int] = [0]
 
         def fake_identity(p):
             call_count[0] += 1
-            return original_identity if call_count[0] == 1 else recycled_identity
+            # First two calls: outer check + _send_signal_to_verified_pid's
+            # internal re-read — both must match for TERM to proceed.
+            # Call 3+: grace window has elapsed, PID recycled → mismatch.
+            return original_identity if call_count[0] <= 2 else recycled_identity
 
         signals_sent: List[Tuple[int, int]] = []
         monkeypatch.setattr(agent_run, "_scan_process_table", lambda: [entry])

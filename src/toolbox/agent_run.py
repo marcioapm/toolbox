@@ -3866,7 +3866,11 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 pgid_note = f" pgid={pgid}" if use_group and pgid is not None else " (pid only — pgid mismatch)"
 
                 # Phase 1: SIGTERM under the lock, then release to let grace run
-                # concurrently with other candidates.
+                # concurrently with other candidates.  For the pid-only case,
+                # route through _send_signal_to_verified_pid so Linux gets the
+                # pidfd guarantee (signal bound before identity re-read, eliminating
+                # the PID-reuse window for that platform).  Group signals have no
+                # pidfd equivalent; use os.killpg directly for those.
                 print(
                     f"  [orphan] {cand.name} pid={cand.pid} age={age_h:.1f}h: "
                     f"TERM{pgid_note}"
@@ -3875,8 +3879,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     if use_group and pgid is not None:
                         os.killpg(pgid, signal.SIGTERM)
                     else:
-                        os.kill(cand.pid, signal.SIGTERM)
-                except (ProcessLookupError, OSError):
+                        _send_signal_to_verified_pid(cand.pid, signal.SIGTERM, cand.identity)
+                except (ProcessLookupError, OSError, RuntimeError):
                     orphan_procs_skipped += 1
                     continue
 
@@ -3921,8 +3925,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     if use_group and pgid is not None:
                         os.killpg(pgid, signal.SIGKILL)
                     else:
-                        os.kill(cand.pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
+                        _send_signal_to_verified_pid(cand.pid, signal.SIGKILL, cand.identity)
+                except (ProcessLookupError, OSError, RuntimeError):
                     pass
                 orphan_procs_killed += 1
 
