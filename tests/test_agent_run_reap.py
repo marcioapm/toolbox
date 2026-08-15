@@ -2106,6 +2106,40 @@ class TestReapIncludeLogs:
         assert "dryrunlog" in out
         assert "logs_collected=1" in out
 
+    def test_dry_run_no_double_count_with_scratch(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """--dry-run must not count a state-less run with tmp/ as both a
+        collected log (pass 2.5) and an orphaned scratch (pass 3).
+
+        In a real run pass 2.5 removes the whole log dir so pass 3 finds
+        no scratch.  In --dry-run nothing is removed; without the fix pass 3
+        re-reports the same directory under a second heading."""
+        old_secs = (agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+        ld = _make_preserved_log(
+            isolated_log_root, "drydbldbl", age_secs=old_secs, make_scratch=True
+        )
+        # Backdate the scratch dir so it is old enough for pass 3.
+        scratch = ld / "tmp"
+        old_ts = time.time() - old_secs
+        for p in scratch.rglob("*"):
+            try:
+                os.utime(p, (old_ts, old_ts))
+            except OSError:
+                pass
+        os.utime(scratch, (old_ts, old_ts))
+
+        rc = agent_run.cmd_reap(_reap_args(include_logs=True, dry_run=True,
+                                            min_age_hours=0.001))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The run must appear once (as a log collection) and never as orphaned scratch.
+        assert "logs_collected=1" in out, f"expected logs_collected=1; output: {out}"
+        assert "orphaned_scratch=0" in out, (
+            f"dry-run must not count same run as orphaned_scratch; output: {out}"
+        )
+
     def test_name_targeting_only_reaps_named_log(
         self, isolated_runs_root, isolated_log_root
     ):

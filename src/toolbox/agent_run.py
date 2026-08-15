@@ -3419,6 +3419,10 @@ def cmd_reap(args: argparse.Namespace) -> int:
     deferred_count = 0
     found_target = False
     reconciled_this_pass = set()
+    # Names whose whole log dir was collected (or reported under --dry-run) by
+    # pass 2.5 in this invocation.  Pass 3 skips these to avoid counting the
+    # same run's scratch as both a collected log and an orphaned scratch dir.
+    logs_acted_on: set[str] = set()
 
     # Filter the state candidates once for both passes (quality F2/C5), and
     # validate names before *any* path construction/mutation (M2). A targeted
@@ -3726,6 +3730,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     "[dry-run]"
                 )
                 logs_collected_count += 1
+                logs_acted_on.add(name)
                 continue
             size = _dir_size_bytes(log_d)
             print(
@@ -3745,6 +3750,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     gc_skipped_count += 1
                     continue
                 logs_collected_count += 1
+                logs_acted_on.add(name)
 
     # Pass 3: a reboot wipes STATE_ROOT (normally tmpfs) while persistent
     # LOG_ROOT/<name>/tmp survives. Sweep those orphaned scratch dirs once
@@ -3754,6 +3760,12 @@ def cmd_reap(args: argparse.Namespace) -> int:
             deferred_count += 1
             continue
         name = log_d.name
+        # Skip names pass 2.5 already acted on (or reported under --dry-run):
+        # the whole log dir was collected, so its scratch is no longer orphaned.
+        # Without this guard, --dry-run double-counts the same run as both a
+        # collected log and an orphaned scratch.
+        if name in logs_acted_on:
+            continue
         scratch_dir = log_d / "tmp"
         try:
             scratch_before = scratch_dir.lstat()
