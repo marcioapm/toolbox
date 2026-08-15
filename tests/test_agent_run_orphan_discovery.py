@@ -825,3 +825,97 @@ class TestArgvCorroboration:
         assert "realrun2" not in out or "state_dir_exists" in out, (
             "realrun2 must not appear as a candidate"
         )
+
+
+# ---------------------------------------------------------------------------
+# S3: state-root guard — runner with foreign AGENT_RUN_STATE_DIR
+# ---------------------------------------------------------------------------
+
+class TestStateRootGuard:
+    """A runner started with a non-default AGENT_RUN_STATE_DIR must be
+    skipped even when its name has no state dir under the reaper's root.
+
+    Verified via _runner_state_root (Linux path mocked; Darwin returns
+    STATE_ROOT unconditionally so the check is a no-op there)."""
+
+    def test_foreign_state_root_skipped(self, isolated_runs_root, monkeypatch):
+        """On Linux, a process whose AGENT_RUN_STATE_DIR differs from the
+        reaper's STATE_ROOT is skipped with reason foreign_state_root."""
+        import platform as _platform
+
+        entry = _make_entry(
+            pid=7900,
+            argv=["agent-run", "foreignrun", "claude"],
+            start_time=FAR_PAST,
+        )
+        _make_log_dir("foreignrun")
+
+        # Simulate Linux: _runner_state_root reads /proc/<pid>/environ and
+        # finds a different root.
+        other_root = isolated_runs_root.parent / "other-state"
+        monkeypatch.setattr(agent_run, "_runner_state_root",
+                            lambda _pid: other_root)
+
+        candidates, skips = _find_orphan_runners(
+            [entry],
+            min_age_seconds=0,
+            now=time.time(),
+            self_pid=os.getpid() + 1000,
+            self_pgid=os.getpgid(0) + 1000,
+        )
+
+        assert not candidates
+        assert any(s.reason == "foreign_state_root" for s in skips), (
+            f"expected foreign_state_root skip, got: {[s.reason for s in skips]}"
+        )
+
+    def test_unreadable_env_skipped(self, isolated_runs_root, monkeypatch):
+        """If the runner's environment cannot be read, skip the candidate
+        (fail-closed: unknown root must not be treated as matching)."""
+        entry = _make_entry(
+            pid=7901,
+            argv=["agent-run", "envfailrun", "claude"],
+            start_time=FAR_PAST,
+        )
+        _make_log_dir("envfailrun")
+
+        # _runner_state_root returns None → unreadable env → skip.
+        monkeypatch.setattr(agent_run, "_runner_state_root", lambda _pid: None)
+
+        candidates, skips = _find_orphan_runners(
+            [entry],
+            min_age_seconds=0,
+            now=time.time(),
+            self_pid=os.getpid() + 1000,
+            self_pgid=os.getpgid(0) + 1000,
+        )
+
+        assert not candidates
+        assert any(s.reason == "state_root_unreadable" for s in skips), (
+            f"expected state_root_unreadable skip, got: {[s.reason for s in skips]}"
+        )
+
+    def test_matching_state_root_is_candidate(self, isolated_runs_root, monkeypatch):
+        """A process whose recovered state root matches STATE_ROOT proceeds
+        to become a candidate (if all other checks pass)."""
+        entry = _make_entry(
+            pid=7902,
+            argv=["agent-run", "samerootrun", "claude"],
+            start_time=FAR_PAST,
+        )
+        _make_log_dir("samerootrun")
+
+        # _runner_state_root returns the same path as agent_run.STATE_ROOT.
+        monkeypatch.setattr(agent_run, "_runner_state_root",
+                            lambda _pid: agent_run.STATE_ROOT)
+
+        candidates, skips = _find_orphan_runners(
+            [entry],
+            min_age_seconds=0,
+            now=time.time(),
+            self_pid=os.getpid() + 1000,
+            self_pgid=os.getpgid(0) + 1000,
+        )
+
+        assert len(candidates) == 1
+        assert candidates[0].name == "samerootrun"

@@ -870,6 +870,19 @@ def _find_orphan_runners(
             skips.append(_OrphanSkip(pid=pid, reason="log_dir_missing", detail=name))
             continue
 
+        # State-root guard: a runner started with AGENT_RUN_STATE_DIR=/other/path
+        # records state there, not under our STATE_ROOT.  The state-dir check below
+        # asks the wrong question unless both roots agree.  Read the process env
+        # to verify; if unreadable (or not Linux), skip conservatively.
+        runner_root = _runner_state_root(pid)
+        if runner_root is None:
+            skips.append(_OrphanSkip(pid=pid, reason="state_root_unreadable"))
+            continue
+        if runner_root.resolve() != STATE_ROOT.resolve():
+            skips.append(_OrphanSkip(pid=pid, reason="foreign_state_root",
+                                     detail=str(runner_root)))
+            continue
+
         # State-dir check: a process with a live state dir is tracked by
         # reap's existing passes, not this one.
         if _path_entry_exists(_state_dir(name)):
@@ -1480,6 +1493,46 @@ def _process_identity(pid: int) -> Optional[str]:
         start = _ps_field(pid, "lstart")
         return f"darwin:{_darwin_lstart_normalize(start)}" if start else None
     return None
+
+
+def _runner_state_root(pid: int) -> Optional[Path]:
+    """Read ``AGENT_RUN_STATE_DIR`` from the environment of ``pid``.
+
+    A runner started with a non-default state root records state there, not
+    under the reaper's ``STATE_ROOT``.  Requiring the two to match before
+    treating a process as an orphan prevents the reaper from killing a live,
+    tracked run just because it used a different root.
+
+    Returns the resolved ``Path`` of the runner's state root, or ``None`` if
+    the environment cannot be read (caller must skip the candidate — fail-closed).
+
+    On Linux the process's NUL-separated ``/proc/<pid>/environ`` is parsed
+    directly.  If ``AGENT_RUN_STATE_DIR`` is absent the runner uses the same
+    default as the reaper (``STATE_ROOT``), so ``STATE_ROOT`` is returned.
+
+    On Darwin we cannot read another process's environment without a privileged
+    API; ``STATE_ROOT`` is returned unconditionally so the caller applies the
+    state-dir check against the reaper's root, accepting the residual S3 risk
+    for non-default-root runners on that platform.
+    """
+    if platform.system() != "Linux":
+        # Conservative fallback: assume the runner shares our root.  The
+        # log-dir corroboration upstream already rejects any process whose
+        # recovered name has no LOG_ROOT entry, limiting the exposure.
+        return STATE_ROOT
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    for kv in raw.split(b"\x00"):
+        if kv.startswith(b"AGENT_RUN_STATE_DIR="):
+            val = kv[len(b"AGENT_RUN_STATE_DIR="):]
+            try:
+                return Path(val.decode("utf-8", errors="strict"))
+            except (UnicodeDecodeError, ValueError):
+                return None
+    # Variable absent: runner uses the compiled-in default.
+    return STATE_ROOT
 
 
 def _watch_pid_is_zombie(pid: int) -> bool:
