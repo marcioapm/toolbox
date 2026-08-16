@@ -1050,6 +1050,78 @@ class TestReapBudget:
         assert "soft candidate-admission budget" in help_text
         assert "may overrun" in help_text
 
+    def test_monotonic_budget_is_not_fooled_by_wall_clock_step_back(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """An NTP step that moves wall time backward must not reset the budget.
+
+        The fix uses time.monotonic() for the budget.  Under a wall-clock
+        step back, time.time()-based elapsed can go negative (apparent budget
+        never expires), while monotonic elapsed stays positive and accurate.
+
+        The test mocks time.monotonic() to report a large elapsed right after
+        reap_start — guaranteeing budget exhaustion — while time.time()
+        returns a value in the past (so a time.time()-based budget sees
+        negative elapsed = never expires).  Any deferred candidate proves the
+        comparison used monotonic, not wall time."""
+        state_root = agent_run.STATE_ROOT
+        state_root.mkdir(parents=True, exist_ok=True)
+        log_root = agent_run.LOG_ROOT
+        log_root.mkdir(parents=True, exist_ok=True)
+
+        names = [f"mono2-{i}" for i in range(4)]
+        for name in names:
+            sd = state_root / name
+            sd.mkdir(exist_ok=True)
+            (sd / "status").write_text("done\n")
+            (sd / "ended_at").write_text("2000-01-01T00:00:00Z\n")
+            ld = log_root / name
+            ld.mkdir(exist_ok=True)
+
+        real_monotonic = time.monotonic
+        # After the first call (which sets reap_start), always return a value
+        # 1000 s ahead, making every budget check immediately expire.
+        mono_calls = {"n": 0, "start": None}
+
+        def fast_monotonic():
+            mono_calls["n"] += 1
+            t = real_monotonic()
+            if mono_calls["n"] == 1:
+                mono_calls["start"] = t
+                return t
+            # Simulate 1000 s elapsed since reap_start was set.
+            return mono_calls["start"] + 1000.0
+
+        monkeypatch.setattr(agent_run.time, "monotonic", fast_monotonic)
+        # time.time() returns a value in the past: if the mutation used
+        # time.time() for both start and comparison, elapsed would be 0.
+        real_time = time.time
+        monkeypatch.setattr(agent_run.time, "time", lambda: real_time() - 3600)
+
+        rc = agent_run.cmd_reap(argparse.Namespace(
+            dry_run=True,
+            idle_hours=None,
+            min_age_hours=0.001,
+            name=None,
+            force_unknown=False,
+            include_logs=False,
+            log_min_age_hours=None,
+            orphan_processes=False,
+            orphan_min_age_hours=None,
+            max_seconds=1.0,
+        ))
+
+        assert rc == 0
+        line = _extract_summary(capsys)
+        deferred = _summary_field(line, "deferred")
+        # With fast_monotonic reporting 1000 s elapsed against a 1 s budget,
+        # every candidate after the first is deferred.  A time.time()-based
+        # bug would see elapsed=0 (mock returns same past value) and defer=0.
+        assert deferred > 0, (
+            f"deferred={deferred}; monotonic not used for budget comparison "
+            "(time.time() step-back should not reset budget)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Linux signal-path proof: pidfd branch used and recorded end-to-end

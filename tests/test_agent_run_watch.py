@@ -928,6 +928,63 @@ class TestGitHardening:
         assert result.facts["dirty"] is False
         assert result.facts["files_changed"] == 0
 
+    def test_git_replace_ref_base_is_stripped(self, tmp_path, monkeypatch):
+        """GIT_REPLACE_REF_BASE alone must be stripped from the git subprocess env."""
+        assert "GIT_REPLACE_REF_BASE" in agent_run.WATCH_GIT_ENV_VARS_TO_STRIP
+
+    def test_git_no_replace_objects_is_set(self):
+        """GIT_NO_REPLACE_OBJECTS=1 must be unconditionally added to every
+        git subprocess env, independently of GIT_REPLACE_REF_BASE being stripped."""
+        import inspect
+        src = inspect.getsource(agent_run._watch_run_git_checked)
+        assert "GIT_NO_REPLACE_OBJECTS" in src, (
+            "_watch_run_git_checked must set GIT_NO_REPLACE_OBJECTS"
+        )
+
+    def test_git_graft_file_is_stripped(self, tmp_path, monkeypatch):
+        """An inherited GIT_GRAFT_FILE rewrites parent pointers silently,
+        making commits_since_start report a wrong value.  The variable must be
+        stripped from every git subprocess env."""
+        import tempfile
+
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        # Commit A: this will be launch_head.
+        (repo / "b.txt").write_text("second\n")
+        _git(repo, "add", "b.txt")
+        _git(repo, "commit", "-q", "-m", "second")
+        commit_a = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        # Commit B: an intermediate commit.
+        (repo / "c.txt").write_text("third\n")
+        _git(repo, "add", "c.txt")
+        _git(repo, "commit", "-q", "-m", "third")
+        # Commit C (HEAD).
+        (repo / "d.txt").write_text("fourth\n")
+        _git(repo, "add", "d.txt")
+        _git(repo, "commit", "-q", "-m", "fourth")
+        commit_c = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        # Graft: HEAD's (C's) parent becomes A, cutting out B.
+        # Without stripping: rev-list A..C = 1 (C only; B is gone from ancestry).
+        # With stripping: rev-list A..C = 2 (B, C are both descendants of A).
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".grafts", delete=False) as gf:
+            gf.write(f"{commit_c} {commit_a}\n")
+            graft_path = gf.name
+        monkeypatch.setenv("GIT_GRAFT_FILE", graft_path)
+
+        result = agent_run._watch_git_facts_checked(repo, commit_a)
+
+        assert result.facts is not None, f"git_error={result.git_error}"
+        assert result.facts["commits_since_start"] == 2, (
+            f"GIT_GRAFT_FILE not stripped: commits_since_start="
+            f"{result.facts['commits_since_start']} (expected 2, got fewer if graft applied)"
+        )
+
     def test_head_change_during_observation_degrades(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"
         _init_repo(repo)
@@ -1086,6 +1143,31 @@ class TestGitUntrackedFiles:
 
         assert result.facts["untracked_files"] == 3
 
+    def test_rename_origin_path_starting_with_question_marks_not_counted(self, tmp_path):
+        """A rename/copy emits two NUL-separated records: the status record
+        R  <new> and a bare origin-path record.  If the origin path starts
+        with "?? " it must not be counted as an untracked file."""
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        # Create and commit a tracked file whose name starts with "?? ".
+        tricky = repo / "?? evil"
+        tricky.write_text("data\n")
+        _git(repo, "add", tricky.name)
+        _git(repo, "commit", "-q", "-m", "add tricky name")
+        # Rename it; the origin path "?? evil" will appear in the -z stream.
+        renamed = repo / "renamed.txt"
+        tricky.rename(renamed)
+        _git(repo, "add", "-A")
+
+        result = agent_run._watch_git_facts_checked(repo, None)
+
+        # Zero untracked files: "?? evil" is the rename origin, not a new file.
+        assert result.facts is not None, f"git_error={result.git_error}"
+        assert result.facts["untracked_files"] == 0, (
+            f"rename origin path counted as untracked: untracked_files="
+            f"{result.facts['untracked_files']}"
+        )
+
     def test_untracked_file_is_counted_and_repo_reads_dirty(
         self, isolated_runs_root, isolated_log_root, tmp_path, capsys
     ):
@@ -1190,7 +1272,11 @@ class TestLogFacts:
         log.write_text("one\ntwo\n")
         monkeypatch.setattr(agent_run, "WATCH_LINE_COUNT_MAX_BYTES", 1)
 
-        assert agent_run._watch_log_facts(log)["lines"] is None
+        with open(log, "rb") as f:
+            import os as _os
+            st = _os.fstat(f.fileno())
+            facts = agent_run._watch_log_facts_from_file(f, log, st)
+        assert facts["lines"] is None
 
     @pytest.mark.parametrize(
         "log_age_secs, check_age, expected_growing",
@@ -1790,21 +1876,29 @@ class TestLaunchWritesCwd:
 
 
 # ---------------------------------------------------------------------------
-# _watch_tail_lines: byte-bounded backward scan
+# _watch_tail_lines_from_file: byte-bounded backward scan (live path)
 # ---------------------------------------------------------------------------
+
+def _tail_from_file(log: Path, n: int) -> list:
+    """Open log and call the live _watch_tail_lines_from_file."""
+    with open(log, "rb") as f:
+        import os as _os
+        end = _os.fstat(f.fileno()).st_size
+        return agent_run._watch_tail_lines_from_file(f, end, n)
+
 
 class TestWatchTailLinesByteBound:
     def test_ordinary_tail_is_unchanged(self, tmp_path):
         lines = [f"line {i}\n" for i in range(500)]
         log = tmp_path / "log"
         log.write_text("".join(lines))
-        result = agent_run._watch_tail_lines(log, 50)
+        result = _tail_from_file(log, 50)
         assert result == [f"line {i}" for i in range(450, 500)]
 
     def test_byte_cap_enforced_on_newline_free_file(self, tmp_path):
         log = tmp_path / "log"
         log.write_bytes(b"x" * (2 * 1024 * 1024))
-        result = agent_run._watch_tail_lines(log, 200)
+        result = _tail_from_file(log, 200)
         total_chars = sum(len(line) for line in result)
         max_expected = agent_run.WATCH_TAIL_MAX_BYTES + agent_run.WATCH_TAIL_READ_BLOCK_BYTES
         assert total_chars <= max_expected
@@ -1815,7 +1909,7 @@ class TestWatchTailLinesByteBound:
             f.write(b"first\n")
             f.write(b"second\n")
             f.write(b"y" * (2 * 1024 * 1024))
-        result = agent_run._watch_tail_lines(log, 200)
+        result = _tail_from_file(log, 200)
         total_chars = sum(len(line) for line in result)
         max_expected = agent_run.WATCH_TAIL_MAX_BYTES + agent_run.WATCH_TAIL_READ_BLOCK_BYTES
         assert total_chars <= max_expected
@@ -1824,13 +1918,13 @@ class TestWatchTailLinesByteBound:
     def test_small_file_returns_every_line(self, tmp_path):
         log = tmp_path / "log"
         log.write_text("a\nb\nc\n")
-        result = agent_run._watch_tail_lines(log, 200)
+        result = _tail_from_file(log, 200)
         assert result == ["a", "b", "c"]
 
     def test_empty_file_returns_empty_list(self, tmp_path):
         log = tmp_path / "log"
         log.write_bytes(b"")
-        result = agent_run._watch_tail_lines(log, 200)
+        result = _tail_from_file(log, 200)
         assert result == []
 
 

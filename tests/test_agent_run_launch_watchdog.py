@@ -84,9 +84,11 @@ def test_watchdog_does_not_fire_before_first_output_within_startup_grace(
 
     signals: list[tuple[int, int]] = []
     monkeypatch.setenv("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "600")
-    monkeypatch.setattr(agent_run, "_pid_alive", _alive_for(3))
+    # Three polls with the runner alive, then the runner dies (identity probe
+    # returns None and pid_alive returns False), ending the loop cleanly.
     identities = iter(["linux:runner"] * 3 + [None])
-    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: next(identities))
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: next(identities, None))
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: False)
     monkeypatch.setattr(agent_run.os, "kill", lambda pid, sig: signals.append((pid, sig)))
 
     _run_watchdog(state, log_dir, 1.0)
@@ -118,6 +120,9 @@ def test_watchdog_does_not_fire_while_the_log_keeps_growing(
 
     monkeypatch.setenv("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "0.5")
     monkeypatch.setattr(agent_run, "_process_identity", _identity)
+    # When identity returns None, _pid_alive is the fallback.  Returning False
+    # exits the loop cleanly without sending any signal.
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: False)
     monkeypatch.setattr(agent_run.os, "kill", lambda pid, sig: signals.append((pid, sig)))
 
     _run_watchdog(state, log_dir, 1.0)
@@ -200,6 +205,45 @@ def test_watchdog_escalation_publishes_killed_with_a_reason(
     assert (state / "exit_code").read_text().strip() == str(128 + signal.SIGKILL)
 
 
+def test_watchdog_escalation_does_not_publish_when_identity_changed(
+    isolated_runs_root, monkeypatch
+):
+    """A mismatched identity at escalation time means the runner is gone and a
+    different process has the pid.  No terminal state must be published and no
+    signal must be sent."""
+    state = _seed_run(isolated_runs_root)
+    (state / agent_run.IDLE_TIMEOUT_MARKER).write_text("42\n")
+    signals_sent = []
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:replacement")
+    monkeypatch.setattr(agent_run, "_send_signal_to_verified_pid",
+                        lambda *_args: signals_sent.append(_args))
+
+    agent_run._watchdog_escalate(state, 4242, "linux:runner")
+
+    assert not (state / "status").exists() or (state / "status").read_text().strip() == "running"
+    assert signals_sent == [], "must not signal a recycled pid"
+
+
+def test_watchdog_escalation_does_not_signal_aux_pid_with_wrong_parent(
+    isolated_runs_root, monkeypatch
+):
+    """An aux pid whose parent is not the runner must not be signalled; pid
+    reuse could have placed an unrelated process in the recorded slot."""
+    state = _seed_run(isolated_runs_root)
+    (state / agent_run.IDLE_TIMEOUT_MARKER).write_text("5\n")
+    # Write a fake pty_pid into state.
+    (state / "pty_pid").write_text("9999\n")
+    os_kills = []
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:runner")
+    monkeypatch.setattr(agent_run, "_pid_parent_pid", lambda _pid: 1)  # not the runner
+    monkeypatch.setattr(agent_run, "_send_signal_to_verified_pid", lambda *_args: None)
+    monkeypatch.setattr(agent_run.os, "kill", lambda pid, sig: os_kills.append((pid, sig)))
+
+    agent_run._watchdog_escalate(state, 4242, "linux:runner")
+
+    assert 9999 not in [p for p, _ in os_kills], "unrelated aux pid must not be signalled"
+
+
 # --- forced kill -----------------------------------------------------------
 
 
@@ -250,14 +294,38 @@ def test_force_kill_legacy_refuses_mismatched_recorded_group(
         agent_run._force_kill_legacy("run", state, 123, signal.SIGKILL)
 
 
+def test_force_kill_legacy_esrch_from_getpgid_is_not_a_refusal(
+    isolated_runs_root, monkeypatch
+):
+    """ESRCH from getpgid means the process already exited; fall through to the
+    ProcessLookupError handler rather than refusing with exit code 1.  A run
+    whose pid died in the check window must not be permanently stuck in
+    'running' with no way to force-kill it."""
+    state = _seed_run(isolated_runs_root)
+    (state / "pgid").write_text("999\n")
+    monkeypatch.setattr(
+        agent_run.os, "getpgid", lambda _pid: (_ for _ in ()).throw(ProcessLookupError(3, "No such process"))
+    )
+    monkeypatch.setattr(
+        agent_run.os, "killpg", lambda _pgid, _sig: (_ for _ in ()).throw(ProcessLookupError(3, "No such process"))
+    )
+    monkeypatch.setattr(agent_run.os, "kill", lambda _pid, _sig: None)
+
+    # Must not raise SystemExit; should return normally (process is gone).
+    agent_run._force_kill_legacy("run", state, 123, signal.SIGKILL)
+
+
 def test_watchdog_stops_when_runner_identity_changes(
-    isolated_runs_root, isolated_log_root, monkeypatch
+        isolated_runs_root, isolated_log_root, monkeypatch
 ):
     state = _seed_run(isolated_runs_root)
     log_dir = isolated_log_root / "run"
     log_dir.mkdir()
     (log_dir / "log").write_text("started\n")
     monkeypatch.setattr(agent_run.time, "sleep", lambda _seconds: None)
+    # _pid_alive returns True so the loop cannot exit on liveness alone —
+    # only a changed identity can terminate it.
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:replacement")
     monkeypatch.setattr(
         agent_run, "_send_signal_to_verified_pid", lambda *_args: pytest.fail("signalled replacement")
@@ -266,6 +334,61 @@ def test_watchdog_stops_when_runner_identity_changes(
     _run_watchdog(state, log_dir, 1.0)
 
     assert not (state / agent_run.IDLE_TIMEOUT_MARKER).exists()
+
+
+def test_watchdog_transient_identity_probe_failure_does_not_abandon_run(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    """A one-shot None from _process_identity must not exit the watchdog when
+    _pid_alive confirms the runner is still alive.
+
+    With the old code (`if _process_identity(pid) != identity: return`),
+    `None != identity` causes an immediate exit on poll 1.  With the fix, a
+    None result falls back to _pid_alive; the loop continues when _pid_alive
+    is True, and only exits on a subsequent poll when _pid_alive is False."""
+    state = _seed_run(isolated_runs_root)
+    log_dir = isolated_log_root / "run"
+    log_dir.mkdir()
+    log = log_dir / "log"
+    log.write_text("started\n")
+    # Backdate so idle_wall > idle_timeout and the idle check can fire,
+    # but the startup-grace window has already elapsed.
+    old = time.time() - 600
+    os.utime(log, (old, old))
+
+    poll_count = {"n": 0}
+    monkeypatch.setattr(agent_run.time, "sleep", lambda _: None)
+
+    def _identity(_pid):
+        poll_count["n"] += 1
+        # Always returns None — identity probe is permanently unavailable.
+        return None
+
+    alive_count = {"n": 0}
+
+    def _alive(_pid):
+        alive_count["n"] += 1
+        # First call (poll 1 fallback): runner still alive.
+        # Second call (poll 2 fallback): runner gone.
+        return alive_count["n"] <= 1
+
+    monkeypatch.setenv("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "0.5")
+    monkeypatch.setattr(agent_run, "_process_identity", _identity)
+    monkeypatch.setattr(agent_run, "_pid_alive", _alive)
+    monkeypatch.setattr(
+        agent_run, "_send_signal_to_verified_pid", lambda *_args: None
+    )
+    monkeypatch.setattr(agent_run, "KILL_ESCALATION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(agent_run, "_watchdog_escalate", lambda *_args: None)
+
+    _run_watchdog(state, log_dir, 1.0)
+
+    # Must have gone through at least 2 identity probes (2 polls).  With the
+    # old code (`None != identity` → return), poll_count["n"] would be 1.
+    assert poll_count["n"] >= 2, (
+        f"watchdog exited after {poll_count['n']} poll(s); "
+        "a None identity must not cause immediate exit when _pid_alive is True"
+    )
 
 
 def test_watchdog_recognizes_output_before_first_poll(
