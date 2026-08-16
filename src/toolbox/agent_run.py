@@ -379,10 +379,13 @@ WATCH_SCRATCH_MAX_FILES: int = 2000
 WATCH_SCRATCH_MAX_ENTRIES: int = 10_000
 # Max directory depth to descend into below the working directory root.
 WATCH_SCRATCH_MAX_DEPTH: int = 8
-# Wall-clock budget for the entire scan, the only bound that holds when the
-# filesystem itself is slow. A 30s watchdog poll runs five serial watches plus
-# a 5s aggregate git budget, so 0.5s per scan keeps scratch under 2% of the
-# cycle per watched run even over SSH.
+# Wall-clock budget for the entire scan, checked between filesystem calls.
+# The budget is cooperative, not hard: a single blocking scandir or stat on a
+# slow/hostile mount can exceed it without interruption.  A 30s watchdog poll
+# runs five serial watches plus a 5s aggregate git budget, so 0.5s per scan
+# keeps scratch under 2% of the cycle per watched run even over SSH.
+# Uses time.monotonic() to avoid NTP jumps skewing deadline arithmetic.
+# The outer deadline check is pinned by test_outer_deadline_check_fires.
 WATCH_SCRATCH_BUDGET_SECONDS: float = 0.5
 # "Recent" window for files_modified_recent, matching the log growing window
 # so both facts describe freshness the same way.
@@ -2907,26 +2910,38 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
       truncated             – True when a bound was hit before the scan finished (bool)
       error                 – categorical reason the result is unknown (str|null)
 
-    Any error yields ``_scratch_unknown``: null counts, never a confident 0.
+    On truncation the result is asymmetric by design:
+      files_modified_recent >= 1  – sound positive evidence (activity was seen);
+                                    kept with truncated=True and error=None.
+      files_modified_recent == 0  – absence of evidence, not evidence of absence;
+                                    degraded to null fields, truncated=True, and a
+                                    categorical code (file_limit/entry_limit/
+                                    timeout/depth_limit).  See test
+                                    test_truncated_zero_degrades_to_null_with_code.
+
+    Any hard error yields ``_scratch_unknown``: null counts, never a confident 0.
     """
     if not working_dir:
         return _scratch_unknown("no_working_dir")
 
     root = Path(working_dir)
+    now = time.monotonic()
+    deadline = now + WATCH_SCRATCH_BUDGET_SECONDS
+
     try:
         if not root.is_dir():
             return _scratch_unknown("not_a_directory")
     except OSError:
         return _scratch_unknown("stat_error")
 
-    now = time.time()
-    deadline = now + WATCH_SCRATCH_BUDGET_SECONDS
+    scan_start = time.time()  # wall-clock epoch for mtime comparisons only
 
     newest_mtime: Optional[float] = None  # epoch seconds of the newest file seen
     files_modified_recent: int = 0
     scanned: int = 0
     entries_visited: int = 0
     truncated: bool = False
+    truncation_code: str = ""  # set alongside truncated=True; one of the categorical codes
 
     # Iterative walk, (path, depth) per entry, so the depth cap costs no
     # recursion.
@@ -2934,8 +2949,12 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
 
     try:
         while queue:
-            if time.time() >= deadline:
+            # Budget is cooperative: checked between filesystem calls, not
+            # during them.  A single blocking scandir/stat can exceed it on
+            # slow or hostile mounts.  See WATCH_SCRATCH_BUDGET_SECONDS.
+            if time.monotonic() >= deadline:
                 truncated = True
+                truncation_code = "timeout"
                 break
 
             current_dir, depth = queue.pop()
@@ -2945,19 +2964,26 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
             # what runs long, and only a per-entry check bounds it.
             with os.scandir(current_dir) as it:
                 for entry in it:
-                    if time.time() >= deadline:
+                    if time.monotonic() >= deadline:
                         truncated = True
+                        truncation_code = "timeout"
                         break
 
                     entries_visited += 1
                     if entries_visited >= WATCH_SCRATCH_MAX_ENTRIES:
                         truncated = True
+                        truncation_code = "entry_limit"
                         break
 
                     if entry.is_dir(follow_symlinks=False):
-                        if (entry.name not in WATCH_SCRATCH_PRUNE_DIRS
-                                and depth < WATCH_SCRATCH_MAX_DEPTH):
-                            queue.append((Path(entry.path), depth + 1))
+                        if entry.name not in WATCH_SCRATCH_PRUNE_DIRS:
+                            if depth < WATCH_SCRATCH_MAX_DEPTH:
+                                queue.append((Path(entry.path), depth + 1))
+                            else:
+                                # Non-pruned subtree skipped solely for depth:
+                                # unseen files may be recent, so mark truncated.
+                                truncated = True
+                                truncation_code = "depth_limit"
                         continue
 
                     # Only regular files contribute to the activity signal.
@@ -2975,15 +3001,18 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
                     scanned += 1
                     if newest_mtime is None or mtime > newest_mtime:
                         newest_mtime = mtime
-                    age = now - mtime
+                    age = scan_start - mtime
                     if 0.0 <= age < WATCH_SCRATCH_RECENT_SECONDS:
                         files_modified_recent += 1
 
                     if scanned >= WATCH_SCRATCH_MAX_FILES:
                         truncated = True
+                        truncation_code = "file_limit"
                         break
 
-            if truncated:
+            if truncated and truncation_code != "depth_limit":
+                # depth_limit only truncates the queue; continue scanning
+                # remaining queued directories unless another bound fires.
                 break
 
     except _ScratchScanError as err:
@@ -2996,9 +3025,18 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
     if newest_mtime is None:
         newest_mtime_age_s: Optional[float] = None
     else:
-        delta = now - newest_mtime
+        delta = scan_start - newest_mtime
         # A future mtime (clock skew) degrades to null rather than a negative age.
         newest_mtime_age_s = max(0.0, delta) if delta >= 0.0 else None
+
+    # Asymmetric truncation contract: files_modified_recent >= 1 is sound
+    # positive evidence even under truncation.  A zero under truncation is
+    # absence of evidence, not evidence of absence — degrade to null fields
+    # plus a categorical code.  Test: test_truncated_zero_degrades_to_null_with_code.
+    if truncated and files_modified_recent == 0:
+        result = _scratch_unknown(truncation_code)
+        result["truncated"] = True
+        return result
 
     return {
         "newest_mtime_age_s": newest_mtime_age_s,
