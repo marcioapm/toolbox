@@ -2695,6 +2695,61 @@ class TestScratchFacts:
         assert result["scanned"] is None
         assert result["truncated"] is False
 
+    def test_file_vanishes_during_classification_returns_null_with_error(self, tmp_path, monkeypatch):
+        """An entry that vanishes between enumeration and stat() must degrade to null + stat_error.
+
+        With two separate predicate calls (is_dir then is_file), a file that
+        disappears after enumeration returns false from both, taking the same
+        path as an ignored FIFO/symlink and producing a confident zero.  The
+        single no-follow stat at classification closes this: any OSError at
+        that point raises stat_error rather than silently continuing.
+
+        This regression is distinct from test_file_vanishes_at_stat: that test
+        covers a file that passes is_file() and vanishes at stat(); this test
+        covers the identical safety failure reached one gate earlier.
+        Mutation: replacing S_ISREG with a constant-True check (so the entry
+        is always classified as a regular file regardless of mode) is not the
+        target here; the target is the OSError at stat() classification: if the
+        stat() raise is swallowed (e.g. 'except OSError: continue'), the test
+        fails because error is None and scanned=0 (confident zero).
+        """
+        (tmp_path / "real.txt").write_text("data\n")
+
+        # A DirEntry that raises OSError on stat() simulates classification-time
+        # disappearance: the entry existed during scandir() but is gone by stat().
+        class VanishingDuringClassification:
+            """Proxy a real DirEntry; raise OSError on stat() before classification."""
+
+            def __init__(self, entry):
+                self._entry = entry
+                self._stat_count = 0
+
+            def stat(self, **kw):
+                self._stat_count += 1
+                # Raise on the first stat() call (classification); the original
+                # two-predicate code would have called is_dir/is_file first and
+                # only stat()ed a surviving file.
+                raise FileNotFoundError(
+                    f"[Errno 2] No such file or directory: '{self._entry.path}'"
+                )
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+        _patch_scandir(monkeypatch, VanishingDuringClassification)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "stat_error", (
+            "Entry vanishing during classification must set error='stat_error', "
+            f"not produce a confident zero (got error={result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None, (
+            "files_modified_recent must be null when an entry vanishes during classification"
+        )
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
     def test_root_deleted_after_validation_returns_null_with_error(self, tmp_path, monkeypatch):
         """Deleting the root between is_dir() and scandir() must degrade to null + "scan_error".
 

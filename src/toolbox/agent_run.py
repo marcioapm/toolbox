@@ -2995,7 +2995,21 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
                         truncation_code = "entry_limit"
                         break
 
-                    if entry.is_dir(follow_symlinks=False):
+                    # One no-follow stat classifies the entry and fetches the
+                    # mtime in a single syscall.  DirEntry.stat(follow_symlinks=
+                    # False) is cached by the OS after the first call, so this
+                    # is cost-neutral relative to two predicate calls.  Any
+                    # OSError (including a file that vanished during
+                    # classification) is caught here, preventing the false/false
+                    # predicate path that silently treated disappearing entries
+                    # as ignorable special files.
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        raise _ScratchScanError("stat_error")
+
+                    st_mode = entry_stat.st_mode
+                    if _stat_module.S_ISDIR(st_mode):
                         if entry.name not in WATCH_SCRATCH_PRUNE_DIRS:
                             if depth < WATCH_SCRATCH_MAX_DEPTH:
                                 queue.append((Path(entry.path), depth + 1))
@@ -3007,16 +3021,10 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
                         continue
 
                     # Only regular files contribute to the activity signal.
-                    if not entry.is_file(follow_symlinks=False):
+                    if not _stat_module.S_ISREG(st_mode):
                         continue
 
-                    try:
-                        mtime = entry.stat(follow_symlinks=False).st_mtime
-                    except OSError:
-                        # The file vanished between is_file() and stat(), so
-                        # the counts so far describe a tree that no longer
-                        # exists: abort rather than report them confidently.
-                        raise _ScratchScanError("stat_error")
+                    mtime = entry_stat.st_mtime
 
                     # NaN and infinities cannot represent a real timestamp:
                     # NaN makes every ordered comparison false (max(0.0, NaN)
