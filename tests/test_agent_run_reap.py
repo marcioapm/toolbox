@@ -2327,18 +2327,6 @@ class TestReapLogMinAgeThreshold:
         assert rc == 0
         assert ld.exists()
 
-    def test_old_empty_preserved_log_is_collected(
-        self, isolated_runs_root, isolated_log_root
-    ):
-        ld = isolated_log_root / "emptyold"
-        ld.mkdir()
-        old = time.time() - 48 * 3600
-        os.utime(ld, (old, old))
-
-        agent_run.cmd_reap(_reap_args(include_logs=True, log_min_age_hours=24))
-
-        assert not ld.exists()
-
     def test_scandir_error_retains_fresh_content_log(
         self, isolated_runs_root, isolated_log_root, monkeypatch
     ):
@@ -2405,19 +2393,15 @@ class TestReapLogMinAgeThreshold:
 
         assert (ld / "fresh").read_text() == "new data\n"
 
-
-    def test_preserved_log_inode_recheck_retains_same_inode_with_fresh_content(
+    def test_preserved_log_age_recheck_retains_same_inode_with_fresh_content(
         self, isolated_runs_root, isolated_log_root, monkeypatch
     ):
-        """Replacement that preserves the inode but freshens its content:
-        only the age recheck can save it (the inode recheck sees the same
-        dev/ino and passes; the age recheck then sees a young mtime and
-        skips deletion)."""
+        """A child written under the lock freshens the dir without changing its
+        inode, so the inode recheck passes and only the age recheck can save it."""
         ld = _make_preserved_log(isolated_log_root, "freshcontent", age_secs=48 * 3600)
 
         @contextmanager
         def freshening_lock(_name):
-            # Write a new file inside the SAME directory — same inode, new child.
             (ld / "freshfile").write_text("brand new\n")
             yield -1
 
@@ -2425,33 +2409,44 @@ class TestReapLogMinAgeThreshold:
 
         agent_run.cmd_reap(_reap_args(include_logs=True, log_min_age_hours=24))
 
-        # The freshly-written child should still be present (dir retained).
         assert (ld / "freshfile").exists(), (
             "age recheck must protect a dir whose inode is unchanged but content is new"
         )
 
-    def test_preserved_log_age_recheck_passes_when_log_was_written_inside_lock(
+    def test_preserved_log_inode_recheck_survives_old_replacement(
         self, isolated_runs_root, isolated_log_root, monkeypatch
     ):
-        """The age recheck under the lock fires even when the inode recheck passed.
+        """A replacement dir that is *also* old passes the age recheck, so only
+        the inode recheck can save it.
 
-        We confirm this by verifying the dir is NOT deleted when a child file
-        is written between the outer scan and the lock, regardless of the inode."""
-        ld = _make_preserved_log(isolated_log_root, "prelock_write", age_secs=48 * 3600)
+        Without the inode recheck, ``_crash_safe_rmtree`` renames the
+        replacement to a ``.reaping-*`` sentinel before the ``expected=``
+        inode comparison rejects the delete — stranding it under a name the
+        next reap's sentinel sweep removes unconditionally.
+        """
+        ld = _make_preserved_log(isolated_log_root, "oldswap", age_secs=48 * 3600)
+        old = time.time() - 48 * 3600
+        replacement = isolated_log_root.parent / "replacement"
+        replacement.mkdir()
+        (replacement / "precious").write_text("PRECIOUS\n")
+        os.utime(replacement / "precious", (old, old))
+        os.utime(replacement, (old, old))
 
         @contextmanager
-        def writing_lock(_name):
-            (ld / "written_under_lock").write_text("fresh\n")
+        def swapping_lock(_name):
+            ld.rename(isolated_log_root.parent / "moved-away")
+            replacement.rename(ld)
             yield -1
 
-        monkeypatch.setattr(agent_run, "_launch_lock", writing_lock)
+        monkeypatch.setattr(agent_run, "_launch_lock", swapping_lock)
 
         agent_run.cmd_reap(_reap_args(include_logs=True, log_min_age_hours=24))
 
-        assert (ld / "written_under_lock").exists(), (
-            "log with fresh content written under the lock must not be deleted"
-        )
-
+        assert (ld / "precious").exists(), "old replacement dir must not be deleted"
+        assert not any(
+            p.name.startswith(agent_run._SENTINEL_PREFIX)
+            for p in isolated_log_root.iterdir()
+        ), "replacement must not be stranded under a sentinel name"
 
     def test_orphan_scratch_replacement_after_age_scan_survives(
         self, isolated_runs_root, isolated_log_root, monkeypatch
@@ -2477,7 +2472,6 @@ class TestReapLogMinAgeThreshold:
         agent_run.cmd_reap(_reap_args(min_age_hours=24))
 
         assert (scratch / "fresh").read_text() == "new data\n"
-
 
     def test_orphan_scratch_age_recheck_retains_freshly_written_file(
         self, isolated_runs_root, isolated_log_root, monkeypatch

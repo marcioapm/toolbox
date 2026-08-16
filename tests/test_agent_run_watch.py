@@ -928,18 +928,29 @@ class TestGitHardening:
         assert result.facts["dirty"] is False
         assert result.facts["files_changed"] == 0
 
-    def test_git_replace_ref_base_is_stripped(self, tmp_path, monkeypatch):
-        """GIT_REPLACE_REF_BASE alone must be stripped from the git subprocess env."""
-        assert "GIT_REPLACE_REF_BASE" in agent_run.WATCH_GIT_ENV_VARS_TO_STRIP
+    def test_git_replace_env_is_neutralised_at_the_subprocess_boundary(
+        self, tmp_path, monkeypatch
+    ):
+        """Both replacement-ref defences are observable in the child env:
+        GIT_REPLACE_REF_BASE is stripped and GIT_NO_REPLACE_OBJECTS is forced."""
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        monkeypatch.setenv("GIT_REPLACE_REF_BASE", "refs/advrev-replace/")
+        seen = []
+        real_run = agent_run.subprocess.run
 
-    def test_git_no_replace_objects_is_set(self):
-        """GIT_NO_REPLACE_OBJECTS=1 must be unconditionally added to every
-        git subprocess env, independently of GIT_REPLACE_REF_BASE being stripped."""
-        import inspect
-        src = inspect.getsource(agent_run._watch_run_git_checked)
-        assert "GIT_NO_REPLACE_OBJECTS" in src, (
-            "_watch_run_git_checked must set GIT_NO_REPLACE_OBJECTS"
-        )
+        def capturing_run(*args, **kwargs):
+            seen.append(kwargs["env"])
+            return real_run(*args, **kwargs)
+
+        monkeypatch.setattr(agent_run.subprocess, "run", capturing_run)
+
+        agent_run._watch_git_facts_checked(repo, None)
+
+        assert seen
+        for env in seen:
+            assert "GIT_REPLACE_REF_BASE" not in env
+            assert env.get("GIT_NO_REPLACE_OBJECTS") == "1"
 
     def test_git_graft_file_is_stripped(self, tmp_path, monkeypatch):
         """An inherited GIT_GRAFT_FILE rewrites parent pointers silently,

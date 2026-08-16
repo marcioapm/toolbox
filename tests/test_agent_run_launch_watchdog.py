@@ -411,6 +411,18 @@ def test_watchdog_recognizes_output_before_first_poll(
     )
     monkeypatch.setattr(agent_run, "KILL_ESCALATION_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(agent_run, "_watchdog_escalate", lambda *_args: None)
+    # Without the initial_log_stat seed the loop never records first output, so
+    # the 600 s startup grace suppresses the kill forever.  Bound the poll count
+    # so that regression fails fast instead of hanging; the fixed path needs ~2.
+    real_sleep = time.sleep
+    polls = {"n": 0}
+
+    def bounded_sleep(seconds):
+        polls["n"] += 1
+        assert polls["n"] <= 10, "watchdog did not terminate; startup grace never released"
+        real_sleep(seconds)
+
+    monkeypatch.setattr(agent_run.time, "sleep", bounded_sleep)
 
     agent_run._idle_watchdog_loop(
         state, log_dir, 4242, "linux:runner", 1.0, baseline
