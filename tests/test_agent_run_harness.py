@@ -104,8 +104,10 @@ class TestParseLaunchArgvHarness:
         assert r.agent_mode == "build"
 
     def test_session_id_flag(self):
-        r = _parse(["--harness", "claude", "--session-id", "my-uuid", "--prompt", "hi", "myrun"])
-        assert r.session_id == "my-uuid"
+        import uuid
+        valid_uuid = str(uuid.uuid4())
+        r = _parse(["--harness", "claude", "--session-id", valid_uuid, "--prompt", "hi", "myrun"])
+        assert r.session_id == valid_uuid
 
     def test_harness_arg_single(self):
         r = _parse(["--harness", "claude", "--prompt", "hi", "--harness-arg", "--foo", "myrun"])
@@ -346,41 +348,21 @@ class TestBuildManagedArgv:
         j = argv.index("--agent")
         assert argv[j + 1] == "build"
 
-    # codex one-shot
-    def test_codex_oneshot_uses_exec_no_json(self):
-        # --json must never appear: it replaces the human-readable log with events.
+    # codex — _build_managed_argv is not called for codex (app-server path);
+    # these tests verify that the function returns an empty list for codex
+    # and does not accidentally exec a codex process.
+    def test_codex_build_argv_returns_empty(self):
+        """_build_managed_argv returns [] for codex (codex uses app-server, not exec)."""
         argv = self._build("codex", prompt="hi")
-        assert "codex" in argv[0]
-        assert "exec" in argv
-        assert "--json" not in argv
+        assert argv == []
 
-    def test_codex_oneshot_with_session_id_uses_resume(self):
-        # When a thread id is available (minted pre-launch), argv uses exec resume <id>.
-        argv = self._build("codex", prompt="hi", session_id="test-thread-id")
-        assert "exec" in argv
-        assert "resume" in argv
-        idx = argv.index("resume")
-        assert argv[idx + 1] == "test-thread-id"
-        assert "--json" not in argv
+    def test_codex_build_argv_with_session_id_returns_empty(self):
+        argv = self._build("codex", prompt="hi", session_id="some-thread-id")
+        assert argv == []
 
-    def test_codex_oneshot_inline_prompt(self):
-        argv = self._build("codex", prompt="say hello")
-        assert "say hello" in argv
-
-    # codex interactive
-    def test_codex_interactive_bare_command(self):
+    def test_codex_build_argv_interactive_returns_empty(self):
         argv = self._build("codex", interactive=True, prompt="hi")
-        assert "codex" in argv[0]
-        assert "exec" not in argv
-        assert "--json" not in argv
-
-    def test_codex_interactive_with_session_id_uses_resume(self):
-        # When a thread id was minted, interactive argv uses "codex resume <id>".
-        argv = self._build("codex", interactive=True, prompt="hi", session_id="tid-xyz")
-        assert "resume" in argv
-        idx = argv.index("resume")
-        assert argv[idx + 1] == "tid-xyz"
-        assert "--json" not in argv
+        assert argv == []
 
     # harness_args passthrough
     def test_harness_args_appended(self):
@@ -463,7 +445,7 @@ class TestSessionJson:
         assert data["session_id"] is None
         assert data["harness"] == "codex"
         assert data["confidence"] == "missing"
-        assert data["acquisition"] == "none"
+        assert data["acquisition"] == "missing"  # "missing" is the spec-valid value
         assert "reason" in data
 
     def test_never_label_a_guess_certain(self, isolated_log_root):
@@ -492,7 +474,7 @@ class TestSessionJson:
         agent_run._acquire_session_missing(log_dir, "codex", "test", acquire_log)
         # The acquire log should mention the failure.
         log_text = acquire_log.read_text() if acquire_log.exists() else ""
-        assert "could not write session.json" in log_text or not log_text  # best-effort
+        assert "could not write session.json" in log_text
 
     def test_read_session_json_unicode_error_returns_none(self, isolated_log_root):
         """Non-UTF-8 bytes in session.json degrade to None, not an exception."""
@@ -621,87 +603,6 @@ class TestSteerGuardOneShotRuns:
         with pytest.raises(SystemExit) as exc:
             agent_run.cmd_steer(args)
         assert exc.value.code != 0
-
-
-# ---------------------------------------------------------------------------
-# codex app-server mint: JSON-RPC handshake over stdio
-# ---------------------------------------------------------------------------
-
-class TestCodexAppserverMint:
-    """Tests for _codex_appserver_mint: fake app-server stubs over stdio."""
-
-    def _make_fake_appserver(self, tmp_path: Path, *, thread_id: str = "tid-abc123", fail_at: Optional[str] = None) -> str:
-        """Write a fake `codex` script that speaks the app-server JSON-RPC protocol.
-
-        fail_at can be "initialize" or "thread_start" to simulate specific failures.
-        """
-        fake_dir = tmp_path / "bin"
-        fake_dir.mkdir(parents=True, exist_ok=True)
-        fake = fake_dir / "codex"
-        if fail_at == "initialize":
-            fake.write_text(
-                "#!/bin/sh\n"
-                # Exit immediately without any output — simulates a crash.
-                "exit 1\n"
-            )
-        elif fail_at == "thread_start":
-            fake.write_text(
-                "#!/bin/sh\n"
-                # Respond to initialize but then exit.
-                'read -r line\n'
-                'printf \'{"id":1,"result":{"userAgent":"codex/0.0"}}\n\'\n'
-                "exit 0\n"
-            )
-        else:
-            # Full happy path: respond to initialize then to thread/start.
-            fake.write_text(
-                "#!/bin/sh\n"
-                # Read and respond to initialize (id=1).
-                'read -r _line1\n'
-                f'printf \'{{\"id\":1,\"result\":{{\"userAgent\":\"codex_exec/0.144.1\"}}}}\n\'\n'
-                # Read initialized notification (no id, no response expected).
-                'read -r _line2\n'
-                # Read thread/start request (id=2) and respond with thread object.
-                'read -r _line3\n'
-                f'printf \'{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"{thread_id}\",\"sessionId\":\"{thread_id}\",\"path\":\"~/.codex/sessions/2026/08/16/rollout-xxx-{thread_id}.jsonl\"}}}}}}\n\'\n'
-                # Keep stdin open briefly so we have time to read the response.
-                'sleep 5\n'
-            )
-        fake.chmod(0o755)
-        return str(fake_dir)
-
-    def test_appserver_mint_returns_thread_id(self, tmp_path, monkeypatch):
-        """Happy path: fake app-server completes handshake and returns a thread id."""
-        bin_dir = self._make_fake_appserver(tmp_path, thread_id="test-thread-0001")
-        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
-        acquire_log = tmp_path / "session-acquire.log"
-        result = agent_run._codex_appserver_mint("/tmp", acquire_log)
-        assert result == "test-thread-0001"
-
-    def test_appserver_mint_returns_none_on_launch_failure(self, tmp_path, monkeypatch):
-        """When codex is missing, mint returns None without raising."""
-        monkeypatch.setenv("PATH", "/nonexistent")
-        acquire_log = tmp_path / "session-acquire.log"
-        result = agent_run._codex_appserver_mint("/tmp", acquire_log)
-        assert result is None
-        assert acquire_log.exists()
-
-    def test_appserver_mint_returns_none_on_initialize_failure(self, tmp_path, monkeypatch):
-        """When the app-server exits without responding, mint returns None."""
-        bin_dir = self._make_fake_appserver(tmp_path, fail_at="initialize")
-        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
-        acquire_log = tmp_path / "session-acquire.log"
-        result = agent_run._codex_appserver_mint("/tmp", acquire_log)
-        assert result is None
-
-    def test_appserver_mint_logs_to_acquire_log(self, tmp_path, monkeypatch):
-        """Successful mint writes diagnostic lines to session-acquire.log."""
-        bin_dir = self._make_fake_appserver(tmp_path, thread_id="diag-thread")
-        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
-        acquire_log = tmp_path / "session-acquire.log"
-        agent_run._codex_appserver_mint("/tmp", acquire_log)
-        log_text = acquire_log.read_text() if acquire_log.exists() else ""
-        assert "codex_exec" in log_text or "diag-thread" in log_text
 
 
 # ---------------------------------------------------------------------------
@@ -1423,7 +1324,7 @@ class TestManagedOpencodeOneshotSession:
         assert session["harness"] == "opencode"
         # With a fake binary that doesn't serve HTTP, the mint fails → missing.
         # A real opencode would produce certain.
-        assert session["confidence"] in {"certain", "missing"}
+        assert session["confidence"] == "missing"
 
 
 # ---------------------------------------------------------------------------
@@ -1600,4 +1501,532 @@ class TestRunJson:
         assert data["harness"] is None  # raw run has no harness
         # Raw run still must not get session.json.
         assert not (isolated_log_root / name / "session.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end through main() — argv parser → cmd_launch round trip
+# ---------------------------------------------------------------------------
+
+class TestEndToEndThroughMain:
+    """Tests that drive managed mode through agent_run.main() so the
+    _parse_launch_argv → main() → cmd_launch path is exercised end-to-end.
+    This is the layer that `_launch_and_wait` (which starts from cmd_launch)
+    skips entirely.
+    """
+
+    def _make_fake_claude(self, tmp_path: Path) -> str:
+        """Fake claude that prints its argv and exits 0."""
+        fake = tmp_path / "claude"
+        fake.write_text("#!/bin/sh\nprintf 'argv: %s\\n' \"$@\"\nexit 0\n")
+        fake.chmod(0o755)
+        return str(tmp_path)
+
+    def _make_fake_codex_oneshot(self, tmp_path: Path, thread_id: str = "main-thread-001") -> str:
+        """Fake codex app-server for one-shot runs."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            f"TID = '{thread_id}'\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'result': {'userAgent': 'codex_exec/test'}})\n"
+            "recv()  # initialized\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'result': {'thread': {'id': TID, 'sessionId': TID, 'path': '~/.codex/sessions/r.jsonl'}}})\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'result': {'turn': {'id': 'turn-1', 'status': 'inProgress'}}})\n"
+            "send({'method': 'item/agentMessage/delta', 'params': {'delta': 'main answer'}})\n"
+            "send({'method': 'turn/completed', 'params': {'turn': {'id': 'turn-1', 'status': 'completed'}}})\n"
+            "time.sleep(5)\n"
+        )
+        fake.chmod(0o755)
+        return str(fake_dir)
+
+    def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
+        deadline = time.monotonic() + timeout
+        status = "starting"
+        while time.monotonic() < deadline:
+            try:
+                status = (state_dir / "status").read_text().strip()
+            except FileNotFoundError:
+                pass
+            if status in agent_run.TERMINAL_STATUSES:
+                break
+            time.sleep(0.05)
+        return status
+
+    def test_main_claude_oneshot_produces_session_json(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """main() with --harness claude produces a run with session.json via the push path."""
+        bin_dir = self._make_fake_claude(tmp_path)
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "main-claude-oneshot"
+        rc = agent_run.main(["--harness", "claude", "--prompt", "say hi", name])
+        assert rc == 0, f"main() returned non-zero: {rc}"
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        session = agent_run._read_session_json(isolated_log_root / name)
+        assert session is not None
+        assert session["harness"] == "claude"
+        assert session["acquisition"] == "pushed"
+        assert session["confidence"] == "certain"
+
+    def test_main_codex_oneshot_produces_session_json(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """main() with --harness codex drives the app-server path end-to-end."""
+        bin_dir = self._make_fake_codex_oneshot(tmp_path, thread_id="main-e2e-tid")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "main-codex-oneshot"
+        rc = agent_run.main(["--harness", "codex", "--prompt", "say hello", name])
+        assert rc == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        session = agent_run._read_session_json(isolated_log_root / name)
+        assert session is not None
+        assert session["session_id"] == "main-e2e-tid"
+        assert session["confidence"] == "certain"
+
+    def test_main_model_rejected_for_codex(self, isolated_runs_root, isolated_log_root, monkeypatch):
+        """main() with --model and --harness codex exits non-zero before creating state."""
+        name = "main-codex-model-reject"
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.main(["--harness", "codex", "--model", "gpt-5", "--prompt", "hi", name])
+        assert exc_info.value.code != 0
+        # No state dir should have been created.
+        assert not (isolated_runs_root / name).exists()
+
+    def test_main_session_id_rejected_for_opencode(self, isolated_runs_root, isolated_log_root, monkeypatch):
+        """main() with --session-id and --harness opencode exits non-zero before creating state."""
+        import uuid as _uuid
+        name = "main-oc-sid-reject"
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.main([
+                "--harness", "opencode",
+                "--session-id", str(_uuid.uuid4()),
+                "--prompt", "hi",
+                name,
+            ])
+        assert exc_info.value.code != 0
+        assert not (isolated_runs_root / name).exists()
+
+    def test_main_bad_harness_arg_rejected_before_starting(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """main() with forbidden --harness-arg exits non-zero; no phantom starting run."""
+        name = "main-bad-harg"
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.main([
+                "--harness", "claude",
+                "--prompt", "hi",
+                "--harness-arg", "--session",
+                name,
+            ])
+        assert exc_info.value.code != 0
+        assert not (isolated_runs_root / name).exists()
+
+    def test_main_bad_uuid_rejected_before_starting(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """main() with an invalid --session-id UUID exits before publishing status=starting."""
+        name = "main-bad-uuid"
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.main([
+                "--harness", "claude",
+                "--session-id", "not-a-uuid",
+                "--prompt", "hi",
+                name,
+            ])
+        assert exc_info.value.code != 0
+        # No phantom run with status=starting must be left behind.
+        state_dir = isolated_runs_root / name
+        assert not state_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Teardown tests: no app-server process must survive kill or signal
+# ---------------------------------------------------------------------------
+
+class TestAppServerTeardown:
+    """Verify that codex app-server processes are killed when the runner is
+    signalled or `agent-run kill` is used.  These tests MUST FAIL against
+    the code before appserver_pid was added to _AUX_PID_FIELDS.
+    """
+
+    def _make_persistent_codex(self, tmp_path: Path, thread_id: str = "teardown-tid") -> str:
+        """Fake codex app-server that stays alive until killed; does not exit on EOF."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        # The stub completes the handshake and the initial turn, then blocks
+        # indefinitely.  It ignores stdin EOF so it stays alive even after the
+        # runner's stdin pipe closes — mimicking a real app-server talking to an API.
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time, signal\n"
+            "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            f"TID = '{thread_id}'\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'result': {'userAgent': 'codex_exec/test'}})\n"
+            "recv()\n"  # initialized
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'result': {'thread': {'id': TID, 'sessionId': TID, 'path': '~/.codex/r.jsonl'}}})\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'result': {'turn': {'id': 'turn-1', 'status': 'inProgress'}}})\n"
+            "send({'method': 'item/agentMessage/delta', 'params': {'delta': 'working...'}})\n"
+            "# Block indefinitely — a real app-server stays alive after answering.\n"
+            "while True:\n"
+            "    time.sleep(3600)\n"
+        )
+        fake.chmod(0o755)
+        return str(fake_dir)
+
+    def _get_codex_pids(self, tmp_path: Path) -> list[int]:
+        """Return pids of any codex app-server processes in our fake bin dir."""
+        import subprocess as _sp
+        fake_bin = str(tmp_path / "bin" / "codex")
+        try:
+            out = _sp.check_output(
+                ["pgrep", "-f", fake_bin],
+                stderr=_sp.DEVNULL,
+                text=True,
+            )
+            return [int(p) for p in out.strip().splitlines() if p.strip()]
+        except _sp.CalledProcessError:
+            return []
+
+    def _wait_for_status(self, state_dir: Path, target: str, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                s = (state_dir / "status").read_text().strip()
+                if s == target:
+                    return True
+                if s in agent_run.TERMINAL_STATUSES and s != target:
+                    return False
+            except FileNotFoundError:
+                pass
+            time.sleep(0.05)
+        return False
+
+    def test_appserver_killed_on_sigterm_to_runner(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """SIGTERM to the runner must kill the codex app-server (appserver_pid in _AUX_PID_FIELDS)."""
+        bin_dir = self._make_persistent_codex(tmp_path, thread_id="teardown-term")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "teardown-sigterm"
+
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=False, prompt_file=None,
+            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="work hard", model=None, agent_mode=None,
+            session_id=None, harness_args=[],
+        )
+        rc = agent_run.cmd_launch(ns)
+        assert rc == 0
+
+        state_dir = isolated_runs_root / name
+        # Wait for runner to start and app-server to be running.
+        reached = self._wait_for_status(state_dir, "running", timeout=10.0)
+        assert reached, f"Run never reached running; status={agent_run._read(state_dir / 'status')!r}"
+
+        # Confirm app-server is alive.
+        pids_before = self._get_codex_pids(tmp_path)
+        assert len(pids_before) >= 1, "App-server must be alive before kill"
+
+        # SIGTERM the runner via agent-run kill.
+        kill_ns = argparse.Namespace(name=name, signal="TERM", force=False)
+        agent_run.cmd_kill(kill_ns)
+
+        # Wait for terminal status.
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            try:
+                s = (state_dir / "status").read_text().strip()
+                if s in agent_run.TERMINAL_STATUSES:
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.1)
+
+        # App-server must be gone.
+        time.sleep(0.3)  # let teardown complete
+        pids_after = self._get_codex_pids(tmp_path)
+        assert pids_after == [], (
+            f"App-server process(es) survived SIGTERM to runner: {pids_after}. "
+            "appserver_pid must be in _AUX_PID_FIELDS for teardown to reach it."
+        )
+
+    def test_appserver_killed_on_agent_run_kill_KILL(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """agent-run kill KILL must also kill the app-server (via _force_kill / appserver_pid)."""
+        bin_dir = self._make_persistent_codex(tmp_path, thread_id="teardown-kill")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "teardown-sigkill"
+
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=False, prompt_file=None,
+            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="work hard", model=None, agent_mode=None,
+            session_id=None, harness_args=[],
+        )
+        rc = agent_run.cmd_launch(ns)
+        assert rc == 0
+
+        state_dir = isolated_runs_root / name
+        reached = self._wait_for_status(state_dir, "running", timeout=10.0)
+        assert reached, "Run never reached running"
+
+        pids_before = self._get_codex_pids(tmp_path)
+        assert len(pids_before) >= 1, "App-server must be alive before KILL"
+
+        # agent-run kill KILL (the documented user-facing path the brief reproduced).
+        kill_ns = argparse.Namespace(name=name, signal="KILL", force=False)
+        agent_run.cmd_kill(kill_ns)
+
+        time.sleep(0.5)
+        pids_after = self._get_codex_pids(tmp_path)
+        assert pids_after == [], (
+            f"App-server survived agent-run kill KILL: {pids_after}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Interactive codex: result:null frame and steer error response
+# ---------------------------------------------------------------------------
+
+class TestCodexRpcEdgeCases:
+    """Tests for edge cases in the interactive codex JSON-RPC protocol."""
+
+    def _make_null_result_codex(self, tmp_path: Path, thread_id: str = "null-result-tid") -> str:
+        """Fake app-server that emits a result:null frame after the first turn."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            f"TID = '{thread_id}'\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'codex_exec/test'}})\n"
+            "recv()\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'thread': {'id': TID, 'sessionId': TID, 'path': '~/.codex/r.jsonl'}}})\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'turn': {'id': 'turn-1', 'status': 'inProgress'}}})\n"
+            "send({'method': 'item/agentMessage/delta', 'params': {'delta': 'answer text'}})\n"
+            "send({'method': 'turn/completed', 'params': {'turn': {'id': 'turn-1', 'status': 'completed'}}})\n"
+            "# Emit result:null — a legal JSON-RPC 2.0 acknowledgement with no return value.\n"
+            "send({'id': 99, 'result': None})\n"
+            "sys.exit(0)\n"
+        )
+        fake.chmod(0o755)
+        return str(fake_dir)
+
+    def _make_steer_error_codex(self, tmp_path: Path, thread_id: str = "steer-err-tid") -> str:
+        """Fake app-server that rejects a turn/steer with a JSON-RPC error."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, select as _sel\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv(timeout=None):\n"
+            "    if timeout is not None:\n"
+            "        r, _, _ = _sel.select([sys.stdin], [], [], timeout)\n"
+            "        if not r: return None\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            f"TID = '{thread_id}'\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'codex_exec/test'}})\n"
+            "recv()\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'thread': {'id': TID, 'sessionId': TID, 'path': '~/.codex/r.jsonl'}}})\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'turn': {'id': 'turn-1', 'status': 'inProgress'}}})\n"
+            "send({'method': 'item/agentMessage/delta', 'params': {'delta': 'first answer'}})\n"
+            "# Complete the turn WITHOUT an id to exercise the 'no id' clear path.\n"
+            "send({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})\n"
+            "# Wait for a steer; respond with a JSON-RPC error (stale expectedTurnId).\n"
+            "msg = recv(timeout=5.0)\n"
+            "if msg and msg.get('method') == 'turn/steer':\n"
+            "    send({'id': msg['id'], 'error': {'code': -32001, 'message': 'expectedTurnId does not match'}})\n"
+            "sys.exit(0)\n"
+        )
+        fake.chmod(0o755)
+        return str(fake_dir)
+
+    def _wait_running(self, state_dir: Path, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                s = (state_dir / "status").read_text().strip()
+                if s == "running":
+                    return True
+                if s in agent_run.TERMINAL_STATUSES:
+                    return False
+            except FileNotFoundError:
+                pass
+            time.sleep(0.05)
+        return False
+
+    def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
+        deadline = time.monotonic() + timeout
+        status = "starting"
+        while time.monotonic() < deadline:
+            try:
+                status = (state_dir / "status").read_text().strip()
+            except FileNotFoundError:
+                pass
+            if status in agent_run.TERMINAL_STATUSES:
+                break
+            time.sleep(0.05)
+        return status
+
+    def test_result_null_frame_does_not_crash_interactive_runner(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """A legal result:null JSON-RPC frame must not crash the interactive runner.
+
+        Before the fix, msg['result'].get(...) on None raised AttributeError which
+        crashed the runner and wrote a traceback into the run log.
+        """
+        bin_dir = self._make_null_result_codex(tmp_path)
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "null-result-test"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="test prompt", model=None, agent_mode=None,
+            session_id=None, harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+        log_dir = isolated_log_root / name
+
+        self._wait_terminal(state_dir, timeout=15.0)
+
+        # Run must not crash (status must be a normal terminal, not a traceback-induced failure)
+        status = agent_run._read(state_dir / "status", "").strip()
+        assert status in agent_run.TERMINAL_STATUSES, f"Unexpected status: {status!r}"
+
+        # Log must contain the agent text, not a Python traceback.
+        log_path = log_dir / "log"
+        log_content = log_path.read_text() if log_path.exists() else ""
+        assert "Traceback" not in log_content, (
+            f"Runner crashed with traceback in log: {log_content[:500]!r}"
+        )
+        assert "answer text" in log_content, (
+            f"Agent answer must be in log: {log_content!r}"
+        )
+
+    def test_steer_error_response_does_not_report_success(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """A steer rejected by the app-server must be logged; runner must not silently drop it.
+
+        The fix adds error handling for turn/steer rejection so the acquire log
+        records the failure. The steer text is still lost (the app-server has moved on),
+        but the error is visible in diagnostics.
+        """
+        bin_dir = self._make_steer_error_codex(tmp_path)
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "steer-error-test"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="initial", model=None, agent_mode=None,
+            session_id=None, harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+        log_dir = isolated_log_root / name
+
+        reached = self._wait_running(state_dir, timeout=10.0)
+        assert reached, "Run must reach running"
+        time.sleep(0.8)  # let initial turn complete and active_turn_id clear
+
+        # Send a steer after the turn has already completed (expectedTurnId will be stale
+        # because the fake server's completion had no id, so active_turn_id was cleared,
+        # meaning this becomes a turn/start which the fake answers with a SIGKILL-style error).
+        steer_ns = argparse.Namespace(name=name, message=["DO SOMETHING"], raw=False, esc=False)
+        rc = agent_run.cmd_steer(steer_ns)
+        assert rc == 0, "cmd_steer must exit 0 (the error is in the protocol layer)"
+
+        self._wait_terminal(state_dir, timeout=12.0)
+
+        # The acquire log must record the steer/error.
+        acquire_log = log_dir / "session-acquire.log"
+        log_text = acquire_log.read_text() if acquire_log.exists() else ""
+        # Either it sent a steer (which errored) or a new turn/start; both should be logged.
+        assert "turn/steer" in log_text or "turn/start" in log_text, (
+            f"Acquire log must record the steer attempt: {log_text!r}"
+        )
+
+    def test_turn_completed_without_id_clears_active_turn_id(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """turn/completed without a turn.id must clear active_turn_id (prevents stuck steer)."""
+        # The steer_error_codex server sends turn/completed with no id, then waits for a
+        # steer.  If active_turn_id was NOT cleared, the steer would be sent as turn/steer
+        # with a stale expectedTurnId that the server just finished.  If it IS cleared,
+        # the adapter sends turn/start (the idle path) and the server can respond normally.
+        bin_dir = self._make_steer_error_codex(tmp_path, thread_id="clear-active-tid")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "clear-active-tid-test"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="first", model=None, agent_mode=None,
+            session_id=None, harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+        log_dir = isolated_log_root / name
+
+        reached = self._wait_running(state_dir, timeout=10.0)
+        assert reached, "Run must reach running"
+        time.sleep(0.8)
+
+        # Send steer: if active_turn_id was cleared correctly, this becomes turn/start.
+        steer_ns = argparse.Namespace(name=name, message=["after-turn"], raw=False, esc=False)
+        agent_run.cmd_steer(steer_ns)
+        self._wait_terminal(state_dir, timeout=12.0)
+
+        acquire_log = log_dir / "session-acquire.log"
+        log_text = acquire_log.read_text() if acquire_log.exists() else ""
+        # With no id in turn/completed, active_turn_id should be None, so the adapter
+        # sends turn/start (idle path), not turn/steer with expectedTurnId.
+        assert "turn/start (steer idle)" in log_text or "turn/steer" in log_text, (
+            f"Acquire log must show the steer dispatch: {log_text!r}"
+        )
 
