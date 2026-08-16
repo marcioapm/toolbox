@@ -368,27 +368,24 @@ WATCH_TAIL_MAX_BYTES: int = 256 * 1024
 # 16 MiB covers a full day of typical PTY capture at ~180 bytes/s.
 WATCH_LINE_COUNT_MAX_BYTES: int = 16 * 1024 * 1024
 
-# Scratch-scan bounds: keep each poll cheap and safe when scanning a working
-# directory that includes gitignored paths (the whole point of the scan).
-# Max files to stat before truncating: large enough to catch typical review
-# output, small enough that a tree with millions of files doesn't stall a poll.
+# Scratch-scan bounds. The scan walks a working directory including its
+# gitignored paths, so nothing about the tree is under our control; each bound
+# caps a different way that walk can run long.
+# Regular files stat()ed before truncating.
 WATCH_SCRATCH_MAX_FILES: int = 2000
-# Max directory *entries visited* across all descended directories, regardless
-# of type.  Bounds enumeration work on wide directories of non-file entries
-# (symlinks, FIFOs, empty sub-dirs) independently of the regular-file cap.
+# Directory entries visited whatever their type, so that a wide directory of
+# non-files (symlinks, FIFOs, empty sub-dirs) is bounded too — the file cap
+# alone never fires there.
 WATCH_SCRATCH_MAX_ENTRIES: int = 10_000
 # Max directory depth to descend into below the working directory root.
 WATCH_SCRATCH_MAX_DEPTH: int = 8
-# Wall-clock budget for the entire scan.  A 30-second watchdog poll runs five
-# serial watches plus a 5-second aggregate git budget; at 0.5 s per scan the
-# scratch phase consumes at most 1.7% of a poll interval per watched run, and
-# five concurrent watches stay well within the 30-second cycle even under SSH.
-# The old 2.0 s ceiling made scratch alone 6.7% per run and five watches could
-# exceed the whole cycle without any SSH overhead.
+# Wall-clock budget for the entire scan, the only bound that holds when the
+# filesystem itself is slow. A 30s watchdog poll runs five serial watches plus
+# a 5s aggregate git budget, so 0.5s per scan keeps scratch under 2% of the
+# cycle per watched run even over SSH.
 WATCH_SCRATCH_BUDGET_SECONDS: float = 0.5
-# "Recent" window for files_modified_recent: how long ago counts as recent
-# activity (60 s matches the log growing window so pollers see consistent
-# freshness semantics across both facts).
+# "Recent" window for files_modified_recent, matching the log growing window
+# so both facts describe freshness the same way.
 WATCH_SCRATCH_RECENT_SECONDS: float = 60.0
 # Directory names pruned from every descent level — heavy generated trees
 # that an agent never writes to and that would dominate the file count.
@@ -1357,36 +1354,30 @@ def _is_dir_safe(path: Path) -> bool:
 
 
 # Tri-state values returned by _probe_dir_state.
-_DIR_PRESENT = "present"        # path.is_dir() returned True
-_DIR_MISSING = "missing"        # path does not exist or is not a directory
-_DIR_UNSTATABLE = "unstatable"  # stat raised OSError (e.g. PermissionError on parent)
+_DIR_PRESENT = "present"        # a directory is there
+_DIR_MISSING = "missing"        # nothing there, or there but not a directory
+_DIR_UNSTATABLE = "unstatable"  # stat raised OSError (e.g. unreadable parent)
 
 
 def _probe_dir_state(path: Path) -> str:
     """Return a tri-state describing *path*: present, missing, or unstatable.
 
-    ``Path.is_dir()`` silently returns ``False`` on some platforms when the
-    filesystem cannot be interrogated (e.g. macOS returns ``False`` instead of
-    raising ``PermissionError`` when a parent directory is unreadable).
-    ``os.stat()`` reliably raises ``OSError`` in those cases.  Callers that
-    must distinguish *cannot stat* from *absent* use this probe instead of
-    ``Path.is_dir()`` or ``_is_dir_safe()``.
+    ``Path.is_dir()`` answers ``False`` both for "absent" and for "cannot be
+    interrogated" (an unreadable parent raises on some platforms and returns
+    ``False`` on others), while ``os.stat()`` raises ``OSError`` for the
+    latter.  Callers that must not read "cannot stat" as "gone" use this
+    probe rather than ``Path.is_dir()`` or ``_is_dir_safe()``.
 
-    An ``ELOOP`` error (self-referential symlink) is treated as missing rather
-    than unstatable, because no directory could ever exist at that path.
+    ``ELOOP`` (self-referential symlink) counts as missing: no directory
+    could ever exist at that path.
     """
     try:
         st = os.stat(path)
-        import stat as _stat
-        return _DIR_PRESENT if _stat.S_ISDIR(st.st_mode) else _DIR_MISSING
+        return _DIR_PRESENT if _stat_module.S_ISDIR(st.st_mode) else _DIR_MISSING
     except FileNotFoundError:
         return _DIR_MISSING
     except OSError as exc:
-        import errno as _errno
-        if exc.errno == _errno.ELOOP:
-            # A self-referential symlink cannot name a directory; treat as absent.
-            return _DIR_MISSING
-        return _DIR_UNSTATABLE
+        return _DIR_MISSING if exc.errno == errno.ELOOP else _DIR_UNSTATABLE
 
 
 def _require_state(name: str) -> Path:
@@ -2869,67 +2860,77 @@ def _watch_emit(payload: dict, as_json: bool, human: str) -> None:
     print(json.dumps(payload) if as_json else human)
 
 
-def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
-    """Scan *working_dir* for recent file-write activity, including gitignored paths.
+class _ScratchScanError(Exception):
+    """Aborts a scratch scan with a categorical *code*.
 
-    Read-only review runs write their findings to gitignored scratch (e.g.
-    ``.taskdocs/probe/``, ``.taskdocs/findings-*.md``) and produce no git
-    facts at all, so git-only evidence treats them as stalled.  This scan
-    gives the watchdog an additional signal that is blind to git status.
-
-    The scan is bounded by WATCH_SCRATCH_MAX_FILES, WATCH_SCRATCH_MAX_ENTRIES,
-    WATCH_SCRATCH_MAX_DEPTH, and WATCH_SCRATCH_BUDGET_SECONDS so it stays cheap
-    on every poll over SSH.  Heavy generated trees listed in
-    WATCH_SCRATCH_PRUNE_DIRS are skipped.
-
-    Returns a dict with keys:
-      newest_mtime_age_s   – age of the most-recently-modified file (float|null)
-      files_modified_recent – count of files modified within WATCH_SCRATCH_RECENT_SECONDS (int|null)
-      scanned              – files actually examined (int|null)
-      truncated            – True when a bound was hit before the scan finished (bool)
-      error                – why the result is unknown, if it is (str|null)
-
-    On any error the numeric fields are null (never 0) with *error* set, so a
-    poller cannot confuse "scan failed" with "no activity".
+    The code is a fixed string, never ``str(exc)``: the scratch facts are
+    rendered into Discord and persisted, and an OSError's text carries the
+    path it failed on.
     """
-    null_result = {
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _scratch_unknown(code: str) -> dict:
+    """Scratch facts saying "unknown, because *code*".
+
+    Every decision field is null rather than 0 so a poller cannot read a
+    failed scan as observed inactivity.
+    """
+    return {
         "newest_mtime_age_s": None,
         "files_modified_recent": None,
         "scanned": None,
         "truncated": False,
-        "error": None,
+        "error": code,
     }
 
+
+def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
+    """Scan *working_dir* for recent file-write activity, gitignored paths included.
+
+    Read-only review runs write their findings to gitignored scratch (e.g.
+    ``.taskdocs/probe/``, ``.taskdocs/findings-*.md``) and produce no git
+    facts at all, so git-only evidence treats them as stalled.  This scan
+    gives the watchdog a signal that is blind to git status.
+
+    Bounded by WATCH_SCRATCH_MAX_FILES, WATCH_SCRATCH_MAX_ENTRIES,
+    WATCH_SCRATCH_MAX_DEPTH and WATCH_SCRATCH_BUDGET_SECONDS so it stays cheap
+    on every poll over SSH; WATCH_SCRATCH_PRUNE_DIRS trees are skipped.
+
+    Returns a dict with keys:
+      newest_mtime_age_s    – age of the most-recently-modified file (float|null)
+      files_modified_recent – files modified within WATCH_SCRATCH_RECENT_SECONDS (int|null)
+      scanned               – files actually examined (int|null)
+      truncated             – True when a bound was hit before the scan finished (bool)
+      error                 – categorical reason the result is unknown (str|null)
+
+    Any error yields ``_scratch_unknown``: null counts, never a confident 0.
+    """
     if not working_dir:
-        return {**null_result, "error": "no_working_dir"}
+        return _scratch_unknown("no_working_dir")
 
     root = Path(working_dir)
     try:
         if not root.is_dir():
-            return {**null_result, "error": "not_a_directory"}
+            return _scratch_unknown("not_a_directory")
     except OSError:
-        return {**null_result, "error": "stat_error"}
+        return _scratch_unknown("stat_error")
 
     now = time.time()
     deadline = now + WATCH_SCRATCH_BUDGET_SECONDS
 
-    newest_mtime: Optional[float] = None  # epoch seconds of the most-recently modified file
+    newest_mtime: Optional[float] = None  # epoch seconds of the newest file seen
     files_modified_recent: int = 0
     scanned: int = 0
     entries_visited: int = 0
     truncated: bool = False
 
-    # Iterative BFS over the directory tree so we can enforce depth limits
-    # without recursion depth concerns.  Each queue entry is (path, depth).
+    # Iterative walk, (path, depth) per entry, so the depth cap costs no
+    # recursion.
     queue: list[tuple[Path, int]] = [(root, 0)]
-
-    # _ScanError is a private sentinel used to break out of the BFS loop and
-    # return a null result when an unrecoverable OS error is encountered.  It
-    # carries a categorical code so no OS-provided path or message leaks into
-    # the contract.  See the docstring safety property at the top of this function.
-    class _ScanError(Exception):
-        def __init__(self, code: str) -> None:
-            self.code = code
 
     try:
         while queue:
@@ -2939,68 +2940,58 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
 
             current_dir, depth = queue.pop()
 
-            try:
-                # Stream the context manager directly — never call list() on it.
-                # Checking the budget inside the for-loop ensures each entry is
-                # deadline-checked before being yielded, so slow NFS or contended
-                # storage cannot block arbitrarily between the first check and the
-                # actual iteration.
-                with os.scandir(current_dir) as it:
-                    for entry in it:
-                        if time.time() >= deadline:
-                            truncated = True
-                            break
+            # Stream the scandir iterator, never list() it, and re-check the
+            # deadline per entry: on slow storage the enumeration itself is
+            # what runs long, and only a per-entry check bounds it.
+            with os.scandir(current_dir) as it:
+                for entry in it:
+                    if time.time() >= deadline:
+                        truncated = True
+                        break
 
-                        entries_visited += 1
-                        if entries_visited >= WATCH_SCRATCH_MAX_ENTRIES:
-                            truncated = True
-                            break
+                    entries_visited += 1
+                    if entries_visited >= WATCH_SCRATCH_MAX_ENTRIES:
+                        truncated = True
+                        break
 
-                        if entry.is_dir(follow_symlinks=False):
-                            if entry.name not in WATCH_SCRATCH_PRUNE_DIRS and depth < WATCH_SCRATCH_MAX_DEPTH:
-                                queue.append((Path(entry.path), depth + 1))
-                            continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if (entry.name not in WATCH_SCRATCH_PRUNE_DIRS
+                                and depth < WATCH_SCRATCH_MAX_DEPTH):
+                            queue.append((Path(entry.path), depth + 1))
+                        continue
 
-                        # Only regular files contribute to the activity signal.
-                        if not entry.is_file(follow_symlinks=False):
-                            continue
+                    # Only regular files contribute to the activity signal.
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
 
-                        try:
-                            mtime = entry.stat(follow_symlinks=False).st_mtime
-                        except OSError:
-                            # A file can vanish between is_file() and stat() (TOCTOU).
-                            # Treat the result as unreliable: raise to abort the scan
-                            # and return null decision fields rather than a confident
-                            # partial count.
-                            raise _ScanError("stat_error")
+                    try:
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        # The file vanished between is_file() and stat(), so
+                        # the counts so far describe a tree that no longer
+                        # exists: abort rather than report them confidently.
+                        raise _ScratchScanError("stat_error")
 
-                        scanned += 1
-                        if newest_mtime is None or mtime > newest_mtime:
-                            newest_mtime = mtime
-                        age = now - mtime
-                        if 0.0 <= age < WATCH_SCRATCH_RECENT_SECONDS:
-                            files_modified_recent += 1
+                    scanned += 1
+                    if newest_mtime is None or mtime > newest_mtime:
+                        newest_mtime = mtime
+                    age = now - mtime
+                    if 0.0 <= age < WATCH_SCRATCH_RECENT_SECONDS:
+                        files_modified_recent += 1
 
-                        if scanned >= WATCH_SCRATCH_MAX_FILES:
-                            truncated = True
-                            break
-
-            except _ScanError:
-                raise  # propagate to outer handler
-            except OSError:
-                # A scandir() on a discovered subdirectory failed (permission
-                # denied, directory removed, etc.).  Partial observations from
-                # this tree are unreliable, so abort and return null fields.
-                raise _ScanError("scan_error")
+                    if scanned >= WATCH_SCRATCH_MAX_FILES:
+                        truncated = True
+                        break
 
             if truncated:
                 break
 
-    except _ScanError as err:
-        return {**null_result, "error": err.code}
+    except _ScratchScanError as err:
+        return _scratch_unknown(err.code)
     except OSError:
-        # Unexpected OS error mid-scan: degrade to null rather than a confident 0.
-        return {**null_result, "error": "scan_error"}
+        # scandir() failed on the root or a discovered subdirectory (removed,
+        # permission denied, I/O error). Partial observations are unreliable.
+        return _scratch_unknown("scan_error")
 
     if newest_mtime is None:
         newest_mtime_age_s: Optional[float] = None
@@ -3046,13 +3037,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
             "top_repeated_read": None,
         },
         "observation_error": None,
-        "scratch": {
-            "newest_mtime_age_s": None,
-            "files_modified_recent": None,
-            "scanned": None,
-            "truncated": False,
-            "error": "not_observed",
-        },
+        "scratch": _scratch_unknown("not_observed"),
     }
     unknown = set(fields) - set(payload)
     if unknown:
@@ -3107,10 +3092,10 @@ def _cmd_watch_observe(
     state_dir_state = _probe_dir_state(state_dir)
 
     if state_dir_state == _DIR_UNSTATABLE:
-        # The state directory exists but cannot be statted (e.g. PermissionError
-        # on its parent).  Emitting a confident terminal-looking status here
-        # would hide a still-live run.  Raise so cmd_watch's never-raise guard
-        # catches it and emits a degraded contract with observation_error set.
+        # The state dir may well be there; we just cannot tell. Any status
+        # emitted here would look terminal and hide a still-live run, so
+        # raise into cmd_watch's never-raise guard, which emits the contract
+        # with observation_error set instead.
         raise PermissionError(
             f"state directory for '{name}' is unreadable — "
             "run may still be live; cannot determine status"
