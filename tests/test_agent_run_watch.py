@@ -116,6 +116,57 @@ def _init_repo(path: Path) -> None:
     _git(path, "commit", "-q", "-m", "initial")
 
 
+def _repo_with_gitignored_finding(repo: Path, subdir: str) -> Path:
+    """A clean repo whose only activity is a file under a gitignored dir.
+
+    This is the blind spot the scratch scan exists for: git reports zero
+    commits, zero untracked files and a clean worktree, yet the run is
+    actively writing.
+    """
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q")
+    (repo / "a.txt").write_text("tracked\n")
+    (repo / ".gitignore").write_text(".taskdocs/\n")
+    _git(repo, "add", "a.txt", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "initial")
+
+    finding = repo / ".taskdocs" / subdir / "findings-001.md"
+    finding.parent.mkdir(parents=True)
+    finding.write_text("analysis\n" * 1000)
+    return finding
+
+
+_REAL_SCANDIR = os.scandir
+
+
+def _patch_scandir(monkeypatch, hook) -> None:
+    """Replace ``os.scandir`` with one that passes each entry through *hook*.
+
+    The replacement stays lazy — one entry per ``__next__`` — so a scan that
+    stops part-way through a directory stops doing work part-way too, which
+    is what the budget tests measure.
+    """
+
+    class _HookedScandir:
+        def __init__(self, path):
+            self._it = _REAL_SCANDIR(path)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return hook(next(self._it))
+
+        def __enter__(self):
+            self._it.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._it.__exit__(*args)
+
+    monkeypatch.setattr(os, "scandir", _HookedScandir)
+
+
 # ---------------------------------------------------------------------------
 # status / terminal mapping
 # ---------------------------------------------------------------------------
@@ -2063,23 +2114,9 @@ class TestScratchFacts:
         """The scan deliberately includes gitignored paths — that is the point.
 
         Regression test for the blind spot: zero git facts but real activity.
-        Zero commits, clean worktree, no untracked files per git, yet a
-        gitignored scratch file just written must produce scratch activity.
         """
-        # Set up a real git repo with a .gitignore covering the scratch dir.
         repo = tmp_path / "repo"
-        repo.mkdir()
-        _git(repo, "init", "-q")
-        (repo / "a.txt").write_text("tracked\n")
-        (repo / ".gitignore").write_text(".taskdocs/\n")
-        _git(repo, "add", "a.txt", ".gitignore")
-        _git(repo, "commit", "-q", "-m", "initial")
-
-        # Write a gitignored finding file.
-        findings_dir = repo / ".taskdocs" / "probe"
-        findings_dir.mkdir(parents=True)
-        scratch_file = findings_dir / "findings-001.md"
-        scratch_file.write_text("analysis\n" * 1000)
+        _repo_with_gitignored_finding(repo, "probe")
 
         # Git confirms zero activity: no commits since start, no untracked files.
         launch_head = agent_run._watch_run_git_checked(
@@ -2174,17 +2211,13 @@ class TestScratchFacts:
     def test_slow_enumeration_hits_budget_before_iterator_exhausted(self, tmp_path, monkeypatch):
         """A slow-per-entry iterator must be cut off by the budget, not list()-materialised.
 
-        Safety property: WATCH_SCRATCH_BUDGET_SECONDS bounds wall-clock time even when
-        each scandir entry is slow to yield.  If list(scandir(...)) is used, all entries
-        are materialised before the first deadline check, so this test would take
-        len(entries) * entry_delay_s regardless of budget.
-
-        This test fails if the implementation calls list(os.scandir(...)).
+        WATCH_SCRATCH_BUDGET_SECONDS has to bound wall-clock time even when the
+        cost is in yielding each entry.  Under list(os.scandir(...)) every entry
+        is materialised before the first deadline check, so the scan would take
+        ENTRY_COUNT * ENTRY_DELAY however small the budget.
         """
-        import os as _os
         import time as _time
 
-        # Each entry introduces a small sleep so the iterator is "slow".
         ENTRY_DELAY = 0.02   # 20 ms per entry
         ENTRY_COUNT = 20     # total would be 400 ms if list()-materialised
         BUDGET = 0.05        # 50 ms — enough for ~2 entries, not all 20
@@ -2192,32 +2225,11 @@ class TestScratchFacts:
         for i in range(ENTRY_COUNT):
             (tmp_path / f"slow_{i}.txt").write_text("data\n")
 
-        real_scandir = _os.scandir
+        def slow(entry):
+            _time.sleep(ENTRY_DELAY)
+            return entry
 
-        class SlowIterator:
-            """Wraps a real DirEntry iterator and sleeps before yielding each entry."""
-
-            def __init__(self, it):
-                self._it = it
-
-            def __iter__(self):
-                return self
-
-            def __next__(self):
-                _time.sleep(ENTRY_DELAY)
-                return next(self._it)
-
-            def __enter__(self):
-                self._it.__enter__()
-                return self
-
-            def __exit__(self, *args):
-                return self._it.__exit__(*args)
-
-        def slow_scandir(path):
-            return SlowIterator(real_scandir(path))
-
-        monkeypatch.setattr(_os, "scandir", slow_scandir)
+        _patch_scandir(monkeypatch, slow)
         monkeypatch.setattr(agent_run, "WATCH_SCRATCH_BUDGET_SECONDS", BUDGET)
 
         start = _time.monotonic()
@@ -2234,11 +2246,9 @@ class TestScratchFacts:
     def test_entries_visited_cap_truncates_independently_of_file_count(self, tmp_path, monkeypatch):
         """A cap on directory entries visited must truncate even when few regular files are found.
 
-        Safety property: WATCH_SCRATCH_MAX_ENTRIES bounds directory enumeration work
-        independently of WATCH_SCRATCH_MAX_FILES.  Without this cap a wide directory of
-        non-regular files (symlinks, FIFOs, empty dirs) enumerates without bound.
-
-        This test fails if no WATCH_SCRATCH_MAX_ENTRIES constant exists or is not enforced.
+        WATCH_SCRATCH_MAX_ENTRIES bounds enumeration work independently of
+        WATCH_SCRATCH_MAX_FILES: a wide directory of non-regular entries never
+        trips the file cap.
         """
         # Create entries that are not regular files (empty sub-dirs) so the file cap won't trigger.
         for i in range(20):
@@ -2255,14 +2265,9 @@ class TestScratchFacts:
     def test_unreadable_subdir_returns_null_with_error(self, tmp_path):
         """A PermissionError on a discovered subdirectory must degrade to null fields + error.
 
-        Safety property: WATCH_SCRATCH_BUDGET_SECONDS alone cannot prevent a healthy run
-        from being misread as inactive — scan errors must produce null decision fields,
-        never a confident zero that the poller reads as observed inactivity.
-
-        This test fails if the inner OSError handler silently continues instead of
-        propagating a null result.
+        A confident zero here reads to the poller as observed inactivity and
+        stalls a healthy run; only null decision fields say "unknown".
         """
-        import os as _os
         import stat as _stat
 
         subdir = tmp_path / "unreadable_subdir"
@@ -2286,18 +2291,10 @@ class TestScratchFacts:
     def test_file_vanishes_at_stat_returns_null_with_error(self, tmp_path, monkeypatch):
         """A FileNotFoundError while statting a discovered file must degrade to null + error.
 
-        Safety property: if a file disappears between is_file() and stat(), the scan
-        must not silently skip it and report a confident zero — the partial observation
-        is unreliable so decision fields must be null.
-
-        This test fails if the inner stat() OSError handler silently continues.
+        The counts gathered so far describe a tree that has already changed
+        underneath the scan, so they must not be reported as observed.
         """
-        import os as _os
-
         (tmp_path / "real.txt").write_text("data\n")
-
-        # Wrap os.scandir so that the DirEntry.stat() method raises FileNotFoundError.
-        real_scandir = _os.scandir
 
         class VanishingEntry:
             """Proxy a real DirEntry but make stat() raise FileNotFoundError."""
@@ -2311,27 +2308,7 @@ class TestScratchFacts:
             def __getattr__(self, name):
                 return getattr(self._entry, name)
 
-        class VanishingIterator:
-            def __init__(self, it):
-                self._it = it
-
-            def __iter__(self):
-                return self
-
-            def __next__(self):
-                return VanishingEntry(next(self._it))
-
-            def __enter__(self):
-                self._it.__enter__()
-                return self
-
-            def __exit__(self, *args):
-                return self._it.__exit__(*args)
-
-        def scandir_vanishing(path):
-            return VanishingIterator(real_scandir(path))
-
-        monkeypatch.setattr(_os, "scandir", scandir_vanishing)
+        _patch_scandir(monkeypatch, VanishingEntry)
 
         result = agent_run._watch_scratch_facts(str(tmp_path))
         assert result["error"] is not None, (
@@ -2346,10 +2323,8 @@ class TestScratchFacts:
     def test_root_deleted_after_validation_returns_null_with_error(self, tmp_path, monkeypatch):
         """Deleting the root between is_dir() check and scandir() must degrade to null + error.
 
-        Safety property: a TOCTOU race between the root-existence check and the scan
-        must not produce a confident zero — the result is unknown and must be null.
-
-        This test fails if the scandir FileNotFoundError is silently swallowed.
+        The root-existence check and the scan are a TOCTOU pair; losing that
+        race leaves the result unknown, not zero.
         """
         import os as _os
         import shutil as _shutil
@@ -2378,20 +2353,14 @@ class TestScratchFacts:
         assert result["scanned"] is None
 
     def test_error_field_contains_no_os_path_or_message(self, tmp_path, monkeypatch):
-        """The 'error' field must contain only categorical codes, never OS file names or messages.
+        """The 'error' field must carry categorical codes only, never OS messages.
 
-        str(exc) on an OSError carries the OS filename (e.g. '/customer/merger-codename/secret.txt').
-        This contract is rendered into Discord and persisted, so path material must never leak.
-
-        Plant a sentinel string in the OS error message and assert it does not appear in the
-        returned error field.  This test fails if any error path serialises str(exc).
+        ``str(exc)`` on an OSError carries the filename it failed on (e.g.
+        '/customer/merger-codename/secret.txt'), and this contract is rendered
+        into Discord and persisted.  Plant a sentinel in the OS error message
+        and assert it does not reach the error field.
         """
-        import os as _os
-
         SENTINEL = "SENTINEL_SECRET_PATH_XYZ987"
-
-        # --- root stat_error path ---
-        real_is_dir = tmp_path.is_dir.__class__  # noqa: unused
 
         class SentinelPath:
             """Proxy Path that raises OSError with the sentinel in the message on is_dir()."""
@@ -2408,15 +2377,7 @@ class TestScratchFacts:
             def __fspath__(self):
                 return str(self._p)
 
-        # Monkeypatch Path so _watch_scratch_facts gets our sentinel path.
-        import pathlib as _pathlib
-        real_Path = _pathlib.Path
-
-        def sentinel_Path(arg):
-            p = real_Path(arg)
-            return SentinelPath(p)
-
-        monkeypatch.setattr(agent_run, "Path", sentinel_Path)
+        monkeypatch.setattr(agent_run, "Path", lambda arg: SentinelPath(Path(arg)))
 
         result = agent_run._watch_scratch_facts(str(tmp_path))
         assert result["error"] is not None
@@ -2425,10 +2386,7 @@ class TestScratchFacts:
         )
 
     def test_error_field_contains_no_os_path_from_scan_error(self, tmp_path, monkeypatch):
-        """Outer OSError during scan must not serialize the exception message.
-
-        This test fails if the outer except OSError uses str(exc) in the error field.
-        """
+        """The scandir failure path must not serialise the exception message either."""
         import os as _os
 
         SENTINEL = "SENTINEL_SCAN_PATH_ABC123"
@@ -2445,7 +2403,7 @@ class TestScratchFacts:
             return real_scandir(path)
 
         monkeypatch.setattr(_os, "scandir", scandir_raises_on_second)
-        # Make a subdir so BFS has a second iteration.
+        # Make a subdir so the walk has a second iteration.
         (tmp_path / "subdir").mkdir()
 
         result = agent_run._watch_scratch_facts(str(tmp_path))
@@ -2462,11 +2420,10 @@ class TestScratchFacts:
     def test_scratch_key_present_in_normal_branch(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
     ):
-        """Normal branch: scratch scan runs and reports recent activity.
+        """Normal branch: the scan runs and reports the recent write.
 
-        Asserts branch-specific values, not just key presence.  Removing the
-        _watch_scratch_facts call from the observed() branch must fail this test
-        because the default payload has error='not_observed', not None.
+        Asserts observed values, not key presence: the payload default is
+        error='not_observed', so only a scan that actually ran gives None.
         """
         repo = tmp_path / "repo"
         _init_repo(repo)
@@ -2494,10 +2451,11 @@ class TestScratchFacts:
     def test_scratch_key_present_in_missing_state_dir_branch(
         self, isolated_runs_root, isolated_log_root, tmp_path, capsys
     ):
-        """Missing-state-dir branch: scratch scan runs when --repo is supplied.
+        """Missing-state-dir branch: the scan runs off --repo, since the
+        recorded cwd went with the state dir.
 
-        Asserts branch-specific values, not just key presence.  Removing the
-        _watch_scratch_facts call from the observed() branch must fail this test.
+        Asserts observed values, not key presence: the payload default is
+        error='not_observed', so only a scan that actually ran gives None.
         """
         workdir = tmp_path / "workdir"
         workdir.mkdir()
@@ -2543,28 +2501,14 @@ class TestScratchFacts:
     def test_review_shaped_regression(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
     ):
-        """Full end-to-end regression: reviewer run with zero git evidence must
-        still show scratch activity from a gitignored file just written.
-
-        This is the canonical blind-spot scenario: zero commits, clean
-        worktree, no untracked files per git, but a gitignored file written
-        during the review run must produce scratch activity in the contract.
-        """
+        """Full end-to-end regression for the blind spot: a reviewer run with
+        zero git evidence must still show scratch activity from a gitignored
+        file written during the run."""
         repo = tmp_path / "repo"
-        repo.mkdir()
-        _git(repo, "init", "-q")
-        (repo / "a.txt").write_text("tracked\n")
-        (repo / ".gitignore").write_text(".taskdocs/\n")
-        _git(repo, "add", "a.txt", ".gitignore")
-        _git(repo, "commit", "-q", "-m", "initial")
+        _repo_with_gitignored_finding(repo, "findings")
         launch_head = agent_run._watch_run_git_checked(
             repo, ["rev-parse", "HEAD"]
         ).stdout.strip()
-
-        # Write a gitignored finding — no git activity, only scratch activity.
-        findings_dir = repo / ".taskdocs" / "findings"
-        findings_dir.mkdir(parents=True)
-        (findings_dir / "findings-001.md").write_text("analysis\n" * 1000)
 
         _make_run(
             isolated_runs_root, isolated_log_root, "sc4",
