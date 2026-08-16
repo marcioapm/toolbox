@@ -252,6 +252,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import stat as _stat_module
 import subprocess
 import sys
@@ -259,6 +260,9 @@ import threading
 import time
 import traceback
 import platform
+import urllib.error
+import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, NamedTuple, Optional, Sequence, Tuple
@@ -2811,7 +2815,11 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
     """Build the watch contract with every field at its null/unknown default,
     overridden by *fields*. The key set is fixed here so it cannot vary
     between the normal, missing-state-dir and observation-error branches, and
-    ``terminal`` is always derived from ``status`` rather than passed in."""
+    ``terminal`` is always derived from ``status`` rather than passed in.
+
+    ``session`` is a new additive field (spec §7): a dict when session.json is
+    present in the run's log dir, null otherwise. Existing keys are unchanged.
+    """
     payload = {
         "schema": "agent-run.watch.v1",
         "name": name,
@@ -2835,6 +2843,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
             "top_repeated_read": None,
         },
         "observation_error": None,
+        "session": None,
     }
     unknown = set(fields) - set(payload)
     if unknown:
@@ -2890,8 +2899,11 @@ def _cmd_watch_observe(
         # preserved)" case, usually a reboot. The `cwd` state file went with
         # it, so git facts need an explicit --repo and every process fact is
         # unknowable.
+        session_data = _read_session_json(log_dir)
         payload = _watch_payload(
-            name, observed_at, WATCH_STATUS_LOG_PRESERVED, **observed(repo_arg, None)
+            name, observed_at, WATCH_STATUS_LOG_PRESERVED,
+            **observed(repo_arg, None),
+            session=session_data,
         )
         _watch_emit(
             payload,
@@ -2917,6 +2929,7 @@ def _cmd_watch_observe(
         elapsed_s = max(0.0, (end_ref - started_dt).total_seconds())
 
     repo_str = repo_arg or (_watch_read_cwd_file(state_dir / "cwd") or None)
+    session_data = _read_session_json(log_dir)
     payload = _watch_payload(
         name,
         observed_at,
@@ -2927,6 +2940,7 @@ def _cmd_watch_observe(
         started_at=started_raw,
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
+        session=session_data,
         **observed(repo_str, _read(state_dir / "launch_head") or None),
     )
     _watch_emit(
@@ -4318,10 +4332,13 @@ def cmd_du(args: argparse.Namespace) -> int:
 def cmd_steer(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     d = _require_state(name)
-    if _read(d / "interactive") != "1":
+    interactive_val = _read(d / "interactive")
+    if interactive_val != "1":
+        # Requirement §5: steer on a one-shot run exits non-zero with a clear
+        # message. Check the interactive state file, not the FIFO's existence.
         sys.exit(
-            f"agent-run: '{name}' is not interactive. "
-            f"Relaunch with: agent-run -i {name} <command...>"
+            f"agent-run: '{name}' was launched one-shot (not interactive) and cannot be steered. "
+            f"Relaunch with -i or --harness ... -i to make it steerable."
         )
     pid = _require_positive_state_int(d, "pid", name)
     if not _pid_alive(pid):
@@ -4767,8 +4784,15 @@ def cmd_launch(args: argparse.Namespace) -> int:
 
 def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int:
     """Perform launch setup while ``lock_fd`` serializes this run name."""
-    argv: List[str] = list(args.command)
-    if not argv:
+    # Managed mode: build argv from harness + flags; raw mode uses args.command.
+    harness: Optional[str] = getattr(args, "harness", None)
+    is_managed = harness is not None
+
+    if is_managed:
+        argv: List[str] = []  # Built after opencode port/session setup below.
+    else:
+        argv = list(args.command)
+    if not is_managed and not argv:
         sys.exit("agent-run: missing command")
     prompt_file: Optional[str] = getattr(args, "prompt_file", None)
     if prompt_file and not Path(prompt_file).is_file():
@@ -4847,11 +4871,6 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                 pass
         sys.exit(f"agent-run: failed to create readiness pipe: {exc}")
 
-    _write(d / "command", _pretty_command(argv) + "\n")
-    _write(d / "argv", json.dumps(argv))
-    submit_mode = _persist_submit_mode(
-        d, argv, getattr(args, "submit_mode", None)
-    )
     # Written before "starting" is published: Path.cwd() raises if the launch
     # directory is gone, and that must not happen once the run already looks
     # active with nothing behind it.
@@ -4888,6 +4907,129 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         # Persisted so introspection can tell whether a running run is guarded
         # by a watchdog at all, and post-mortem can reconstruct the launch.
         _write(d / "idle_timeout", f"{idle_timeout}\n")
+
+    # Managed mode: build argv, acquire session id, and write session.json.
+    # This happens after state dirs are ready (session.json goes in log_d)
+    # and before the fork, so the runner's argv is fully resolved at fork time.
+    acquire_log = log_d / "session-acquire.log"
+    opencode_port: Optional[int] = None
+    opencode_session_id: Optional[str] = None
+    managed_prompt: Optional[str] = getattr(args, "prompt", None) if is_managed else None
+    managed_model: Optional[str] = getattr(args, "model", None) if is_managed else None
+    managed_agent_mode: Optional[str] = getattr(args, "agent_mode", None) if is_managed else None
+    managed_session_id_arg: Optional[str] = getattr(args, "session_id", None) if is_managed else None
+    managed_harness_args: List[str] = getattr(args, "harness_args", []) if is_managed else []
+
+    if is_managed:
+        if harness == "claude":
+            # Push acquisition: generate or use a caller-supplied UUID4.
+            claude_session_id = _claude_mint_session_id(managed_session_id_arg)
+            _acquire_session_claude(log_d, claude_session_id, acquire_log)
+            argv = _build_managed_argv(
+                harness,
+                interactive=args.interactive,
+                prompt=managed_prompt,
+                prompt_file=prompt_file,
+                model=managed_model,
+                agent_mode=managed_agent_mode,
+                cwd=None,
+                session_id=claude_session_id,
+                harness_args=managed_harness_args,
+            )
+
+        elif harness == "opencode":
+            if args.interactive:
+                # Mint-then-attach: start a temporary server process, poll health,
+                # POST /session, then attach the TUI to it.
+                try:
+                    opencode_port = _find_free_port()
+                    _acquire_log_write(acquire_log, f"opencode selected port={opencode_port}")
+                except RuntimeError as exc:
+                    _acquire_session_missing(log_d, "opencode", str(exc), acquire_log)
+                    opencode_port = None
+
+                if opencode_port is not None:
+                    # We need the server up before we can POST /session. Launch a
+                    # temporary opencode --serve process on the chosen port, poll health,
+                    # then mint the session. The actual TUI is launched in the runner.
+                    # The --port flag on the bare TUI is sufficient — health poll
+                    # happens in the runner child where the TUI is already started.
+                    # Here we just pre-select the port and defer minting to post-health.
+                    # The server comes up when the TUI starts; minting must happen there.
+                    # Record port for the runner to use.
+                    _acquire_log_write(acquire_log, f"opencode port={opencode_port} reserved; minting deferred to runner startup")
+                    opencode_session_id = None  # minted in runner after health poll
+                # Build the argv with port; session id set in runner after minting.
+                argv = _build_managed_argv(
+                    harness,
+                    interactive=True,
+                    prompt=None,  # delivered post-attach via FIFO
+                    prompt_file=None,
+                    model=managed_model,
+                    agent_mode=managed_agent_mode,
+                    cwd=None,
+                    session_id=None,
+                    harness_args=managed_harness_args,
+                    opencode_port=opencode_port,
+                    opencode_session_id=None,  # minted in runner; --session added at runner startup
+                )
+            else:
+                # One-shot: opencode run [message]; no session id acquisition (no API at launch).
+                _acquire_session_missing(
+                    log_d, "opencode",
+                    "opencode run (one-shot) does not expose session id at launch",
+                    acquire_log,
+                )
+                argv = _build_managed_argv(
+                    harness,
+                    interactive=False,
+                    prompt=managed_prompt,
+                    prompt_file=prompt_file,
+                    model=managed_model,
+                    agent_mode=managed_agent_mode,
+                    cwd=None,
+                    session_id=None,
+                    harness_args=managed_harness_args,
+                )
+
+        elif harness == "codex":
+            if not args.interactive:
+                # Reported acquisition: session id parsed from first --json JSONL line
+                # in _run_managed_oneshot_codex; session.json written there.
+                _acquire_log_write(acquire_log, "codex one-shot: session id will be parsed from --json first line")
+            else:
+                # Interactive codex TUI: spike result — no id exposed at TUI startup.
+                # Finding: the bare `codex` TUI does not emit a machine-readable id
+                # at startup (no --json flag for interactive mode, no HTTP API).
+                # Confidence: missing, reason: interactive TUI id not exposed.
+                _acquire_session_missing(
+                    log_d, "codex",
+                    "interactive codex TUI does not expose session id at startup; "
+                    "check ~/.codex/sessions/ for rollout-<ISO>-<uuid>.jsonl after the run",
+                    acquire_log,
+                )
+            argv = _build_managed_argv(
+                harness,
+                interactive=args.interactive,
+                prompt=managed_prompt,
+                prompt_file=prompt_file,
+                model=managed_model,
+                agent_mode=managed_agent_mode,
+                cwd=None,
+                session_id=managed_session_id_arg,
+                harness_args=managed_harness_args,
+            )
+
+    # Now argv is finalized. Write command/argv state files.
+    _write(d / "command", _pretty_command(argv) + "\n")
+    _write(d / "argv", json.dumps(argv))
+    submit_mode = _persist_submit_mode(
+        d, argv, getattr(args, "submit_mode", None)
+    )
+    # For managed opencode interactive, force CRLF (opencode is Bun-based).
+    if is_managed and harness == "opencode" and args.interactive:
+        submit_mode = SUBMIT_MODE_CRLF
+        _write(d / "submit_mode", submit_mode + "\n")
 
     # Double-fork to detach from the terminal and become our own session
     # leader. The grandchild runs the actual agent.
@@ -4964,6 +5106,9 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         echo_interval,
         tmp_dir=scratch_dir,
         idle_timeout=getattr(args, "idle_timeout", None),
+        managed_harness=harness,
+        managed_prompt=managed_prompt if is_managed else None,
+        opencode_port=opencode_port,
     )
     return 0  # never reached
 
@@ -5258,11 +5403,19 @@ def _runner(
     echo_interval: float = 2.0,
     tmp_dir: Optional[Path] = None,
     idle_timeout: Optional[float] = None,
+    managed_harness: Optional[str] = None,
+    managed_prompt: Optional[str] = None,
+    opencode_port: Optional[int] = None,
 ) -> None:
     """Execute in the detached session-leader process.
 
     Writes pid/pgid then either execs the agent directly (non-interactive)
     or forks a PTY child and shuttles FIFO <-> PTY master <-> log (interactive).
+
+    For managed opencode interactive runs, performs health polling and session
+    minting after the TUI has started (the TUI's HTTP server is only available
+    once the process is running). Session id is recorded to session.json in
+    log_dir, and the initial prompt is delivered via the PTY/FIFO mechanism.
     """
     my_pid = os.getpid()
     log_fd = -1
@@ -5481,7 +5634,28 @@ def _runner(
 
     try:
         agent_started_monotonic = time.monotonic()
-        if interactive:
+        if managed_harness is not None:
+            # Managed mode: harness-specific execution path.
+            acquire_log = log_dir / "session-acquire.log"
+            if interactive and managed_harness == "opencode" and opencode_port is not None:
+                # For opencode interactive: the PTY child starts the TUI with
+                # --port <N>, then this runner thread polls health and mints a
+                # session id before the prompt is delivered. The prompt must be
+                # delivered AFTER the TUI is ready (health=true), not at launch.
+                # _run_managed_interactive_opencode handles the full sequence.
+                exit_code = _run_managed_interactive_opencode(
+                    state_dir, log_dir, list(argv), log_fd, _ready,
+                    prompt_file, managed_prompt, submit_mode, acquire_log,
+                    opencode_port,
+                )
+            elif interactive:
+                exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
+            else:
+                exit_code = _run_managed_oneshot(
+                    state_dir, log_dir, list(argv), log_fd, _ready, prompt_file,
+                    managed_harness, acquire_log,
+                )
+        elif interactive:
             exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
         else:
             exit_code = _run_oneshot(state_dir, argv, log_fd, _ready, prompt_file)
@@ -5865,6 +6039,501 @@ def _run_interactive(
 
 
 # ---------------------------------------------------------------------------
+# Managed mode — harness-specific command building and session acquisition
+# ---------------------------------------------------------------------------
+
+# Valid harness names for --harness.
+MANAGED_HARNESSES: frozenset[str] = frozenset({"claude", "opencode", "codex"})
+
+# Port-scan range for opencode's --port.
+_OPENCODE_PORT_MIN = 40000
+_OPENCODE_PORT_MAX = 49999
+
+# Health poll: how long to wait for opencode to become healthy (seconds).
+_OPENCODE_HEALTH_TIMEOUT = 30.0
+_OPENCODE_HEALTH_POLL_INTERVAL = 0.25
+
+
+def _find_free_port(lo: int = _OPENCODE_PORT_MIN, hi: int = _OPENCODE_PORT_MAX) -> int:
+    """Bind a TCP socket with SO_REUSEADDR to find a free port in [lo, hi].
+
+    Raises RuntimeError if no port is available after exhausting the range.
+    """
+    for port in range(lo, hi + 1):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError(f"no free TCP port in range {lo}–{hi}")
+
+
+def _opencode_health_poll(port: int, timeout: float, acquire_log: Path) -> bool:
+    """Poll GET /global/health until {"healthy":true} or timeout.
+
+    Diagnostic messages go to acquire_log only, never to the PTY log.
+    Returns True when healthy, False on timeout.
+    """
+    url = f"http://127.0.0.1:{port}/global/health"
+    deadline = time.monotonic() + timeout
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        try:
+            with urllib.request.urlopen(url, timeout=2.0) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(body)
+                if data.get("healthy") is True:
+                    _acquire_log_write(acquire_log, f"health ok after {attempt} attempt(s)")
+                    return True
+        except (urllib.error.URLError, json.JSONDecodeError, OSError):
+            pass
+        time.sleep(_OPENCODE_HEALTH_POLL_INTERVAL)
+    _acquire_log_write(acquire_log, f"health poll timed out after {timeout:.1f}s ({attempt} attempt(s))")
+    return False
+
+
+def _opencode_mint_session(port: int, title: str, acquire_log: Path) -> Optional[str]:
+    """POST /session to mint a new opencode session. Returns the session id or None."""
+    url = f"http://127.0.0.1:{port}/session"
+    payload = json.dumps({"title": title}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            session_id = data.get("id")
+            if session_id and isinstance(session_id, str):
+                _acquire_log_write(acquire_log, f"minted session id={session_id!r}")
+                return session_id
+            _acquire_log_write(acquire_log, f"POST /session returned no id: {body[:200]}")
+            return None
+    except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+        _acquire_log_write(acquire_log, f"POST /session failed: {exc}")
+        return None
+
+
+def _acquire_log_write(path: Path, message: str) -> None:
+    """Append a timestamped line to the session acquisition diagnostic log."""
+    try:
+        with path.open("a") as f:
+            f.write(f"{_now_iso()} {message}\n")
+    except OSError:
+        pass
+
+
+def _write_session_json(log_dir: Path, data: dict) -> None:
+    """Atomically write session.json into log_dir."""
+    path = log_dir / "session.json"
+    tmp = log_dir / f".session.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_session_json(log_dir: Path) -> Optional[dict]:
+    """Read session.json from log_dir, or None if absent or malformed."""
+    try:
+        return json.loads((log_dir / "session.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def _build_managed_argv(
+    harness: str,
+    *,
+    interactive: bool,
+    prompt: Optional[str],
+    prompt_file: Optional[str],
+    model: Optional[str],
+    agent_mode: Optional[str],
+    cwd: Optional[str],
+    session_id: Optional[str],
+    harness_args: List[str],
+    # opencode-specific: pre-minted session id is passed via --session; the
+    # launch prompt is withheld here because --session silently swallows --prompt.
+    opencode_port: Optional[int] = None,
+    opencode_session_id: Optional[str] = None,
+) -> List[str]:
+    """Build the command argv for the given harness and mode.
+
+    For opencode interactive, the prompt is NOT included in argv (see gotcha
+    in BRIEF-01: --session silently swallows --prompt). The prompt is delivered
+    post-attach via the PTY/FIFO steer path. This function makes that
+    combination structurally impossible: any caller that passes an opencode
+    interactive session_id must leave prompt/prompt_file out of this argv.
+    """
+    argv: List[str] = []
+
+    if harness == "claude":
+        argv.append("claude")
+        if model:
+            argv.extend(["--model", model])
+        if session_id:
+            argv.extend(["--session-id", session_id])
+        if not interactive:
+            # One-shot: claude -p/--print.  Prompt inline or via stdin.
+            argv.append("--print")
+            argv.extend(["--permission-mode", "bypassPermissions"])
+            if prompt:
+                argv.append(prompt)
+            # prompt_file is handled by _run_oneshot via stdin; not added to argv.
+        else:
+            # Interactive TUI: bare claude with permissions bypass.
+            argv.extend(["--permission-mode", "bypassPermissions"])
+            # Interactive prompt-file delivery via the PTY/FIFO helper (_run_interactive).
+        if harness_args:
+            argv.extend(harness_args)
+
+    elif harness == "opencode":
+        argv.append("opencode")
+        if model:
+            argv.extend(["-m", model])
+        if agent_mode:
+            argv.extend(["--agent", agent_mode])
+        if not interactive:
+            # One-shot: opencode run [message].
+            argv.append("run")
+            if prompt:
+                argv.append(prompt)
+            # prompt_file delivered via stdin by _run_oneshot.
+        else:
+            # Interactive TUI: bare opencode (the [default] command).
+            # --port directs the HTTP API to a known port for health-polling.
+            if opencode_port is not None:
+                argv.extend(["--port", str(opencode_port)])
+            # --session attaches to the pre-minted session id.
+            if opencode_session_id:
+                argv.extend(["--session", opencode_session_id])
+            argv.append("--auto")
+            # NEVER add --prompt here: --session silently swallows it (see gotcha).
+        if harness_args:
+            argv.extend(harness_args)
+
+    elif harness == "codex":
+        if not interactive:
+            argv.extend(["codex", "exec"])
+            argv.append("--json")
+            if model:
+                argv.extend(["--model", model])
+            if prompt:
+                argv.append(prompt)
+            # prompt_file: stdin-delivered by _run_oneshot.
+        else:
+            argv.append("codex")
+            if model:
+                argv.extend(["--model", model])
+            if prompt:
+                argv.append(prompt)
+        if harness_args:
+            argv.extend(harness_args)
+
+    return argv
+
+
+def _claude_mint_session_id(caller_id: Optional[str]) -> str:
+    """Return a caller-supplied UUID4 or generate a fresh one."""
+    if caller_id:
+        return caller_id
+    return str(uuid.uuid4())
+
+
+def _acquire_session_claude(
+    log_dir: Path,
+    session_id: str,
+    acquire_log: Path,
+) -> None:
+    """Write session.json for a claude run (pushed acquisition)."""
+    _acquire_log_write(acquire_log, f"claude push session_id={session_id!r}")
+    _write_session_json(log_dir, {
+        "session_id": session_id,
+        "harness": "claude",
+        "acquisition": "pushed",
+        "confidence": "certain",
+        "observed_at": _now_iso(),
+    })
+
+
+def _acquire_session_opencode_minted(
+    log_dir: Path,
+    session_id: str,
+    acquire_log: Path,
+) -> None:
+    """Write session.json for opencode (minted via POST /session)."""
+    _acquire_log_write(acquire_log, f"opencode minted session_id={session_id!r}")
+    _write_session_json(log_dir, {
+        "session_id": session_id,
+        "harness": "opencode",
+        "acquisition": "minted",
+        "confidence": "certain",
+        "observed_at": _now_iso(),
+    })
+
+
+def _acquire_session_missing(
+    log_dir: Path,
+    harness: str,
+    reason: str,
+    acquire_log: Path,
+) -> None:
+    """Write a session.json with confidence=missing when acquisition fails."""
+    _acquire_log_write(acquire_log, f"{harness} session acquisition failed: {reason}")
+    _write_session_json(log_dir, {
+        "session_id": None,
+        "harness": harness,
+        "acquisition": "missing",
+        "confidence": "missing",
+        "reason": reason,
+        "observed_at": _now_iso(),
+    })
+
+
+def _parse_codex_session_id_from_jsonl(line: str) -> Optional[str]:
+    """Parse a codex --json JSONL line for thread_id (the session UUID).
+
+    codex emits {"type":"thread.started","thread_id":"<uuid>"} as the very
+    first stdout line, before any model call (verified spike 2026-08-16).
+    """
+    try:
+        data = json.loads(line)
+        if data.get("type") == "thread.started":
+            tid = data.get("thread_id")
+            if isinstance(tid, str) and tid:
+                return tid
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return None
+
+
+def _run_managed_oneshot(
+    state_dir: Path,
+    log_dir: Path,
+    argv: List[str],
+    log_fd: int,
+    ready: "callable",
+    prompt_file: Optional[str],
+    harness: str,
+    acquire_log: Path,
+) -> int:
+    """One-shot execution for a managed run.
+
+    Wraps _run_oneshot but intercepts codex's stdout to parse the session id
+    from the first JSONL line before forwarding all output to the log.
+    For claude, the session id is already known (pushed). For opencode one-shot,
+    no session id is acquired (opencode run does not expose a session API at launch).
+    """
+    if harness == "codex":
+        return _run_managed_oneshot_codex(
+            state_dir, log_dir, argv, log_fd, ready, prompt_file, acquire_log
+        )
+    # claude and opencode one-shot: use the standard path.
+    return _run_oneshot(state_dir, argv, log_fd, ready, prompt_file)
+
+
+def _run_managed_oneshot_codex(
+    state_dir: Path,
+    log_dir: Path,
+    argv: List[str],
+    log_fd: int,
+    ready: "callable",
+    prompt_file: Optional[str],
+    acquire_log: Path,
+) -> int:
+    """One-shot codex run that captures session id from the first --json JSONL line.
+
+    Intercepts stdout through a pipe: the first line is parsed for the
+    thread_id, then all output (including the first line) is forwarded to log_fd.
+    session.json is written as soon as the first line arrives, before any model
+    call — satisfying the "known at the same moment the first prompt goes over
+    the wire" requirement.
+    """
+    # Pipe to intercept stdout.
+    pipe_r, pipe_w = os.pipe()
+
+    with _block_handled_runner_signals():
+        pid = os.fork()
+        if pid != 0:
+            _publish_or_reap_child(state_dir, "agent_pid", pid)
+            _write(state_dir / "status", "running\n")
+            ready()
+        else:
+            _reset_runner_signal_handlers()
+
+    if pid == 0:
+        _reset_runner_signal_handlers()
+        os.close(pipe_r)
+        if prompt_file:
+            try:
+                stdin_fd = os.open(prompt_file, os.O_RDONLY)
+            except OSError as exc:
+                os.write(2, f"agent-run: cannot open prompt file: {exc}\n".encode())
+                os._exit(127)
+        else:
+            stdin_fd = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(stdin_fd, 0)
+        os.dup2(pipe_w, 1)
+        os.dup2(pipe_w, 2)
+        if stdin_fd > 2:
+            os.close(stdin_fd)
+        if pipe_w > 2:
+            os.close(pipe_w)
+        try:
+            os.execvp(argv[0], list(argv))
+        except OSError as exc:
+            os.write(2, f"agent-run: exec failed: {exc}\n".encode())
+            os._exit(127)
+
+    # Parent: read from pipe, parse first line for session id, forward all to log.
+    os.close(pipe_w)
+    session_captured = False
+    buf = b""
+    try:
+        with os.fdopen(pipe_r, "rb") as pipe:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                if not session_captured:
+                    # Look for a complete first line.
+                    nl = buf.find(b"\n")
+                    if nl >= 0:
+                        first_line = buf[:nl].decode("utf-8", errors="replace").strip()
+                        session_id = _parse_codex_session_id_from_jsonl(first_line)
+                        if session_id:
+                            _write_session_json(log_dir, {
+                                "session_id": session_id,
+                                "harness": "codex",
+                                "acquisition": "reported",
+                                "confidence": "certain",
+                                "observed_at": _now_iso(),
+                            })
+                            _acquire_log_write(acquire_log, f"codex reported thread_id={session_id!r}")
+                        else:
+                            _acquire_session_missing(
+                                log_dir, "codex",
+                                f"first line did not contain thread_id: {first_line[:100]!r}",
+                                acquire_log,
+                            )
+                        session_captured = True
+                try:
+                    os.write(log_fd, buf if not session_captured else chunk)
+                    buf = b""
+                except OSError:
+                    break
+    except OSError:
+        pass
+
+    # Write any remaining buffer to log.
+    if buf:
+        try:
+            os.write(log_fd, buf)
+        except OSError:
+            pass
+
+    if not session_captured:
+        _acquire_session_missing(log_dir, "codex", "process exited before first JSONL line", acquire_log)
+
+    _, status = os.waitpid(pid, 0)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
+
+
+def _run_managed_interactive_opencode(
+    state_dir: Path,
+    log_dir: Path,
+    argv: List[str],
+    log_fd: int,
+    ready: "callable",
+    prompt_file: Optional[str],
+    prompt: Optional[str],
+    submit_mode: str,
+    acquire_log: Path,
+    opencode_port: Optional[int] = None,
+) -> int:
+    """Interactive opencode run: attach TUI to a pre-minted session.
+
+    Sequence:
+      1. Fork PTY child with argv (which includes --port <N>).
+      2. Health-poll GET /global/health on port N until healthy.
+      3. POST /session to mint the session id; write session.json.
+      4. Deliver the prompt via the PTY/FIFO mechanism.
+
+    The prompt is withheld from the initial argv: --session silently swallows
+    --prompt (verified spike). Instead, the prompt is delivered post-attach
+    via the FIFO steer path, exactly as `agent-run steer` does.
+
+    If health polling fails or session minting fails, the run continues with
+    confidence=missing — the run must never be aborted by acquisition failure.
+    """
+    # Write inline prompt to a temp file if only a string was given.
+    tmp_prompt_file: Optional[str] = None
+    effective_prompt_file = prompt_file
+
+    if prompt and not prompt_file:
+        tmp_path = log_dir / "tmp" / f".managed-prompt.{os.getpid()}.txt"
+        try:
+            tmp_path.write_bytes(prompt.encode("utf-8"))
+            tmp_prompt_file = str(tmp_path)
+            effective_prompt_file = tmp_prompt_file
+        except OSError as exc:
+            _acquire_log_write(acquire_log, f"could not write temp prompt file: {exc}")
+
+    # Arrange for session acquisition to happen in the prompt delivery window.
+    # A helper thread runs health-poll + mint while _run_interactive is waiting
+    # PROMPT_SUBMISSION_DELAY_SECONDS before delivering the prompt. The thread
+    # writes session.json as soon as the session id is known.
+    def _acquire_in_background() -> None:
+        if opencode_port is None:
+            return
+        health_ok = _opencode_health_poll(opencode_port, _OPENCODE_HEALTH_TIMEOUT, acquire_log)
+        if not health_ok:
+            _acquire_session_missing(
+                log_dir, "opencode",
+                f"health poll timed out on port {opencode_port}",
+                acquire_log,
+            )
+            return
+        session_id = _opencode_mint_session(opencode_port, state_dir.name, acquire_log)
+        if session_id:
+            _acquire_session_opencode_minted(log_dir, session_id, acquire_log)
+        else:
+            _acquire_session_missing(
+                log_dir, "opencode", "POST /session returned no id", acquire_log
+            )
+
+    acquire_thread = threading.Thread(target=_acquire_in_background, daemon=True)
+    acquire_thread.start()
+
+    try:
+        return _run_interactive(
+            state_dir, argv, log_fd, ready, effective_prompt_file, submit_mode
+        )
+    finally:
+        acquire_thread.join(timeout=_OPENCODE_HEALTH_TIMEOUT + 5.0)
+        if tmp_prompt_file:
+            try:
+                Path(tmp_prompt_file).unlink()
+            except FileNotFoundError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # CLI dispatch
 # ---------------------------------------------------------------------------
 
@@ -6181,6 +6850,14 @@ class _LaunchArgv(NamedTuple):
     ``subcommand_tokens`` is non-None when the first non-flag token is a known
     subcommand and no launch flags were supplied; main() delegates to argparse
     in that case and ignores all other fields.
+
+    Managed-mode fields (harness is not None):
+      harness       — "claude" | "opencode" | "codex"
+      prompt        — inline prompt string (mutually exclusive with prompt_file)
+      model         — model string forwarded to the harness
+      agent_mode    — harness agent/mode name (opencode --agent)
+      session_id    — caller-supplied session id (--session-id)
+      harness_args  — extra raw args forwarded verbatim after harness's own args
     """
     interactive: bool
     prompt_file: Optional[str]
@@ -6191,6 +6868,13 @@ class _LaunchArgv(NamedTuple):
     name: str
     command: List[str]
     subcommand_tokens: Optional[List[str]]
+    # Managed-mode fields; all None/empty for raw runs.
+    harness: Optional[str] = None
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+    agent_mode: Optional[str] = None
+    session_id: Optional[str] = None
+    harness_args: List[str] = []
 
 
 _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
@@ -6212,6 +6896,13 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
       --echo / --echo=N
       --submit-mode=cr|crlf
       --idle-timeout N / --idle-timeout=N
+      --harness <claude|opencode|codex>
+      --prompt <text>
+      --model <model>
+      --agent-mode <name>
+      --session-id <id>
+      --harness-arg <raw>  (repeatable)
+      --cwd <dir>  (accepted but not stored here; used by cmd_launch)
 
     Preserves the -- separator semantics: name must precede --, everything
     after -- is taken verbatim.  Without --, a leading-dash token immediately
@@ -6221,6 +6912,9 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     were set, returns with subcommand_tokens set to the remaining argv so
     main() can delegate to argparse; all other fields hold zero values in that
     case.
+
+    Managed mode (--harness) and raw mode (trailing command) are mutually
+    exclusive: supplying both raises _LaunchArgvError.
     """
     tokens = list(raw)
     interactive = False
@@ -6229,6 +6923,12 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     echo_interval: float = 2.0
     submit_mode: Optional[str] = None
     idle_timeout: Optional[float] = None
+    harness: Optional[str] = None
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+    agent_mode: Optional[str] = None
+    session_id: Optional[str] = None
+    harness_args: List[str] = []
 
     # Consume flags in any order before the name.
     while tokens:
@@ -6281,7 +6981,90 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                 raise _LaunchArgvError(f"agent-run: --idle-timeout {exc}") from exc
             tokens = tokens[1:]
             continue
+        # Managed-mode flags.
+        if tokens[0] in ("--harness",):
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: --harness requires a value (claude|opencode|codex)")
+            harness = tokens[1]
+            if harness not in MANAGED_HARNESSES:
+                raise _LaunchArgvError(
+                    f"agent-run: --harness {harness!r} is not valid; "
+                    f"choose one of: {', '.join(sorted(MANAGED_HARNESSES))}"
+                )
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--harness="):
+            harness = tokens[0].split("=", 1)[1]
+            if harness not in MANAGED_HARNESSES:
+                raise _LaunchArgvError(
+                    f"agent-run: --harness {harness!r} is not valid; "
+                    f"choose one of: {', '.join(sorted(MANAGED_HARNESSES))}"
+                )
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--prompt":
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: --prompt requires a text argument")
+            prompt = tokens[1]
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--prompt="):
+            prompt = tokens[0].split("=", 1)[1]
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--model":
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: --model requires a value")
+            model = tokens[1]
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--model="):
+            model = tokens[0].split("=", 1)[1]
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--agent-mode":
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: --agent-mode requires a value")
+            agent_mode = tokens[1]
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--agent-mode="):
+            agent_mode = tokens[0].split("=", 1)[1]
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--session-id":
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: --session-id requires a value")
+            session_id = tokens[1]
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--session-id="):
+            session_id = tokens[0].split("=", 1)[1]
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--harness-arg":
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: --harness-arg requires a value")
+            harness_args = harness_args + [tokens[1]]
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--harness-arg="):
+            harness_args = harness_args + [tokens[0].split("=", 1)[1]]
+            tokens = tokens[1:]
+            continue
+        # --cwd is accepted but handled by cmd_launch, not stored in _LaunchArgv.
+        if tokens[0] == "--cwd":
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: --cwd requires a path")
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--cwd="):
+            tokens = tokens[1:]
+            continue
         break
+
+    # Managed mode and raw mode (-- trailing command) are mutually exclusive.
+    # Check after flag parsing so the error fires only when both are present.
 
     # A bare "--" before any name has no run to attach the command to.
     if tokens and tokens[0] == "--":
@@ -6293,7 +7076,12 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     # No launch flags set and first token is a known subcommand: delegate to
     # argparse.  A run may not be named after a subcommand, so a "--" after a
     # subcommand name is still part of that subcommand's own argv.
-    any_launch_flag = interactive or prompt_file or echo or submit_mode is not None or idle_timeout is not None
+    any_launch_flag = (
+        interactive or prompt_file or echo or submit_mode is not None
+        or idle_timeout is not None or harness is not None or prompt is not None
+        or model is not None or agent_mode is not None or session_id is not None
+        or bool(harness_args)
+    )
     if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
         return _LaunchArgv(
             interactive=False, prompt_file=None, echo=False, echo_interval=2.0,
@@ -6301,15 +7089,71 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             subcommand_tokens=tokens,
         )
 
-    if len(tokens) < 2:
+    if len(tokens) < 1 or (len(tokens) < 2 and harness is None):
         # Signal main() to print help; name/command are meaningless here.
         return _LaunchArgv(
             interactive=interactive, prompt_file=prompt_file, echo=echo,
             echo_interval=echo_interval, submit_mode=submit_mode,
             idle_timeout=idle_timeout, name="", command=[],
             subcommand_tokens=None,
+            harness=harness, prompt=prompt, model=model,
+            agent_mode=agent_mode, session_id=session_id, harness_args=harness_args,
         )
 
+    # In managed mode (--harness), the name is the only remaining token.
+    # There is no trailing command — managed mode builds its own argv.
+    if harness is not None:
+        if len(tokens) == 0:
+            return _LaunchArgv(
+                interactive=interactive, prompt_file=prompt_file, echo=echo,
+                echo_interval=echo_interval, submit_mode=submit_mode,
+                idle_timeout=idle_timeout, name="", command=[],
+                subcommand_tokens=None,
+                harness=harness, prompt=prompt, model=model,
+                agent_mode=agent_mode, session_id=session_id, harness_args=harness_args,
+            )
+        name = tokens[0]
+        rest = tokens[1:]
+        if not name or "/" in name or name.startswith("-"):
+            raise _LaunchArgvError(f"agent-run: invalid name '{name}'")
+        if rest and rest[0] == "--":
+            raise _LaunchArgvError(
+                "agent-run: --harness and a trailing '-- <command>' are mutually exclusive; "
+                "in managed mode agent-run builds the command itself"
+            )
+        if rest:
+            # Any remaining tokens after the name in managed mode are an error.
+            raise _LaunchArgvError(
+                f"agent-run: unexpected tokens after run name in managed mode: "
+                f"{rest!r}; use --harness-arg to pass extra flags to the harness"
+            )
+        # Validate prompt and prompt_file mutual exclusion.
+        if prompt and prompt_file:
+            raise _LaunchArgvError("agent-run: --prompt and --prompt-file are mutually exclusive")
+        # One of --prompt or --prompt-file is required for managed mode.
+        if not prompt and not prompt_file:
+            raise _LaunchArgvError(
+                "agent-run: managed mode requires exactly one of --prompt <text> or --prompt-file <path>"
+            )
+        return _LaunchArgv(
+            interactive=interactive,
+            prompt_file=prompt_file,
+            echo=echo,
+            echo_interval=echo_interval,
+            submit_mode=submit_mode,
+            idle_timeout=idle_timeout,
+            name=name,
+            command=[],
+            subcommand_tokens=None,
+            harness=harness,
+            prompt=prompt,
+            model=model,
+            agent_mode=agent_mode,
+            session_id=session_id,
+            harness_args=harness_args,
+        )
+
+    # Raw mode.
     name, *rest = tokens
     if not name or "/" in name or name.startswith("-"):
         raise _LaunchArgvError(f"agent-run: invalid name '{name}'")
@@ -6381,16 +7225,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _build_parser().print_help()
         return 2
 
-    ns = argparse.Namespace(
-        name=parsed.name,
-        command=parsed.command,
-        interactive=parsed.interactive,
-        prompt_file=parsed.prompt_file,
-        echo=parsed.echo,
-        echo_interval=parsed.echo_interval,
-        submit_mode=parsed.submit_mode,
-        idle_timeout=parsed.idle_timeout if parsed.idle_timeout is not None else _idle_timeout_env_seconds(),
-    )
+    if parsed.harness is not None:
+        # Managed mode: build Namespace for cmd_launch with harness fields.
+        ns = argparse.Namespace(
+            name=parsed.name,
+            command=[],  # built by cmd_launch from harness + flags
+            interactive=parsed.interactive,
+            prompt_file=parsed.prompt_file,
+            echo=parsed.echo,
+            echo_interval=parsed.echo_interval,
+            submit_mode=parsed.submit_mode,
+            idle_timeout=parsed.idle_timeout if parsed.idle_timeout is not None else _idle_timeout_env_seconds(),
+            harness=parsed.harness,
+            prompt=parsed.prompt,
+            model=parsed.model,
+            agent_mode=parsed.agent_mode,
+            session_id=parsed.session_id,
+            harness_args=parsed.harness_args,
+        )
+    else:
+        ns = argparse.Namespace(
+            name=parsed.name,
+            command=parsed.command,
+            interactive=parsed.interactive,
+            prompt_file=parsed.prompt_file,
+            echo=parsed.echo,
+            echo_interval=parsed.echo_interval,
+            submit_mode=parsed.submit_mode,
+            idle_timeout=parsed.idle_timeout if parsed.idle_timeout is not None else _idle_timeout_env_seconds(),
+        )
     return cmd_launch(ns)
 
 

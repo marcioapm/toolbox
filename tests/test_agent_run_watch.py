@@ -22,6 +22,7 @@ WATCH_CONTRACT_KEYS = {
     "schema", "name", "observed_at", "status", "exit_code", "pid",
     "interactive", "started_at", "ended_at", "elapsed_s", "terminal",
     "launch_error", "log", "repo", "git", "git_error", "signals", "observation_error",
+    "session",
 }
 
 # The `signals` object emitted whenever the log could not be read at all.
