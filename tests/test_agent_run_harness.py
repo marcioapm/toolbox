@@ -347,11 +347,21 @@ class TestBuildManagedArgv:
         assert argv[j + 1] == "build"
 
     # codex one-shot
-    def test_codex_oneshot_uses_exec_json(self):
+    def test_codex_oneshot_uses_exec_no_json(self):
+        # --json must never appear: it replaces the human-readable log with events.
         argv = self._build("codex", prompt="hi")
         assert "codex" in argv[0]
         assert "exec" in argv
-        assert "--json" in argv
+        assert "--json" not in argv
+
+    def test_codex_oneshot_with_session_id_uses_resume(self):
+        # When a thread id is available (minted pre-launch), argv uses exec resume <id>.
+        argv = self._build("codex", prompt="hi", session_id="test-thread-id")
+        assert "exec" in argv
+        assert "resume" in argv
+        idx = argv.index("resume")
+        assert argv[idx + 1] == "test-thread-id"
+        assert "--json" not in argv
 
     def test_codex_oneshot_inline_prompt(self):
         argv = self._build("codex", prompt="say hello")
@@ -362,6 +372,14 @@ class TestBuildManagedArgv:
         argv = self._build("codex", interactive=True, prompt="hi")
         assert "codex" in argv[0]
         assert "exec" not in argv
+        assert "--json" not in argv
+
+    def test_codex_interactive_with_session_id_uses_resume(self):
+        # When a thread id was minted, interactive argv uses "codex resume <id>".
+        argv = self._build("codex", interactive=True, prompt="hi", session_id="tid-xyz")
+        assert "resume" in argv
+        idx = argv.index("resume")
+        assert argv[idx + 1] == "tid-xyz"
         assert "--json" not in argv
 
     # harness_args passthrough
@@ -606,29 +624,84 @@ class TestSteerGuardOneShotRuns:
 
 
 # ---------------------------------------------------------------------------
-# Codex JSONL session id parser
+# codex app-server mint: JSON-RPC handshake over stdio
 # ---------------------------------------------------------------------------
 
-class TestParseCodexSessionIdFromJsonl:
-    def test_parses_thread_started_line(self):
-        line = '{"type":"thread.started","thread_id":"01a00b2a-8408-7790-be58-86445cd3af81"}'
-        result = agent_run._parse_codex_session_id_from_jsonl(line)
-        assert result == "01a00b2a-8408-7790-be58-86445cd3af81"
+class TestCodexAppserverMint:
+    """Tests for _codex_appserver_mint: fake app-server stubs over stdio."""
 
-    def test_returns_none_for_other_event_types(self):
-        line = '{"type":"turn.started"}'
-        assert agent_run._parse_codex_session_id_from_jsonl(line) is None
+    def _make_fake_appserver(self, tmp_path: Path, *, thread_id: str = "tid-abc123", fail_at: Optional[str] = None) -> str:
+        """Write a fake `codex` script that speaks the app-server JSON-RPC protocol.
 
-    def test_returns_none_for_invalid_json(self):
-        assert agent_run._parse_codex_session_id_from_jsonl("not json") is None
+        fail_at can be "initialize" or "thread_start" to simulate specific failures.
+        """
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        if fail_at == "initialize":
+            fake.write_text(
+                "#!/bin/sh\n"
+                # Exit immediately without any output — simulates a crash.
+                "exit 1\n"
+            )
+        elif fail_at == "thread_start":
+            fake.write_text(
+                "#!/bin/sh\n"
+                # Respond to initialize but then exit.
+                'read -r line\n'
+                'printf \'{"id":1,"result":{"userAgent":"codex/0.0"}}\n\'\n'
+                "exit 0\n"
+            )
+        else:
+            # Full happy path: respond to initialize then to thread/start.
+            fake.write_text(
+                "#!/bin/sh\n"
+                # Read and respond to initialize (id=1).
+                'read -r _line1\n'
+                f'printf \'{{\"id\":1,\"result\":{{\"userAgent\":\"codex_exec/0.144.1\"}}}}\n\'\n'
+                # Read initialized notification (no id, no response expected).
+                'read -r _line2\n'
+                # Read thread/start request (id=2) and respond with thread object.
+                'read -r _line3\n'
+                f'printf \'{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"{thread_id}\",\"sessionId\":\"{thread_id}\",\"path\":\"~/.codex/sessions/2026/08/16/rollout-xxx-{thread_id}.jsonl\"}}}}}}\n\'\n'
+                # Keep stdin open briefly so we have time to read the response.
+                'sleep 5\n'
+            )
+        fake.chmod(0o755)
+        return str(fake_dir)
 
-    def test_returns_none_when_no_thread_id(self):
-        line = '{"type":"thread.started"}'
-        assert agent_run._parse_codex_session_id_from_jsonl(line) is None
+    def test_appserver_mint_returns_thread_id(self, tmp_path, monkeypatch):
+        """Happy path: fake app-server completes handshake and returns a thread id."""
+        bin_dir = self._make_fake_appserver(tmp_path, thread_id="test-thread-0001")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        acquire_log = tmp_path / "session-acquire.log"
+        result = agent_run._codex_appserver_mint("/tmp", acquire_log)
+        assert result == "test-thread-0001"
 
-    def test_returns_none_for_empty_thread_id(self):
-        line = '{"type":"thread.started","thread_id":""}'
-        assert agent_run._parse_codex_session_id_from_jsonl(line) is None
+    def test_appserver_mint_returns_none_on_launch_failure(self, tmp_path, monkeypatch):
+        """When codex is missing, mint returns None without raising."""
+        monkeypatch.setenv("PATH", "/nonexistent")
+        acquire_log = tmp_path / "session-acquire.log"
+        result = agent_run._codex_appserver_mint("/tmp", acquire_log)
+        assert result is None
+        assert acquire_log.exists()
+
+    def test_appserver_mint_returns_none_on_initialize_failure(self, tmp_path, monkeypatch):
+        """When the app-server exits without responding, mint returns None."""
+        bin_dir = self._make_fake_appserver(tmp_path, fail_at="initialize")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        acquire_log = tmp_path / "session-acquire.log"
+        result = agent_run._codex_appserver_mint("/tmp", acquire_log)
+        assert result is None
+
+    def test_appserver_mint_logs_to_acquire_log(self, tmp_path, monkeypatch):
+        """Successful mint writes diagnostic lines to session-acquire.log."""
+        bin_dir = self._make_fake_appserver(tmp_path, thread_id="diag-thread")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        acquire_log = tmp_path / "session-acquire.log"
+        agent_run._codex_appserver_mint("/tmp", acquire_log)
+        log_text = acquire_log.read_text() if acquire_log.exists() else ""
+        assert "codex_exec" in log_text or "diag-thread" in log_text
 
 
 # ---------------------------------------------------------------------------
@@ -846,47 +919,112 @@ class TestManagedClaudeLaunch:
         )
 
 
-class TestManagedCodexOneShotSessionParsing:
-    """Tests for codex --json first-line session id parsing."""
+class TestManagedCodexOneShotAppServer:
+    """Tests for codex managed one-shot: app-server JSON-RPC mint+run."""
 
-    def _make_fake_codex(self, tmp_path: Path, *, emit_thread_id: bool = True) -> str:
-        """Write a fake `codex` script that emits the expected JSONL line.
+    def _make_fake_codex_suite(
+        self,
+        tmp_path: Path,
+        *,
+        thread_id: str = "test-thread-uuid-0001",
+        appserver_works: bool = True,
+    ) -> str:
+        """Write a fake `codex` Python script that handles app-server JSON-RPC.
 
-        The real codex CLI writes a plain-text banner to stderr before any JSONL
-        output on stdout when stdin is not a TTY. The fake reproduces this exactly
-        so tests verify stderr merging does not corrupt the parse.
+        When called as 'codex app-server', speaks the full JSON-RPC protocol:
+        initialize → initialized notification → thread/start → turn/start →
+        item/agentMessage/delta events → turn/completed.
+
+        When app-server fails (appserver_works=False), exits immediately.
         """
         fake_dir = tmp_path / "bin"
         fake_dir.mkdir(parents=True, exist_ok=True)
         fake = fake_dir / "codex"
-        if emit_thread_id:
+
+        if appserver_works:
+            # Full JSON-RPC app-server implemented in Python for reliability.
             fake.write_text(
-                "#!/bin/sh\n"
-                # Banner on stderr (matches real codex-cli behaviour).
-                'printf "Reading additional input from stdin...\\n" >&2\n'
-                'printf \'{"type":"thread.started","thread_id":"test-thread-uuid-0001"}\\n\'\n'
-                'printf \'{"type":"turn.started"}\\n\'\n'
-                'printf \'the answer is 42\\n\'\n'
-                "exit 0\n"
+                "#!/usr/bin/env python3\n"
+                "import sys, json, time\n"
+                "\n"
+                "def send(obj):\n"
+                "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+                "    sys.stdout.flush()\n"
+                "\n"
+                "def recv():\n"
+                "    line = sys.stdin.readline()\n"
+                "    if not line:\n"
+                "        return None\n"
+                "    try:\n"
+                "        return json.loads(line.strip())\n"
+                "    except Exception:\n"
+                "        return None\n"
+                "\n"
+                "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+                "    sys.exit(1)\n"
+                "\n"
+                f"THREAD_ID = '{thread_id}'\n"
+                "\n"
+                "# Read initialize\n"
+                "msg = recv()\n"
+                "if not msg or msg.get('method') != 'initialize':\n"
+                "    sys.exit(1)\n"
+                "send({'id': msg['id'], 'result': {'userAgent': 'codex_exec/0.144.1'}})\n"
+                "\n"
+                "# Read initialized notification (no response)\n"
+                "msg = recv()\n"
+                "\n"
+                "# Read thread/start\n"
+                "msg = recv()\n"
+                "if not msg or msg.get('method') != 'thread/start':\n"
+                "    sys.exit(1)\n"
+                "send({'id': msg['id'], 'result': {'thread': {\n"
+                "    'id': THREAD_ID, 'sessionId': THREAD_ID,\n"
+                "    'path': f'~/.codex/sessions/rollout-{THREAD_ID}.jsonl',\n"
+                "    'parentThreadId': None, 'forkedFromId': None,\n"
+                "}}})\n"
+                "\n"
+                "# Read turn/start\n"
+                "msg = recv()\n"
+                "if not msg or msg.get('method') != 'turn/start':\n"
+                "    sys.exit(1)\n"
+                "turn_id = 'turn-001'\n"
+                "send({'id': msg['id'], 'result': {'turn': {'id': turn_id, 'status': 'inProgress'}}})\n"
+                "\n"
+                "# Emit agent text via delta events (the answer to any prompt).\n"
+                "send({'method': 'item/agentMessage/delta', 'params': {\n"
+                "    'threadId': THREAD_ID, 'turnId': turn_id,\n"
+                "    'itemId': 'item-001', 'delta': 'the answer is 42',\n"
+                "}})\n"
+                "\n"
+                "# turn/completed\n"
+                "send({'method': 'turn/completed', 'params': {\n"
+                "    'threadId': THREAD_ID,\n"
+                "    'turn': {'id': turn_id, 'status': 'completed'},\n"
+                "}})\n"
+                "\n"
+                "# Keep stdin open so the manager can read all output before killing.\n"
+                "time.sleep(10)\n"
             )
         else:
+            # app-server fails immediately.
             fake.write_text(
-                "#!/bin/sh\n"
-                'printf "Reading additional input from stdin...\\n" >&2\n'
-                'printf \'{"type":"turn.started"}\\n\'\n'
-                'printf \'hello\\n\'\n'
-                "exit 0\n"
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "if len(sys.argv) >= 2 and sys.argv[1] == 'app-server':\n"
+                "    sys.exit(1)\n"
+                "sys.exit(1)\n"
             )
         fake.chmod(0o755)
         return str(fake_dir)
 
-    def test_codex_oneshot_parses_thread_id_to_session_json(
+    def test_codex_oneshot_minted_session_json(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
-        """session.json must be written with acquisition=reported, confidence=certain."""
-        bin_dir = self._make_fake_codex(tmp_path)
+        """When app-server succeeds, session.json has acquisition=minted, confidence=certain."""
+        bin_dir = self._make_fake_codex_suite(tmp_path, thread_id="minted-thread-0001")
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
-        name = "codex-oneshot-1"
+        name = "codex-appserver-1"
         status, session = _launch_and_wait(
             isolated_runs_root, isolated_log_root, name,
             harness="codex",
@@ -895,24 +1033,23 @@ class TestManagedCodexOneShotSessionParsing:
         )
         assert session is not None
         assert session["harness"] == "codex"
-        assert session["acquisition"] == "reported"
+        assert session["acquisition"] == "minted"
         assert session["confidence"] == "certain"
-        assert session["session_id"] == "test-thread-uuid-0001"
+        assert session["session_id"] == "minted-thread-0001"
 
-    def test_codex_oneshot_missing_thread_id_writes_missing(
+    def test_codex_oneshot_fallback_to_missing_when_appserver_fails(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
-        """When codex doesn't emit thread_id, confidence=missing, run still completes."""
-        bin_dir = self._make_fake_codex(tmp_path, emit_thread_id=False)
+        """When app-server fails, run still completes with confidence=missing."""
+        bin_dir = self._make_fake_codex_suite(tmp_path, appserver_works=False)
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
-        name = "codex-oneshot-2"
+        name = "codex-appserver-2"
         status, session = _launch_and_wait(
             isolated_runs_root, isolated_log_root, name,
             harness="codex",
             interactive=False,
             prompt="what is 6*7",
         )
-        # Run must still complete, not fail because of missing session id.
         assert status in agent_run.TERMINAL_STATUSES
         assert session is not None
         assert session["confidence"] == "missing"
@@ -922,9 +1059,9 @@ class TestManagedCodexOneShotSessionParsing:
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
         """session.json goes in the persistent log dir, not the ephemeral state dir."""
-        bin_dir = self._make_fake_codex(tmp_path)
+        bin_dir = self._make_fake_codex_suite(tmp_path)
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
-        name = "codex-oneshot-3"
+        name = "codex-appserver-3"
         _launch_and_wait(
             isolated_runs_root, isolated_log_root, name,
             harness="codex",
@@ -933,6 +1070,36 @@ class TestManagedCodexOneShotSessionParsing:
         )
         assert (isolated_log_root / name / "session.json").exists()
         assert not (isolated_runs_root / name / "session.json").exists()
+
+    def test_codex_log_contains_readable_output_not_jsonl(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """After Part A: the codex log must contain readable prose, not --json events."""
+        bin_dir = self._make_fake_codex_suite(tmp_path, thread_id="readable-test")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "codex-readable-log"
+        _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="codex",
+            interactive=False,
+            prompt="what is 6*7",
+        )
+        log_path = isolated_log_root / name / "log"
+        deadline = time.monotonic() + 5.0
+        log_content = ""
+        while time.monotonic() < deadline:
+            if log_path.exists():
+                log_content = log_path.read_text()
+                if log_content:
+                    break
+            time.sleep(0.05)
+        # Must contain the human-readable answer, not a JSONL event stream.
+        assert "the answer is 42" in log_content, (
+            f"Expected readable output in codex log, got: {log_content!r}"
+        )
+        assert '"type"' not in log_content, (
+            f"JSONL event stream must not appear in codex log: {log_content!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -996,3 +1163,154 @@ class TestWatchSessionIntegration:
         payload = json.loads(capsys.readouterr().out)
         assert payload["session"] == session_data
         assert payload["session"]["session_id"] == "ses_test123"
+
+
+# ---------------------------------------------------------------------------
+# run.json — reboot-durable launch/exit manifest (C2)
+# ---------------------------------------------------------------------------
+
+class TestRunJson:
+    """Tests for the run.json persistent manifest written to log_dir."""
+
+    def test_write_run_json_creates_file(self, isolated_log_root):
+        log_dir = isolated_log_root / "myrun"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        agent_run._write_run_json(log_dir, {"name": "myrun", "cwd": "/tmp"})
+        path = log_dir / "run.json"
+        assert path.exists()
+        data = json.loads(path.read_text())
+        assert data["name"] == "myrun"
+        assert data["cwd"] == "/tmp"
+
+    def test_write_run_json_merges_exit_fields(self, isolated_log_root):
+        """Exit-time update preserves launch fields and adds exit fields."""
+        log_dir = isolated_log_root / "myrun2"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        agent_run._write_run_json(log_dir, {"name": "myrun2", "started_at": "2026-08-16T10:00:00Z"})
+        agent_run._write_run_json(log_dir, {"exit_code": 0, "status": "done", "ended_at": "2026-08-16T10:01:00Z"})
+        data = json.loads((log_dir / "run.json").read_text())
+        assert data["name"] == "myrun2"
+        assert data["started_at"] == "2026-08-16T10:00:00Z"
+        assert data["exit_code"] == 0
+        assert data["status"] == "done"
+
+    def test_write_run_json_is_atomic(self, isolated_log_root):
+        log_dir = isolated_log_root / "myrun3"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        agent_run._write_run_json(log_dir, {"x": 1})
+        assert list(log_dir.glob(".run.*.tmp")) == []
+
+    def test_run_json_written_at_launch(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """A managed run writes run.json with launch fields before the fork."""
+        fake = tmp_path / "claude"
+        fake.write_text("#!/bin/sh\necho hi\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        name = "runjson-launch"
+        _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="claude",
+            interactive=False,
+            prompt="hello",
+        )
+        run_json_path = isolated_log_root / name / "run.json"
+        assert run_json_path.exists(), "run.json must be written at launch"
+        data = json.loads(run_json_path.read_text())
+        assert data["name"] == name
+        assert data["harness"] == "claude"
+        assert isinstance(data["argv"], list)
+        assert data["interactive"] is False
+
+    def test_run_json_written_at_exit(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """run.json gains exit_code, ended_at, and status after the run completes."""
+        fake = tmp_path / "claude"
+        fake.write_text("#!/bin/sh\necho hi\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        name = "runjson-exit"
+        status, _ = _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="claude",
+            interactive=False,
+            prompt="hello",
+        )
+        run_json_path = isolated_log_root / name / "run.json"
+        assert run_json_path.exists()
+        data = json.loads(run_json_path.read_text())
+        assert "exit_code" in data
+        assert "ended_at" in data
+        assert "status" in data
+
+    def test_run_json_survives_ephemeral_state_deletion(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """Simulates a reboot: after /tmp dir is deleted, run.json in /var/tmp still has facts."""
+        fake = tmp_path / "claude"
+        fake.write_text("#!/bin/sh\necho hi\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        name = "runjson-reboot"
+        _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="claude",
+            interactive=False,
+            prompt="hello",
+        )
+        # Simulate reboot: delete the ephemeral /tmp state dir.
+        state_dir = isolated_runs_root / name
+        import shutil as _shutil
+        if state_dir.exists():
+            _shutil.rmtree(state_dir)
+        assert not state_dir.exists(), "State dir should be gone (simulating reboot)"
+
+        # After reboot, the persistent log dir still has all attribution facts.
+        log_dir = isolated_log_root / name
+        run_json_path = log_dir / "run.json"
+        assert run_json_path.exists(), "run.json must survive in /var/tmp"
+        data = json.loads(run_json_path.read_text())
+        assert data.get("name") == name
+        assert data.get("cwd") is not None
+        assert data.get("argv") is not None
+        assert data.get("started_at") is not None
+        assert data.get("exit_code") is not None
+
+    def test_raw_run_also_gets_run_json(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """Raw runs get run.json too (it is launch metadata, not session acquisition)."""
+        fake_echo = tmp_path / "myecho.sh"
+        fake_echo.write_text("#!/bin/sh\necho hello\n")
+        fake_echo.chmod(0o755)
+        name = "runjson-raw"
+        ns = argparse.Namespace(
+            name=name,
+            command=[str(fake_echo)],
+            interactive=False,
+            prompt_file=None,
+            echo=False,
+            echo_interval=2.0,
+            submit_mode=None,
+            idle_timeout=None,
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                s = (state_dir / "status").read_text().strip()
+            except FileNotFoundError:
+                s = "starting"
+            if s in agent_run.TERMINAL_STATUSES:
+                break
+            time.sleep(0.05)
+        run_json_path = isolated_log_root / name / "run.json"
+        assert run_json_path.exists(), "Raw run must also get run.json"
+        data = json.loads(run_json_path.read_text())
+        assert data["harness"] is None  # raw run has no harness
+        # Raw run still must not get session.json.
+        assert not (isolated_log_root / name / "session.json").exists()
+

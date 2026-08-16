@@ -4913,13 +4913,16 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     # at fork time and session.json is written before status=running is published.
     acquire_log = log_d / "session-acquire.log"
     opencode_port: Optional[int] = None
+    managed_prompt: Optional[str] = None
+    managed_model: Optional[str] = None
+    managed_harness_args: List[str] = []
 
     if is_managed:
-        managed_prompt: Optional[str] = getattr(args, "prompt", None)
-        managed_model: Optional[str] = getattr(args, "model", None)
+        managed_prompt = getattr(args, "prompt", None)
+        managed_model = getattr(args, "model", None)
         managed_agent_mode: Optional[str] = getattr(args, "agent_mode", None)
         managed_session_id_arg: Optional[str] = getattr(args, "session_id", None)
-        managed_harness_args: List[str] = getattr(args, "harness_args", [])
+        managed_harness_args = getattr(args, "harness_args", [])
 
         # Materialise an inline prompt into a file so every interactive path
         # uses prompt_file, keeping the delivery code uniform.
@@ -5043,26 +5046,31 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
 
         elif harness == "codex":
             if not args.interactive:
-                # Reported acquisition: session id parsed from --json first JSONL line
-                # on stdout in _run_managed_oneshot_codex; session.json written there.
-                _acquire_log_write(acquire_log, "codex one-shot: session id parsed from --json stdout")
+                # One-shot: entire run goes through app-server JSON-RPC so the
+                # thread id is minted AND the turn runs on the same process inside
+                # _run_managed_oneshot_codex_appserver (dispatched from _runner).
+                # We record a descriptive command for postmortem but don't exec it.
+                _acquire_log_write(acquire_log, "codex one-shot: using app-server for mint+run")
+                argv = ["codex", "app-server"]  # descriptive; not exec'd directly
             else:
-                # Interactive codex TUI does not expose a session id at startup.
+                # Interactive codex TUI: use plain "codex" PTY. Session id is missing
+                # because app-server turn/steer wiring requires additional work.
+                # Finding documented in ACCEPTANCE-RESULTS.md.
                 _acquire_session_missing(
                     log_d, "codex",
-                    "interactive codex TUI does not expose session id at startup; "
-                    "check ~/.codex/sessions/ for rollout-<ISO>-<uuid>.jsonl after the run",
+                    "interactive codex TUI: session id not available at PTY startup; "
+                    "app-server turn/steer wiring deferred (see ACCEPTANCE-RESULTS.md)",
                     acquire_log,
                 )
-            argv = _build_managed_argv(
-                harness,
-                interactive=args.interactive,
-                prompt=managed_prompt,
-                model=managed_model,
-                agent_mode=managed_agent_mode,
-                session_id=None,
-                harness_args=managed_harness_args,
-            )
+                argv = _build_managed_argv(
+                    harness,
+                    interactive=True,
+                    prompt=managed_prompt,
+                    model=managed_model,
+                    agent_mode=managed_agent_mode,
+                    session_id=None,
+                    harness_args=managed_harness_args,
+                )
 
     _write(d / "command", _pretty_command(argv) + "\n")
     _write(d / "argv", json.dumps(argv))
@@ -5071,6 +5079,26 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     )
     # Note: _submit_mode_for_argv already returns crlf for any argv whose
     # executable is opencode, so no override is needed here.
+
+    # Duplicate immutable launch facts into the persistent log dir so they
+    # survive a reboot that wipes the ephemeral /tmp state dir. run.json is
+    # a copy for postmortem — nothing reads it as a liveness signal.
+    _launch_run_json: dict = {
+        "name": name,
+        "argv": argv,
+        "command": _pretty_command(argv),
+        "cwd": cwd,
+        "started_at": (_read(d / "started_at") or "").strip() or None,
+        "interactive": args.interactive,
+        "harness": harness,
+    }
+    if is_managed:
+        _launch_run_json["model"] = getattr(args, "model", None)
+        _launch_run_json["agent_mode"] = getattr(args, "agent_mode", None)
+    try:
+        _write_run_json(log_d, _launch_run_json)
+    except Exception:  # noqa: BLE001
+        pass  # never fail the run
 
     # Double-fork to detach from the terminal and become our own session
     # leader. The grandchild runs the actual agent.
@@ -5149,6 +5177,9 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         idle_timeout=getattr(args, "idle_timeout", None),
         managed_harness=harness,
         opencode_port=opencode_port,
+        codex_appserver_args=managed_harness_args if is_managed else None,
+        managed_prompt=managed_prompt if is_managed else None,
+        managed_model=managed_model if is_managed else None,
     )
     return 0  # never reached
 
@@ -5445,6 +5476,9 @@ def _runner(
     idle_timeout: Optional[float] = None,
     managed_harness: Optional[str] = None,
     opencode_port: Optional[int] = None,
+    codex_appserver_args: Optional[List[str]] = None,
+    managed_prompt: Optional[str] = None,
+    managed_model: Optional[str] = None,
 ) -> None:
     """Execute in the detached session-leader process.
 
@@ -5507,8 +5541,9 @@ def _runner(
 
     def _finalize(code: int) -> None:
         if not (state_dir / "exit_code").exists():
+            ended_at = _now_iso()
             _write(state_dir / "exit_code", f"{code}\n")
-            _write(state_dir / "ended_at", _now_iso() + "\n")
+            _write(state_dir / "ended_at", ended_at + "\n")
             status = "done" if code == 0 else "failed"
             # A watchdog kill is a deliberate termination, not a crash, and
             # carries the same reap_reason every other `killed` producer writes.
@@ -5527,6 +5562,13 @@ def _runner(
                     status = "launch_failed"
                     _record_launch_error(PROMPT_UNSUBMITTED_ERROR)
             _write(state_dir / "status", status + "\n")
+            # Mirror exit facts to the persistent log dir so they survive a
+            # reboot that wipes the ephemeral state dir.
+            _write_run_json(log_dir, {
+                "ended_at": ended_at,
+                "exit_code": code,
+                "status": status,
+            })
 
     handling_signal = False
     render_pid: Optional[int] = None
@@ -5680,8 +5722,22 @@ def _runner(
                     opencode_port,
                 )
             elif managed_harness == "codex" and not interactive:
-                exit_code = _run_managed_oneshot_codex(
-                    state_dir, log_dir, list(argv), log_fd, _ready, prompt_file, acquire_log
+                # One-shot codex: run entirely through app-server JSON-RPC.
+                # The grandchild inherits cwd from the parent (same as _cmd_launch_locked).
+                try:
+                    cwd_str = os.getcwd()
+                except OSError:
+                    cwd_str = "/"
+                exit_code = _run_managed_oneshot_codex_appserver(
+                    state_dir, log_dir,
+                    prompt=managed_prompt,
+                    prompt_file=prompt_file,
+                    cwd=cwd_str,
+                    harness_args=codex_appserver_args or [],
+                    model=managed_model,
+                    log_fd=log_fd,
+                    ready=_ready,
+                    acquire_log=acquire_log,
                 )
             elif interactive:
                 exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
@@ -6082,6 +6138,135 @@ MANAGED_HARNESSES: frozenset[str] = frozenset({"claude", "opencode", "codex"})
 _OPENCODE_HEALTH_TIMEOUT = 30.0
 _OPENCODE_HEALTH_POLL_INTERVAL = 0.25
 
+# codex app-server: timeout for the full initialize+thread/start handshake (seconds).
+_CODEX_APPSERVER_TIMEOUT = 20.0
+
+
+def _codex_appserver_mint(cwd: str, acquire_log: Path) -> Optional[str]:
+    """Mint a codex thread id via `codex app-server` JSON-RPC over stdio.
+
+    Sends initialize / initialized / thread/start and reads the thread id from
+    the result before any prompt is delivered. clientInfo.name must be
+    "codex_exec" so the proxy attributes the subsequent requests to codex
+    (identify_client checks UA and originator for "codex"/"codex_exec").
+
+    Returns the thread id string, or None if any step fails. The subprocess is
+    always killed before returning; chatter never reaches the PTY log.
+    """
+    import subprocess as _subprocess
+
+    rpc_id = 0
+
+    def _next_id() -> int:
+        nonlocal rpc_id
+        rpc_id += 1
+        return rpc_id
+
+    def _send(proc, obj: dict) -> None:
+        line = json.dumps(obj) + "\n"
+        proc.stdin.write(line.encode())
+        proc.stdin.flush()
+
+    def _recv_result(proc, expected_id: int) -> Optional[dict]:
+        """Read lines from proc.stdout until the response for expected_id arrives."""
+        deadline = time.monotonic() + _CODEX_APPSERVER_TIMEOUT
+        buf = b""
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            ready, _, _ = select.select([proc.stdout], [], [], min(remaining, 0.5))
+            if not ready:
+                if proc.poll() is not None:
+                    break  # process died
+                continue
+            chunk = proc.stdout.read1(4096)  # type: ignore[attr-defined]
+            if not chunk:
+                break  # EOF
+            buf += chunk
+            while b"\n" in buf:
+                nl = buf.index(b"\n")
+                line = buf[:nl]
+                buf = buf[nl + 1:]
+                try:
+                    msg = json.loads(line.decode("utf-8", errors="replace"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if msg.get("id") == expected_id and "result" in msg:
+                    return msg["result"]
+                if msg.get("id") == expected_id and "error" in msg:
+                    return None
+        return None
+
+    try:
+        proc = _subprocess.Popen(
+            ["codex", "app-server"],
+            stdin=_subprocess.PIPE,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        _acquire_log_write(acquire_log, f"codex app-server: launch failed: {exc}")
+        return None
+
+    try:
+        # Initialize: clientInfo.name="codex_exec" sets originator and User-Agent
+        # so the proxy's identify_client recognises the request as codex traffic.
+        init_id = _next_id()
+        _send(proc, {
+            "jsonrpc": "2.0",
+            "id": init_id,
+            "method": "initialize",
+            "params": {"clientInfo": {"name": "codex_exec", "title": "agent-run", "version": "0"}},
+        })
+        init_result = _recv_result(proc, init_id)
+        if init_result is None:
+            _acquire_log_write(acquire_log, "codex app-server: initialize failed or timed out")
+            return None
+        _acquire_log_write(acquire_log, f"codex app-server: initialized ({init_result.get('userAgent', '?')})")
+
+        # initialized notification: no id, no response expected.
+        _send(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+
+        # thread/start: mints a thread and returns its id + rollout path before any prompt.
+        # Method names are lowercase on the wire; "Thread/start" is rejected.
+        thread_id_rpc = _next_id()
+        _send(proc, {
+            "jsonrpc": "2.0",
+            "id": thread_id_rpc,
+            "method": "thread/start",
+            "params": {"cwd": cwd},
+        })
+        thread_result = _recv_result(proc, thread_id_rpc)
+        if thread_result is None:
+            _acquire_log_write(acquire_log, "codex app-server: thread/start failed or timed out")
+            return None
+
+        thread = thread_result.get("thread") or thread_result
+        thread_id = thread.get("id") or thread.get("sessionId")
+        rollout_path = thread.get("path", "?")
+        if not isinstance(thread_id, str) or not thread_id:
+            _acquire_log_write(acquire_log, f"codex app-server: no thread id in result: {thread_result}")
+            return None
+
+        _acquire_log_write(acquire_log, f"codex app-server: minted thread_id={thread_id!r} rollout={rollout_path!r}")
+        return thread_id
+
+    except OSError as exc:
+        _acquire_log_write(acquire_log, f"codex app-server: I/O error: {exc}")
+        return None
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5.0)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
 
 def _find_free_port() -> int:
     """Ask the kernel for a free loopback port.
@@ -6156,9 +6341,9 @@ def _opencode_prefork_mint(
 ) -> Optional[str]:
     """Start a temporary opencode process, mint a session, return the session id.
 
-    Launches opencode with --port <port> in headless one-shot mode (opencode run
-    with a throwaway prompt) so its HTTP API is available, polls /global/health,
-    posts /session, then kills the temporary process and returns the id.
+    Launches opencode --port <port> --auto (bare TUI, headless) so its HTTP API
+    is available at /global/health and /session, polls until healthy, posts
+    /session to mint an id, then kills the temporary process and returns the id.
 
     The minted session is pre-registered in the opencode database and will be
     continued when the real TUI is started with --session <id>. Returns None
@@ -6166,12 +6351,13 @@ def _opencode_prefork_mint(
     """
     import subprocess as _subprocess
 
-    # Start a headless opencode in server mode on the chosen port.
-    # We use 'opencode run' with --port so it starts the HTTP API but exits
-    # on its own when the prompt is answered. We kill it once minting is done.
+    # Start a bare opencode TUI in server mode on the chosen port.
+    # --auto puts it in a non-interactive headless state that still binds the
+    # HTTP API at /global/health and /session; "opencode run --port" exits too
+    # quickly for the health poll to land before the port is released.
     try:
         proc = subprocess.Popen(
-            ["opencode", "run", "--port", str(port), "agent-run session init"],
+            ["opencode", "--port", str(port), "--auto"],
             stdout=_subprocess.DEVNULL,
             stderr=_subprocess.DEVNULL,
             cwd=cwd,
@@ -6234,6 +6420,241 @@ def _read_session_json(log_dir: Path) -> Optional[dict]:
         return data if isinstance(data, dict) else None
     except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
         return None
+
+
+def _write_run_json(log_dir: Path, data: dict) -> None:
+    """Atomically merge data into run.json in log_dir.
+
+    If run.json already exists (e.g. the exit-time update merging into the
+    launch-time record), existing keys are preserved and data keys overwrite.
+    Never raises — failure must not affect the run.
+
+    run.json stores immutable launch facts (name, argv, command, cwd,
+    started_at, harness, interactive) and exit facts (ended_at, exit_code,
+    status). It lives in the persistent log dir so all fields survive a reboot
+    that wipes the ephemeral /tmp state. It is a copy for postmortem, not a
+    relocation: the /tmp files are still written exactly as before and nothing
+    reads run.json as a liveness signal.
+    """
+    path = log_dir / "run.json"
+    try:
+        existing: dict = json.loads(path.read_text()) if path.exists() else {}
+    except Exception:  # noqa: BLE001
+        existing = {}
+    existing.update(data)
+    tmp = log_dir / f".run.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        tmp.write_text(json.dumps(existing, indent=2))
+        tmp.replace(path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _run_managed_oneshot_codex_appserver(
+    state_dir: Path,
+    log_dir: Path,
+    prompt: Optional[str],
+    prompt_file: Optional[str],
+    cwd: str,
+    harness_args: List[str],
+    model: Optional[str],
+    log_fd: int,
+    ready: "callable",
+    acquire_log: Path,
+) -> int:
+    """One-shot codex run via app-server JSON-RPC: mint thread, send turn, stream output.
+
+    Keeps the app-server process running across initialize/thread.start/turn.start
+    so the rollout file exists before the turn runs. Extracts human-readable text
+    from item/agentMessage/delta events and writes it to log_fd so tail/watch/
+    idle-timeout observe incremental progress. JSON-RPC chatter goes only to
+    session-acquire.log, never the PTY log.
+
+    session.json is written after thread/start (before the first model call) with
+    acquisition="minted", confidence="certain".
+    """
+    import subprocess as _subprocess
+
+    rpc_id_counter = [0]
+
+    def _next_id() -> int:
+        rpc_id_counter[0] += 1
+        return rpc_id_counter[0]
+
+    def _send(proc, obj: dict) -> None:
+        proc.stdin.write((json.dumps(obj) + "\n").encode())
+        proc.stdin.flush()
+
+    def _read_prompt() -> str:
+        if prompt_file:
+            try:
+                return Path(prompt_file).read_text(errors="replace")
+            except OSError as exc:
+                return f"(prompt file unreadable: {exc})"
+        return prompt or ""
+
+    try:
+        proc = _subprocess.Popen(
+            ["codex", "app-server"] + list(harness_args),
+            stdin=_subprocess.PIPE,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        _acquire_log_write(acquire_log, f"codex app-server: launch failed: {exc}")
+        _record_session(log_dir, acquire_log, "codex", None, "none", "missing",
+                        f"codex app-server launch failed: {exc}")
+        _write(state_dir / "status", "running\n")
+        ready()
+        return 1
+
+    thread_id: Optional[str] = None
+    exit_code = 1
+
+    try:
+        # ---- initialize ----
+        init_id = _next_id()
+        _send(proc, {
+            "jsonrpc": "2.0", "id": init_id, "method": "initialize",
+            "params": {"clientInfo": {"name": "codex_exec", "title": "agent-run", "version": "0"}},
+        })
+        _send(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+
+        # ---- thread/start: mint the thread id ----
+        thread_rpc_id = _next_id()
+        _send(proc, {
+            "jsonrpc": "2.0", "id": thread_rpc_id, "method": "thread/start",
+            "params": {"cwd": cwd},
+        })
+
+        # Read responses until we get the thread/start result.
+        buf = b""
+        deadline = time.monotonic() + _CODEX_APPSERVER_TIMEOUT
+        while time.monotonic() < deadline and thread_id is None:
+            ready_fds, _, _ = select.select([proc.stdout], [], [], 0.2)
+            if not ready_fds:
+                if proc.poll() is not None:
+                    break
+                continue
+            chunk = proc.stdout.read1(4096)  # type: ignore[attr-defined]
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                nl = buf.index(b"\n")
+                line = buf[:nl]; buf = buf[nl + 1:]
+                try:
+                    msg = json.loads(line.decode("utf-8", errors="replace"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if msg.get("id") == thread_rpc_id and "result" in msg:
+                    t = msg["result"].get("thread") or msg["result"]
+                    thread_id = t.get("id") or t.get("sessionId")
+                    rollout = t.get("path", "?")
+                    if thread_id:
+                        _acquire_log_write(acquire_log, f"codex app-server: minted thread_id={thread_id!r} rollout={rollout!r}")
+                        _record_session(log_dir, acquire_log, "codex", thread_id, "minted", "certain")
+                elif msg.get("id") == thread_rpc_id and "error" in msg:
+                    _acquire_log_write(acquire_log, f"codex app-server: thread/start error: {msg['error']}")
+                    break
+
+        if thread_id is None:
+            _acquire_log_write(acquire_log, "codex app-server: thread/start failed or timed out")
+            _record_session(log_dir, acquire_log, "codex", None, "none", "missing",
+                            "thread/start failed or timed out")
+
+        # Signal readiness (session.json written, status transitions to running).
+        _write(state_dir / "status", "running\n")
+        ready()
+
+        if thread_id is None:
+            return 1
+
+        # ---- turn/start: run the prompt on the minted thread ----
+        turn_rpc_id = _next_id()
+        prompt_text = _read_prompt()
+        _send(proc, {
+            "jsonrpc": "2.0", "id": turn_rpc_id, "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt_text}],
+            },
+        })
+
+        # Stream events: write agent text deltas to log_fd; wait for turn/completed.
+        turn_done = False
+        turn_error = False
+        buf = b""
+        deadline = time.monotonic() + 600  # 10-minute hard cap for a one-shot turn
+        while time.monotonic() < deadline and not turn_done:
+            ready_fds, _, _ = select.select([proc.stdout], [], [], 0.2)
+            if not ready_fds:
+                if proc.poll() is not None:
+                    break
+                continue
+            chunk = proc.stdout.read1(4096)  # type: ignore[attr-defined]
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                nl = buf.index(b"\n")
+                line = buf[:nl]; buf = buf[nl + 1:]
+                try:
+                    msg = json.loads(line.decode("utf-8", errors="replace"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                method = msg.get("method", "")
+                params = msg.get("params") or {}
+                # Text deltas from the agent message: write immediately to log for live tail.
+                if method == "item/agentMessage/delta":
+                    delta = params.get("delta")
+                    if isinstance(delta, str) and delta:
+                        try:
+                            os.write(log_fd, delta.encode("utf-8", errors="replace"))
+                        except OSError:
+                            pass
+                elif method == "turn/completed":
+                    turn_done = True
+                    turn_status = (params.get("turn") or {}).get("status", "")
+                    exit_code = 0 if turn_status == "completed" else 1
+                    _acquire_log_write(acquire_log, f"codex app-server: turn completed status={turn_status!r}")
+                    # Write a trailing newline so the log ends cleanly.
+                    try:
+                        os.write(log_fd, b"\n")
+                    except OSError:
+                        pass
+                elif method == "turn/completed" or (msg.get("id") == turn_rpc_id and "error" in msg):
+                    turn_error = True
+                    turn_done = True
+
+        if not turn_done:
+            _acquire_log_write(acquire_log, "codex app-server: turn did not complete (timeout or process died)")
+            exit_code = 1
+
+    except OSError as exc:
+        _acquire_log_write(acquire_log, f"codex app-server: I/O error: {exc}")
+        if not (state_dir / "status").exists() or (state_dir / "status").read_text().strip() == "starting":
+            _write(state_dir / "status", "running\n")
+            ready()
+        exit_code = 1
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5.0)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return exit_code
 
 
 def _build_managed_argv(
@@ -6302,21 +6723,35 @@ def _build_managed_argv(
 
     elif harness == "codex":
         if not interactive:
+            # One-shot: resume the pre-minted thread so id is known before exec.
+            # "codex exec resume <id>" when a thread was minted; plain "codex exec"
+            # as fallback (confidence=missing) when mint failed.
             argv.extend(["codex", "exec"])
-            argv.append("--json")
+            if harness_args:
+                # Insert before positional args so -c flags are recognised by the parser.
+                argv.extend(harness_args)
+            if session_id:
+                argv.extend(["resume", session_id])
             if model:
                 argv.extend(["--model", model])
             if prompt:
                 argv.append(prompt)
             # prompt_file: stdin-delivered by _run_oneshot.
         else:
-            argv.append("codex")
+            # Interactive TUI: resume the pre-minted thread when available,
+            # otherwise fall back to plain "codex" (id will be missing).
+            if session_id:
+                argv.extend(["codex", "resume"])
+            else:
+                argv.extend(["codex"])
+            if harness_args:
+                argv.extend(harness_args)
+            if session_id:
+                argv.append(session_id)
             if model:
                 argv.extend(["--model", model])
             if prompt:
                 argv.append(prompt)
-        if harness_args:
-            argv.extend(harness_args)
 
     return argv
 
@@ -6375,187 +6810,6 @@ def _acquire_session_missing(
 ) -> None:
     """Write a session.json with confidence=missing when acquisition fails."""
     _record_session(log_dir, acquire_log, harness, None, "none", "missing", reason)
-
-
-def _parse_codex_session_id_from_jsonl(line: str) -> Optional[str]:
-    """Parse a codex --json JSONL line for thread_id (the session UUID).
-
-    codex emits {"type":"thread.started","thread_id":"<uuid>"} as the first
-    stdout line, before any model call.
-    """
-    try:
-        data = json.loads(line)
-        if data.get("type") == "thread.started":
-            tid = data.get("thread_id")
-            if isinstance(tid, str) and tid:
-                return tid
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    return None
-
-
-def _run_managed_oneshot_codex(
-    state_dir: Path,
-    log_dir: Path,
-    argv: List[str],
-    log_fd: int,
-    ready: "callable",
-    prompt_file: Optional[str],
-    acquire_log: Path,
-) -> int:
-    """One-shot codex run that captures session id from the first --json JSONL line.
-
-    stdout and stderr are kept on separate fds: codex writes a plain-text
-    banner ("Reading additional input from stdin...") to stderr before the JSONL
-    starts, so merging them would corrupt the first-line parse. stdout is piped
-    for id capture then forwarded; stderr goes directly to log_fd.
-
-    Output is streamed incrementally using os.read() so tail/watch/idle-timeout
-    observe live progress rather than waiting for the process to exit.
-
-    session.json is written as soon as the first complete stdout line arrives,
-    before any model call — satisfying the "known at the same moment the first
-    prompt goes over the wire" requirement.
-    """
-    # Separate pipes: stdout captured for id parsing, stderr direct to log.
-    stdout_r, stdout_w = os.pipe()
-    stderr_r, stderr_w = os.pipe()
-
-    with _block_handled_runner_signals():
-        pid = os.fork()
-        if pid != 0:
-            _publish_or_reap_child(state_dir, "agent_pid", pid)
-            _write(state_dir / "status", "running\n")
-            ready()
-        else:
-            _reset_runner_signal_handlers()
-
-    if pid == 0:
-        _reset_runner_signal_handlers()
-        os.close(stdout_r)
-        os.close(stderr_r)
-        if prompt_file:
-            try:
-                stdin_fd = os.open(prompt_file, os.O_RDONLY)
-            except OSError as exc:
-                os.write(2, f"agent-run: cannot open prompt file: {exc}\n".encode())
-                os._exit(127)
-        else:
-            stdin_fd = os.open(os.devnull, os.O_RDONLY)
-        os.dup2(stdin_fd, 0)
-        os.dup2(stdout_w, 1)
-        os.dup2(stderr_w, 2)
-        if stdin_fd > 2:
-            os.close(stdin_fd)
-        if stdout_w > 2:
-            os.close(stdout_w)
-        if stderr_w > 2:
-            os.close(stderr_w)
-        try:
-            os.execvp(argv[0], list(argv))
-        except OSError as exc:
-            os.write(2, f"agent-run: exec failed: {exc}\n".encode())
-            os._exit(127)
-
-    # Parent: relay stderr directly to log, parse stdout for the session id.
-    os.close(stdout_w)
-    os.close(stderr_w)
-
-    session_captured = False
-    head = b""  # accumulates stdout bytes until first newline
-
-    while True:
-        # Check whether the child has exited (non-blocking) so we do not hang
-        # on a descendant that inherits the pipe write ends.
-        wpid, wstatus = os.waitpid(pid, os.WNOHANG)
-        child_done = wpid == pid
-
-        # Drain whatever is ready on stdout or stderr.
-        fds_ready, _, _ = select.select([stdout_r, stderr_r], [], [], 0.05)
-
-        for fd in fds_ready:
-            chunk = os.read(fd, 4096)
-            if not chunk:
-                continue
-            if fd == stdout_r:
-                if not session_captured:
-                    head += chunk
-                    nl = head.find(b"\n")
-                    if nl >= 0:
-                        line = head[:nl].decode("utf-8", errors="replace").strip()
-                        session_id = _parse_codex_session_id_from_jsonl(line)
-                        if session_id:
-                            _record_session(
-                                log_dir, acquire_log, "codex", session_id,
-                                "reported", "certain",
-                            )
-                        else:
-                            _record_session(
-                                log_dir, acquire_log, "codex", None,
-                                "none", "missing",
-                                f"first stdout line had no thread_id: {line[:100]!r}",
-                            )
-                        session_captured = True
-                try:
-                    os.write(log_fd, chunk)
-                except OSError:
-                    pass
-            else:
-                # stderr: forward to log so post-mortem sees it.
-                try:
-                    os.write(log_fd, chunk)
-                except OSError:
-                    pass
-
-        if child_done:
-            # Drain any remaining buffered output after child exits.
-            for fd in (stdout_r, stderr_r):
-                try:
-                    while True:
-                        chunk = os.read(fd, 4096)
-                        if not chunk:
-                            break
-                        if fd == stdout_r and not session_captured:
-                            head += chunk
-                            nl = head.find(b"\n")
-                            if nl >= 0:
-                                line = head[:nl].decode("utf-8", errors="replace").strip()
-                                session_id = _parse_codex_session_id_from_jsonl(line)
-                                if session_id:
-                                    _record_session(
-                                        log_dir, acquire_log, "codex", session_id,
-                                        "reported", "certain",
-                                    )
-                                else:
-                                    _record_session(
-                                        log_dir, acquire_log, "codex", None,
-                                        "none", "missing",
-                                        f"first stdout line had no thread_id: {line[:100]!r}",
-                                    )
-                                session_captured = True
-                        try:
-                            os.write(log_fd, chunk)
-                        except OSError:
-                            pass
-                except OSError:
-                    pass
-            break
-
-    os.close(stdout_r)
-    os.close(stderr_r)
-
-    if not session_captured:
-        _record_session(
-            log_dir, acquire_log, "codex", None, "none", "missing",
-            "process exited before first JSONL line",
-        )
-
-    # wstatus is already set from the WNOHANG poll above when child_done.
-    if os.WIFEXITED(wstatus):
-        return os.WEXITSTATUS(wstatus)
-    if os.WIFSIGNALED(wstatus):
-        return 128 + os.WTERMSIG(wstatus)
-    return 1
 
 
 def _run_managed_interactive_opencode(
