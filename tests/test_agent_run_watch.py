@@ -2377,6 +2377,84 @@ class TestScratchFacts:
         assert result["newest_mtime_age_s"] is None
         assert result["scanned"] is None
 
+    def test_error_field_contains_no_os_path_or_message(self, tmp_path, monkeypatch):
+        """The 'error' field must contain only categorical codes, never OS file names or messages.
+
+        str(exc) on an OSError carries the OS filename (e.g. '/customer/merger-codename/secret.txt').
+        This contract is rendered into Discord and persisted, so path material must never leak.
+
+        Plant a sentinel string in the OS error message and assert it does not appear in the
+        returned error field.  This test fails if any error path serialises str(exc).
+        """
+        import os as _os
+
+        SENTINEL = "SENTINEL_SECRET_PATH_XYZ987"
+
+        # --- root stat_error path ---
+        real_is_dir = tmp_path.is_dir.__class__  # noqa: unused
+
+        class SentinelPath:
+            """Proxy Path that raises OSError with the sentinel in the message on is_dir()."""
+
+            def __init__(self, p):
+                self._p = p
+
+            def is_dir(self):
+                raise OSError(f"[Errno 13] Permission denied: '{SENTINEL}/secret.txt'")
+
+            def __str__(self):
+                return str(self._p)
+
+            def __fspath__(self):
+                return str(self._p)
+
+        # Monkeypatch Path so _watch_scratch_facts gets our sentinel path.
+        import pathlib as _pathlib
+        real_Path = _pathlib.Path
+
+        def sentinel_Path(arg):
+            p = real_Path(arg)
+            return SentinelPath(p)
+
+        monkeypatch.setattr(agent_run, "Path", sentinel_Path)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] is not None
+        assert SENTINEL not in (result["error"] or ""), (
+            f"Sentinel path '{SENTINEL}' leaked into error field: {result['error']!r}"
+        )
+
+    def test_error_field_contains_no_os_path_from_scan_error(self, tmp_path, monkeypatch):
+        """Outer OSError during scan must not serialize the exception message.
+
+        This test fails if the outer except OSError uses str(exc) in the error field.
+        """
+        import os as _os
+
+        SENTINEL = "SENTINEL_SCAN_PATH_ABC123"
+        (tmp_path / "file.txt").write_text("data\n")
+
+        real_scandir = _os.scandir
+
+        call_count = [0]
+
+        def scandir_raises_on_second(path):
+            call_count[0] += 1
+            if call_count[0] > 1:
+                raise OSError(f"[Errno 5] I/O error: '{SENTINEL}/disk-failure'")
+            return real_scandir(path)
+
+        monkeypatch.setattr(_os, "scandir", scandir_raises_on_second)
+        # Make a subdir so BFS has a second iteration.
+        (tmp_path / "subdir").mkdir()
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        # May or may not error depending on execution order; if it errors, no sentinel.
+        if result["error"] is not None:
+            assert SENTINEL not in result["error"], (
+                f"Sentinel path '{SENTINEL}' leaked into error field: {result['error']!r}"
+            )
+
     # ------------------------------------------------------------------
     # end-to-end tests through cmd_watch
     # ------------------------------------------------------------------

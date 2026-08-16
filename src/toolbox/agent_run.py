@@ -2874,8 +2874,8 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
     try:
         if not root.is_dir():
             return {**null_result, "error": "not_a_directory"}
-    except OSError as exc:
-        return {**null_result, "error": f"stat_error: {exc!s}"[:200]}
+    except OSError:
+        return {**null_result, "error": "stat_error"}
 
     now = time.time()
     deadline = now + WATCH_SCRATCH_BUDGET_SECONDS
@@ -2965,9 +2965,9 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
 
     except _ScanError as err:
         return {**null_result, "error": err.code}
-    except OSError as exc:
+    except OSError:
         # Unexpected OS error mid-scan: degrade to null rather than a confident 0.
-        return {**null_result, "error": f"scan_error: {exc!s}"[:200]}
+        return {**null_result, "error": "scan_error"}
 
     if newest_mtime is None:
         newest_mtime_age_s: Optional[float] = None
