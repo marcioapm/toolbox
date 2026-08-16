@@ -696,18 +696,13 @@ a reserved sentinel so an interrupted deletion is resumed by the next reap;
 `--dry-run` runs the same read-only eligibility checks and prints only actions
 a real reap would take, without mutating or deleting anything.
 
-`--max-seconds N` sets an overall wall-clock budget for the entire invocation.
-The budget is checked between candidates in every pass — not mid-operation —
-so any action already in progress completes normally before the limit is
-enforced. When the budget expires, the remaining candidates in all passes are
-skipped; the summary line reports them as `deferred=N` and the process exits 0,
-so the next scheduled tick picks up where this one left off. This matters in
-practice because a process stuck in uninterruptible `D` state can block a
-`/proc` read (or equivalent) indefinitely. Without a budget, a single stalled
-candidate can cause the entire reap to overrun its own scheduling interval,
-which then causes the next scheduled invocation to start while the previous one
-is still running. Use a value comfortably below the scheduling interval; a 30-
-minute interval pairs naturally with `--max-seconds 600`.
+`--max-seconds N` sets a soft candidate-admission budget. The monotonic budget
+is checked between candidates in every pass, not during an operation already in
+progress. Scans, lock waits, recursive filesystem reads, and TERM/KILL grace
+periods can therefore overrun it; an uninterruptible kernel read cannot be
+bounded by this process. When the budget expires, later candidates are skipped,
+the summary reports `deferred=N`, and the process exits 0 so a later scheduled
+tick can resume. Leave enough scheduling margin for one in-progress operation.
 
 ### Scheduling
 
@@ -760,11 +755,11 @@ tuning retention thresholds.
 
 #### Interval vs. budget
 
-Keep `--max-seconds` comfortably under the scheduling interval so a slow
-invocation cannot overlap the next one. Overlapping reap invocations contend
-on the same per-name locks, which serializes work and defeats the point of
-running on a short interval. A 30-minute interval with `--max-seconds 600`
-leaves a generous margin; adjust proportionally for longer intervals.
+Keep `--max-seconds` comfortably under the scheduling interval and allow for an
+in-progress operation to overrun it. Overlapping reap invocations contend on
+the same per-name locks, which serializes work and defeats the point of running
+on a short interval. A 30-minute interval with `--max-seconds 600` usually
+leaves ample margin; use an external service timeout if a hard bound is needed.
 
 #### systemd (Linux, user units)
 
