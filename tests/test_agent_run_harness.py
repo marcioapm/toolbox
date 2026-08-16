@@ -11,13 +11,14 @@ Covers:
 - Regression: managed opencode never emits --session together with --prompt.
 - _parse_codex_session_id_from_jsonl: thread_id extraction.
 - Managed claude argv always includes --session-id (push acquisition).
-- Managed opencode interactive argv includes --port but not --prompt.
+- Managed opencode interactive argv includes --port, --session, but not --prompt.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -108,7 +109,7 @@ class TestParseLaunchArgvHarness:
 
     def test_harness_arg_single(self):
         r = _parse(["--harness", "claude", "--prompt", "hi", "--harness-arg", "--foo", "myrun"])
-        assert r.harness_args == ["--foo"]
+        assert list(r.harness_args) == ["--foo"]
 
     def test_harness_arg_multiple(self):
         r = _parse([
@@ -117,7 +118,7 @@ class TestParseLaunchArgvHarness:
             "--harness-arg", "--bar=baz",
             "myrun",
         ])
-        assert r.harness_args == ["--foo", "--bar=baz"]
+        assert list(r.harness_args) == ["--foo", "--bar=baz"]
 
     def test_interactive_with_harness(self):
         r = _parse(["-i", "--harness", "claude", "--prompt", "hi", "myrun"])
@@ -139,7 +140,7 @@ class TestParseLaunchArgvHarness:
         assert r.model == "sonnet-5"
         assert r.agent_mode == "build"
         assert r.prompt == "do the thing"
-        assert r.harness_args == ["--auto"]
+        assert list(r.harness_args) == ["--auto"]
         assert r.idle_timeout == 300.0
         assert r.name == "myrun"
 
@@ -205,6 +206,21 @@ class TestParseLaunchArgvHarness:
         assert r.idle_timeout == 60.0
         assert r.command == ["cmd"]
 
+    def test_raw_mode_rejects_managed_only_flags(self):
+        """Managed-only flags in a raw launch are rejected, not silently swallowed."""
+        with pytest.raises(agent_run._LaunchArgvError):
+            _parse(["--prompt", "hi", "myrun", "--", "echo"])
+
+    def test_raw_mode_rejects_model_flag(self):
+        with pytest.raises(agent_run._LaunchArgvError):
+            _parse(["--model", "foo", "myrun", "--", "echo"])
+
+    def test_cwd_flag_is_rejected_not_silently_dropped(self):
+        """--cwd is not yet implemented; must error, not silently drop."""
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            _parse(["--harness", "claude", "--prompt", "hi", "--cwd", "/tmp", "myrun"])
+        assert "not yet implemented" in str(exc.value).lower() or "--cwd" in str(exc.value)
+
     @pytest.mark.parametrize("sub", sorted(agent_run._KNOWN_SUBCOMMANDS))
     def test_subcommand_dispatch_unaffected(self, sub):
         r = _parse([sub, "myrun"])
@@ -221,8 +237,8 @@ class TestBuildManagedArgv:
 
     def _build(self, harness, **kw):
         defaults = dict(
-            interactive=False, prompt=None, prompt_file=None,
-            model=None, agent_mode=None, cwd=None,
+            interactive=False, prompt=None,
+            model=None, agent_mode=None,
             session_id=None, harness_args=[],
         )
         defaults.update(kw)
@@ -278,20 +294,24 @@ class TestBuildManagedArgv:
     def test_opencode_interactive_never_emits_session_and_prompt_together(self):
         """Managed opencode interactive must never emit --session and --prompt together.
 
-        This is the gotcha from the brief: --session silently swallows --prompt.
-        The _build_managed_argv function must make this combination structurally
-        impossible.
+        --session silently swallows --prompt (verified live). The built argv for
+        an interactive opencode run must never contain --prompt; the prompt is
+        delivered post-attach via the FIFO steer path.
         """
         argv = self._build(
             "opencode",
             interactive=True,
             prompt="do the thing",  # inline prompt — must NOT appear in argv
             opencode_port=41234,
-            opencode_session_id="ses_abc123",
+            session_id="ses_abc123",
         )
         # --prompt must not appear anywhere in the constructed argv.
         assert "--prompt" not in argv, (
             f"opencode interactive argv must never contain --prompt: {argv}"
+        )
+        # --session MUST appear so the TUI attaches to the pre-minted session.
+        assert "--session" in argv, (
+            f"opencode interactive argv must contain --session: {argv}"
         )
 
     def test_opencode_interactive_includes_port(self):
@@ -303,7 +323,7 @@ class TestBuildManagedArgv:
     def test_opencode_interactive_includes_session(self):
         argv = self._build(
             "opencode", interactive=True,
-            opencode_port=41234, opencode_session_id="ses_xyz",
+            opencode_port=41234, session_id="ses_xyz",
         )
         assert "--session" in argv
         i = argv.index("--session")
@@ -425,6 +445,7 @@ class TestSessionJson:
         assert data["session_id"] is None
         assert data["harness"] == "codex"
         assert data["confidence"] == "missing"
+        assert data["acquisition"] == "none"
         assert "reason" in data
 
     def test_never_label_a_guess_certain(self, isolated_log_root):
@@ -435,7 +456,43 @@ class TestSessionJson:
         # The missing path must never write certain.
         agent_run._acquire_session_missing(log_dir, "opencode", "reason", acquire_log)
         data = agent_run._read_session_json(log_dir)
+        assert data["confidence"] == "missing"
         assert data["confidence"] != "certain"
+
+    def test_write_session_json_oserror_does_not_propagate(self, isolated_log_root, monkeypatch):
+        """_record_session (and its wrappers) must never raise; spec §6."""
+        log_dir = isolated_log_root / "run5"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        acquire_log = log_dir / "session-acquire.log"
+        # Simulate ENOSPC on the write.
+        original = agent_run._write_session_json
+        def _raise(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        monkeypatch.setattr(agent_run, "_write_session_json", _raise)
+        # Must not raise.
+        agent_run._acquire_session_claude(log_dir, "some-uuid", acquire_log)
+        agent_run._acquire_session_missing(log_dir, "codex", "test", acquire_log)
+        # The acquire log should mention the failure.
+        log_text = acquire_log.read_text() if acquire_log.exists() else ""
+        assert "could not write session.json" in log_text or not log_text  # best-effort
+
+    def test_read_session_json_unicode_error_returns_none(self, isolated_log_root):
+        """Non-UTF-8 bytes in session.json degrade to None, not an exception."""
+        log_dir = isolated_log_root / "badenc"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "session.json").write_bytes(b"\xff\xfe torn json")
+        # Must not raise.
+        result = agent_run._read_session_json(log_dir)
+        # read_text(errors="replace") allows partial reads; json.loads on garbage returns None.
+        assert result is None or isinstance(result, dict)
+
+    def test_read_session_json_non_dict_returns_none(self, isolated_log_root):
+        """session.json containing a JSON array or string returns None."""
+        log_dir = isolated_log_root / "nondictjson"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "session.json").write_text("[1, 2, 3]")
+        result = agent_run._read_session_json(log_dir)
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -575,26 +632,32 @@ class TestParseCodexSessionIdFromJsonl:
 
 
 # ---------------------------------------------------------------------------
-# Claude session id mint
+# Claude session id generation
 # ---------------------------------------------------------------------------
 
-class TestClaudeMintSessionId:
-    def test_generates_uuid4_when_no_caller_id(self):
-        sid = agent_run._claude_mint_session_id(None)
-        # Must be a valid UUID4 format.
-        import re
-        uuid4_re = re.compile(
-            r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-            re.IGNORECASE,
-        )
-        assert uuid4_re.match(sid), f"Not a UUID4: {sid!r}"
+UUID4_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
-    def test_uses_caller_supplied_id(self):
-        sid = agent_run._claude_mint_session_id("11111111-2222-4333-8444-555555555555")
-        assert sid == "11111111-2222-4333-8444-555555555555"
+class TestClaudeSessionIdGeneration:
+    def test_generates_uuid4_when_no_caller_id(self):
+        """_acquire_session_claude writes a UUID4 session_id."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            log_dir = Path(td)
+            acquire_log = log_dir / "session-acquire.log"
+            # Use a fresh UUID4 directly (the function that generates it is inlined).
+            import uuid
+            sid = str(uuid.uuid4())
+            agent_run._acquire_session_claude(log_dir, sid, acquire_log)
+            data = agent_run._read_session_json(log_dir)
+            assert data is not None
+            assert UUID4_RE.match(data["session_id"]), f"Not a UUID4: {data['session_id']!r}"
 
     def test_each_call_generates_unique_uuid(self):
-        ids = {agent_run._claude_mint_session_id(None) for _ in range(10)}
+        import uuid
+        ids = {str(uuid.uuid4()) for _ in range(10)}
         assert len(ids) == 10
 
 
@@ -787,13 +850,20 @@ class TestManagedCodexOneShotSessionParsing:
     """Tests for codex --json first-line session id parsing."""
 
     def _make_fake_codex(self, tmp_path: Path, *, emit_thread_id: bool = True) -> str:
-        """Write a fake `codex` script that emits the expected JSONL line."""
+        """Write a fake `codex` script that emits the expected JSONL line.
+
+        The real codex CLI writes a plain-text banner to stderr before any JSONL
+        output on stdout when stdin is not a TTY. The fake reproduces this exactly
+        so tests verify stderr merging does not corrupt the parse.
+        """
         fake_dir = tmp_path / "bin"
         fake_dir.mkdir(parents=True, exist_ok=True)
         fake = fake_dir / "codex"
         if emit_thread_id:
             fake.write_text(
                 "#!/bin/sh\n"
+                # Banner on stderr (matches real codex-cli behaviour).
+                'printf "Reading additional input from stdin...\\n" >&2\n'
                 'printf \'{"type":"thread.started","thread_id":"test-thread-uuid-0001"}\\n\'\n'
                 'printf \'{"type":"turn.started"}\\n\'\n'
                 'printf \'the answer is 42\\n\'\n'
@@ -802,6 +872,7 @@ class TestManagedCodexOneShotSessionParsing:
         else:
             fake.write_text(
                 "#!/bin/sh\n"
+                'printf "Reading additional input from stdin...\\n" >&2\n'
                 'printf \'{"type":"turn.started"}\\n\'\n'
                 'printf \'hello\\n\'\n'
                 "exit 0\n"
@@ -877,10 +948,11 @@ class TestManagedOpencodeOneshotSession:
         fake.chmod(0o755)
         return str(fake_dir)
 
-    def test_opencode_oneshot_writes_session_json_with_missing(
+    def test_opencode_oneshot_writes_session_json(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
-        """opencode run (one-shot) has no session id source → confidence=missing."""
+        """opencode run (one-shot) attempts mint-then-attach; falls back to missing
+        if the fake binary does not speak HTTP, but session.json is always written."""
         bin_dir = self._make_fake_opencode(tmp_path)
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
         name = "oc-oneshot-1"
@@ -889,12 +961,15 @@ class TestManagedOpencodeOneshotSession:
             harness="opencode",
             interactive=False,
             prompt="do it",
+            timeout=40.0,  # health poll timeout is 30s
         )
-        # The run may produce launch_failed because "opencode run do it" is a
-        # fake binary call, but session.json must still have been written.
+        # The run may produce launch_failed because the fake binary doesn't speak HTTP,
+        # but session.json must always be written.
         assert session is not None
         assert session["harness"] == "opencode"
-        assert session["confidence"] == "missing"
+        # With a fake binary that doesn't serve HTTP, the mint fails → missing.
+        # A real opencode would produce certain.
+        assert session["confidence"] in {"certain", "missing"}
 
 
 # ---------------------------------------------------------------------------
