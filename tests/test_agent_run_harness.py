@@ -1103,6 +1103,293 @@ class TestManagedCodexOneShotAppServer:
 
 
 # ---------------------------------------------------------------------------
+# Codex interactive: app-server JSON-RPC mint + turn/steer
+# ---------------------------------------------------------------------------
+
+class TestManagedCodexInteractiveAppServer:
+    """Tests for codex managed interactive: app-server stays alive, FIFO steer → turn/steer."""
+
+    def _make_fake_codex_interactive(
+        self,
+        tmp_path: Path,
+        *,
+        thread_id: str = "interactive-thread-0001",
+        appserver_works: bool = True,
+        steer_wait_seconds: float = 3.0,
+    ) -> str:
+        """Write a fake codex app-server that handles interactive protocol.
+
+        Sequence: initialize → thread/start → turn/start (initial prompt) →
+        item/agentMessage/delta → turn/completed → wait up to steer_wait_seconds
+        for a steer (turn/steer or turn/start) → if received, emit steered response
+        → exit.  If the steer wait times out or stdin closes, exit immediately.
+        """
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+
+        if appserver_works:
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys, json, time, select\n"
+                "\n"
+                "def send(obj):\n"
+                "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+                "    sys.stdout.flush()\n"
+                "\n"
+                "def recv(timeout=None):\n"
+                "    if timeout is not None:\n"
+                "        ready, _, _ = select.select([sys.stdin], [], [], timeout)\n"
+                "        if not ready:\n"
+                "            return None\n"
+                "    line = sys.stdin.readline()\n"
+                "    if not line:\n"
+                "        return None\n"
+                "    try:\n"
+                "        return json.loads(line.strip())\n"
+                "    except Exception:\n"
+                "        return None\n"
+                "\n"
+                "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+                "    sys.exit(1)\n"
+                "\n"
+                f"THREAD_ID = '{thread_id}'\n"
+                f"STEER_WAIT = {steer_wait_seconds}\n"
+                "\n"
+                "# Handshake: initialize\n"
+                "msg = recv()\n"
+                "if not msg or msg.get('method') != 'initialize':\n"
+                "    sys.exit(1)\n"
+                "send({'id': msg['id'], 'result': {'userAgent': 'codex_exec/0.144.1'}})\n"
+                "\n"
+                "# initialized notification (no response)\n"
+                "msg = recv()\n"
+                "\n"
+                "# thread/start\n"
+                "msg = recv()\n"
+                "if not msg or msg.get('method') != 'thread/start':\n"
+                "    sys.exit(1)\n"
+                "send({'id': msg['id'], 'result': {'thread': {\n"
+                "    'id': THREAD_ID, 'sessionId': THREAD_ID,\n"
+                "    'path': f'~/.codex/sessions/rollout-{THREAD_ID}.jsonl',\n"
+                "    'parentThreadId': None, 'forkedFromId': None,\n"
+                "}}})\n"
+                "\n"
+                "# Initial turn/start (initial prompt)\n"
+                "msg = recv()\n"
+                "if not msg or msg.get('method') != 'turn/start':\n"
+                "    sys.exit(1)\n"
+                "turn_id = 'turn-001'\n"
+                "send({'id': msg['id'], 'result': {'turn': {'id': turn_id, 'status': 'inProgress'}}})\n"
+                "send({'method': 'item/agentMessage/delta', 'params': {\n"
+                "    'threadId': THREAD_ID, 'turnId': turn_id, 'itemId': 'i1',\n"
+                "    'delta': 'initial response',\n"
+                "}})\n"
+                "send({'method': 'turn/completed', 'params': {\n"
+                "    'threadId': THREAD_ID,\n"
+                "    'turn': {'id': turn_id, 'status': 'completed'},\n"
+                "}})\n"
+                "\n"
+                "# Wait up to STEER_WAIT seconds for a steer message.\n"
+                "msg = recv(timeout=STEER_WAIT)\n"
+                "if msg is None:\n"
+                "    sys.exit(0)\n"
+                "steer_method = msg.get('method', '')\n"
+                "if steer_method in ('turn/steer', 'turn/start'):\n"
+                "    turn_id2 = 'turn-002'\n"
+                "    send({'id': msg['id'], 'result': {'turn': {'id': turn_id2, 'status': 'inProgress'}}})\n"
+                "    send({'method': 'item/agentMessage/delta', 'params': {\n"
+                "        'threadId': THREAD_ID, 'turnId': turn_id2, 'itemId': 'i2',\n"
+                "        'delta': 'steered response',\n"
+                "    }})\n"
+                "    send({'method': 'turn/completed', 'params': {\n"
+                "        'threadId': THREAD_ID,\n"
+                "        'turn': {'id': turn_id2, 'status': 'completed'},\n"
+                "    }})\n"
+                "\n"
+                "# Exit so the runner loop sees EOF and terminates.\n"
+                "sys.exit(0)\n"
+            )
+        else:
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "if len(sys.argv) >= 2 and sys.argv[1] == 'app-server':\n"
+                "    sys.exit(1)\n"
+                "sys.exit(1)\n"
+            )
+        fake.chmod(0o755)
+        return str(fake_dir)
+
+    def _wait_for_running(self, state_dir: Path, timeout: float = 10.0) -> bool:
+        """Wait until the run's status file shows 'running'. Returns True if reached."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                status = (state_dir / "status").read_text().strip()
+                if status == "running":
+                    return True
+                if status in agent_run.TERMINAL_STATUSES:
+                    return False
+            except FileNotFoundError:
+                pass
+            time.sleep(0.05)
+        return False
+
+    def _wait_for_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
+        """Wait for terminal status. Returns final status string."""
+        deadline = time.monotonic() + timeout
+        status = "starting"
+        while time.monotonic() < deadline:
+            try:
+                status = (state_dir / "status").read_text().strip()
+            except FileNotFoundError:
+                status = "starting"
+            if status in agent_run.TERMINAL_STATUSES:
+                break
+            time.sleep(0.05)
+        return status
+
+    def test_interactive_codex_minted_session_json(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """Interactive codex via app-server writes session.json with minted/certain."""
+        # steer_wait_seconds=0.5: fake exits quickly after initial turn completes.
+        bin_dir = self._make_fake_codex_interactive(
+            tmp_path, thread_id="iact-thread-0001", steer_wait_seconds=0.5
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "codex-iact-session"
+        ns = argparse.Namespace(
+            name=name,
+            command=[],
+            interactive=True,
+            prompt_file=None,
+            echo=False,
+            echo_interval=2.0,
+            submit_mode=None,
+            idle_timeout=None,
+            harness="codex",
+            prompt="say hi",
+            model=None,
+            agent_mode=None,
+            session_id=None,
+            harness_args=[],
+        )
+        rc = agent_run.cmd_launch(ns)
+        assert rc == 0
+        state_dir = isolated_runs_root / name
+        log_dir = isolated_log_root / name
+
+        # Wait for the run to reach running (session.json is written then).
+        reached_running = self._wait_for_running(state_dir, timeout=10.0)
+        assert reached_running, "Interactive codex run must reach 'running'"
+
+        # session.json must show minted/certain at this point.
+        session = agent_run._read_session_json(log_dir)
+        assert session is not None, "session.json must be written for interactive codex"
+        assert session["harness"] == "codex"
+        assert session["acquisition"] == "minted"
+        assert session["confidence"] == "certain"
+        assert session["session_id"] == "iact-thread-0001"
+
+        # Fake exits after the steer wait times out; run will reach terminal status.
+        self._wait_for_terminal(state_dir, timeout=10.0)
+
+    def test_interactive_codex_log_contains_initial_response(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """Log must show readable text from the initial turn, not JSON-RPC frames."""
+        bin_dir = self._make_fake_codex_interactive(
+            tmp_path, thread_id="iact-thread-0002", steer_wait_seconds=0.5
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "codex-iact-log"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="say hi", model=None, agent_mode=None,
+            session_id=None, harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+        log_dir = isolated_log_root / name
+
+        self._wait_for_terminal(state_dir, timeout=12.0)
+
+        log_path = log_dir / "log"
+        log_content = log_path.read_text() if log_path.exists() else ""
+        assert "initial response" in log_content, (
+            f"Log must contain readable agent text, got: {log_content!r}"
+        )
+        assert '"method"' not in log_content, (
+            f"JSON-RPC frames must not appear in the run log: {log_content!r}"
+        )
+
+    def test_interactive_codex_steer_lands_and_answered(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """agent-run steer sends turn/steer or turn/start to the app-server; response lands in log."""
+        # steer_wait_seconds=5.0: fake waits long enough for the test to send a steer.
+        bin_dir = self._make_fake_codex_interactive(
+            tmp_path, thread_id="iact-thread-0003", steer_wait_seconds=5.0
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "codex-iact-steer"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="initial prompt", model=None, agent_mode=None,
+            session_id=None, harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+        log_dir = isolated_log_root / name
+
+        # Wait for running, then steer after a brief settle.
+        reached = self._wait_for_running(state_dir, timeout=10.0)
+        assert reached, "Run must reach running before steer"
+        time.sleep(0.8)  # let initial turn complete so the agent is idle
+
+        # Send steer via cmd_steer.
+        steer_ns = argparse.Namespace(name=name, message=["STEER_MSG"], raw=False, esc=False)
+        rc = agent_run.cmd_steer(steer_ns)
+        assert rc == 0, "steer must exit 0 on an interactive run"
+
+        # Wait for the run to finish (fake exits after handling one steer).
+        self._wait_for_terminal(state_dir, timeout=15.0)
+
+        log_path = log_dir / "log"
+        log_content = log_path.read_text() if log_path.exists() else ""
+        assert "steered response" in log_content, (
+            f"Log must contain the steered response, got: {log_content!r}"
+        )
+
+    def test_interactive_codex_fallback_to_missing_when_appserver_fails(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """When app-server fails, session.json has confidence=missing but run still starts."""
+        bin_dir = self._make_fake_codex_interactive(tmp_path, appserver_works=False)
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "codex-iact-missing"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="hi", model=None, agent_mode=None,
+            session_id=None, harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+        log_dir = isolated_log_root / name
+
+        self._wait_for_terminal(state_dir, timeout=15.0)
+        session = agent_run._read_session_json(log_dir)
+        assert session is not None, "session.json must always be written"
+        assert session["confidence"] == "missing"
+        assert session["session_id"] is None
+
+
+# ---------------------------------------------------------------------------
 # Opencode one-shot: session acquisition always fails gracefully
 # ---------------------------------------------------------------------------
 

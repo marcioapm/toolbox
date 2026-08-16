@@ -5045,32 +5045,13 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                 )
 
         elif harness == "codex":
-            if not args.interactive:
-                # One-shot: entire run goes through app-server JSON-RPC so the
-                # thread id is minted AND the turn runs on the same process inside
-                # _run_managed_oneshot_codex_appserver (dispatched from _runner).
-                # We record a descriptive command for postmortem but don't exec it.
-                _acquire_log_write(acquire_log, "codex one-shot: using app-server for mint+run")
-                argv = ["codex", "app-server"]  # descriptive; not exec'd directly
-            else:
-                # Interactive codex TUI: use plain "codex" PTY. Session id is missing
-                # because app-server turn/steer wiring requires additional work.
-                # Finding documented in ACCEPTANCE-RESULTS.md.
-                _acquire_session_missing(
-                    log_d, "codex",
-                    "interactive codex TUI: session id not available at PTY startup; "
-                    "app-server turn/steer wiring deferred (see ACCEPTANCE-RESULTS.md)",
-                    acquire_log,
-                )
-                argv = _build_managed_argv(
-                    harness,
-                    interactive=True,
-                    prompt=managed_prompt,
-                    model=managed_model,
-                    agent_mode=managed_agent_mode,
-                    session_id=None,
-                    harness_args=managed_harness_args,
-                )
+            # Both one-shot and interactive run entirely through app-server JSON-RPC:
+            # thread/start mints the id, turn/start runs the prompt. The argv here is
+            # descriptive only (for postmortem); it is never exec'd.
+            _acquire_log_write(acquire_log, f"codex {'interactive' if args.interactive else 'one-shot'}: using app-server for mint+run")
+            argv = ["codex", "app-server"]  # descriptive; not exec'd directly
+            # session.json is written from inside _run_managed_*_codex_appserver
+            # (post-fork in the runner) after the thread id is minted.
 
     _write(d / "command", _pretty_command(argv) + "\n")
     _write(d / "argv", json.dumps(argv))
@@ -5739,6 +5720,24 @@ def _runner(
                     ready=_ready,
                     acquire_log=acquire_log,
                 )
+            elif managed_harness == "codex" and interactive:
+                # Interactive codex: app-server stays alive; steer input from FIFO
+                # is forwarded as turn/steer JSON-RPC calls; text deltas stream to log.
+                try:
+                    cwd_str = os.getcwd()
+                except OSError:
+                    cwd_str = "/"
+                exit_code = _run_managed_interactive_codex_appserver(
+                    state_dir, log_dir,
+                    prompt=managed_prompt,
+                    prompt_file=prompt_file,
+                    cwd=cwd_str,
+                    harness_args=codex_appserver_args or [],
+                    model=managed_model,
+                    log_fd=log_fd,
+                    ready=_ready,
+                    acquire_log=acquire_log,
+                )
             elif interactive:
                 exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
             else:
@@ -6141,6 +6140,35 @@ _OPENCODE_HEALTH_POLL_INTERVAL = 0.25
 # codex app-server: timeout for the full initialize+thread/start handshake (seconds).
 _CODEX_APPSERVER_TIMEOUT = 20.0
 
+# Path to codex auth file which stores the API key used by the llmproxy provider.
+_CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
+
+
+def _codex_subprocess_env() -> Optional[dict]:
+    """Return an environment dict for codex app-server subprocesses.
+
+    Codex reads its API key from the env var named by config.env_key (typically
+    OPENAI_API_KEY). When agent-run is launched from a shell that does not export
+    this variable, the subprocess inherits nothing and fails immediately with
+    "Missing environment variable". This helper reads the key from
+    ~/.codex/auth.json (codex's own credential store) and injects it, leaving
+    all other inherited variables intact. Returns None to let Popen inherit the
+    environment as-is when the key is already set or auth.json is unreadable.
+    """
+    key_name = "OPENAI_API_KEY"
+    if os.environ.get(key_name):
+        return None  # already set; nothing to do
+    try:
+        auth = json.loads(_CODEX_AUTH_PATH.read_text())
+        api_key = auth.get(key_name)
+        if api_key and isinstance(api_key, str):
+            env = dict(os.environ)
+            env[key_name] = api_key
+            return env
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return None
+
 
 def _codex_appserver_mint(cwd: str, acquire_log: Path) -> Optional[str]:
     """Mint a codex thread id via `codex app-server` JSON-RPC over stdio.
@@ -6202,6 +6230,7 @@ def _codex_appserver_mint(cwd: str, acquire_log: Path) -> Optional[str]:
             stdin=_subprocess.PIPE,
             stdout=_subprocess.PIPE,
             stderr=_subprocess.DEVNULL,
+            env=_codex_subprocess_env(),
         )
     except OSError as exc:
         _acquire_log_write(acquire_log, f"codex app-server: launch failed: {exc}")
@@ -6502,6 +6531,7 @@ def _run_managed_oneshot_codex_appserver(
             stdin=_subprocess.PIPE,
             stdout=_subprocess.PIPE,
             stderr=_subprocess.DEVNULL,
+            env=_codex_subprocess_env(),
         )
     except OSError as exc:
         _acquire_log_write(acquire_log, f"codex app-server: launch failed: {exc}")
@@ -6641,6 +6671,359 @@ def _run_managed_oneshot_codex_appserver(
             ready()
         exit_code = 1
     finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5.0)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return exit_code
+
+
+def _run_managed_interactive_codex_appserver(
+    state_dir: Path,
+    log_dir: Path,
+    prompt: Optional[str],
+    prompt_file: Optional[str],
+    cwd: str,
+    harness_args: List[str],
+    model: Optional[str],
+    log_fd: int,
+    ready: "callable",
+    acquire_log: Path,
+) -> int:
+    """Interactive codex run via app-server JSON-RPC: mint thread, relay steer via turn/steer.
+
+    Keeps a single codex app-server process alive for the session lifetime.
+    Sequence: initialize → thread/start (mints id, writes session.json) → turn/start
+    (delivers initial prompt) → select loop relaying FIFO steer input as turn/steer or
+    turn/start calls and streaming item/agentMessage/delta text to log_fd.
+
+    The FIFO (state_dir/stdin) is created pre-fork by the launcher; this function opens
+    it for reading and sets up a keeper child to hold the write end open (preventing EOF
+    between steers), matching the interactive PTY mechanism but without a PTY.
+
+    JSON-RPC chatter goes to session-acquire.log only; agent text deltas go to log_fd.
+    """
+    import subprocess as _subprocess
+
+    rpc_id_counter = [0]
+
+    def _next_id() -> int:
+        rpc_id_counter[0] += 1
+        return rpc_id_counter[0]
+
+    def _send(proc, obj: dict) -> None:
+        proc.stdin.write((json.dumps(obj) + "\n").encode())
+        proc.stdin.flush()
+
+    def _read_prompt() -> str:
+        if prompt_file:
+            try:
+                return Path(prompt_file).read_text(errors="replace")
+            except OSError as exc:
+                return f"(prompt file unreadable: {exc})"
+        return prompt or ""
+
+    # Start the long-lived app-server process.
+    try:
+        proc = _subprocess.Popen(
+            ["codex", "app-server"] + list(harness_args),
+            stdin=_subprocess.PIPE,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.DEVNULL,
+            cwd=cwd,
+            env=_codex_subprocess_env(),
+        )
+    except OSError as exc:
+        _acquire_log_write(acquire_log, f"codex app-server interactive: launch failed: {exc}")
+        _record_session(log_dir, acquire_log, "codex", None, "none", "missing",
+                        f"codex app-server launch failed: {exc}")
+        _write(state_dir / "status", "running\n")
+        ready()
+        return 1
+
+    thread_id: Optional[str] = None
+    exit_code = 1
+    # Active turn id: set when turn/start result arrives, cleared on turn/completed.
+    # Used as expectedTurnId for turn/steer; None means agent is idle between turns.
+    active_turn_id: Optional[str] = None
+
+    # Keeper child: holds the FIFO write end open so the runner never sees EOF.
+    fifo_path = state_dir / "stdin"
+    keeper_pid: Optional[int] = None
+    keeper_r, keeper_w = os.pipe()
+
+    with _block_handled_runner_signals():
+        keeper_pid = os.fork()
+        if keeper_pid != 0:
+            _publish_or_reap_child(state_dir, "keeper_pid", keeper_pid)
+        else:
+            _reset_runner_signal_handlers()
+
+    if keeper_pid == 0:
+        # Keeper child: open FIFO for writing then sleep indefinitely.
+        _reset_runner_signal_handlers()
+        os.close(keeper_r)
+        fd = os.open(str(fifo_path), os.O_RDWR)
+        try:
+            os.write(keeper_w, b".")
+        finally:
+            os.close(keeper_w)
+        try:
+            while True:
+                time.sleep(3600)
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        os._exit(0)
+
+    os.close(keeper_w)
+    # Wait for keeper to open the FIFO before we open the read end.
+    try:
+        os.read(keeper_r, 1)
+    except OSError:
+        pass
+    os.close(keeper_r)
+
+    # FIFO read end (non-blocking after open, gated by select).
+    fifo_fd = os.open(str(fifo_path), os.O_RDONLY)
+    flags = fcntl.fcntl(fifo_fd, fcntl.F_GETFL)
+    fcntl.fcntl(fifo_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    try:
+        # ---- initialize ----
+        init_id = _next_id()
+        _send(proc, {
+            "jsonrpc": "2.0", "id": init_id, "method": "initialize",
+            "params": {"clientInfo": {"name": "codex_exec", "title": "agent-run", "version": "0"}},
+        })
+        _send(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+
+        # ---- thread/start: mint the thread id ----
+        thread_rpc_id = _next_id()
+        _send(proc, {
+            "jsonrpc": "2.0", "id": thread_rpc_id, "method": "thread/start",
+            "params": {"cwd": cwd},
+        })
+
+        # Read until thread/start result arrives (20s timeout).
+        buf = b""
+        deadline = time.monotonic() + _CODEX_APPSERVER_TIMEOUT
+        while time.monotonic() < deadline and thread_id is None:
+            ready_fds, _, _ = select.select([proc.stdout], [], [], 0.2)
+            if not ready_fds:
+                if proc.poll() is not None:
+                    break
+                continue
+            chunk = proc.stdout.read1(4096)  # type: ignore[attr-defined]
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                nl = buf.index(b"\n")
+                line = buf[:nl]; buf = buf[nl + 1:]
+                try:
+                    msg = json.loads(line.decode("utf-8", errors="replace"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if msg.get("id") == thread_rpc_id and "result" in msg:
+                    t = msg["result"].get("thread") or msg["result"]
+                    thread_id = t.get("id") or t.get("sessionId")
+                    rollout = t.get("path", "?")
+                    if thread_id:
+                        _acquire_log_write(acquire_log, f"codex app-server interactive: minted thread_id={thread_id!r} rollout={rollout!r}")
+                        _record_session(log_dir, acquire_log, "codex", thread_id, "minted", "certain")
+                elif msg.get("id") == thread_rpc_id and "error" in msg:
+                    _acquire_log_write(acquire_log, f"codex app-server interactive: thread/start error: {msg['error']}")
+                    break
+
+        if thread_id is None:
+            _acquire_log_write(acquire_log, "codex app-server interactive: thread/start failed or timed out")
+            _record_session(log_dir, acquire_log, "codex", None, "none", "missing",
+                            "thread/start failed or timed out")
+            _write(state_dir / "status", "running\n")
+            ready()
+            return 1
+
+        # ---- turn/start: deliver the initial prompt ----
+        turn_rpc_id = _next_id()
+        prompt_text = _read_prompt()
+        _send(proc, {
+            "jsonrpc": "2.0", "id": turn_rpc_id, "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt_text}],
+            },
+        })
+
+        # Signal readiness: session.json written, status transitions to running.
+        _write(state_dir / "status", "running\n")
+        ready()
+
+        # ---- main select loop ----
+        # Sources: proc.stdout (app-server events), fifo_fd (steer input).
+        # app-server stdout → parse JSON-RPC notifications:
+        #   item/agentMessage/delta  → write delta text to log_fd
+        #   turn/completed           → clear active_turn_id
+        #   turn/start result        → set active_turn_id
+        # FIFO → steer text → turn/steer (if active turn) or turn/start (if idle).
+        steer_buf = b""  # accumulated steer bytes (newline-terminated messages)
+        # Hard cap: 24 hours for the longest conceivable interactive session.
+        session_deadline = time.monotonic() + 86400
+        app_stdout = proc.stdout
+
+        while time.monotonic() < session_deadline:
+            if proc.poll() is not None:
+                break  # app-server died
+
+            try:
+                readable, _, _ = select.select([app_stdout, fifo_fd], [], [], 0.3)
+            except (OSError, select.error) as exc:
+                if isinstance(exc, OSError) and exc.errno == errno.EINTR:
+                    continue
+                break
+
+            if app_stdout in readable:
+                try:
+                    chunk = app_stdout.read1(4096)  # type: ignore[attr-defined]
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    break  # EOF from app-server
+                buf += chunk
+                while b"\n" in buf:
+                    nl = buf.index(b"\n")
+                    line_bytes = buf[:nl]; buf = buf[nl + 1:]
+                    try:
+                        msg = json.loads(line_bytes.decode("utf-8", errors="replace"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    method = msg.get("method", "")
+                    params = msg.get("params") or {}
+                    msg_id = msg.get("id")
+
+                    if method == "item/agentMessage/delta":
+                        # Stream agent text to the run log (readable by tail/clean).
+                        delta = params.get("delta")
+                        if isinstance(delta, str) and delta:
+                            try:
+                                os.write(log_fd, delta.encode("utf-8", errors="replace"))
+                            except OSError:
+                                pass
+
+                    elif method == "turn/completed":
+                        # Turn finished: clear active turn id, write trailing newline.
+                        turn_info = params.get("turn") or {}
+                        completed_id = turn_info.get("id")
+                        if active_turn_id and completed_id == active_turn_id:
+                            active_turn_id = None
+                        turn_status = turn_info.get("status", "")
+                        _acquire_log_write(acquire_log, f"codex app-server interactive: turn completed id={completed_id!r} status={turn_status!r}")
+                        exit_code = 0 if turn_status == "completed" else exit_code
+                        try:
+                            os.write(log_fd, b"\n")
+                        except OSError:
+                            pass
+
+                    elif msg_id == turn_rpc_id and "result" in msg:
+                        # turn/start acknowledged: capture the turn id.
+                        turn_info = (msg["result"].get("turn") or msg["result"])
+                        new_turn_id = turn_info.get("id") if isinstance(turn_info, dict) else None
+                        if new_turn_id:
+                            active_turn_id = new_turn_id
+                            _acquire_log_write(acquire_log, f"codex app-server interactive: turn started id={active_turn_id!r}")
+                        # Reset turn_rpc_id so future responses match new steer rpc ids.
+                        turn_rpc_id = -1
+
+                    elif msg_id is not None and "result" in msg:
+                        # Response to a steer or subsequent turn/start: capture turn id.
+                        turn_info = (msg["result"].get("turn") or msg["result"])
+                        if isinstance(turn_info, dict):
+                            new_turn_id = turn_info.get("id")
+                            if new_turn_id:
+                                active_turn_id = new_turn_id
+                                _acquire_log_write(acquire_log, f"codex app-server interactive: turn id updated to {active_turn_id!r}")
+
+            if fifo_fd in readable:
+                try:
+                    chunk = os.read(fifo_fd, 4096)
+                except (BlockingIOError, OSError):
+                    chunk = b""
+                if chunk:
+                    steer_buf += chunk
+                # Process complete lines from the steer buffer (each line = one steer message).
+                # The FIFO write includes a newline+CR from the submit_mode mechanism.
+                while b"\n" in steer_buf or b"\r" in steer_buf:
+                    # Split on the first CR or LF to get one message at a time.
+                    for sep in (b"\r\n", b"\n", b"\r"):
+                        idx = steer_buf.find(sep)
+                        if idx >= 0:
+                            break
+                    else:
+                        break
+                    msg_bytes = steer_buf[:idx]
+                    steer_buf = steer_buf[idx + len(sep):]
+                    steer_text = msg_bytes.decode("utf-8", errors="replace").strip()
+                    if not steer_text:
+                        continue
+                    steer_rpc_id = _next_id()
+                    if active_turn_id is not None:
+                        # Mid-turn: steer the running turn.
+                        _send(proc, {
+                            "jsonrpc": "2.0", "id": steer_rpc_id, "method": "turn/steer",
+                            "params": {
+                                "threadId": thread_id,
+                                "expectedTurnId": active_turn_id,
+                                "input": [{"type": "text", "text": steer_text}],
+                            },
+                        })
+                        _acquire_log_write(acquire_log, f"codex app-server interactive: turn/steer expectedTurnId={active_turn_id!r} text={steer_text[:80]!r}")
+                    else:
+                        # Idle between turns: start a new turn with the steer text.
+                        turn_rpc_id = steer_rpc_id
+                        _send(proc, {
+                            "jsonrpc": "2.0", "id": steer_rpc_id, "method": "turn/start",
+                            "params": {
+                                "threadId": thread_id,
+                                "input": [{"type": "text", "text": steer_text}],
+                            },
+                        })
+                        _acquire_log_write(acquire_log, f"codex app-server interactive: turn/start (steer idle) text={steer_text[:80]!r}")
+
+        _acquire_log_write(acquire_log, f"codex app-server interactive: session loop ended exit_code={exit_code}")
+
+    except OSError as exc:
+        _acquire_log_write(acquire_log, f"codex app-server interactive: I/O error: {exc}")
+        if not (state_dir / "status").exists() or (state_dir / "status").read_text().strip() == "starting":
+            _write(state_dir / "status", "running\n")
+            ready()
+        exit_code = 1
+    finally:
+        try:
+            os.close(fifo_fd)
+        except OSError:
+            pass
+        if keeper_pid is not None:
+            try:
+                os.kill(keeper_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(keeper_pid, 0)
+            except ChildProcessError:
+                pass
         try:
             proc.stdin.close()
         except OSError:

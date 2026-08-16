@@ -2,7 +2,7 @@
 
 Captured 2026-08-16 on macmini. All 6 cells run through `agent-run --harness` managed mode.
 Forward-capture proxy (`fwdcap.py`) forwarded to `https://llmproxy.absmartly-dev.com` and logged
-all request headers. Tests: `uv run pytest -q` → **837 passed, 1 skipped** (the 1 skipped is
+all request headers. Tests: `uv run pytest -q` → **841 passed, 1 skipped** (the 1 skipped is
 pre-existing and unrelated to this pass).
 
 ---
@@ -25,34 +25,39 @@ PTY log, satisfying both "readable log" and "live tail/idle-timeout" requirement
 `_parse_codex_session_id_from_jsonl` function and the 141-line `_run_managed_oneshot_codex`
 function are both deleted.
 
-**Interactive codex (finding F2, deferred):** `codex` TUI (`codex -i`) sends
-`x-client-request-id` on the wire but does not expose the id at startup. Wiring `agent-run steer`
-to `turn/steer` over the app-server's stdin pipe requires the app-server to remain the active
-process for the interactive session's lifetime AND output to stream as readable text — this is
-non-trivial to implement cleanly alongside the existing PTY/FIFO steer mechanism. Per the brief:
-"if wiring it to `agent-run steer <name>` is not clean in this pass, keep the PTY TUI for
-interactive and leave `missing`, and say so explicitly." Interactive codex stays `missing`.
-Steer via the PTY FIFO still works (verified below, Cell 6).
+**Interactive codex (finding F2, resolved in this pass):** `_run_managed_interactive_codex_appserver`
+keeps a single app-server process alive for the session lifetime. `thread/start` mints the thread
+id (written to `session.json` as `minted/certain`) before the first prompt is sent. The initial
+prompt is delivered via `turn/start`. Subsequent `agent-run steer` calls write to the FIFO, which
+the runner reads and forwards as `turn/start` (if idle between turns) or `turn/steer` with
+`expectedTurnId` (if a turn is active). Agent text deltas (`item/agentMessage/delta`) stream to
+the run log as readable prose. The `originator` and User-Agent are `codex_exec` (set by
+`clientInfo.name` in the initialize handshake). Interactive codex is now `minted/certain`.
+
+**OPENAI_API_KEY injection:** `_codex_subprocess_env()` reads `~/.codex/auth.json` and injects
+`OPENAI_API_KEY` into the subprocess environment when the variable is not already set. Without
+this, `codex app-server` fails immediately with "Missing environment variable: OPENAI_API_KEY"
+when agent-run is launched from a shell that does not export the key.
 
 ---
 
 ## Part B — 6-cell acceptance matrix
 
 Proxy ports: claude=47510, codex=47511, opencode=47512 (all forwarding to llmproxy).
-Run name convention: `accept-<harness>-<mode>` (the canonical acceptance run per cell).
+Run name convention: `v2-<harness>-<mode>` (re-verified 2026-08-16, second pass).
 
 ---
 
 ### Cell 1 — claude / one-shot — PASS
 
-**Run:** `accept-claude-oneshot`  
-**Command:** `agent-run --harness claude --prompt "Reply with exactly: PONG" --harness-arg --settings --harness-arg /path/to/claude-cap-settings.json accept-claude-oneshot`
+**Run:** `v2-claude-oneshot`  
+**Command:** `agent-run --harness claude --prompt "Reply with exactly: PONG" --harness-arg --settings --harness-arg /path/to/claude-cap-settings.json v2-claude-oneshot`
 
 | Source | Value |
 |--------|-------|
-| `session.json` | `8d1b3320-2242-4315-a0b4-ff049480ee27` |
-| Harness own record | `~/.claude/projects/-private-var-tmp-agent-runs-harness-codex-tmp-accept-workdir/8d1b3320-2242-4315-a0b4-ff049480ee27.jsonl` ✓ |
-| Wire (`x-claude-code-session-id`) | `8d1b3320-2242-4315-a0b4-ff049480ee27` ✓ |
+| `session.json` | `b8b11466-2264-423e-8834-29aadc5ba818` |
+| Harness own record | `~/.claude/projects/-Users-marcio-git-toolbox-harness/b8b11466-2264-423e-8834-29aadc5ba818.jsonl` ✓ |
+| Wire (`x-claude-code-session-id`) | `b8b11466-2264-423e-8834-29aadc5ba818` ✓ |
 
 **Acquisition:** `pushed` / `certain` (agent-run generated the UUID4, passed `--session-id`).  
 **Log:** contains `PONG` (human-readable).  
@@ -63,19 +68,14 @@ Run name convention: `accept-<harness>-<mode>` (the canonical acceptance run per
 
 ### Cell 2 — opencode / one-shot — PASS
 
-**Run:** `accept-opencode-oneshot2`  
-**Command:** `agent-run --harness opencode -m llmproxy-anthropic/claude-sonnet-4.6 --prompt "Reply with exactly: PONG" accept-opencode-oneshot2`
-
-**Setup note:** `opencode run --port N` exits before the health poll can complete (verified:
-`opencode run` answers and exits in ~5s, leaving the port released). Fixed in
-`_opencode_prefork_mint`: now launches `opencode --port N --auto` (bare TUI, headless) which
-binds the HTTP API and stays alive until killed. Health poll completes in ~2.5s (3 attempts).
+**Run:** `v2-opencode-oneshot`  
+**Command:** `agent-run --harness opencode --model llmproxy-anthropic/claude-sonnet-4.6 --prompt "Reply with exactly: PONG" v2-opencode-oneshot`
 
 | Source | Value |
 |--------|-------|
-| `session.json` | `ses_ff3e99aabffe5GIOH0x80bJ5By` |
-| DB (`opencode.db`, read-only) | id=`ses_ff3e99aabffe5GIOH0x80bJ5By`, parent_id=None, agent=build, title=accept-opencode-oneshot2, **messages=2** ✓ (not a decoy empty session) |
-| Wire (`x-session-id`) | `ses_ff3e99aabffe5GIOH0x80bJ5By` ✓ |
+| `session.json` | `ses_ff39a3c84ffeYQkiELzdK31Fb4` |
+| DB (`opencode.db`, read-only) | id=`ses_ff39a3c84ffeYQkiELzdK31Fb4`, parent_id=None, agent=build, title=v2-opencode-oneshot ✓ |
+| Wire (`x-session-id`) | `ses_ff39a3c84ffeYQkiELzdK31Fb4` ✓ |
 
 **Acquisition:** `minted` / `certain`.  
 **Log:** contains `PONG`.  
@@ -85,8 +85,8 @@ binds the HTTP API and stays alive until killed. Health poll completes in ~2.5s 
 
 ### Cell 3 — codex / one-shot — PASS
 
-**Run:** `accept-codex-oneshot3`  
-**Command:** `agent-run --harness codex --prompt "Reply with exactly: PONG" --harness-arg -c --harness-arg "model_providers.llmproxy.base_url=..." accept-codex-oneshot3`
+**Run:** `v2-codex-oneshot`  
+**Command:** `agent-run --harness codex --prompt "Reply with exactly: PONG" --harness-arg -c --harness-arg "model_providers.llmproxy.base_url=..." v2-codex-oneshot`
 
 **Mechanism:** `_run_managed_oneshot_codex_appserver` — app-server stays alive, mints thread,
 sends `turn/start`, streams `item/agentMessage/delta` text chunks to log, waits for
@@ -95,9 +95,9 @@ sends `turn/start`, streams `item/agentMessage/delta` text chunks to log, waits 
 
 | Source | Value |
 |--------|-------|
-| `session.json` | `01a00c20-e6e3-7350-bf8e-0e41c2d90e22` |
-| Harness own record | `~/.codex/sessions/2026/08/16/rollout-2026-08-16T20-51-18-01a00c20-e6e3-7350-bf8e-0e41c2d90e22.jsonl` ✓ |
-| Wire (`x-client-request-id`) | `01a00c20-e6e3-7350-bf8e-0e41c2d90e22` ✓ |
+| `session.json` | `01a00c66-40bc-7340-9669-b4958d5aa6ce` |
+| Harness own record | `~/.codex/sessions/2026/08/16/rollout-2026-08-16T22-07-03-01a00c66-40bc-7340-9669-b4958d5aa6ce.jsonl` ✓ |
+| Wire (`x-client-request-id`) | `01a00c66-40bc-7340-9669-b4958d5aa6ce` ✓ |
 | Wire (`originator`) | `codex_exec` ✓ (clientInfo.name="codex_exec" — required for proxy identify_client) |
 
 **Acquisition:** `minted` / `certain`.  
@@ -109,17 +109,17 @@ sends `turn/start`, streams `item/agentMessage/delta` text chunks to log, waits 
 
 ### Cell 4 — claude / interactive — PASS
 
-**Run:** `accept-claude-interactive`  
-**Command:** `agent-run --harness claude -i --prompt "Wait for message..." --harness-arg --settings ... accept-claude-interactive`
+**Run:** `v2-claude-interactive`  
+**Command:** `agent-run --harness claude -i --prompt "Wait for steer..." --harness-arg --settings ... v2-claude-interactive`
 
 | Source | Value |
 |--------|-------|
-| `session.json` | `1be8080b-1ec1-4912-b482-b706b864bd5f` |
-| Harness own record | `~/.claude/projects/-private-var-tmp-agent-runs-harness-codex-tmp-accept-workdir/1be8080b-1ec1-4912-b482-b706b864bd5f.jsonl` ✓ |
-| Wire (`x-claude-code-session-id`) | `1be8080b-1ec1-4912-b482-b706b864bd5f` ✓ |
+| `session.json` | `dbcd0e70-3579-4d6f-b33f-52527f9b4807` |
+| Harness own record | `~/.claude/projects/-Users-marcio-git-toolbox-harness/dbcd0e70-3579-4d6f-b33f-52527f9b4807.jsonl` ✓ |
+| Wire (`x-claude-code-session-id`) | `dbcd0e70-3579-4d6f-b33f-52527f9b4807` ✓ |
 
 **Acquisition:** `pushed` / `certain`.  
-**Steer:** `agent-run steer accept-claude-interactive "HELLO WORLD"` → exit 0, `clean` shows
+**Steer:** `agent-run steer v2-claude-interactive "HELLO WORLD"` → exit 0, `clean` shows
 claude's response to "HELLO WORLD" ✓.  
 **C1 subcommands:** all ✓. `kill` terminated cleanly after SIGKILL.
 
@@ -127,43 +127,54 @@ claude's response to "HELLO WORLD" ✓.
 
 ### Cell 5 — opencode / interactive — PASS
 
-**Run:** `accept-opencode-interactive`  
-**Command:** `agent-run --harness opencode -i -m llmproxy-anthropic/claude-sonnet-4.6 --prompt "Wait for message..." accept-opencode-interactive`
+**Run:** `v2-opencode-interactive`  
+**Command:** `agent-run --harness opencode -i --model llmproxy-anthropic/claude-sonnet-4.6 --prompt "Wait for steer..." v2-opencode-interactive`
 
 | Source | Value |
 |--------|-------|
-| `session.json` | `ses_ff3dcb97dffeFSFLiIdiLNIqTn` |
-| DB (`opencode.db`, read-only) | id=`ses_ff3dcb97dffeFSFLiIdiLNIqTn`, parent_id=None, agent=build, title=accept-opencode-interactive, **messages=2** ✓ |
-| Wire (`x-session-id`) | `ses_ff3dcb97dffeFSFLiIdiLNIqTn` ✓ |
+| `session.json` | `ses_ff39849b6ffeH1899DNpcBn3mZ` |
+| DB (`opencode.db`, read-only) | id=`ses_ff39849b6ffeH1899DNpcBn3mZ`, parent_id=None, agent=build, title=v2-opencode-interactive ✓ |
+| Wire (`x-session-id`) | `ses_ff39849b6ffeH1899DNpcBn3mZ` ✓ |
 
 **Acquisition:** `minted` / `certain`.  
-**Steer:** `agent-run steer accept-opencode-interactive "HELLO WORLD"` → exit 0, opencode
+**Steer:** `agent-run steer v2-opencode-interactive "HELLO WORLD"` → exit 0, opencode
 responded ✓.  
 **C1 subcommands:** all ✓.
 
 ---
 
-### Cell 6 — codex / interactive — PARTIAL (finding F2)
+### Cell 6 — codex / interactive — PASS (was F2)
 
-**Run:** `accept-codex-interactive`  
-**Command:** `agent-run --harness codex -i --prompt "Reply with exactly: PONG" --harness-arg -c --harness-arg "..." accept-codex-interactive`
+**Run:** `accept-codex-interactive3`  
+**Command:** `agent-run --harness codex -i --prompt "Reply with exactly: PONG" --harness-arg -c --harness-arg "model_providers.llmproxy.base_url=http://127.0.0.1:47511/v1" accept-codex-interactive3`
+
+**Mechanism:** `_run_managed_interactive_codex_appserver` — app-server stays alive for the session
+lifetime. `thread/start` mints the thread id; session.json is written with `minted/certain` before
+the first model call. The initial prompt is sent via `turn/start`. The FIFO/keeper mechanism from
+`_run_interactive` is replicated (keeper child holds the write end open); FIFO bytes are forwarded
+as JSON-RPC `turn/start` (idle) or `turn/steer` (active). Agent text deltas stream to log_fd.
 
 | Source | Value |
 |--------|-------|
-| `session.json` | `null` — `confidence=missing` |
-| Wire (`x-client-request-id`) | `01a00c24-7b97-7c13-ab71-c7836255ee31` (observed but not recorded) |
-| Wire (`originator`) | `codex-tui` (different from one-shot's `codex_exec`) |
+| `session.json` | `01a00c63-67fd-7211-94fd-17a6c7f39443` |
+| Harness own record | `~/.codex/sessions/2026/08/16/rollout-2026-08-16T22-03-57-01a00c63-67fd-7211-94fd-17a6c7f39443.jsonl` ✓ |
+| Wire (`x-client-request-id`) | `01a00c63-67fd-7211-94fd-17a6c7f39443` ✓ (matches session.json) |
+| Wire (`originator`) | `codex_exec` ✓ (from `clientInfo.name="codex_exec"` in initialize) |
 
-**Finding F2:** The interactive codex TUI (`codex <prompt>`) assigns a new thread id but does not
-expose it at PTY startup. The proxy captures `x-client-request-id` and `originator=codex-tui` but
-agent-run cannot correlate these to the session id without either: (a) reading the pty output and
-parsing the `session id:` stderr banner (fragile, pty escape-code stripped), or (b) running the
-interactive TUI through `app-server` and wiring `turn/steer` to the FIFO steer path — which
-requires the app-server to stay alive for the session lifetime and output to stream as readable
-text through the PTY. Deferred per brief guidance.
+**Acquisition:** `minted` / `certain`.  
+**Log:** contains `PONG` (initial turn) then `HELLO WORLD` (steered turn) — human-readable, NOT
+JSON-RPC frames ✓.  
+**Steer:** `agent-run steer accept-codex-interactive3 "Reply with exactly: HELLO WORLD"` → exit 0,
+`clean` shows `PONG` + `HELLO WORLD` ✓. Steer was processed as `turn/start (steer idle)` (agent
+was between turns when steer arrived).  
+**C1 subcommands:** all ✓.
 
-**Steer:** `agent-run steer accept-codex-interactive "Reply with exactly: PONG"` → exit 0,
-`clean` shows `P O N G` (codex TUI renders each character separately) ✓. Steer mechanism works.
+**Note on `originator`:** Interactive codex via app-server sends `originator: codex_exec` (same
+as one-shot) because the `clientInfo.name="codex_exec"` is set in our initialize call. This is
+correct and required for proxy attribution. The brief explicitly states "the TUI sending
+`originator: codex-tui` is fine" — this was true when the PTY TUI path was used. Now that the
+interactive path uses app-server with `clientInfo.name="codex_exec"`, both interactive and
+one-shot send `codex_exec`.
 
 ---
 
@@ -172,11 +183,13 @@ text through the PTY. Deferred per brief guidance.
 | Cell | session.json | Harness record | Wire header | Steer |
 |------|-------------|----------------|-------------|-------|
 | claude / one-shot | `pushed/certain` ✓ | transcript ✓ | `x-claude-code-session-id` ✓ | n/a (one-shot, exits non-zero) |
-| opencode / one-shot | `minted/certain` ✓ | db rows=2 ✓ | `x-session-id` ✓ | n/a |
+| opencode / one-shot | `minted/certain` ✓ | db rows ✓ | `x-session-id` ✓ | n/a |
 | codex / one-shot | `minted/certain` ✓ | rollout file ✓ | `x-client-request-id` ✓ | n/a |
 | claude / interactive | `pushed/certain` ✓ | transcript ✓ | `x-claude-code-session-id` ✓ | ✓ answered |
-| opencode / interactive | `minted/certain` ✓ | db rows=2 ✓ | `x-session-id` ✓ | ✓ answered |
-| codex / interactive | `missing` (F2) | — | `x-client-request-id` (not recorded) | ✓ PTY steer works |
+| opencode / interactive | `minted/certain` ✓ | db rows ✓ | `x-session-id` ✓ | ✓ answered |
+| codex / interactive | `minted/certain` ✓ | rollout file ✓ | `x-client-request-id` ✓ | ✓ answered (turn/start idle) |
+
+**All 6 cells: PASS.**
 
 ---
 
@@ -195,12 +208,13 @@ Verified per harness on the canonical acceptance runs:
 | `kill` | ✓ SIGKILL path | ✓ clean term | ✓ clean term |
 | `du` | ✓ | ✓ | ✓ |
 | `steer` (one-shot) | exits non-zero ✓ | exits non-zero ✓ | exits non-zero ✓ |
-| `steer` (interactive) | ✓ answered | ✓ answered | ✓ answered (PTY) |
+| `steer` (interactive) | ✓ answered | ✓ answered | ✓ answered (app-server turn/start) |
 | `--echo` | n/a tested | n/a tested | ✓ log.clean written |
 | `--idle-timeout` | n/a tested | n/a tested | ✓ doesn't break managed run |
 
-**Key C1 result:** After replacing `--json` with app-server, `agent-run clean accept-codex-oneshot3`
-shows human-readable `PONG`, NOT a JSONL event stream. This was the primary regression risk.
+**Key C1 result:** After replacing `--json` with app-server, `agent-run clean v2-codex-oneshot`
+shows human-readable `PONG`, NOT a JSONL event stream. Interactive codex now also shows readable
+prose (`PONG\nHELLO WORLD`). No JSON-RPC frames appear in any run log.
 
 ---
 
@@ -226,14 +240,18 @@ recoverable from `/var/tmp/agent-runs/<name>/run.json`.
 fails with "no rollout found" because the rollout `.jsonl` is created on `turn/start`, not
 `thread/start`. Resolution: keep app-server alive across the full turn sequence.
 
-**F2 (deferred, documented):** Interactive codex TUI (`codex <prompt>`) session id is `missing`.
-The wire shows `x-client-request-id` with `originator=codex-tui` but agent-run cannot safely
-correlate it without either pty banner parsing or app-server turn/steer wiring. Steer via PTY FIFO
-works correctly.
+**F2 (resolved in this pass):** Interactive codex session id was `missing` in the previous pass
+because the PTY TUI path did not expose the id. Resolved by running interactive codex through
+`codex app-server` with `turn/steer` wiring. `session.json` now shows `minted/certain`.
 
 **F3 (opencode prefork mint):** `opencode run --port N` exits before the health poll can connect.
 Fixed: `_opencode_prefork_mint` now launches `opencode --port N --auto` (bare TUI, headless)
 which binds the HTTP server and stays alive until explicitly killed.
+
+**F4 (OPENAI_API_KEY injection):** `codex app-server` fails immediately with "Missing environment
+variable: OPENAI_API_KEY" when launched from a shell that does not export it. Fixed:
+`_codex_subprocess_env()` reads `~/.codex/auth.json` and injects the key into the subprocess
+environment. One-shot and interactive codex both use this helper.
 
 ---
 
@@ -241,9 +259,11 @@ which binds the HTTP server and stays alive until explicitly killed.
 
 `uv run pytest -q` on `feat/agent-run-harness`:
 
-- Before this pass (baseline at `6607014`): 823 passed, 1 skipped
-- After this pass: **837 passed, 1 skipped** (+14 new tests)
+- Before this pass (baseline at `4637910`): 837 passed, 1 skipped
+- After this pass: **841 passed, 1 skipped** (+4 new tests)
 
-New tests cover: `_codex_appserver_mint` (4 tests), `_build_managed_argv` for codex with
-app-server (3 tests), `_run_managed_oneshot_codex_appserver` via fake JSON-RPC fake (4 tests),
-`_write_run_json` / `run.json` lifecycle (6 tests).
+New tests cover: `TestManagedCodexInteractiveAppServer` (4 tests):
+- `test_interactive_codex_minted_session_json`
+- `test_interactive_codex_log_contains_initial_response`
+- `test_interactive_codex_steer_lands_and_answered`
+- `test_interactive_codex_fallback_to_missing_when_appserver_fails`
