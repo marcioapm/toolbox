@@ -2755,3 +2755,48 @@ class TestScratchFacts:
         assert scratch["files_modified_recent"] >= 1
         assert scratch["newest_mtime_age_s"] is not None
         assert scratch["newest_mtime_age_s"] < agent_run.WATCH_SCRATCH_RECENT_SECONDS
+
+    def test_repo_arg_does_not_redirect_scratch_scan(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        """--repo must not move the scratch scan off the run's recorded launch cwd.
+
+        The active branch computes repo for git facts as repo_arg or recorded_cwd.
+        Passing --repo must not silently replace the cwd used for the scratch scan:
+        activity written to the recorded cwd must be visible even when --repo
+        points at a different directory.
+        """
+        recorded_cwd = tmp_path / "recorded_cwd"
+        recorded_cwd.mkdir()
+        # Recent file in the recorded cwd — the scratch scan must see this.
+        (recorded_cwd / "findings.md").write_text("analysis\n")
+
+        repo_override = tmp_path / "repo_override"
+        _init_repo(repo_override)
+        # Only old file in the override directory.
+        old_file = repo_override / "old.txt"
+        old_file.write_text("old\n")
+        old_time = time.time() - 7200
+        os.utime(old_file, (old_time, old_time))
+
+        _make_run(
+            isolated_runs_root, isolated_log_root, "sc5",
+            status="running", pid=111, log_age_secs=1,
+            cwd=str(recorded_cwd),
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        # Pass --repo pointing at repo_override, which has no recent activity.
+        agent_run.cmd_watch(_watch_args("sc5", repo=str(repo_override)))
+        payload = json.loads(capsys.readouterr().out)
+
+        scratch = payload["scratch"]
+        # Git facts use repo_override (the --repo argument).
+        assert payload["repo"] == str(repo_override)
+        # Scratch must use the recorded cwd, not the --repo override.
+        assert scratch["error"] is None, (
+            f"Scratch scan must use recorded cwd, not --repo override "
+            f"(error={scratch['error']!r})"
+        )
+        assert scratch["files_modified_recent"] >= 1, (
+            "Scratch must see the recent file in recorded cwd, not the old file in repo_override"
+        )

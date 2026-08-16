@@ -3191,6 +3191,7 @@ def _cmd_watch_observe(
         elapsed_s = max(0.0, (end_ref - started_dt).total_seconds())
 
     repo_str = repo_arg or (_watch_read_cwd_file(state_dir / "cwd") or None)
+    recorded_cwd = _watch_read_cwd_file(state_dir / "cwd") or None
     payload = _watch_payload(
         name,
         observed_at,
@@ -3201,7 +3202,10 @@ def _cmd_watch_observe(
         started_at=started_raw,
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
-        **observed(repo_str, _read(state_dir / "launch_head") or None, repo_str),
+        # repo_str is for git-fact attribution; recorded_cwd is for scratch so
+        # that --repo (correcting which repo to inspect) does not silently move
+        # the scratch scan off the run's launch directory.
+        **observed(repo_str, _read(state_dir / "launch_head") or None, recorded_cwd),
     )
     _watch_emit(
         payload,
