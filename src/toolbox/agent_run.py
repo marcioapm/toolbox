@@ -368,6 +368,35 @@ WATCH_TAIL_MAX_BYTES: int = 256 * 1024
 # 16 MiB covers a full day of typical PTY capture at ~180 bytes/s.
 WATCH_LINE_COUNT_MAX_BYTES: int = 16 * 1024 * 1024
 
+# Scratch-scan bounds. The scan walks a working directory including its
+# gitignored paths, so nothing about the tree is under our control; each bound
+# caps a different way that walk can run long.
+# Regular files stat()ed before truncating.
+WATCH_SCRATCH_MAX_FILES: int = 2000
+# Directory entries visited whatever their type, so that a wide directory of
+# non-files (symlinks, FIFOs, empty sub-dirs) is bounded too — the file cap
+# alone never fires there.
+WATCH_SCRATCH_MAX_ENTRIES: int = 10_000
+# Max directory depth to descend into below the working directory root.
+WATCH_SCRATCH_MAX_DEPTH: int = 8
+# Wall-clock budget for the entire scan, checked between filesystem calls.
+# The budget is cooperative, not hard: a single blocking scandir or stat on a
+# slow/hostile mount can exceed it without interruption.  A 30s watchdog poll
+# runs five serial watches plus a 5s aggregate git budget, so 0.5s per scan
+# keeps scratch under 2% of the cycle per watched run even over SSH.
+# Uses time.monotonic() to avoid NTP jumps skewing deadline arithmetic.
+# The outer deadline check is pinned by test_outer_deadline_check_fires.
+WATCH_SCRATCH_BUDGET_SECONDS: float = 0.5
+# "Recent" window for files_modified_recent, matching the log growing window
+# so both facts describe freshness the same way.
+WATCH_SCRATCH_RECENT_SECONDS: float = 60.0
+# Directory names pruned from every descent level — heavy generated trees
+# that an agent never writes to and that would dominate the file count.
+WATCH_SCRATCH_PRUNE_DIRS: frozenset[str] = frozenset({
+    ".git", "node_modules", "__pycache__", ".venv",
+    "target", "dist", "build",
+})
+
 # Git env vars that redirect a command at a different repo/index than the one
 # named on the command line; a poll must not inherit these from its caller.
 WATCH_GIT_ENV_VARS_TO_STRIP: frozenset[str] = frozenset(
@@ -1325,6 +1354,33 @@ def _is_dir_safe(path: Path) -> bool:
         return path.is_dir()
     except OSError:
         return False
+
+
+# Tri-state values returned by _probe_dir_state.
+_DIR_PRESENT = "present"        # a directory is there
+_DIR_MISSING = "missing"        # nothing there, or there but not a directory
+_DIR_UNSTATABLE = "unstatable"  # stat raised OSError (e.g. unreadable parent)
+
+
+def _probe_dir_state(path: Path) -> str:
+    """Return a tri-state describing *path*: present, missing, or unstatable.
+
+    ``Path.is_dir()`` answers ``False`` both for "absent" and for "cannot be
+    interrogated" (an unreadable parent raises on some platforms and returns
+    ``False`` on others), while ``os.stat()`` raises ``OSError`` for the
+    latter.  Callers that must not read "cannot stat" as "gone" use this
+    probe rather than ``Path.is_dir()`` or ``_is_dir_safe()``.
+
+    ``ELOOP`` (self-referential symlink) counts as missing: no directory
+    could ever exist at that path.
+    """
+    try:
+        st = os.stat(path)
+        return _DIR_PRESENT if _stat_module.S_ISDIR(st.st_mode) else _DIR_MISSING
+    except FileNotFoundError:
+        return _DIR_MISSING
+    except OSError as exc:
+        return _DIR_MISSING if exc.errno == errno.ELOOP else _DIR_UNSTATABLE
 
 
 def _require_state(name: str) -> Path:
@@ -2779,11 +2835,31 @@ def cmd_watch(args: argparse.Namespace) -> int:
     as_json = bool(args.json)
     state_dir = _state_dir(name)
     log_dir = _log_dir(name)
-    if not _is_dir_safe(state_dir) and not _is_dir_safe(log_dir):
-        # Distinct from the never-raise guard below: nothing to observe, as
-        # opposed to observation breaking. Empty stdout, exit 2.
+
+    state_dir_probe = _probe_dir_state(state_dir)
+    log_dir_probe = _probe_dir_state(log_dir)
+
+    if state_dir_probe == _DIR_MISSING and log_dir_probe == _DIR_MISSING:
+        # Both paths are conclusively absent: no run by this name exists.
+        # Distinct from observation breaking; empty stdout, exit 2.
         print(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}", file=sys.stderr)
         return 2
+
+    if state_dir_probe == _DIR_UNSTATABLE or log_dir_probe == _DIR_UNSTATABLE:
+        # At least one path cannot be statted: the run may be live but
+        # unreadable.  Emit the degraded contract so a poller never reads
+        # "can't observe" as "no such run", then exit 0.
+        message = (
+            f"cannot stat {'state' if state_dir_probe == _DIR_UNSTATABLE else 'log'} "
+            f"directory for '{name}' — run may be live but is unreadable"
+        )
+        payload = _watch_payload(name, _now_iso(), "unknown", observation_error=message)
+        _watch_emit(
+            payload,
+            as_json,
+            f"name={name} status={payload['status']} observation_error={message!r}",
+        )
+        return 0
 
     # Everything below observes best-effort facts about a run this process
     # does not control; an unanticipated failure must still print the full
@@ -2805,6 +2881,309 @@ def cmd_watch(args: argparse.Namespace) -> int:
 def _watch_emit(payload: dict, as_json: bool, human: str) -> None:
     """Print the contract as JSON, or *human* as the one-line form."""
     print(json.dumps(payload) if as_json else human)
+
+
+class _ScratchScanError(Exception):
+    """Aborts a scratch scan with a categorical *code*.
+
+    The code is a fixed string, never ``str(exc)``: the scratch facts are
+    rendered into Discord and persisted, and an OSError's text carries the
+    path it failed on.
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _scratch_unknown(code: str) -> dict:
+    """Scratch facts saying "unknown, because *code*".
+
+    Every decision field is null rather than 0 so a poller cannot read a
+    failed scan as observed inactivity.
+    """
+    return {
+        "newest_mtime_age_s": None,
+        "files_modified_recent": None,
+        "scanned": None,
+        "truncated": False,
+        "error": code,
+    }
+
+
+def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
+    """Scan *working_dir* for recent file-write activity, gitignored paths included.
+
+    Read-only review runs write their findings to gitignored scratch (e.g.
+    ``.taskdocs/probe/``, ``.taskdocs/findings-*.md``) and produce no git
+    facts at all, so git-only evidence treats them as stalled.  This scan
+    gives the watchdog a signal that is blind to git status.
+
+    Bounded by WATCH_SCRATCH_MAX_FILES, WATCH_SCRATCH_MAX_ENTRIES,
+    WATCH_SCRATCH_MAX_DEPTH and WATCH_SCRATCH_BUDGET_SECONDS so it stays cheap
+    on every poll over SSH; WATCH_SCRATCH_PRUNE_DIRS trees are skipped.
+
+    Returns a dict with keys:
+      newest_mtime_age_s    – age of the most-recently-modified file (float|null)
+      files_modified_recent – files modified within WATCH_SCRATCH_RECENT_SECONDS (int|null)
+      scanned               – files actually examined (int|null)
+      truncated             – True when a bound was hit before the scan finished (bool)
+      error                 – categorical reason the result is unknown (str|null)
+
+    On truncation the result is asymmetric by design:
+      files_modified_recent >= 1  – sound positive evidence (activity was seen
+                                    within the root tree; fd-based descent with
+                                    O_NOFOLLOW prevents counting outside files);
+                                    kept with truncated=True and error=None.
+      files_modified_recent == 0  – absence of evidence, not evidence of absence;
+                                    degraded to null fields, truncated=True, and a
+                                    categorical code (file_limit/entry_limit/
+                                    timeout/depth_limit).  See test
+                                    test_truncated_zero_degrades_to_null_with_code.
+
+    Any hard error yields ``_scratch_unknown``: null counts, never a confident 0.
+    """
+    if not working_dir:
+        return _scratch_unknown("no_working_dir")
+
+    root = Path(working_dir)
+    now = time.monotonic()
+    deadline = now + WATCH_SCRATCH_BUDGET_SECONDS
+
+    try:
+        if not root.is_dir():
+            return _scratch_unknown("not_a_directory")
+    except OSError:
+        return _scratch_unknown("stat_error")
+
+    scan_start = time.time()  # wall-clock epoch for mtime comparisons only
+
+    newest_mtime: Optional[float] = None  # epoch seconds of the newest file seen
+    files_modified_recent: int = 0
+    scanned: int = 0
+    entries_visited: int = 0
+    truncated: bool = False
+    truncation_code: str = ""  # set alongside truncated=True; one of the categorical codes
+
+    # Iterative walk using opened directory descriptors so descent cannot follow
+    # a symlink that replaced a queued directory between classification and
+    # descent.  O_NOFOLLOW|O_DIRECTORY causes os.open to fail (ENOTDIR/ELOOP)
+    # when the target is a symlink, preventing both outside-positive injection
+    # and active-subtree hiding.  The queue stores (fd, depth) tuples; open fds
+    # are bounded by the queue, not by total entries seen.
+    #
+    # Fall-back (platforms without O_NOFOLLOW or O_DIRECTORY, or where
+    # os.open does not accept dir_fd): revalidate directory identity with
+    # lstat(st_dev, st_ino) immediately before descent and fail unknown on any
+    # mismatch.  This narrows but does not fully close the race: a swap that
+    # completes between the lstat and the scandir call cannot be detected.
+    _DIR_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    _USE_FD_DESCENT = (
+        hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in os.supports_dir_fd
+    )
+
+    try:
+        root_fd = os.open(str(root), _DIR_OPEN_FLAGS)
+    except OSError:
+        return _scratch_unknown("stat_error")
+
+    # Queue stores (fd, depth).  Each fd is open and will be closed after
+    # its contents are scanned (or when the queue is drained on early exit).
+    queue: list[tuple[int, int]] = [(root_fd, 0)]
+
+    def _drain_queue(q: list) -> None:
+        """Close every fd remaining in the queue without raising."""
+        for _fd, _ in q:
+            try:
+                os.close(_fd)
+            except OSError:
+                pass
+        q.clear()
+
+    try:
+        while queue:
+            # Budget is cooperative: checked between filesystem calls, not
+            # during them.  A single blocking scandir/stat can exceed it on
+            # slow or hostile mounts.  See WATCH_SCRATCH_BUDGET_SECONDS.
+            if time.monotonic() >= deadline:
+                truncated = True
+                truncation_code = "timeout"
+                break
+
+            current_fd, depth = queue.pop()
+
+            # Stream the scandir iterator, never list() it, and re-check the
+            # deadline per entry: on slow storage the enumeration itself is
+            # what runs long, and only a per-entry check bounds it.
+            try:
+                with os.scandir(current_fd) as it:
+                    for entry in it:
+                        if time.monotonic() >= deadline:
+                            truncated = True
+                            truncation_code = "timeout"
+                            break
+
+                        entries_visited += 1
+                        if entries_visited >= WATCH_SCRATCH_MAX_ENTRIES:
+                            truncated = True
+                            truncation_code = "entry_limit"
+                            break
+
+                        # One no-follow stat classifies the entry and fetches the
+                        # mtime in a single syscall.  DirEntry.stat(follow_symlinks=
+                        # False) is cached by the OS after the first call, so this
+                        # is cost-neutral relative to two predicate calls.  Any
+                        # OSError (including a file that vanished during
+                        # classification) is caught here, preventing the false/false
+                        # predicate path that silently treated disappearing entries
+                        # as ignorable special files.
+                        try:
+                            entry_stat = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            raise _ScratchScanError("stat_error")
+
+                        st_mode = entry_stat.st_mode
+                        if _stat_module.S_ISDIR(st_mode):
+                            if entry.name not in WATCH_SCRATCH_PRUNE_DIRS:
+                                if depth < WATCH_SCRATCH_MAX_DEPTH:
+                                    # Open child fd relative to current_fd (openat
+                                    # semantics): O_NOFOLLOW rejects a symlink that
+                                    # replaced the queued directory after classification,
+                                    # failing with ENOTDIR or ELOOP; other OSErrors
+                                    # (EACCES, EIO, ENOENT) are scan failures.
+                                    # On the fallback path, revalidate identity (st_dev,
+                                    # st_ino) before opening; a mismatch means the
+                                    # directory was replaced but the recheck cannot
+                                    # detect a swap between lstat and scandir.
+                                    if _USE_FD_DESCENT:
+                                        try:
+                                            child_fd = os.open(
+                                                entry.name,
+                                                _DIR_OPEN_FLAGS,
+                                                dir_fd=current_fd,
+                                            )
+                                        except OSError as _open_err:
+                                            # ENOTDIR/ELOOP: O_NOFOLLOW rejected a
+                                            # symlink — directory identity changed.
+                                            # Other errors: permission, I/O, gone.
+                                            if _open_err.errno in (errno.ENOTDIR, errno.ELOOP):
+                                                raise _ScratchScanError("stat_error")
+                                            raise _ScratchScanError("scan_error")
+                                    else:
+                                        child_path = Path(entry.path)
+                                        try:
+                                            recheck = os.lstat(str(child_path))
+                                        except OSError:
+                                            raise _ScratchScanError("stat_error")
+                                        if (
+                                            recheck.st_dev != entry_stat.st_dev
+                                            or recheck.st_ino != entry_stat.st_ino
+                                        ):
+                                            raise _ScratchScanError("stat_error")
+                                        try:
+                                            child_fd = os.open(str(child_path), _DIR_OPEN_FLAGS)
+                                        except OSError:
+                                            raise _ScratchScanError("scan_error")
+                                    queue.append((child_fd, depth + 1))
+                                else:
+                                    # Non-pruned subtree skipped solely for depth:
+                                    # unseen files may be recent, so mark truncated.
+                                    truncated = True
+                                    truncation_code = "depth_limit"
+                            continue
+
+                        # Only regular files contribute to the activity signal.
+                        if not _stat_module.S_ISREG(st_mode):
+                            continue
+
+                        mtime = entry_stat.st_mtime
+
+                        # NaN and infinities cannot represent a real timestamp:
+                        # NaN makes every ordered comparison false (max(0.0, NaN)
+                        # returns 0.0); -inf reads as infinitely old; +inf reaches
+                        # clock_skew only incidentally.  Reject all three uniformly
+                        # so hostile or faulty FUSE/NFS stat data cannot manufacture
+                        # a confident zero.
+                        if not math.isfinite(mtime):
+                            raise _ScratchScanError("invalid_mtime")
+
+                        scanned += 1
+                        if newest_mtime is None or mtime > newest_mtime:
+                            newest_mtime = mtime
+                        age = scan_start - mtime
+                        if age < -WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS:
+                            # mtime materially in the future: clock disagreement on the
+                            # filesystem server.  A freshly-written file on NFS can show
+                            # age < 0 because the server clock leads the client.  Beyond
+                            # WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS this is unsound to
+                            # ignore: degrade to null rather than report a confident zero
+                            # (matching the tolerance the log path already applies).
+                            raise _ScratchScanError("clock_skew")
+                        # age is >= -TOLERANCE here; minor jitter (age < 0 within tolerance)
+                        # is treated as 0, which is within the recent window.
+                        if age < WATCH_SCRATCH_RECENT_SECONDS:
+                            files_modified_recent += 1
+
+                        if scanned >= WATCH_SCRATCH_MAX_FILES:
+                            truncated = True
+                            truncation_code = "file_limit"
+                            break
+
+            finally:
+                # current_fd was opened before being pushed; close it now
+                # regardless of how the scan ended (normal, break, exception).
+                try:
+                    os.close(current_fd)
+                except OSError:
+                    pass
+
+            if truncated and truncation_code != "depth_limit":
+                # depth_limit only truncates the queue; continue scanning
+                # remaining queued directories unless another bound fires.
+                break
+
+    except _ScratchScanError as err:
+        _drain_queue(queue)
+        return _scratch_unknown(err.code)
+    except OSError:
+        _drain_queue(queue)
+        # scandir() failed on the root or a discovered subdirectory (removed,
+        # permission denied, I/O error). Partial observations are unreliable.
+        return _scratch_unknown("scan_error")
+
+    # Drain any remaining queued fds (e.g. after a truncation break above).
+    _drain_queue(queue)
+
+    if newest_mtime is None:
+        newest_mtime_age_s: Optional[float] = None
+    else:
+        delta = scan_start - newest_mtime
+        # Clamp minor future jitter (within WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS)
+        # to 0.0; material clock skew was already caught per-file above.
+        newest_mtime_age_s = max(0.0, delta)
+
+    # Asymmetric truncation contract: files_modified_recent >= 1 is sound
+    # positive evidence even under truncation — fd-based descent with
+    # O_NOFOLLOW|O_DIRECTORY confines the scan to the root tree so outside
+    # files cannot be counted.  A zero under truncation is absence of evidence,
+    # not evidence of absence — degrade to null fields plus a categorical code.
+    # Tests: test_truncated_zero_degrades_to_null_with_code (zero-degradation),
+    # test_queued_dir_replaced_by_symlink_outside_injection (confinement positive),
+    # test_queued_dir_replaced_by_symlink_hides_activity (confinement zero).
+    if truncated and files_modified_recent == 0:
+        result = _scratch_unknown(truncation_code)
+        result["truncated"] = True
+        return result
+
+    return {
+        "newest_mtime_age_s": newest_mtime_age_s,
+        "files_modified_recent": files_modified_recent,
+        "scanned": scanned,
+        "truncated": truncated,
+        "error": None,
+    }
 
 
 def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
@@ -2835,6 +3214,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
             "top_repeated_read": None,
         },
         "observation_error": None,
+        "scratch": _scratch_unknown("not_observed"),
     }
     unknown = set(fields) - set(payload)
     if unknown:
@@ -2871,7 +3251,7 @@ def _cmd_watch_observe(
     # names can change between this line and the actual read.
     log = _log_file_for(name)
 
-    def observed(repo: Optional[str], launch_head: Optional[str]) -> dict:
+    def observed(repo: Optional[str], launch_head: Optional[str], cwd: Optional[str]) -> dict:
         git, git_error = _watch_repo_git(repo, launch_head)
         log_facts, signals = _watch_log_observation(log)
         return {
@@ -2883,15 +3263,28 @@ def _cmd_watch_observe(
             "git": git,
             "git_error": git_error,
             "signals": signals,
+            "scratch": _watch_scratch_facts(cwd),
         }
 
-    if not state_dir.is_dir():
+    state_dir_state = _probe_dir_state(state_dir)
+
+    if state_dir_state == _DIR_UNSTATABLE:
+        # The state dir may well be there; we just cannot tell. Any status
+        # emitted here would look terminal and hide a still-live run, so
+        # raise into cmd_watch's never-raise guard, which emits the contract
+        # with observation_error set instead.
+        raise PermissionError(
+            f"state directory for '{name}' is unreadable — "
+            "run may still be live; cannot determine status"
+        )
+
+    if state_dir_state == _DIR_MISSING:
         # State dir gone, log survived: cmd_status's "not running (log
         # preserved)" case, usually a reboot. The `cwd` state file went with
         # it, so git facts need an explicit --repo and every process fact is
         # unknowable.
         payload = _watch_payload(
-            name, observed_at, WATCH_STATUS_LOG_PRESERVED, **observed(repo_arg, None)
+            name, observed_at, WATCH_STATUS_LOG_PRESERVED, **observed(repo_arg, None, repo_arg)
         )
         _watch_emit(
             payload,
@@ -2917,6 +3310,7 @@ def _cmd_watch_observe(
         elapsed_s = max(0.0, (end_ref - started_dt).total_seconds())
 
     repo_str = repo_arg or (_watch_read_cwd_file(state_dir / "cwd") or None)
+    recorded_cwd = _watch_read_cwd_file(state_dir / "cwd") or None
     payload = _watch_payload(
         name,
         observed_at,
@@ -2927,7 +3321,10 @@ def _cmd_watch_observe(
         started_at=started_raw,
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
-        **observed(repo_str, _read(state_dir / "launch_head") or None),
+        # repo_str is for git-fact attribution; recorded_cwd is for scratch so
+        # that --repo (correcting which repo to inspect) does not silently move
+        # the scratch scan off the run's launch directory.
+        **observed(repo_str, _read(state_dir / "launch_head") or None, recorded_cwd),
     )
     _watch_emit(
         payload,

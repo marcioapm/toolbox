@@ -22,6 +22,7 @@ WATCH_CONTRACT_KEYS = {
     "schema", "name", "observed_at", "status", "exit_code", "pid",
     "interactive", "started_at", "ended_at", "elapsed_s", "terminal",
     "launch_error", "log", "repo", "git", "git_error", "signals", "observation_error",
+    "scratch",
 }
 
 # The `signals` object emitted whenever the log could not be read at all.
@@ -113,6 +114,57 @@ def _init_repo(path: Path) -> None:
     (path / "a.txt").write_text("hello\n")
     _git(path, "add", "a.txt")
     _git(path, "commit", "-q", "-m", "initial")
+
+
+def _repo_with_gitignored_finding(repo: Path, subdir: str) -> Path:
+    """A clean repo whose only activity is a file under a gitignored dir.
+
+    This is the blind spot the scratch scan exists for: git reports zero
+    commits, zero untracked files and a clean worktree, yet the run is
+    actively writing.
+    """
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q")
+    (repo / "a.txt").write_text("tracked\n")
+    (repo / ".gitignore").write_text(".taskdocs/\n")
+    _git(repo, "add", "a.txt", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "initial")
+
+    finding = repo / ".taskdocs" / subdir / "findings-001.md"
+    finding.parent.mkdir(parents=True)
+    finding.write_text("analysis\n" * 1000)
+    return finding
+
+
+_REAL_SCANDIR = os.scandir
+
+
+def _patch_scandir(monkeypatch, hook) -> None:
+    """Replace ``os.scandir`` with one that passes each entry through *hook*.
+
+    The replacement stays lazy — one entry per ``__next__`` — so a scan that
+    stops part-way through a directory stops doing work part-way too, which
+    is what the budget tests measure.
+    """
+
+    class _HookedScandir:
+        def __init__(self, path):
+            self._it = _REAL_SCANDIR(path)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return hook(next(self._it))
+
+        def __enter__(self):
+            self._it.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._it.__exit__(*args)
+
+    monkeypatch.setattr(os, "scandir", _HookedScandir)
 
 
 # ---------------------------------------------------------------------------
@@ -2015,6 +2067,39 @@ class TestIsDirSafe:
         assert payload["observation_error"] is None
 
     @ROOT_SKIP
+    def test_cmd_watch_unstatable_state_and_missing_log_exits_zero_not_two(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """An unstatable state dir with no log must not return exit 2 (stop polling).
+
+        The old _is_dir_safe gate collapsed every OSError on the state dir to
+        False.  If the log was also absent, the conjunction was True and cmd_watch
+        returned exit 2, which tells the poller to stop polling this name —
+        permanently hiding a healthy but temporarily unreadable run.
+
+        With tri-state probes, UNSTATABLE + MISSING must emit the degraded
+        contract (observation_error set) and return exit 0.
+        """
+        # Create only the state dir, make the parent unreadable so stat fails.
+        state_dir = isolated_runs_root / "w4"
+        state_dir.mkdir(parents=True)
+        (state_dir / "status").write_text("running\n")
+        # No log dir created → log path is MISSING.
+        isolated_runs_root.chmod(0o000)
+        try:
+            rc = agent_run.cmd_watch(_watch_args("w4"))
+        finally:
+            isolated_runs_root.chmod(0o755)
+        assert rc == 0, (
+            "UNSTATABLE state + MISSING log must return exit 0, not exit 2; "
+            "exit 2 permanently stops polling the run"
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert isinstance(payload["observation_error"], str)
+        assert payload["observation_error"]
+
+    @ROOT_SKIP
     def test_cmd_status_does_not_raise_when_state_root_unreadable(
         self, isolated_runs_root, isolated_log_root, capsys
     ):
@@ -2030,3 +2115,1115 @@ class TestIsDirSafe:
         assert rc == 0
         out = capsys.readouterr().out
         assert "not running (log preserved)" in out
+
+
+# ---------------------------------------------------------------------------
+# scratch file-activity facts
+# ---------------------------------------------------------------------------
+
+class TestScratchFacts:
+    """Tests for _watch_scratch_facts and scratch field in the watch contract."""
+
+    SCRATCH_KEYS = {"newest_mtime_age_s", "files_modified_recent", "scanned", "truncated", "error"}
+
+    # ------------------------------------------------------------------
+    # unit-level tests of _watch_scratch_facts
+    # ------------------------------------------------------------------
+
+    def test_file_under_working_dir_is_reflected(self, tmp_path):
+        """A file written under the working dir shows up in the scratch facts."""
+        f = tmp_path / "findings.md"
+        f.write_text("review output\n")
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert set(result.keys()) == self.SCRATCH_KEYS
+        assert result["error"] is None
+        assert result["scanned"] >= 1
+        assert result["newest_mtime_age_s"] is not None
+        assert result["newest_mtime_age_s"] >= 0.0
+        # File was just written so it must count as recent.
+        assert result["files_modified_recent"] >= 1
+
+    def test_gitignored_scratch_file_is_included(self, tmp_path):
+        """The scan deliberately includes gitignored paths — that is the point.
+
+        Regression test for the blind spot: zero git facts but real activity.
+        """
+        repo = tmp_path / "repo"
+        _repo_with_gitignored_finding(repo, "probe")
+
+        # Git confirms zero activity: no commits since start, no untracked files.
+        launch_head = agent_run._watch_run_git_checked(
+            repo, ["rev-parse", "HEAD"]
+        ).stdout.strip()
+        git_result = agent_run._watch_git_facts_checked(repo, launch_head)
+        assert git_result.facts is not None
+        assert git_result.facts["commits_since_start"] == 0
+        assert git_result.facts["untracked_files"] == 0
+        assert git_result.facts["files_changed"] == 0
+
+        # Scratch scan must see the finding despite git seeing nothing.
+        result = agent_run._watch_scratch_facts(str(repo))
+        assert result["error"] is None
+        assert result["scanned"] is not None
+        assert result["scanned"] >= 1
+        # The scratch file was just written: it must count as recent.
+        assert result["files_modified_recent"] >= 1
+        assert result["newest_mtime_age_s"] is not None
+        assert result["newest_mtime_age_s"] < agent_run.WATCH_SCRATCH_RECENT_SECONDS
+
+    def test_pruned_dirs_are_not_descended(self, tmp_path):
+        """Directories in WATCH_SCRATCH_PRUNE_DIRS must not be entered."""
+        for dirname in agent_run.WATCH_SCRATCH_PRUNE_DIRS:
+            pruned = tmp_path / dirname
+            pruned.mkdir()
+            (pruned / "heavy.json").write_text("x" * 100)
+
+        # Put one real file outside the pruned dirs so we scan something.
+        (tmp_path / "real.py").write_text("code\n")
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] is None
+        # Only the one real file outside pruned dirs counts.
+        assert result["scanned"] == 1
+
+    def test_file_count_bound_sets_truncated(self, tmp_path, monkeypatch):
+        """Hitting WATCH_SCRATCH_MAX_FILES with zero recent files degrades to null + file_limit.
+
+        When the cap fires and files_modified_recent is still zero, the zero
+        is absence of evidence (unseen files may be recent).  The result must
+        have null decision fields, truncated=True, and error="file_limit".
+        """
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_MAX_FILES", 3)
+        # Only old files — the cap fires before any recent file could be found.
+        old_time = time.time() - 7200
+        for i in range(10):
+            f = tmp_path / f"f{i}.txt"
+            f.write_text("data\n")
+            os.utime(f, (old_time, old_time))
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["truncated"] is True
+        assert result["error"] == "file_limit"
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+
+    def test_truncated_with_recent_file_keeps_positive_evidence(self, tmp_path, monkeypatch):
+        """Hitting a bound after finding a recent file keeps positive evidence.
+
+        files_modified_recent >= 1 under truncation is sound positive evidence —
+        the scan saw activity.  The result must keep the count, truncated=True,
+        and error=None.  Test: pinning the asymmetric truncation contract.
+
+        Uses depth_limit truncation with a known-recent file at depth 1 and a
+        subdir at depth 2 that causes depth_limit to fire.  The recent file is
+        always scanned; the depth-limited subdir is reliably not.
+        """
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_MAX_DEPTH", 1)
+        # Recent file at depth 1: always scanned.
+        subdir = tmp_path / "sub"
+        subdir.mkdir()
+        (subdir / "recent.txt").write_text("data\n")
+        # Another subdir at depth 1 that has a child at depth 2: fires depth_limit.
+        deep_parent = tmp_path / "deep_parent"
+        deep_parent.mkdir()
+        deep_child = deep_parent / "nested"
+        deep_child.mkdir()
+        (deep_child / "unseen.txt").write_text("data\n")
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["truncated"] is True
+        # The recent file was seen, so positive evidence must be kept.
+        assert result["files_modified_recent"] is not None
+        assert result["files_modified_recent"] >= 1, (
+            "files_modified_recent must reflect the scanned recent file"
+        )
+        assert result["error"] is None, (
+            "Positive evidence under truncation must keep error=None"
+        )
+
+    def test_missing_or_unreadable_dir_returns_null_with_error_not_zero(self, tmp_path):
+        """A missing working directory must degrade to null fields + exact categorical code."""
+        missing = tmp_path / "does-not-exist"
+        result = agent_run._watch_scratch_facts(str(missing))
+        assert result["error"] == "not_a_directory"
+        # The numeric fields must be null, not a confident 0.
+        assert result["newest_mtime_age_s"] is None
+        assert result["files_modified_recent"] is None
+        assert result["scanned"] is None
+
+    def test_no_working_dir_returns_null_with_error(self):
+        """A None or empty working_dir degrades gracefully with an exact categorical code."""
+        for bad in (None, ""):
+            result = agent_run._watch_scratch_facts(bad)
+            assert result["error"] == "no_working_dir"
+            assert result["newest_mtime_age_s"] is None
+            assert result["files_modified_recent"] is None
+            assert result["scanned"] is None
+
+    def test_idle_working_dir_reports_large_age_not_error(self, tmp_path):
+        """A real directory with only old files reports a large age, not an error."""
+        old_file = tmp_path / "old.txt"
+        old_file.write_text("old\n")
+        # Age it to 1 hour ago.
+        old_time = time.time() - 3600
+        os.utime(old_file, (old_time, old_time))
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] is None
+        assert result["scanned"] == 1
+        assert result["newest_mtime_age_s"] is not None
+        assert result["newest_mtime_age_s"] >= agent_run.WATCH_SCRATCH_RECENT_SECONDS
+        assert result["files_modified_recent"] == 0
+
+    def test_future_mtime_beyond_tolerance_degrades_to_null_with_clock_skew(self, tmp_path):
+        """A materially future mtime must degrade to null + error='clock_skew'.
+
+        A confident zero is internally contradictory: newest_mtime_age_s is
+        null (clock disagreement) while files_modified_recent=0 claims inactivity
+        was observed.  On NFS/server-clock skew a freshly written file can have
+        a future mtime, so the zero fails toward escalation of a healthy run.
+
+        Choice matches the log path: minor jitter within
+        WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS is clamped to 0 (still recent);
+        beyond the tolerance the scan degrades.  Test: mutation replacing the
+        clock_skew raise with a pass now reports files_modified_recent=0,
+        error=None — a confident zero — and this test fails.
+        """
+        f = tmp_path / "future.txt"
+        f.write_text("data\n")
+        future_time = time.time() + agent_run.WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS + 10.0
+        os.utime(f, (future_time, future_time))
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "clock_skew", (
+            f"Materially future mtime must set error='clock_skew' (got {result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_future_mtime_within_tolerance_counts_as_recent(self, tmp_path):
+        """A mtime within WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS ahead is treated as 'now'.
+
+        Minor NFS/server-clock jitter should not degrade the scan; a freshly
+        written file with a slightly future timestamp must count as recent.
+        """
+        f = tmp_path / "jitter.txt"
+        f.write_text("data\n")
+        # Set mtime slightly in the future but within the tolerance.
+        jitter = agent_run.WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS / 2
+        os.utime(f, (time.time() + jitter, time.time() + jitter))
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] is None, (
+            "Minor future jitter within tolerance must not degrade the scan"
+        )
+        assert result["files_modified_recent"] is not None
+        assert result["files_modified_recent"] >= 1, (
+            "A file with minor future jitter must count as recent"
+        )
+
+    def test_nan_mtime_degrades_to_null_with_invalid_mtime(self, tmp_path, monkeypatch):
+        """A NaN st_mtime must degrade to null fields + error='invalid_mtime'.
+
+        NaN makes every ordered comparison false: the file is neither recent
+        nor clock-skewed, and max(0.0, NaN) returns 0.0.  Without the
+        isfinite guard this produces a confident zero, which can trigger
+        escalation of a healthy run.  Mutation: remove the math.isfinite
+        guard and the test fails because error is None and scanned=1.
+        """
+        import math as _math
+
+        (tmp_path / "real.txt").write_text("data\n")
+
+        class NaNMtimeEntry:
+            """Proxy a real DirEntry but return NaN from stat().st_mtime."""
+
+            def __init__(self, entry):
+                self._entry = entry
+
+            def stat(self, **kw):
+                s = self._entry.stat(**kw)
+                return type("FakeStat", (), {
+                    "st_mtime": float("nan"),
+                    "st_mode": s.st_mode,
+                })()
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+        _patch_scandir(monkeypatch, NaNMtimeEntry)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "invalid_mtime", (
+            f"NaN mtime must set error='invalid_mtime' (got {result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_positive_infinity_mtime_degrades_to_null_with_invalid_mtime(self, tmp_path, monkeypatch):
+        """+inf st_mtime must degrade to null fields + error='invalid_mtime'.
+
+        Positive infinity reaches the clock_skew guard incidentally, but one
+        uniform invalid_mtime category for all non-finite values is simpler
+        and deterministic.  Mutation: remove the isfinite guard and the test
+        fails because error changes to 'clock_skew' instead of 'invalid_mtime'.
+        """
+        (tmp_path / "real.txt").write_text("data\n")
+
+        class PosInfMtimeEntry:
+            def __init__(self, entry):
+                self._entry = entry
+
+            def stat(self, **kw):
+                s = self._entry.stat(**kw)
+                return type("FakeStat", (), {
+                    "st_mtime": float("inf"),
+                    "st_mode": s.st_mode,
+                })()
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+        _patch_scandir(monkeypatch, PosInfMtimeEntry)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "invalid_mtime", (
+            f"+inf mtime must set error='invalid_mtime' (got {result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_negative_infinity_mtime_degrades_to_null_with_invalid_mtime(self, tmp_path, monkeypatch):
+        """-inf st_mtime must degrade to null fields + error='invalid_mtime'.
+
+        Negative infinity is treated as infinitely old without the guard:
+        the file is not recent, age > 0, and the scan completes with a
+        confident zero.  Mutation: remove the isfinite guard and the test
+        fails because error is None and files_modified_recent=0.
+        """
+        (tmp_path / "real.txt").write_text("data\n")
+
+        class NegInfMtimeEntry:
+            def __init__(self, entry):
+                self._entry = entry
+
+            def stat(self, **kw):
+                s = self._entry.stat(**kw)
+                return type("FakeStat", (), {
+                    "st_mtime": float("-inf"),
+                    "st_mode": s.st_mode,
+                })()
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+        _patch_scandir(monkeypatch, NegInfMtimeEntry)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "invalid_mtime", (
+            f"-inf mtime must set error='invalid_mtime' (got {result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_wall_clock_budget_sets_truncated_before_exhaustion(self, tmp_path, monkeypatch):
+        """When the wall-clock budget is zero the scan truncates with error=timeout.
+
+        With no recent files found before the deadline, the zero is unsound:
+        result must have null fields, truncated=True, and error="timeout".
+        """
+        # Create only old files so the timeout fires with files_modified_recent==0.
+        old_time = time.time() - 7200
+        for i in range(5):
+            f = tmp_path / f"f{i}.txt"
+            f.write_text("data\n")
+            os.utime(f, (old_time, old_time))
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_BUDGET_SECONDS", 0.0)
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["truncated"] is True
+        assert result["error"] == "timeout"
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+
+    def test_outer_deadline_check_fires(self, tmp_path, monkeypatch):
+        """The outer per-queue-item deadline check must set truncated=True.
+
+        The outer check runs at the top of the while-queue loop before each
+        directory is processed.  To isolate it from the inner per-entry check:
+        two empty subdirectories are used (no entries → inner check never runs for
+        them).  The deadline expires precisely on the outer check for the second
+        empty subdirectory; with the outer check active, truncated=True.  With it
+        disabled the scan processes both empty subdirs and exits with truncated=False.
+
+        time.monotonic() call sequence (2 empty subdirs in root):
+          call 1: setup (now = ...)
+          call 2: outer check — root (proceed: return real time, deadline not yet)
+          call 3: inner check — root entry 1 (aaa_sub1, dir, not a file, no stat)
+          call 4: inner check — root entry 2 (zzz_sub2, dir, not a file, no stat)
+          call 5: outer check — zzz_sub2 (proceed: empty, real time)
+          call 6: outer check — aaa_sub1 (HERE: return past deadline → truncated=True)
+        Without the outer check: call 6 does not happen; aaa_sub1 is processed
+        (0 entries), queue empties, exits with truncated=False.
+
+        Mutation: disable the outer ``if time.monotonic() >= deadline: break``
+        block — this test then gets truncated=False and fails.
+        """
+        import time as _time
+
+        # Two empty subdirectories: no files, so the inner per-entry check
+        # for sub dirs never fires (their entries are dirs, counted but not
+        # stat-called; the inner check does fire once per entry in root).
+        (tmp_path / "aaa_sub1").mkdir()
+        (tmp_path / "zzz_sub2").mkdir()
+
+        call_count = [0]
+        real_monotonic = _time.monotonic
+
+        def patched_monotonic():
+            call_count[0] += 1
+            val = real_monotonic()
+            # Call 6 is the outer check for aaa_sub1 (3rd queue item).
+            # Returning past deadline here causes the outer check to truncate
+            # before aaa_sub1 is processed.
+            if call_count[0] >= 6:
+                return val + 1000.0
+            return val
+
+        monkeypatch.setattr(agent_run.time, "monotonic", patched_monotonic)
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["truncated"] is True, (
+            "Outer deadline check must set truncated=True; with it disabled the "
+            "scan processes both empty directories and exits with truncated=False"
+        )
+
+    def test_slow_enumeration_hits_budget_before_iterator_exhausted(self, tmp_path, monkeypatch):
+        """A slow-per-entry iterator must be cut off by the budget, not list()-materialised.
+
+        WATCH_SCRATCH_BUDGET_SECONDS has to bound wall-clock time even when the
+        cost is in yielding each entry.  Under list(os.scandir(...)) every entry
+        is materialised before the first deadline check, so the scan would take
+        ENTRY_COUNT * ENTRY_DELAY however small the budget.
+        """
+        import time as _time
+
+        ENTRY_DELAY = 0.02   # 20 ms per entry
+        ENTRY_COUNT = 20     # total would be 400 ms if list()-materialised
+        BUDGET = 0.05        # 50 ms — enough for ~2 entries, not all 20
+
+        for i in range(ENTRY_COUNT):
+            (tmp_path / f"slow_{i}.txt").write_text("data\n")
+
+        def slow(entry):
+            _time.sleep(ENTRY_DELAY)
+            return entry
+
+        _patch_scandir(monkeypatch, slow)
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_BUDGET_SECONDS", BUDGET)
+
+        start = _time.monotonic()
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        elapsed = _time.monotonic() - start
+
+        # Must respect the budget: must not take nearly as long as list()-materialising all entries.
+        assert elapsed < ENTRY_DELAY * ENTRY_COUNT * 0.5, (
+            f"Scan took {elapsed:.3f}s; list()-materialisation would have taken "
+            f"~{ENTRY_DELAY * ENTRY_COUNT:.3f}s — the budget is not being checked during enumeration"
+        )
+        assert result["truncated"] is True, "Budget hit must set truncated=True"
+
+    def test_entries_visited_cap_truncates_independently_of_file_count(self, tmp_path, monkeypatch):
+        """Entry cap with zero recent files degrades to null + entry_limit.
+
+        WATCH_SCRATCH_MAX_ENTRIES bounds enumeration work independently of
+        WATCH_SCRATCH_MAX_FILES: a wide directory of non-regular entries never
+        trips the file cap.  When the cap fires with no recent files seen, the
+        zero is unsound; the result must have null decision fields, truncated=True,
+        and error="entry_limit".
+        """
+        # Create entries that are not regular files (empty sub-dirs) so the file cap won't trigger.
+        for i in range(20):
+            (tmp_path / f"subdir_{i}").mkdir()
+
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_MAX_ENTRIES", 5)
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["truncated"] is True, (
+            "Entries-visited cap must set truncated=True when exceeded by non-file entries"
+        )
+        assert result["error"] == "entry_limit"
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+
+    def test_depth_limit_at_cap_sets_truncated(self, tmp_path, monkeypatch):
+        """A non-pruned directory at the depth cap must set truncated=True + depth_limit.
+
+        With WATCH_SCRATCH_MAX_DEPTH=1, a subdirectory encountered at depth=1
+        cannot be descended (depth < MAX_DEPTH is False for depth=1).  If the
+        only recent file is inside that subdirectory, the zero is unsound;
+        the result must have null decision fields, truncated=True, and
+        error="depth_limit".
+        Mutation: replace ``depth < WATCH_SCRATCH_MAX_DEPTH`` with
+        ``depth <= WATCH_SCRATCH_MAX_DEPTH`` — this test then fails because
+        the file is found, positive evidence is kept, and truncated=False.
+        """
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_MAX_DEPTH", 1)
+        # File at depth 2: root/sub (depth=1) is descended, sub/inner (depth=2 dir) is not.
+        # recent file is inside inner (depth 3 if we count files, depth 2 for the dir).
+        # Actually: root (depth=0) → sub (depth=1, descended) → inner (depth=1 dir, NOT descended)
+        # File must be inside a dir at depth=1 that tries to descend further.
+        inner = tmp_path / "sub" / "inner"
+        inner.mkdir(parents=True)
+        (inner / "recent.txt").write_text("recent\n")
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["truncated"] is True, (
+            "Non-pruned directory at max depth must set truncated=True"
+        )
+        assert result["error"] == "depth_limit"
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+
+    def test_depth_limit_file_at_cap_is_scanned(self, tmp_path, monkeypatch):
+        """A file exactly at the depth cap must be scanned (no truncation from depth alone)."""
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_MAX_DEPTH", 1)
+        # File at depth=1 (root/sub/file.txt): sub is enqueued from root (depth=0),
+        # file.txt is inside sub (depth=1) which is at cap but still descended.
+        at_cap = tmp_path / "sub" / "file.txt"
+        at_cap.parent.mkdir()
+        at_cap.write_text("recent\n")
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        # No directory beyond cap was encountered, so depth_limit must not fire.
+        assert result["error"] is None, (
+            "File at the depth cap must be scanned without triggering depth_limit"
+        )
+        assert result["files_modified_recent"] >= 1
+        assert result["scanned"] >= 1
+
+    def test_depth_propagation_regression(self, tmp_path, monkeypatch):
+        """Depth must advance by exactly 1 per level; a non-advancing depth hides deep files.
+
+        Mutation: replace ``depth + 1`` with ``depth`` in the queue append.
+        With WATCH_SCRATCH_MAX_DEPTH=1 and a file three levels deep, the mutant
+        never hits the depth cap (depth never grows past 0) and the file is
+        scanned, making this test fail on error != depth_limit.
+        """
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_MAX_DEPTH", 1)
+        # Three-level tree: root/a/b/c.txt — only accessible if depth does not advance.
+        deep = tmp_path / "a" / "b" / "c.txt"
+        deep.parent.mkdir(parents=True)
+        deep.write_text("data\n")
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        # With correct depth tracking: a/b is at depth 2 > MAX_DEPTH=1, so it is
+        # not enqueued and the scan sees only the depth_limit truncation.
+        assert result["truncated"] is True
+        # depth_limit may be overridden by another code if multiple bounds fire,
+        # but the scan must not report confident non-null counts.
+        assert result["files_modified_recent"] is None, (
+            "Depth propagation regression: depth not advancing lets deep files through"
+        )
+
+    def test_unreadable_subdir_returns_null_with_error(self, tmp_path):
+        """A PermissionError on a discovered subdirectory must degrade to null + exact code.
+
+        A confident zero here reads to the poller as observed inactivity and
+        stalls a healthy run; only null decision fields say "unknown".
+        """
+        import stat as _stat
+
+        subdir = tmp_path / "unreadable_subdir"
+        subdir.mkdir()
+        (subdir / "file.txt").write_text("data\n")
+        subdir.chmod(0)  # remove all permissions
+
+        try:
+            result = agent_run._watch_scratch_facts(str(tmp_path))
+            assert result["error"] == "scan_error", (
+                "A PermissionError on a subdirectory must set error='scan_error'"
+            )
+            assert result["files_modified_recent"] is None, (
+                "files_modified_recent must be null, not a confident 0"
+            )
+            assert result["newest_mtime_age_s"] is None
+            assert result["scanned"] is None
+            assert result["truncated"] is False
+        finally:
+            subdir.chmod(_stat.S_IRWXU)
+
+    def test_file_vanishes_at_stat_returns_null_with_error(self, tmp_path, monkeypatch):
+        """A FileNotFoundError while statting a file must degrade to null + error="stat_error".
+
+        The counts gathered so far describe a tree that has already changed
+        underneath the scan, so they must not be reported as observed.
+        """
+        (tmp_path / "real.txt").write_text("data\n")
+
+        class VanishingEntry:
+            """Proxy a real DirEntry but make stat() raise FileNotFoundError."""
+
+            def __init__(self, entry):
+                self._entry = entry
+
+            def stat(self, **kw):
+                raise FileNotFoundError(f"[Errno 2] No such file: '{self._entry.path}'")
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+        _patch_scandir(monkeypatch, VanishingEntry)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "stat_error", (
+            "A stat FileNotFoundError must set error='stat_error', not a different category"
+        )
+        assert result["files_modified_recent"] is None, (
+            "files_modified_recent must be null after a stat error"
+        )
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_file_vanishes_during_classification_returns_null_with_error(self, tmp_path, monkeypatch):
+        """An entry that vanishes between enumeration and stat() must degrade to null + stat_error.
+
+        With two separate predicate calls (is_dir then is_file), a file that
+        disappears after enumeration returns false from both, taking the same
+        path as an ignored FIFO/symlink and producing a confident zero.  The
+        single no-follow stat at classification closes this: any OSError at
+        that point raises stat_error rather than silently continuing.
+
+        This regression is distinct from test_file_vanishes_at_stat: that test
+        covers a file that passes is_file() and vanishes at stat(); this test
+        covers the identical safety failure reached one gate earlier.
+        Mutation: replacing S_ISREG with a constant-True check (so the entry
+        is always classified as a regular file regardless of mode) is not the
+        target here; the target is the OSError at stat() classification: if the
+        stat() raise is swallowed (e.g. 'except OSError: continue'), the test
+        fails because error is None and scanned=0 (confident zero).
+        """
+        (tmp_path / "real.txt").write_text("data\n")
+
+        # A DirEntry that raises OSError on stat() simulates classification-time
+        # disappearance: the entry existed during scandir() but is gone by stat().
+        class VanishingDuringClassification:
+            """Proxy a real DirEntry; raise OSError on stat() before classification."""
+
+            def __init__(self, entry):
+                self._entry = entry
+                self._stat_count = 0
+
+            def stat(self, **kw):
+                self._stat_count += 1
+                # Raise on the first stat() call (classification); the original
+                # two-predicate code would have called is_dir/is_file first and
+                # only stat()ed a surviving file.
+                raise FileNotFoundError(
+                    f"[Errno 2] No such file or directory: '{self._entry.path}'"
+                )
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+        _patch_scandir(monkeypatch, VanishingDuringClassification)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "stat_error", (
+            "Entry vanishing during classification must set error='stat_error', "
+            f"not produce a confident zero (got error={result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None, (
+            "files_modified_recent must be null when an entry vanishes during classification"
+        )
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_root_deleted_after_validation_returns_null_with_error(self, tmp_path):
+        """Root deleted between is_dir() and os.open() must degrade to null + stat_error.
+
+        The root-existence check (is_dir) and the directory open are a TOCTOU
+        pair.  With fd-based traversal the race window is narrower than with
+        pathname-based scandir, but deleting the root before os.open still
+        produces an OSError that must degrade to null decision fields, not zero.
+        """
+        target = tmp_path / "scanroot"
+        target.mkdir()
+        (target / "file.txt").write_text("data\n")
+
+        # Delete the target between is_dir() and os.open() by removing it first.
+        # We can simulate this deterministically: delete the directory before
+        # calling _watch_scratch_facts (is_dir will return False and we get
+        # not_a_directory) — that is the expected degradation path.
+        import shutil as _shutil
+        _shutil.rmtree(str(target))
+
+        result = agent_run._watch_scratch_facts(str(target))
+        assert result["error"] in ("not_a_directory", "stat_error", "scan_error"), (
+            f"Missing root must set a categorical error "
+            f"(got {result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None, (
+            "files_modified_recent must be null when root does not exist"
+        )
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_error_field_contains_no_os_path_or_message(self, tmp_path, monkeypatch):
+        """The 'error' field must carry categorical codes only, never OS messages.
+
+        ``str(exc)`` on an OSError carries the filename it failed on (e.g.
+        '/customer/merger-codename/secret.txt'), and this contract is rendered
+        into Discord and persisted.  Plant a sentinel in the OS error message
+        and assert it does not reach the error field.  Also checks all five
+        scratch keys are present and decision fields are null.
+        """
+        SENTINEL = "SENTINEL_SECRET_PATH_XYZ987"
+
+        class SentinelPath:
+            """Proxy Path that raises OSError with the sentinel in the message on is_dir()."""
+
+            def __init__(self, p):
+                self._p = p
+
+            def is_dir(self):
+                raise OSError(f"[Errno 13] Permission denied: '{SENTINEL}/secret.txt'")
+
+            def __str__(self):
+                return str(self._p)
+
+            def __fspath__(self):
+                return str(self._p)
+
+        monkeypatch.setattr(agent_run, "Path", lambda arg: SentinelPath(Path(arg)))
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "stat_error"
+        assert SENTINEL not in (result["error"] or ""), (
+            f"Sentinel path '{SENTINEL}' leaked into error field: {result['error']!r}"
+        )
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+
+    def test_error_field_contains_no_os_path_from_scan_error(self, tmp_path, monkeypatch):
+        """The scandir failure path must set error='scan_error' and not leak the exception text.
+
+        Deterministically requires scan_error: make scandir raise on the second
+        call (the subdirectory).  All five scratch fields are asserted.
+        """
+        import os as _os
+
+        SENTINEL = "SENTINEL_SCAN_PATH_ABC123"
+        (tmp_path / "file.txt").write_text("data\n")
+
+        real_scandir = _os.scandir
+
+        call_count = [0]
+
+        def scandir_raises_on_second(path):
+            call_count[0] += 1
+            if call_count[0] > 1:
+                raise OSError(f"[Errno 5] I/O error: '{SENTINEL}/disk-failure'")
+            return real_scandir(path)
+
+        monkeypatch.setattr(_os, "scandir", scandir_raises_on_second)
+        # Subdir ensures the walk has a second scandir call, making scan_error deterministic.
+        (tmp_path / "subdir").mkdir()
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "scan_error", (
+            "scandir OSError must produce error='scan_error', not a different category"
+        )
+        assert SENTINEL not in result["error"], (
+            f"Sentinel path '{SENTINEL}' leaked into error field: {result['error']!r}"
+        )
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_directory_symlinks_are_not_followed(self, tmp_path):
+        """A directory symlink inside the scan root must not be descended.
+
+        entry.is_dir(follow_symlinks=False) must be False for a symlink-to-dir,
+        so the scanner skips it without following into the target.  Mutation:
+        change follow_symlinks=False to follow_symlinks=True (or remove it) —
+        the symlink is then classified as a directory and the external file is
+        scanned, making this test fail because scanned > 0 from outside the root.
+        """
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "external.txt").write_text("external data\n")
+
+        scanroot = tmp_path / "scanroot"
+        scanroot.mkdir()
+        # Symlink to the outside directory — must not be followed.
+        (scanroot / "link_to_outside").symlink_to(outside)
+        # No regular files inside scanroot itself.
+
+        result = agent_run._watch_scratch_facts(str(scanroot))
+        assert result["error"] is None, (
+            "A directory symlink must be skipped cleanly, not cause an error"
+        )
+        # No file inside scanroot (the symlink is not followed), so scanned=0
+        # and no truncation.
+        assert result["scanned"] == 0, (
+            "Symlink-to-dir must not be followed; external file must not be scanned"
+        )
+        assert result["files_modified_recent"] == 0
+        assert result["truncated"] is False
+
+    def test_queued_dir_replaced_by_symlink_outside_injection(self, tmp_path):
+        """A child dir replaced by a symlink after classification must degrade to error.
+
+        Outside-positive injection: entry.stat() sees a real directory (cached
+        from scandir enumeration), classification queues it for descent, but by
+        the time os.open() runs the name has been replaced by a symlink to an
+        outside tree with a recent file.  O_NOFOLLOW rejects the symlink and
+        the scan degrades to a categorical error rather than counting an outside
+        file as in-root positive evidence.
+
+        This property is the confinement guarantee in the asymmetric truncation
+        contract comment: files_modified_recent >= 1 is sound because the fd-
+        based descent prevents outside files from being counted.
+
+        Mutation: remove O_NOFOLLOW (or use a pathname instead of dir_fd) and
+        the scan follows the symlink, files_modified_recent=1 from the outside
+        file, error=None — this test fails.
+        """
+        import os as _os
+        import shutil as _shutil
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "outside_recent.txt").write_text("outside\n")
+
+        scanroot = tmp_path / "scanroot"
+        scanroot.mkdir()
+        child = scanroot / "child"
+        child.mkdir()
+        # No files in child itself; the swap injects the outside recent file.
+
+        real_scandir = _os.scandir
+        swapped = [False]
+
+        def scandir_swap_on_child(path):
+            """Perform the swap right after priming the DirEntry stat cache.
+
+            Prime entry.stat() before the swap so classification sees S_ISDIR
+            (the cached pre-swap mode).  After the swap, os.open with O_NOFOLLOW
+            sees the symlink and fails.  Without priming, entry.stat would do a
+            live lstat after the swap, see S_ISLNK, and silently skip the entry
+            — that path does not exercise the race this test covers.
+            """
+            it = real_scandir(path)
+
+            class SwappingIter:
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    entry = next(it)
+                    if not swapped[0] and entry.name == "child":
+                        # Prime the stat cache: first call caches S_ISDIR.
+                        entry.stat(follow_symlinks=False)
+                        # Swap child for a symlink to the outside tree.
+                        _shutil.rmtree(str(child))
+                        child.symlink_to(outside)
+                        swapped[0] = True
+                    return entry
+
+                def __enter__(self):
+                    it.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return it.__exit__(*args)
+
+            return SwappingIter()
+
+        original_scandir = _os.scandir
+        _os.scandir = scandir_swap_on_child
+        try:
+            result = agent_run._watch_scratch_facts(str(scanroot))
+        finally:
+            _os.scandir = original_scandir
+
+        assert result["error"] is not None, (
+            "A child replaced by a symlink to an outside tree must degrade to "
+            f"a categorical error (got error=None, files_modified_recent="
+            f"{result['files_modified_recent']!r}) — outside file was counted"
+        )
+        assert result["files_modified_recent"] is None, (
+            "files_modified_recent must be null when a queued dir was swapped for a symlink"
+        )
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+
+    def test_queued_dir_replaced_by_symlink_hides_activity(self, tmp_path):
+        """A child dir with recent files replaced by symlink must degrade to error.
+
+        Active-subtree hiding: child/recent.txt exists when child is enumerated
+        (entry.stat() → S_ISDIR, cached), but child is replaced by a symlink
+        to an old outside tree before descent.  O_NOFOLLOW rejects the symlink,
+        returning a categorical error rather than a confident zero from the old
+        outside tree.
+
+        Mutation: remove O_NOFOLLOW from _DIR_OPEN_FLAGS and the scan follows
+        the replacement symlink, sees only old files, reports
+        files_modified_recent=0 with error=None — a confident zero from an
+        unrelated tree — this test fails.
+        """
+        import os as _os
+        import shutil as _shutil
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        old_time = __import__("time").time() - 7200
+        old_file = outside / "old.txt"
+        old_file.write_text("old\n")
+        _os.utime(str(old_file), (old_time, old_time))
+
+        scanroot = tmp_path / "scanroot"
+        scanroot.mkdir()
+        child = scanroot / "child"
+        child.mkdir()
+        (child / "recent.txt").write_text("recent activity\n")
+
+        real_scandir = _os.scandir
+        swapped = [False]
+
+        def scandir_swap_on_child(path):
+            it = real_scandir(path)
+
+            class SwappingIter:
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    entry = next(it)
+                    if not swapped[0] and entry.name == "child":
+                        entry.stat(follow_symlinks=False)  # prime cache → S_ISDIR
+                        _shutil.rmtree(str(child))
+                        child.symlink_to(outside)
+                        swapped[0] = True
+                    return entry
+
+                def __enter__(self):
+                    it.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return it.__exit__(*args)
+
+            return SwappingIter()
+
+        original_scandir = _os.scandir
+        _os.scandir = scandir_swap_on_child
+        try:
+            result = agent_run._watch_scratch_facts(str(scanroot))
+        finally:
+            _os.scandir = original_scandir
+
+        assert result["error"] is not None, (
+            "A child swapped for a symlink to an old outside tree must degrade to "
+            f"a categorical error, not a confident zero (got error=None, "
+            f"files_modified_recent={result['files_modified_recent']!r})"
+        )
+        assert result["files_modified_recent"] is None, (
+            "files_modified_recent must be null, not a confident zero from an unrelated tree"
+        )
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+
+    # ------------------------------------------------------------------
+    # end-to-end tests through cmd_watch
+    # ------------------------------------------------------------------
+
+    def test_scratch_key_present_in_normal_branch(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        """Normal branch: the scan runs and reports the recent write.
+
+        Asserts observed values, not key presence: the payload default is
+        error='not_observed', so only a scan that actually ran gives None.
+        """
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        # Write a recent file so the scan has something to report.
+        (repo / "recent_finding.md").write_text("analysis output\n")
+        _make_run(
+            isolated_runs_root, isolated_log_root, "sc1",
+            status="running", pid=111, log_age_secs=1, cwd=str(repo),
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("sc1"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        scratch = payload["scratch"]
+        assert set(scratch.keys()) == self.SCRATCH_KEYS
+        # Branch-specific values: a real scan ran and saw the recent file.
+        assert scratch["error"] is None, (
+            f"Normal branch must run the scan (error={scratch['error']!r}); "
+            "if _watch_scratch_facts is removed, error defaults to 'not_observed'"
+        )
+        assert scratch["files_modified_recent"] >= 1, (
+            "Normal branch must report the recent file written above"
+        )
+
+    def test_scratch_key_present_in_missing_state_dir_branch(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        """Missing-state-dir branch: the scan runs off --repo, since the
+        recorded cwd went with the state dir.
+
+        Asserts observed values, not key presence: the payload default is
+        error='not_observed', so only a scan that actually ran gives None.
+        """
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        # Write a recent file so the scan has something to report.
+        (workdir / "finding.md").write_text("review notes\n")
+        _make_run(
+            isolated_runs_root, isolated_log_root, "sc2",
+            write_state=False, log_text="line1\n",
+        )
+        agent_run.cmd_watch(_watch_args("sc2", repo=str(workdir)))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        scratch = payload["scratch"]
+        assert set(scratch.keys()) == self.SCRATCH_KEYS
+        # Branch-specific values: the scan ran via --repo and saw the recent file.
+        assert scratch["error"] is None, (
+            f"Missing-state branch with --repo must run the scan (error={scratch['error']!r}); "
+            "if _watch_scratch_facts is removed, error defaults to 'not_observed'"
+        )
+        assert scratch["files_modified_recent"] >= 1, (
+            "Missing-state branch must report the recent file written above"
+        )
+
+    def test_scratch_key_present_in_observation_error_branch(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """Observation-error branch: scratch defaults to not_observed with all five null/false fields.
+
+        The most dangerous mutation replaces the not_observed default with
+        files_modified_recent=0, scanned=0, error=null — this test must fail
+        that mutant by checking all five values explicitly.
+        """
+        _make_run(
+            isolated_runs_root, isolated_log_root, "sc3",
+            status="running", pid=111, log_age_secs=1,
+        )
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("synthetic crash")
+
+        monkeypatch.setattr(agent_run, "_effective_status", _boom)
+        agent_run.cmd_watch(_watch_args("sc3"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        scratch = payload["scratch"]
+        assert set(scratch.keys()) == self.SCRATCH_KEYS
+        # Observation-error path uses _watch_payload defaults = _scratch_unknown("not_observed").
+        assert scratch["error"] == "not_observed", (
+            "Observation-error branch must default to error='not_observed', "
+            "not a confident zero with error=None"
+        )
+        assert scratch["files_modified_recent"] is None
+        assert scratch["newest_mtime_age_s"] is None
+        assert scratch["scanned"] is None
+        assert scratch["truncated"] is False
+
+    def test_review_shaped_regression(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        """Full end-to-end regression for the blind spot: a reviewer run with
+        zero git evidence must still show scratch activity from a gitignored
+        file written during the run."""
+        repo = tmp_path / "repo"
+        _repo_with_gitignored_finding(repo, "findings")
+        launch_head = agent_run._watch_run_git_checked(
+            repo, ["rev-parse", "HEAD"]
+        ).stdout.strip()
+
+        _make_run(
+            isolated_runs_root, isolated_log_root, "sc4",
+            status="running", pid=111, log_age_secs=1,
+            cwd=str(repo), launch_head=launch_head,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("sc4"))
+        payload = json.loads(capsys.readouterr().out)
+
+        # Confirm git sees nothing: no commits, no dirty files.
+        git = payload["git"]
+        assert git is not None
+        assert git["commits_since_start"] == 0
+        assert git["untracked_files"] == 0
+        assert git["files_changed"] == 0
+
+        # Scratch must report the gitignored file.
+        scratch = payload["scratch"]
+        assert scratch["error"] is None
+        assert scratch["files_modified_recent"] >= 1
+        assert scratch["newest_mtime_age_s"] is not None
+        assert scratch["newest_mtime_age_s"] < agent_run.WATCH_SCRATCH_RECENT_SECONDS
+
+    def test_repo_arg_does_not_redirect_scratch_scan(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        """--repo must not move the scratch scan off the run's recorded launch cwd.
+
+        The active branch computes repo for git facts as repo_arg or recorded_cwd.
+        Passing --repo must not silently replace the cwd used for the scratch scan:
+        activity written to the recorded cwd must be visible even when --repo
+        points at a different directory.
+        """
+        recorded_cwd = tmp_path / "recorded_cwd"
+        recorded_cwd.mkdir()
+        # Recent file in the recorded cwd — the scratch scan must see this.
+        (recorded_cwd / "findings.md").write_text("analysis\n")
+
+        repo_override = tmp_path / "repo_override"
+        _init_repo(repo_override)
+        # Only old file in the override directory.
+        old_file = repo_override / "old.txt"
+        old_file.write_text("old\n")
+        old_time = time.time() - 7200
+        os.utime(old_file, (old_time, old_time))
+
+        _make_run(
+            isolated_runs_root, isolated_log_root, "sc5",
+            status="running", pid=111, log_age_secs=1,
+            cwd=str(recorded_cwd),
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        # Pass --repo pointing at repo_override, which has no recent activity.
+        agent_run.cmd_watch(_watch_args("sc5", repo=str(repo_override)))
+        payload = json.loads(capsys.readouterr().out)
+
+        scratch = payload["scratch"]
+        # Git facts use repo_override (the --repo argument).
+        assert payload["repo"] == str(repo_override)
+        # Scratch must use the recorded cwd, not the --repo override.
+        assert scratch["error"] is None, (
+            f"Scratch scan must use recorded cwd, not --repo override "
+            f"(error={scratch['error']!r})"
+        )
+        assert scratch["files_modified_recent"] >= 1, (
+            "Scratch must see the recent file in recorded cwd, not the old file in repo_override"
+        )
