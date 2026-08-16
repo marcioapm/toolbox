@@ -265,6 +265,81 @@ class TestDuGrouping:
 
         assert all(row.key != "linked" for row in agent_run._du_collect_rows())
 
+    @pytest.mark.parametrize("root_kind", ["state", "log"])
+    def test_du_per_entry_lstat_error_skips_that_entry_only(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, root_kind
+    ):
+        """An entry whose lstat raises between iterdir() and lstat() must be
+        skipped; healthy sibling entries must still appear with their real sizes."""
+        root = isolated_runs_root if root_kind == "state" else isolated_log_root
+        # Create two real run dirs.
+        healthy = root / "healthy"
+        doomed = root / "doomed"
+        healthy.mkdir()
+        doomed.mkdir()
+        if root_kind == "log":
+            (healthy / "log").write_bytes(b"x" * 100)
+            (doomed / "log").write_bytes(b"x" * 100)
+
+        real_lstat = Path.lstat
+
+        def failing_lstat(self):
+            if self.name == "doomed":
+                raise FileNotFoundError(2, "No such file or directory", str(self))
+            return real_lstat(self)
+
+        monkeypatch.setattr(Path, "lstat", failing_lstat)
+
+        rows = {r.key: r for r in agent_run._du_collect_rows()}
+
+        # "healthy" must appear; "doomed" may be absent but must not wipe "healthy".
+        assert "healthy" in rows, "healthy sibling must still be reported"
+
+
+# ---------------------------------------------------------------------------
+# cmd_list symlink exclusion (M3 parity with du)
+# ---------------------------------------------------------------------------
+
+class TestListSymlinkExclusion:
+    @pytest.mark.parametrize("root_kind", ["state", "log"])
+    def test_list_ignores_top_level_symlink(
+        self, isolated_runs_root, isolated_log_root, capsys, root_kind
+    ):
+        """A symlink under STATE_ROOT or LOG_ROOT must not appear in cmd_list output."""
+        outside = isolated_log_root.parent / f"outside-list-{root_kind}"
+        outside.mkdir()
+        (outside / "log").write_text("data\n")
+        root = isolated_runs_root if root_kind == "state" else isolated_log_root
+        (root / "linkedrun").symlink_to(outside, target_is_directory=True)
+
+        agent_run.cmd_list(argparse.Namespace(all=True, status=None, include_logs=True))
+
+        out = capsys.readouterr().out
+        assert "linkedrun" not in out
+
+
+# ---------------------------------------------------------------------------
+# _dir_size_bytes top-argument symlink exclusion (M3)
+# ---------------------------------------------------------------------------
+
+class TestDirSizeBytesTopSymlink:
+    def test_symlink_top_returns_zero(self, tmp_path):
+        """_dir_size_bytes must return 0 when ``d`` itself is a symlink,
+        even when the target directory contains files."""
+        target = tmp_path / "real"
+        target.mkdir()
+        (target / "payload").write_bytes(b"x" * 500)
+        link = tmp_path / "link"
+        link.symlink_to(target, target_is_directory=True)
+
+        assert agent_run._dir_size_bytes(link) == 0
+
+    def test_real_dir_is_still_counted(self, tmp_path):
+        d = tmp_path / "real"
+        d.mkdir()
+        (d / "f").write_bytes(b"y" * 300)
+        assert agent_run._dir_size_bytes(d) == 300
+
 
 # ---------------------------------------------------------------------------
 # du -- --top truncation
@@ -624,15 +699,10 @@ class TestParseLaunchArgv:
         assert r.subcommand_tokens is None
 
     @pytest.mark.parametrize("name", sorted(agent_run._KNOWN_SUBCOMMANDS))
-    def test_dashdash_allows_subcommand_name_as_run_name(self, name):
-        r = self._parse([name, "--", "echo", "hi"])
-        assert r.name == name
-        assert r.command == ["echo", "hi"]
-        assert r.subcommand_tokens is None
-
-    def test_dashdash_subcommand_name_still_rejects_empty_command(self):
-        with pytest.raises(agent_run._LaunchArgvError, match="empty command"):
-            self._parse(["list", "--"])
+    def test_subcommand_name_with_dashdash_dispatches_as_subcommand(self, name):
+        """A known subcommand token always dispatches, even with "--" following it."""
+        r = self._parse([name, "--", "myrun"])
+        assert r.subcommand_tokens == [name, "--", "myrun"]
 
     def test_dashdash_flags_before_name(self):
         r = self._parse(["--echo", "--idle-timeout", "30", "myrun", "--", "some-cmd", "--flag"])

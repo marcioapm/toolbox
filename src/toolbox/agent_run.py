@@ -364,6 +364,9 @@ WATCH_GIT_TOTAL_BUDGET_SECONDS: float = 5.0
 WATCH_TAIL_READ_BLOCK_BYTES: int = 65536
 # Cap how far the tail scan walks back, however few newlines it has found.
 WATCH_TAIL_MAX_BYTES: int = 256 * 1024
+# Line counting is skipped above this threshold and log.lines is set to null.
+# 16 MiB covers a full day of typical PTY capture at ~180 bytes/s; above that
+# a file is growing unusually fast and a line count is expensive to compute.
 WATCH_LINE_COUNT_MAX_BYTES: int = 16 * 1024 * 1024
 
 # Git env vars that redirect a command at a different repo/index than the one
@@ -379,6 +382,9 @@ WATCH_GIT_ENV_VARS_TO_STRIP: frozenset[str] = frozenset(
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_CEILING_DIRECTORIES",
         "GIT_REPLACE_REF_BASE",
+        # GIT_GRAFT_FILE points at a caller-controlled file that silently
+        # rewrites parent pointers, making commits_since_start wrong.
+        "GIT_GRAFT_FILE",
     }
 )
 
@@ -1627,6 +1633,13 @@ def _newest_mtime(d: Path) -> Optional[float]:
         return None
 
 
+# Sentinel returned by _newest_mtime_recursive when an OSError cut the walk
+# short before all entries were seen.  Distinct from None (genuinely empty
+# directory, walk completed).  Callers that apply a fallback mtime must check
+# for this sentinel and skip the candidate instead of deleting it.
+_WALK_INCOMPLETE: object = object()
+
+
 def _newest_mtime_recursive(
     d: Path,
     cutoff: Optional[float] = None,
@@ -1635,6 +1648,12 @@ def _newest_mtime_recursive(
 ) -> Optional[float]:
     """Newest mtime anywhere below ``d`` (including ``d`` itself unless
     ``skip_top_dir_mtime`` is set), without following symlinks.
+
+    Returns ``None`` when the walk completed and no entries were found (the
+    directory is genuinely empty).  Returns the ``_WALK_INCOMPLETE`` sentinel
+    when an ``OSError`` prevented the walk from completing — the caller must
+    not apply a fallback mtime in that case, since the directory may contain
+    fresh files that simply could not be enumerated.
 
     When ``skip_top_dir_mtime`` is ``True`` the root directory's own mtime
     is excluded from the result.  Pass 2.5 uses this when checking a log dir
@@ -1657,17 +1676,17 @@ def _newest_mtime_recursive(
     try:
         top_st = os.stat(d, follow_symlinks=False)
         if skip_top_dir_mtime:
-            # Sentinel: any real child mtime beats this value; replaced on
-            # the first entry seen so that an empty directory still returns
-            # None (caller treats None as "cannot determine age → skip").
+            # Any real child mtime replaces this value; a genuinely empty
+            # directory keeps it as None so the caller can apply a fallback.
             newest: Optional[float] = None
         else:
             newest = top_st.st_mtime
             if cutoff is not None and newest > cutoff:
                 return newest
     except OSError:
-        return None
+        return _WALK_INCOMPLETE  # type: ignore[return-value]
 
+    walk_error = False
     stack: List[str] = [str(d)]
     while stack:
         current = stack.pop()
@@ -1675,6 +1694,7 @@ def _newest_mtime_recursive(
             with os.scandir(current) as it:
                 entries = list(it)
         except OSError:
+            walk_error = True
             continue
         for entry in entries:
             try:
@@ -1688,6 +1708,10 @@ def _newest_mtime_recursive(
                 return newest
             if _stat_module.S_ISDIR(st.st_mode):
                 stack.append(entry.path)
+    if walk_error and newest is None:
+        # At least one directory was unreadable and no mtime was found — the
+        # directory may contain fresh content that could not be seen.
+        return _WALK_INCOMPLETE  # type: ignore[return-value]
     return newest
 
 
@@ -1696,16 +1720,22 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
     ``d``, in bytes, excluding anything at or below ``exclude`` (if given —
     used to report a log dir's size without double-counting its ``tmp/``
     scratch subdirectory). Read-only: uses ``os.scandir`` and never follows
-    symlinks (``entry.stat(follow_symlinks=False)``), so this cannot be
-    tricked into walking outside ``d`` and cannot count a symlink target's
-    size as if it were local. Tolerates races (a file vanishing between
-    scan and stat) by skipping the entry rather than raising; an unreadable
-    ``d`` itself returns 0.
+    symlinks (``entry.stat(follow_symlinks=False)``), so neither the walk
+    interior nor ``d`` itself can be a symlink that redirects the count
+    outside ``d``. Tolerates races (a file vanishing between scan and stat)
+    by skipping the entry rather than raising; an unreadable or non-real-
+    directory ``d`` returns 0.
 
     Shared by `reap --include-logs` (per-candidate size in its report line)
     and `du` (per-group/per-run totals), so both report the same notion of
     "size" for a log directory.
     """
+    try:
+        top_st = d.lstat()
+    except OSError:
+        return 0
+    if not _stat_module.S_ISDIR(top_st.st_mode):
+        return 0
     total = 0
     stack = [d]
     while stack:
@@ -1933,7 +1963,7 @@ def _watch_effective_status(state_dir: Path, idle_threshold: Optional[float] = N
     if status not in {"starting", "running", "stalled"}:
         return status
     pid = _safe_int(_read(state_dir / "pid"))
-    if pid is None or pid <= 0:
+    if pid is None:
         return "unverified"
     if _watch_pid_is_zombie(pid):
         return "died"
@@ -2189,6 +2219,18 @@ def _env_bool_default(env_name: str) -> bool:
     return False
 
 
+def _lstat_st_mode(p: Path) -> int:
+    """Return ``p.lstat().st_mode``, or 0 on any ``OSError``.
+
+    Used where ``p.is_dir()`` would follow a symlink; callers check the
+    result with ``S_ISDIR`` to exclude symlinks and vanished entries alike.
+    """
+    try:
+        return p.lstat().st_mode
+    except OSError:
+        return 0
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     _prune_old_logs()
     _opportunistic_heal()
@@ -2261,7 +2303,9 @@ def cmd_list(args: argparse.Namespace) -> int:
     print(heading)
     if STATE_ROOT.is_dir():
         state_names = {
-            p.name for p in STATE_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")
+            p.name for p in STATE_ROOT.iterdir()
+            if not p.name.startswith(".")
+            and _stat_module.S_ISDIR(_lstat_st_mode(p))
         }
     shown = 0
     shown_names = set()
@@ -2307,7 +2351,8 @@ def cmd_list(args: argparse.Namespace) -> int:
     if LOG_ROOT.is_dir():
         log_only_names = {
             p.name for p in LOG_ROOT.iterdir()
-            if p.is_dir() and not p.name.startswith(".")
+            if not p.name.startswith(".")
+            and _stat_module.S_ISDIR(_lstat_st_mode(p))
         } - state_names
     if include_logs:
         if log_only_names:
@@ -2533,11 +2578,30 @@ def _watch_git_facts_checked(repo: Path, launch_head: Optional[str]) -> _WatchGi
         return _WatchGitFactsResult(None, fsck_outcome.error)
 
     porcelain_outcome = run_git(["status", "--porcelain", "-z", "--untracked-files=all"])
+    # --untracked-files=all disables git's directory-collapse optimisation so
+    # each file in an untracked tree is a separate record.  A large untracked
+    # tree (e.g. node_modules/ not yet gitignored) can expand output by ~10x
+    # inside the shared git budget; the failure mode is git_error: "timeout".
     if porcelain_outcome.stdout is None:
         return _WatchGitFactsResult(None, porcelain_outcome.error)
     porcelain = porcelain_outcome.stdout
-    records = [record for record in porcelain.split("\0") if record]
-    untracked_files = sum(1 for record in records if record.startswith("?? "))
+    # Parse the NUL-delimited porcelain stream as a state machine.  A rename
+    # or copy entry (`R`/`C` in XY position) emits two NUL-separated records:
+    # the status record and then a bare origin-path record with no XY prefix.
+    # Consuming the origin path here prevents a path that starts with "?? "
+    # from being counted as an untracked file.
+    records = [r for r in porcelain.split("\0") if r]
+    untracked_files = 0
+    skip_next = False
+    for record in records:
+        if skip_next:
+            skip_next = False
+            continue
+        xy = record[:2] if len(record) >= 2 else ""
+        if xy[0:1] in ("R", "C"):
+            skip_next = True
+        if record.startswith("?? "):
+            untracked_files += 1
     shortstat_outcome = run_git(["diff", head_oid, "--shortstat"])
     if shortstat_outcome.stdout is None:
         return _WatchGitFactsResult(None, shortstat_outcome.error)
@@ -2593,39 +2657,6 @@ def _watch_git_facts_checked(repo: Path, launch_head: Optional[str]) -> _WatchGi
         },
         None,
     )
-
-
-def _watch_tail_lines(log: Optional[Path], n: int) -> List[str]:
-    """Last ``n`` decoded text lines of a log, or ``[]`` on any read failure
-    (missing file, permission error, stale NFS handle, non-regular file).
-    The backward scan never reads past ``WATCH_TAIL_MAX_BYTES``, even if
-    fewer than ``n`` newlines have been found by then; a truncated scan
-    returns whatever lines were found within the cap rather than the full
-    tail. Reads through ``_watch_open_validated_log`` so this reader and
-    the log-facts reader cannot drift apart on what counts as a safe log."""
-    with _watch_open_validated_log(log) as f:
-        if f is None:
-            return []
-        try:
-            f.seek(0, os.SEEK_END)
-            end = f.tell()
-            chunks: List[bytes] = []
-            pos = end
-            newline_count = 0
-            bytes_read = 0
-            while pos > 0 and newline_count <= n and bytes_read < WATCH_TAIL_MAX_BYTES:
-                read_size = min(WATCH_TAIL_READ_BLOCK_BYTES, pos)
-                pos -= read_size
-                f.seek(pos)
-                chunk = f.read(read_size)
-                newline_count += chunk.count(b"\n")
-                bytes_read += len(chunk)
-                chunks.append(chunk)
-            data = b"".join(reversed(chunks))
-        except OSError:
-            return []
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    return lines[-n:]
 
 
 def _watch_normalize_lines(lines: List[str]) -> List[str]:
@@ -2748,6 +2779,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
     ``signals.repeated_error`` and ``signals.top_repeated_read`` share one
     winner rule: the most-repeated qualifying line/path in the log tail, or
     ``null`` if nothing repeats at least ``WATCH_REPEAT_THRESHOLD`` times.
+
+    ``log.lines`` is ``null`` when the log exceeds ``WATCH_LINE_COUNT_MAX_BYTES``
+    (16 MiB); ``log.bytes`` is always populated and gives the true file size.
+    A log that large is a pathological PTY capture; the degradation is explicit
+    rather than a wrong integer.
     """
     name = _validate_run_name(args.name)
     repo_arg = _watch_validate_repo_arg(getattr(args, "repo", None))
@@ -2913,21 +2949,6 @@ def _cmd_watch_observe(
     return 0
 
 
-def _watch_log_facts(log: Optional[Path]) -> Optional[dict]:
-    """Byte/line/freshness facts for the run's log, or ``None`` if it
-    cannot be opened and validated as a regular file (missing, permission
-    error, stale mount, or a non-regular file at that path).
-
-    Reads through ``_watch_open_validated_log`` so size/mtime/line-count all
-    come from the one fstat-validated descriptor, instead of a stat-by-name
-    followed by an open-by-name that could land on a different inode."""
-    with _watch_open_validated_log(log) as f:
-        if f is None:
-            return None
-        st = os.fstat(f.fileno())
-        return _watch_log_facts_from_file(f, log, st)
-
-
 def _watch_log_facts_from_file(f, log: Path, st: os.stat_result) -> dict:
     delta = time.time() - st.st_mtime
     if delta < -WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS:
@@ -2990,15 +3011,6 @@ def _watch_log_observation(log: Optional[Path]) -> tuple[Optional[dict], dict]:
         except OSError:
             return None, _watch_signals_from_lines([])
     return facts, _watch_signals_from_lines(lines)
-
-
-def _watch_signals(log: Optional[Path]) -> dict:
-    """Repeated-error and repeated-read signals over the log's last
-    ``WATCH_TAIL_LINES`` lines. Always returns a populated object — a
-    signals object with all-null fields when the log is unreadable is still
-    a valid, well-formed fact."""
-    lines = _watch_normalize_lines(_watch_tail_lines(log, WATCH_TAIL_LINES))
-    return _watch_signals_from_lines(lines)
 
 
 def _watch_signals_from_lines(lines: List[str]) -> dict:
@@ -3788,7 +3800,12 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 cutoff=time.time() - log_min_age_threshold,
                 skip_top_dir_mtime=True,
             )
+            if newest is _WALK_INCOMPLETE:
+                continue  # enumeration failed; cannot determine age, retain
             if newest is None:
+                # Walk completed, directory is genuinely empty — judge by the
+                # container's own mtime (which does not change when files
+                # inside are appended to, only when entries are added/removed).
                 newest = log_before.st_mtime
             age_secs = time.time() - newest
             if age_secs < log_min_age_threshold:
@@ -3823,6 +3840,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
                         cutoff=time.time() - log_min_age_threshold,
                         skip_top_dir_mtime=True,
                     )
+                    if newest_current is _WALK_INCOMPLETE:
+                        continue  # enumeration failed; retain
                     if newest_current is None:
                         newest_current = log_current.st_mtime
                     if time.time() - newest_current < log_min_age_threshold:
@@ -3868,7 +3887,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         if _path_entry_exists(_state_dir(name)):
             continue
         newest = _newest_mtime_recursive(scratch_dir, cutoff=time.time() - min_age_threshold)
-        if newest is None or time.time() - newest < min_age_threshold:
+        if newest is None or newest is _WALK_INCOMPLETE or time.time() - newest < min_age_threshold:
             continue
         age_h = (time.time() - newest) / 3600
         print(
@@ -3895,7 +3914,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 newest_current = _newest_mtime_recursive(
                     scratch_dir, cutoff=time.time() - min_age_threshold
                 )
-                if newest_current is None or time.time() - newest_current < min_age_threshold:
+                if (newest_current is None or newest_current is _WALK_INCOMPLETE
+                        or time.time() - newest_current < min_age_threshold):
                     continue
                 _safe_rmtree(scratch_dir, log_d, expected=scratch_before)
             except (OSError, SystemExit) as exc:
@@ -4122,19 +4142,29 @@ def _du_collect_rows() -> List[_DuRow]:
     state_names: set = set()
     if STATE_ROOT.is_dir():
         try:
-            state_names = {
-                p.name for p in STATE_ROOT.iterdir()
-                if not p.name.startswith(".") and _stat_module.S_ISDIR(p.lstat().st_mode)
-            }
+            for p in STATE_ROOT.iterdir():
+                if p.name.startswith("."):
+                    continue
+                try:
+                    st = p.lstat()
+                except OSError:
+                    continue
+                if _stat_module.S_ISDIR(st.st_mode):
+                    state_names.add(p.name)
         except OSError:
             state_names = set()
     log_names: set = set()
     if LOG_ROOT.is_dir():
         try:
-            log_names = {
-                p.name for p in LOG_ROOT.iterdir()
-                if not p.name.startswith(".") and _stat_module.S_ISDIR(p.lstat().st_mode)
-            }
+            for p in LOG_ROOT.iterdir():
+                if p.name.startswith("."):
+                    continue
+                try:
+                    st = p.lstat()
+                except OSError:
+                    continue
+                if _stat_module.S_ISDIR(st.st_mode):
+                    log_names.add(p.name)
         except OSError:
             log_names = set()
 
@@ -4639,13 +4669,18 @@ def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
     if sig == signal.SIGKILL and pgid is not None:
         try:
             live_pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            # Process already exited or is a zombie; nothing to signal.
+            # Fall through to the existing ProcessLookupError handler below.
+            pass
         except OSError as exc:
             sys.exit(f"agent-run: refusing to force-kill '{name}': cannot verify process group ({exc})")
-        if live_pgid != pgid:
-            sys.exit(
-                f"agent-run: refusing to force-kill '{name}': recorded pgid {pgid} "
-                f"does not contain pid {pid} (current pgid {live_pgid})"
-            )
+        else:
+            if live_pgid != pgid:
+                sys.exit(
+                    f"agent-run: refusing to force-kill '{name}': recorded pgid {pgid} "
+                    f"does not contain pid {pid} (current pgid {live_pgid})"
+                )
     try:
         # Only the uncatchable SIGKILL targets the group: a catchable signal
         # sent group-wide reaches the runner's children directly, racing the
@@ -5086,7 +5121,14 @@ def _idle_watchdog_loop(
 
     while True:
         time.sleep(poll)
-        if _process_identity(runner_pid) != runner_identity:
+        current_identity = _process_identity(runner_pid)
+        if current_identity is not None and current_identity != runner_identity:
+            # Process slot has been reused; a different process occupies this
+            # pid.  Stop guarding immediately — the original runner is gone.
+            return
+        if current_identity is None and not _pid_alive(runner_pid):
+            # Identity probe failed (transient OSError, fork pressure, etc.)
+            # and a cheaper liveness check confirms the runner is gone.
             return
         now_monotonic = time.monotonic()
         try:
@@ -5130,7 +5172,7 @@ def _idle_watchdog_loop(
         return
     deadline = time.monotonic() + KILL_ESCALATION_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        if _process_identity(runner_pid) != runner_identity:
+        if not _pid_alive(runner_pid):
             return
         time.sleep(KILL_POLL_INTERVAL_SECONDS)
     _watchdog_escalate(state_dir, runner_pid, runner_identity)
@@ -5365,7 +5407,8 @@ def _runner(
         if identity is None:
             raise RuntimeError("cannot record runner process identity")
         _write(state_dir / "pid", f"{my_pid}\n")
-        # After setsid(), pid == pgid (we're the session & group leader).
+        # _cmd_launch_locked called setsid() before entering _runner, so
+        # pid == pgid here (this process is the session and group leader).
         _write(state_dir / "pgid", f"{runner_pgid}\n")
         _write(state_dir / "process_identity", identity + "\n")
 
@@ -6281,9 +6324,10 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     # No launch flags set and first token is a known subcommand: delegate to
     # argparse.  Returning here keeps the subcommand check out of main()'s
     # own conditional chain without duplicating the flag-state test.
+    # A run may not be named after a subcommand; a "--" separator after a
+    # subcommand name is still part of the subcommand's own argv.
     any_launch_flag = interactive or prompt_file or echo or submit_mode is not None or idle_timeout is not None
-    explicit_launch = len(tokens) >= 2 and tokens[1] == "--"
-    if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag and not explicit_launch:
+    if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
         return _LaunchArgv(
             interactive=False, prompt_file=None, echo=False, echo_interval=2.0,
             submit_mode=None, idle_timeout=None, name="", command=[],
