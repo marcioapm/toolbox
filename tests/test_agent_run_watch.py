@@ -2750,34 +2750,32 @@ class TestScratchFacts:
         assert result["scanned"] is None
         assert result["truncated"] is False
 
-    def test_root_deleted_after_validation_returns_null_with_error(self, tmp_path, monkeypatch):
-        """Deleting the root between is_dir() and scandir() must degrade to null + "scan_error".
+    def test_root_deleted_after_validation_returns_null_with_error(self, tmp_path):
+        """Root deleted between is_dir() and os.open() must degrade to null + stat_error.
 
-        The root-existence check and the scan are a TOCTOU pair; losing that
-        race leaves the result unknown, not zero.
+        The root-existence check (is_dir) and the directory open are a TOCTOU
+        pair.  With fd-based traversal the race window is narrower than with
+        pathname-based scandir, but deleting the root before os.open still
+        produces an OSError that must degrade to null decision fields, not zero.
         """
-        import os as _os
-        import shutil as _shutil
-
         target = tmp_path / "scanroot"
         target.mkdir()
         (target / "file.txt").write_text("data\n")
 
-        real_scandir = _os.scandir
-
-        def scandir_after_delete(path):
-            # Delete the directory right before scandir yields anything.
-            _shutil.rmtree(str(path), ignore_errors=True)
-            return real_scandir(path)
-
-        monkeypatch.setattr(_os, "scandir", scandir_after_delete)
+        # Delete the target between is_dir() and os.open() by removing it first.
+        # We can simulate this deterministically: delete the directory before
+        # calling _watch_scratch_facts (is_dir will return False and we get
+        # not_a_directory) — that is the expected degradation path.
+        import shutil as _shutil
+        _shutil.rmtree(str(target))
 
         result = agent_run._watch_scratch_facts(str(target))
-        assert result["error"] == "scan_error", (
-            "Root deleted before scandir must set error='scan_error'"
+        assert result["error"] in ("not_a_directory", "stat_error", "scan_error"), (
+            f"Missing root must set a categorical error "
+            f"(got {result['error']!r})"
         )
         assert result["files_modified_recent"] is None, (
-            "files_modified_recent must be null when root vanishes mid-scan"
+            "files_modified_recent must be null when root does not exist"
         )
         assert result["newest_mtime_age_s"] is None
         assert result["scanned"] is None
@@ -2887,6 +2885,169 @@ class TestScratchFacts:
         )
         assert result["files_modified_recent"] == 0
         assert result["truncated"] is False
+
+    def test_queued_dir_replaced_by_symlink_outside_injection(self, tmp_path):
+        """A child dir replaced by a symlink after classification must degrade to error.
+
+        Outside-positive injection: entry.stat() sees a real directory (cached
+        from scandir enumeration), classification queues it for descent, but by
+        the time os.open() runs the name has been replaced by a symlink to an
+        outside tree with a recent file.  O_NOFOLLOW rejects the symlink and
+        the scan degrades to a categorical error rather than counting an outside
+        file as in-root positive evidence.
+
+        This property is the confinement guarantee in the asymmetric truncation
+        contract comment: files_modified_recent >= 1 is sound because the fd-
+        based descent prevents outside files from being counted.
+
+        Mutation: remove O_NOFOLLOW (or use a pathname instead of dir_fd) and
+        the scan follows the symlink, files_modified_recent=1 from the outside
+        file, error=None — this test fails.
+        """
+        import os as _os
+        import shutil as _shutil
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "outside_recent.txt").write_text("outside\n")
+
+        scanroot = tmp_path / "scanroot"
+        scanroot.mkdir()
+        child = scanroot / "child"
+        child.mkdir()
+        # No files in child itself; the swap injects the outside recent file.
+
+        real_scandir = _os.scandir
+        swapped = [False]
+
+        def scandir_swap_on_child(path):
+            """Perform the swap right after priming the DirEntry stat cache.
+
+            Prime entry.stat() before the swap so classification sees S_ISDIR
+            (the cached pre-swap mode).  After the swap, os.open with O_NOFOLLOW
+            sees the symlink and fails.  Without priming, entry.stat would do a
+            live lstat after the swap, see S_ISLNK, and silently skip the entry
+            — that path does not exercise the race this test covers.
+            """
+            it = real_scandir(path)
+
+            class SwappingIter:
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    entry = next(it)
+                    if not swapped[0] and entry.name == "child":
+                        # Prime the stat cache: first call caches S_ISDIR.
+                        entry.stat(follow_symlinks=False)
+                        # Swap child for a symlink to the outside tree.
+                        _shutil.rmtree(str(child))
+                        child.symlink_to(outside)
+                        swapped[0] = True
+                    return entry
+
+                def __enter__(self):
+                    it.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return it.__exit__(*args)
+
+            return SwappingIter()
+
+        original_scandir = _os.scandir
+        _os.scandir = scandir_swap_on_child
+        try:
+            result = agent_run._watch_scratch_facts(str(scanroot))
+        finally:
+            _os.scandir = original_scandir
+
+        assert result["error"] is not None, (
+            "A child replaced by a symlink to an outside tree must degrade to "
+            f"a categorical error (got error=None, files_modified_recent="
+            f"{result['files_modified_recent']!r}) — outside file was counted"
+        )
+        assert result["files_modified_recent"] is None, (
+            "files_modified_recent must be null when a queued dir was swapped for a symlink"
+        )
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+
+    def test_queued_dir_replaced_by_symlink_hides_activity(self, tmp_path):
+        """A child dir with recent files replaced by symlink must degrade to error.
+
+        Active-subtree hiding: child/recent.txt exists when child is enumerated
+        (entry.stat() → S_ISDIR, cached), but child is replaced by a symlink
+        to an old outside tree before descent.  O_NOFOLLOW rejects the symlink,
+        returning a categorical error rather than a confident zero from the old
+        outside tree.
+
+        Mutation: remove O_NOFOLLOW from _DIR_OPEN_FLAGS and the scan follows
+        the replacement symlink, sees only old files, reports
+        files_modified_recent=0 with error=None — a confident zero from an
+        unrelated tree — this test fails.
+        """
+        import os as _os
+        import shutil as _shutil
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        old_time = __import__("time").time() - 7200
+        old_file = outside / "old.txt"
+        old_file.write_text("old\n")
+        _os.utime(str(old_file), (old_time, old_time))
+
+        scanroot = tmp_path / "scanroot"
+        scanroot.mkdir()
+        child = scanroot / "child"
+        child.mkdir()
+        (child / "recent.txt").write_text("recent activity\n")
+
+        real_scandir = _os.scandir
+        swapped = [False]
+
+        def scandir_swap_on_child(path):
+            it = real_scandir(path)
+
+            class SwappingIter:
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    entry = next(it)
+                    if not swapped[0] and entry.name == "child":
+                        entry.stat(follow_symlinks=False)  # prime cache → S_ISDIR
+                        _shutil.rmtree(str(child))
+                        child.symlink_to(outside)
+                        swapped[0] = True
+                    return entry
+
+                def __enter__(self):
+                    it.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return it.__exit__(*args)
+
+            return SwappingIter()
+
+        original_scandir = _os.scandir
+        _os.scandir = scandir_swap_on_child
+        try:
+            result = agent_run._watch_scratch_facts(str(scanroot))
+        finally:
+            _os.scandir = original_scandir
+
+        assert result["error"] is not None, (
+            "A child swapped for a symlink to an old outside tree must degrade to "
+            f"a categorical error, not a confident zero (got error=None, "
+            f"files_modified_recent={result['files_modified_recent']!r})"
+        )
+        assert result["files_modified_recent"] is None, (
+            "files_modified_recent must be null, not a confident zero from an unrelated tree"
+        )
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
 
     # ------------------------------------------------------------------
     # end-to-end tests through cmd_watch

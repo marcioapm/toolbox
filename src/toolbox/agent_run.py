@@ -2931,7 +2931,9 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
       error                 – categorical reason the result is unknown (str|null)
 
     On truncation the result is asymmetric by design:
-      files_modified_recent >= 1  – sound positive evidence (activity was seen);
+      files_modified_recent >= 1  – sound positive evidence (activity was seen
+                                    within the root tree; fd-based descent with
+                                    O_NOFOLLOW prevents counting outside files);
                                     kept with truncated=True and error=None.
       files_modified_recent == 0  – absence of evidence, not evidence of absence;
                                     degraded to null fields, truncated=True, and a
@@ -2963,9 +2965,42 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
     truncated: bool = False
     truncation_code: str = ""  # set alongside truncated=True; one of the categorical codes
 
-    # Iterative walk, (path, depth) per entry, so the depth cap costs no
-    # recursion.
-    queue: list[tuple[Path, int]] = [(root, 0)]
+    # Iterative walk using opened directory descriptors so descent cannot follow
+    # a symlink that replaced a queued directory between classification and
+    # descent.  O_NOFOLLOW|O_DIRECTORY causes os.open to fail (ENOTDIR/ELOOP)
+    # when the target is a symlink, preventing both outside-positive injection
+    # and active-subtree hiding.  The queue stores (fd, depth) tuples; open fds
+    # are bounded by the queue, not by total entries seen.
+    #
+    # Fall-back (platforms without O_NOFOLLOW or O_DIRECTORY, or where
+    # os.open does not accept dir_fd): revalidate directory identity with
+    # lstat(st_dev, st_ino) immediately before descent and fail unknown on any
+    # mismatch.  This narrows but does not fully close the race: a swap that
+    # completes between the lstat and the scandir call cannot be detected.
+    _DIR_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    _USE_FD_DESCENT = (
+        hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in os.supports_dir_fd
+    )
+
+    try:
+        root_fd = os.open(str(root), _DIR_OPEN_FLAGS)
+    except OSError:
+        return _scratch_unknown("stat_error")
+
+    # Queue stores (fd, depth).  Each fd is open and will be closed after
+    # its contents are scanned (or when the queue is drained on early exit).
+    queue: list[tuple[int, int]] = [(root_fd, 0)]
+
+    def _drain_queue(q: list) -> None:
+        """Close every fd remaining in the queue without raising."""
+        for _fd, _ in q:
+            try:
+                os.close(_fd)
+            except OSError:
+                pass
+        q.clear()
 
     try:
         while queue:
@@ -2977,85 +3012,132 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
                 truncation_code = "timeout"
                 break
 
-            current_dir, depth = queue.pop()
+            current_fd, depth = queue.pop()
 
             # Stream the scandir iterator, never list() it, and re-check the
             # deadline per entry: on slow storage the enumeration itself is
             # what runs long, and only a per-entry check bounds it.
-            with os.scandir(current_dir) as it:
-                for entry in it:
-                    if time.monotonic() >= deadline:
-                        truncated = True
-                        truncation_code = "timeout"
-                        break
+            try:
+                with os.scandir(current_fd) as it:
+                    for entry in it:
+                        if time.monotonic() >= deadline:
+                            truncated = True
+                            truncation_code = "timeout"
+                            break
 
-                    entries_visited += 1
-                    if entries_visited >= WATCH_SCRATCH_MAX_ENTRIES:
-                        truncated = True
-                        truncation_code = "entry_limit"
-                        break
+                        entries_visited += 1
+                        if entries_visited >= WATCH_SCRATCH_MAX_ENTRIES:
+                            truncated = True
+                            truncation_code = "entry_limit"
+                            break
 
-                    # One no-follow stat classifies the entry and fetches the
-                    # mtime in a single syscall.  DirEntry.stat(follow_symlinks=
-                    # False) is cached by the OS after the first call, so this
-                    # is cost-neutral relative to two predicate calls.  Any
-                    # OSError (including a file that vanished during
-                    # classification) is caught here, preventing the false/false
-                    # predicate path that silently treated disappearing entries
-                    # as ignorable special files.
-                    try:
-                        entry_stat = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        raise _ScratchScanError("stat_error")
+                        # One no-follow stat classifies the entry and fetches the
+                        # mtime in a single syscall.  DirEntry.stat(follow_symlinks=
+                        # False) is cached by the OS after the first call, so this
+                        # is cost-neutral relative to two predicate calls.  Any
+                        # OSError (including a file that vanished during
+                        # classification) is caught here, preventing the false/false
+                        # predicate path that silently treated disappearing entries
+                        # as ignorable special files.
+                        try:
+                            entry_stat = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            raise _ScratchScanError("stat_error")
 
-                    st_mode = entry_stat.st_mode
-                    if _stat_module.S_ISDIR(st_mode):
-                        if entry.name not in WATCH_SCRATCH_PRUNE_DIRS:
-                            if depth < WATCH_SCRATCH_MAX_DEPTH:
-                                queue.append((Path(entry.path), depth + 1))
-                            else:
-                                # Non-pruned subtree skipped solely for depth:
-                                # unseen files may be recent, so mark truncated.
-                                truncated = True
-                                truncation_code = "depth_limit"
-                        continue
+                        st_mode = entry_stat.st_mode
+                        if _stat_module.S_ISDIR(st_mode):
+                            if entry.name not in WATCH_SCRATCH_PRUNE_DIRS:
+                                if depth < WATCH_SCRATCH_MAX_DEPTH:
+                                    # Open child fd relative to current_fd (openat
+                                    # semantics): O_NOFOLLOW rejects a symlink that
+                                    # replaced the queued directory after classification,
+                                    # failing with ENOTDIR or ELOOP; other OSErrors
+                                    # (EACCES, EIO, ENOENT) are scan failures.
+                                    # On the fallback path, revalidate identity (st_dev,
+                                    # st_ino) before opening; a mismatch means the
+                                    # directory was replaced but the recheck cannot
+                                    # detect a swap between lstat and scandir.
+                                    if _USE_FD_DESCENT:
+                                        try:
+                                            child_fd = os.open(
+                                                entry.name,
+                                                _DIR_OPEN_FLAGS,
+                                                dir_fd=current_fd,
+                                            )
+                                        except OSError as _open_err:
+                                            # ENOTDIR/ELOOP: O_NOFOLLOW rejected a
+                                            # symlink — directory identity changed.
+                                            # Other errors: permission, I/O, gone.
+                                            if _open_err.errno in (errno.ENOTDIR, errno.ELOOP):
+                                                raise _ScratchScanError("stat_error")
+                                            raise _ScratchScanError("scan_error")
+                                    else:
+                                        child_path = Path(entry.path)
+                                        try:
+                                            recheck = os.lstat(str(child_path))
+                                        except OSError:
+                                            raise _ScratchScanError("stat_error")
+                                        if (
+                                            recheck.st_dev != entry_stat.st_dev
+                                            or recheck.st_ino != entry_stat.st_ino
+                                        ):
+                                            raise _ScratchScanError("stat_error")
+                                        try:
+                                            child_fd = os.open(str(child_path), _DIR_OPEN_FLAGS)
+                                        except OSError:
+                                            raise _ScratchScanError("scan_error")
+                                    queue.append((child_fd, depth + 1))
+                                else:
+                                    # Non-pruned subtree skipped solely for depth:
+                                    # unseen files may be recent, so mark truncated.
+                                    truncated = True
+                                    truncation_code = "depth_limit"
+                            continue
 
-                    # Only regular files contribute to the activity signal.
-                    if not _stat_module.S_ISREG(st_mode):
-                        continue
+                        # Only regular files contribute to the activity signal.
+                        if not _stat_module.S_ISREG(st_mode):
+                            continue
 
-                    mtime = entry_stat.st_mtime
+                        mtime = entry_stat.st_mtime
 
-                    # NaN and infinities cannot represent a real timestamp:
-                    # NaN makes every ordered comparison false (max(0.0, NaN)
-                    # returns 0.0); -inf reads as infinitely old; +inf reaches
-                    # clock_skew only incidentally.  Reject all three uniformly
-                    # so hostile or faulty FUSE/NFS stat data cannot manufacture
-                    # a confident zero.
-                    if not math.isfinite(mtime):
-                        raise _ScratchScanError("invalid_mtime")
+                        # NaN and infinities cannot represent a real timestamp:
+                        # NaN makes every ordered comparison false (max(0.0, NaN)
+                        # returns 0.0); -inf reads as infinitely old; +inf reaches
+                        # clock_skew only incidentally.  Reject all three uniformly
+                        # so hostile or faulty FUSE/NFS stat data cannot manufacture
+                        # a confident zero.
+                        if not math.isfinite(mtime):
+                            raise _ScratchScanError("invalid_mtime")
 
-                    scanned += 1
-                    if newest_mtime is None or mtime > newest_mtime:
-                        newest_mtime = mtime
-                    age = scan_start - mtime
-                    if age < -WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS:
-                        # mtime materially in the future: clock disagreement on the
-                        # filesystem server.  A freshly-written file on NFS can show
-                        # age < 0 because the server clock leads the client.  Beyond
-                        # WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS this is unsound to
-                        # ignore: degrade to null rather than report a confident zero
-                        # (matching the tolerance the log path already applies).
-                        raise _ScratchScanError("clock_skew")
-                    # age is >= -TOLERANCE here; minor jitter (age < 0 within tolerance)
-                    # is treated as 0, which is within the recent window.
-                    if age < WATCH_SCRATCH_RECENT_SECONDS:
-                        files_modified_recent += 1
+                        scanned += 1
+                        if newest_mtime is None or mtime > newest_mtime:
+                            newest_mtime = mtime
+                        age = scan_start - mtime
+                        if age < -WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS:
+                            # mtime materially in the future: clock disagreement on the
+                            # filesystem server.  A freshly-written file on NFS can show
+                            # age < 0 because the server clock leads the client.  Beyond
+                            # WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS this is unsound to
+                            # ignore: degrade to null rather than report a confident zero
+                            # (matching the tolerance the log path already applies).
+                            raise _ScratchScanError("clock_skew")
+                        # age is >= -TOLERANCE here; minor jitter (age < 0 within tolerance)
+                        # is treated as 0, which is within the recent window.
+                        if age < WATCH_SCRATCH_RECENT_SECONDS:
+                            files_modified_recent += 1
 
-                    if scanned >= WATCH_SCRATCH_MAX_FILES:
-                        truncated = True
-                        truncation_code = "file_limit"
-                        break
+                        if scanned >= WATCH_SCRATCH_MAX_FILES:
+                            truncated = True
+                            truncation_code = "file_limit"
+                            break
+
+            finally:
+                # current_fd was opened before being pushed; close it now
+                # regardless of how the scan ended (normal, break, exception).
+                try:
+                    os.close(current_fd)
+                except OSError:
+                    pass
 
             if truncated and truncation_code != "depth_limit":
                 # depth_limit only truncates the queue; continue scanning
@@ -3063,11 +3145,16 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
                 break
 
     except _ScratchScanError as err:
+        _drain_queue(queue)
         return _scratch_unknown(err.code)
     except OSError:
+        _drain_queue(queue)
         # scandir() failed on the root or a discovered subdirectory (removed,
         # permission denied, I/O error). Partial observations are unreliable.
         return _scratch_unknown("scan_error")
+
+    # Drain any remaining queued fds (e.g. after a truncation break above).
+    _drain_queue(queue)
 
     if newest_mtime is None:
         newest_mtime_age_s: Optional[float] = None
@@ -3078,9 +3165,13 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
         newest_mtime_age_s = max(0.0, delta)
 
     # Asymmetric truncation contract: files_modified_recent >= 1 is sound
-    # positive evidence even under truncation.  A zero under truncation is
-    # absence of evidence, not evidence of absence — degrade to null fields
-    # plus a categorical code.  Test: test_truncated_zero_degrades_to_null_with_code.
+    # positive evidence even under truncation — fd-based descent with
+    # O_NOFOLLOW|O_DIRECTORY confines the scan to the root tree so outside
+    # files cannot be counted.  A zero under truncation is absence of evidence,
+    # not evidence of absence — degrade to null fields plus a categorical code.
+    # Tests: test_truncated_zero_degrades_to_null_with_code (zero-degradation),
+    # test_queued_dir_replaced_by_symlink_outside_injection (confinement positive),
+    # test_queued_dir_replaced_by_symlink_hides_activity (confinement zero).
     if truncated and files_modified_recent == 0:
         result = _scratch_unknown(truncation_code)
         result["truncated"] = True
