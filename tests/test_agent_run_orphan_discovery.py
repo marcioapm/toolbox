@@ -933,6 +933,29 @@ class TestStateRootGuard:
         assert len(candidates) == 1
         assert candidates[0].name == "samerootrun"
 
+    def test_darwin_unknown_state_root_skips_candidate(
+        self, isolated_runs_root, monkeypatch
+    ):
+        entry = _make_entry(
+            pid=7903,
+            argv=["agent-run", "darwinrun", "claude"],
+            start_time=FAR_PAST,
+        )
+        _make_log_dir("darwinrun")
+        monkeypatch.setattr(agent_run.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(agent_run, "_runner_state_root", _runner_state_root_real)
+
+        candidates, skips = _find_orphan_runners(
+            [entry],
+            min_age_seconds=0,
+            now=time.time(),
+            self_pid=os.getpid() + 1000,
+            self_pgid=os.getpgid(0) + 1000,
+        )
+
+        assert not candidates
+        assert any(skip.reason == "state_root_unreadable" for skip in skips)
+
 
 # ---------------------------------------------------------------------------
 # Linux path proof: _runner_state_root with forced Linux branch
