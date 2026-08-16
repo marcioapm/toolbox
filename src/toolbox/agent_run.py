@@ -3022,7 +3022,17 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
                     if newest_mtime is None or mtime > newest_mtime:
                         newest_mtime = mtime
                     age = scan_start - mtime
-                    if 0.0 <= age < WATCH_SCRATCH_RECENT_SECONDS:
+                    if age < -WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS:
+                        # mtime materially in the future: clock disagreement on the
+                        # filesystem server.  A freshly-written file on NFS can show
+                        # age < 0 because the server clock leads the client.  Beyond
+                        # WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS this is unsound to
+                        # ignore: degrade to null rather than report a confident zero
+                        # (matching the tolerance the log path already applies).
+                        raise _ScratchScanError("clock_skew")
+                    # age is >= -TOLERANCE here; minor jitter (age < 0 within tolerance)
+                    # is treated as 0, which is within the recent window.
+                    if age < WATCH_SCRATCH_RECENT_SECONDS:
                         files_modified_recent += 1
 
                     if scanned >= WATCH_SCRATCH_MAX_FILES:
@@ -3046,8 +3056,9 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
         newest_mtime_age_s: Optional[float] = None
     else:
         delta = scan_start - newest_mtime
-        # A future mtime (clock skew) degrades to null rather than a negative age.
-        newest_mtime_age_s = max(0.0, delta) if delta >= 0.0 else None
+        # Clamp minor future jitter (within WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS)
+        # to 0.0; material clock skew was already caught per-file above.
+        newest_mtime_age_s = max(0.0, delta)
 
     # Asymmetric truncation contract: files_modified_recent >= 1 is sound
     # positive evidence even under truncation.  A zero under truncation is

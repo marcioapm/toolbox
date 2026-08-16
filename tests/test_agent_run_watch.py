@@ -2276,6 +2276,55 @@ class TestScratchFacts:
         assert result["newest_mtime_age_s"] >= agent_run.WATCH_SCRATCH_RECENT_SECONDS
         assert result["files_modified_recent"] == 0
 
+    def test_future_mtime_beyond_tolerance_degrades_to_null_with_clock_skew(self, tmp_path):
+        """A materially future mtime must degrade to null + error='clock_skew'.
+
+        A confident zero is internally contradictory: newest_mtime_age_s is
+        null (clock disagreement) while files_modified_recent=0 claims inactivity
+        was observed.  On NFS/server-clock skew a freshly written file can have
+        a future mtime, so the zero fails toward escalation of a healthy run.
+
+        Choice matches the log path: minor jitter within
+        WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS is clamped to 0 (still recent);
+        beyond the tolerance the scan degrades.  Test: mutation replacing the
+        clock_skew raise with a pass now reports files_modified_recent=0,
+        error=None — a confident zero — and this test fails.
+        """
+        f = tmp_path / "future.txt"
+        f.write_text("data\n")
+        future_time = time.time() + agent_run.WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS + 10.0
+        os.utime(f, (future_time, future_time))
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "clock_skew", (
+            f"Materially future mtime must set error='clock_skew' (got {result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_future_mtime_within_tolerance_counts_as_recent(self, tmp_path):
+        """A mtime within WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS ahead is treated as 'now'.
+
+        Minor NFS/server-clock jitter should not degrade the scan; a freshly
+        written file with a slightly future timestamp must count as recent.
+        """
+        f = tmp_path / "jitter.txt"
+        f.write_text("data\n")
+        # Set mtime slightly in the future but within the tolerance.
+        jitter = agent_run.WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS / 2
+        os.utime(f, (time.time() + jitter, time.time() + jitter))
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] is None, (
+            "Minor future jitter within tolerance must not degrade the scan"
+        )
+        assert result["files_modified_recent"] is not None
+        assert result["files_modified_recent"] >= 1, (
+            "A file with minor future jitter must count as recent"
+        )
+
     def test_wall_clock_budget_sets_truncated_before_exhaustion(self, tmp_path, monkeypatch):
         """When the wall-clock budget is zero the scan truncates with error=timeout.
 
