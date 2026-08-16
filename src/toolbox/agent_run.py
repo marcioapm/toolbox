@@ -1356,6 +1356,39 @@ def _is_dir_safe(path: Path) -> bool:
         return False
 
 
+# Tri-state values returned by _probe_dir_state.
+_DIR_PRESENT = "present"        # path.is_dir() returned True
+_DIR_MISSING = "missing"        # path does not exist or is not a directory
+_DIR_UNSTATABLE = "unstatable"  # stat raised OSError (e.g. PermissionError on parent)
+
+
+def _probe_dir_state(path: Path) -> str:
+    """Return a tri-state describing *path*: present, missing, or unstatable.
+
+    ``Path.is_dir()`` silently returns ``False`` on some platforms when the
+    filesystem cannot be interrogated (e.g. macOS returns ``False`` instead of
+    raising ``PermissionError`` when a parent directory is unreadable).
+    ``os.stat()`` reliably raises ``OSError`` in those cases.  Callers that
+    must distinguish *cannot stat* from *absent* use this probe instead of
+    ``Path.is_dir()`` or ``_is_dir_safe()``.
+
+    An ``ELOOP`` error (self-referential symlink) is treated as missing rather
+    than unstatable, because no directory could ever exist at that path.
+    """
+    try:
+        st = os.stat(path)
+        import stat as _stat
+        return _DIR_PRESENT if _stat.S_ISDIR(st.st_mode) else _DIR_MISSING
+    except FileNotFoundError:
+        return _DIR_MISSING
+    except OSError as exc:
+        import errno as _errno
+        if exc.errno == _errno.ELOOP:
+            # A self-referential symlink cannot name a directory; treat as absent.
+            return _DIR_MISSING
+        return _DIR_UNSTATABLE
+
+
 def _require_state(name: str) -> Path:
     d = _state_dir(name)
     if not d.is_dir():
@@ -3071,7 +3104,19 @@ def _cmd_watch_observe(
             "scratch": _watch_scratch_facts(cwd),
         }
 
-    if not state_dir.is_dir():
+    state_dir_state = _probe_dir_state(state_dir)
+
+    if state_dir_state == _DIR_UNSTATABLE:
+        # The state directory exists but cannot be statted (e.g. PermissionError
+        # on its parent).  Emitting a confident terminal-looking status here
+        # would hide a still-live run.  Raise so cmd_watch's never-raise guard
+        # catches it and emits a degraded contract with observation_error set.
+        raise PermissionError(
+            f"state directory for '{name}' is unreadable — "
+            "run may still be live; cannot determine status"
+        )
+
+    if state_dir_state == _DIR_MISSING:
         # State dir gone, log survived: cmd_status's "not running (log
         # preserved)" case, usually a reboot. The `cwd` state file went with
         # it, so git facts need an explicit --repo and every process fact is
