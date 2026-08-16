@@ -2462,9 +2462,16 @@ class TestScratchFacts:
     def test_scratch_key_present_in_normal_branch(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
     ):
-        """Normal branch: scratch key is present and has the correct sub-keys."""
+        """Normal branch: scratch scan runs and reports recent activity.
+
+        Asserts branch-specific values, not just key presence.  Removing the
+        _watch_scratch_facts call from the observed() branch must fail this test
+        because the default payload has error='not_observed', not None.
+        """
         repo = tmp_path / "repo"
         _init_repo(repo)
+        # Write a recent file so the scan has something to report.
+        (repo / "recent_finding.md").write_text("analysis output\n")
         _make_run(
             isolated_runs_root, isolated_log_root, "sc1",
             status="running", pid=111, log_age_secs=1, cwd=str(repo),
@@ -2473,20 +2480,46 @@ class TestScratchFacts:
         agent_run.cmd_watch(_watch_args("sc1"))
         payload = json.loads(capsys.readouterr().out)
         assert set(payload.keys()) == WATCH_CONTRACT_KEYS
-        assert set(payload["scratch"].keys()) == self.SCRATCH_KEYS
+        scratch = payload["scratch"]
+        assert set(scratch.keys()) == self.SCRATCH_KEYS
+        # Branch-specific values: a real scan ran and saw the recent file.
+        assert scratch["error"] is None, (
+            f"Normal branch must run the scan (error={scratch['error']!r}); "
+            "if _watch_scratch_facts is removed, error defaults to 'not_observed'"
+        )
+        assert scratch["files_modified_recent"] >= 1, (
+            "Normal branch must report the recent file written above"
+        )
 
     def test_scratch_key_present_in_missing_state_dir_branch(
-        self, isolated_runs_root, isolated_log_root, capsys
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
     ):
-        """Missing-state-dir branch: scratch key is also present."""
+        """Missing-state-dir branch: scratch scan runs when --repo is supplied.
+
+        Asserts branch-specific values, not just key presence.  Removing the
+        _watch_scratch_facts call from the observed() branch must fail this test.
+        """
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        # Write a recent file so the scan has something to report.
+        (workdir / "finding.md").write_text("review notes\n")
         _make_run(
             isolated_runs_root, isolated_log_root, "sc2",
             write_state=False, log_text="line1\n",
         )
-        agent_run.cmd_watch(_watch_args("sc2"))
+        agent_run.cmd_watch(_watch_args("sc2", repo=str(workdir)))
         payload = json.loads(capsys.readouterr().out)
         assert set(payload.keys()) == WATCH_CONTRACT_KEYS
-        assert set(payload["scratch"].keys()) == self.SCRATCH_KEYS
+        scratch = payload["scratch"]
+        assert set(scratch.keys()) == self.SCRATCH_KEYS
+        # Branch-specific values: the scan ran via --repo and saw the recent file.
+        assert scratch["error"] is None, (
+            f"Missing-state branch with --repo must run the scan (error={scratch['error']!r}); "
+            "if _watch_scratch_facts is removed, error defaults to 'not_observed'"
+        )
+        assert scratch["files_modified_recent"] >= 1, (
+            "Missing-state branch must report the recent file written above"
+        )
 
     def test_scratch_key_present_in_observation_error_branch(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
