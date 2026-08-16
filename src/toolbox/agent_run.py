@@ -2835,11 +2835,31 @@ def cmd_watch(args: argparse.Namespace) -> int:
     as_json = bool(args.json)
     state_dir = _state_dir(name)
     log_dir = _log_dir(name)
-    if not _is_dir_safe(state_dir) and not _is_dir_safe(log_dir):
-        # Distinct from the never-raise guard below: nothing to observe, as
-        # opposed to observation breaking. Empty stdout, exit 2.
+
+    state_dir_probe = _probe_dir_state(state_dir)
+    log_dir_probe = _probe_dir_state(log_dir)
+
+    if state_dir_probe == _DIR_MISSING and log_dir_probe == _DIR_MISSING:
+        # Both paths are conclusively absent: no run by this name exists.
+        # Distinct from observation breaking; empty stdout, exit 2.
         print(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}", file=sys.stderr)
         return 2
+
+    if state_dir_probe == _DIR_UNSTATABLE or log_dir_probe == _DIR_UNSTATABLE:
+        # At least one path cannot be statted: the run may be live but
+        # unreadable.  Emit the degraded contract so a poller never reads
+        # "can't observe" as "no such run", then exit 0.
+        message = (
+            f"cannot stat {'state' if state_dir_probe == _DIR_UNSTATABLE else 'log'} "
+            f"directory for '{name}' — run may be live but is unreadable"
+        )
+        payload = _watch_payload(name, _now_iso(), "unknown", observation_error=message)
+        _watch_emit(
+            payload,
+            as_json,
+            f"name={name} status={payload['status']} observation_error={message!r}",
+        )
+        return 0
 
     # Everything below observes best-effort facts about a run this process
     # does not control; an unanticipated failure must still print the full

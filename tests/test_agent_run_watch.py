@@ -2067,6 +2067,39 @@ class TestIsDirSafe:
         assert payload["observation_error"] is None
 
     @ROOT_SKIP
+    def test_cmd_watch_unstatable_state_and_missing_log_exits_zero_not_two(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """An unstatable state dir with no log must not return exit 2 (stop polling).
+
+        The old _is_dir_safe gate collapsed every OSError on the state dir to
+        False.  If the log was also absent, the conjunction was True and cmd_watch
+        returned exit 2, which tells the poller to stop polling this name —
+        permanently hiding a healthy but temporarily unreadable run.
+
+        With tri-state probes, UNSTATABLE + MISSING must emit the degraded
+        contract (observation_error set) and return exit 0.
+        """
+        # Create only the state dir, make the parent unreadable so stat fails.
+        state_dir = isolated_runs_root / "w4"
+        state_dir.mkdir(parents=True)
+        (state_dir / "status").write_text("running\n")
+        # No log dir created → log path is MISSING.
+        isolated_runs_root.chmod(0o000)
+        try:
+            rc = agent_run.cmd_watch(_watch_args("w4"))
+        finally:
+            isolated_runs_root.chmod(0o755)
+        assert rc == 0, (
+            "UNSTATABLE state + MISSING log must return exit 0, not exit 2; "
+            "exit 2 permanently stops polling the run"
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert isinstance(payload["observation_error"], str)
+        assert payload["observation_error"]
+
+    @ROOT_SKIP
     def test_cmd_status_does_not_raise_when_state_root_unreadable(
         self, isolated_runs_root, isolated_log_root, capsys
     ):
