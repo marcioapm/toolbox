@@ -2890,6 +2890,14 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
     # without recursion depth concerns.  Each queue entry is (path, depth).
     queue: list[tuple[Path, int]] = [(root, 0)]
 
+    # _ScanError is a private sentinel used to break out of the BFS loop and
+    # return a null result when an unrecoverable OS error is encountered.  It
+    # carries a categorical code so no OS-provided path or message leaks into
+    # the contract.  See the docstring safety property at the top of this function.
+    class _ScanError(Exception):
+        def __init__(self, code: str) -> None:
+            self.code = code
+
     try:
         while queue:
             if time.time() >= deadline:
@@ -2927,7 +2935,11 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
                         try:
                             mtime = entry.stat(follow_symlinks=False).st_mtime
                         except OSError:
-                            continue
+                            # A file can vanish between is_file() and stat() (TOCTOU).
+                            # Treat the result as unreliable: raise to abort the scan
+                            # and return null decision fields rather than a confident
+                            # partial count.
+                            raise _ScanError("stat_error")
 
                         scanned += 1
                         if newest_mtime is None or mtime > newest_mtime:
@@ -2940,16 +2952,22 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
                             truncated = True
                             break
 
+            except _ScanError:
+                raise  # propagate to outer handler
             except OSError:
-                # Permission denied or the directory vanished mid-scan; skip it.
-                continue
+                # A scandir() on a discovered subdirectory failed (permission
+                # denied, directory removed, etc.).  Partial observations from
+                # this tree are unreliable, so abort and return null fields.
+                raise _ScanError("scan_error")
 
             if truncated:
                 break
 
+    except _ScanError as err:
+        return {**null_result, "error": err.code}
     except OSError as exc:
         # Unexpected OS error mid-scan: degrade to null rather than a confident 0.
-        return {**null_result, "scanned": scanned or None, "error": f"scan_error: {exc!s}"[:200]}
+        return {**null_result, "error": f"scan_error: {exc!s}"[:200]}
 
     if newest_mtime is None:
         newest_mtime_age_s: Optional[float] = None

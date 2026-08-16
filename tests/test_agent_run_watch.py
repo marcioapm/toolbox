@@ -2252,6 +2252,131 @@ class TestScratchFacts:
             "Entries-visited cap must set truncated=True when exceeded by non-file entries"
         )
 
+    def test_unreadable_subdir_returns_null_with_error(self, tmp_path):
+        """A PermissionError on a discovered subdirectory must degrade to null fields + error.
+
+        Safety property: WATCH_SCRATCH_BUDGET_SECONDS alone cannot prevent a healthy run
+        from being misread as inactive — scan errors must produce null decision fields,
+        never a confident zero that the poller reads as observed inactivity.
+
+        This test fails if the inner OSError handler silently continues instead of
+        propagating a null result.
+        """
+        import os as _os
+        import stat as _stat
+
+        subdir = tmp_path / "unreadable_subdir"
+        subdir.mkdir()
+        (subdir / "file.txt").write_text("data\n")
+        subdir.chmod(0)  # remove all permissions
+
+        try:
+            result = agent_run._watch_scratch_facts(str(tmp_path))
+            assert result["error"] is not None, (
+                "A PermissionError on a subdirectory must set error, not silently skip"
+            )
+            assert result["files_modified_recent"] is None, (
+                "files_modified_recent must be null, not a confident 0"
+            )
+            assert result["newest_mtime_age_s"] is None
+            assert result["scanned"] is None
+        finally:
+            subdir.chmod(_stat.S_IRWXU)
+
+    def test_file_vanishes_at_stat_returns_null_with_error(self, tmp_path, monkeypatch):
+        """A FileNotFoundError while statting a discovered file must degrade to null + error.
+
+        Safety property: if a file disappears between is_file() and stat(), the scan
+        must not silently skip it and report a confident zero — the partial observation
+        is unreliable so decision fields must be null.
+
+        This test fails if the inner stat() OSError handler silently continues.
+        """
+        import os as _os
+
+        (tmp_path / "real.txt").write_text("data\n")
+
+        # Wrap os.scandir so that the DirEntry.stat() method raises FileNotFoundError.
+        real_scandir = _os.scandir
+
+        class VanishingEntry:
+            """Proxy a real DirEntry but make stat() raise FileNotFoundError."""
+
+            def __init__(self, entry):
+                self._entry = entry
+
+            def stat(self, **kw):
+                raise FileNotFoundError(f"[Errno 2] No such file: '{self._entry.path}'")
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+        class VanishingIterator:
+            def __init__(self, it):
+                self._it = it
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return VanishingEntry(next(self._it))
+
+            def __enter__(self):
+                self._it.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._it.__exit__(*args)
+
+        def scandir_vanishing(path):
+            return VanishingIterator(real_scandir(path))
+
+        monkeypatch.setattr(_os, "scandir", scandir_vanishing)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] is not None, (
+            "A stat FileNotFoundError must set error, not silently skip"
+        )
+        assert result["files_modified_recent"] is None, (
+            "files_modified_recent must be null after a stat error"
+        )
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+
+    def test_root_deleted_after_validation_returns_null_with_error(self, tmp_path, monkeypatch):
+        """Deleting the root between is_dir() check and scandir() must degrade to null + error.
+
+        Safety property: a TOCTOU race between the root-existence check and the scan
+        must not produce a confident zero — the result is unknown and must be null.
+
+        This test fails if the scandir FileNotFoundError is silently swallowed.
+        """
+        import os as _os
+        import shutil as _shutil
+
+        target = tmp_path / "scanroot"
+        target.mkdir()
+        (target / "file.txt").write_text("data\n")
+
+        real_scandir = _os.scandir
+
+        def scandir_after_delete(path):
+            # Delete the directory right before scandir yields anything.
+            _shutil.rmtree(str(path), ignore_errors=True)
+            return real_scandir(path)
+
+        monkeypatch.setattr(_os, "scandir", scandir_after_delete)
+
+        result = agent_run._watch_scratch_facts(str(target))
+        assert result["error"] is not None, (
+            "Root deleted before scandir must set error, not return a confident zero"
+        )
+        assert result["files_modified_recent"] is None, (
+            "files_modified_recent must be null when root vanishes mid-scan"
+        )
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+
     # ------------------------------------------------------------------
     # end-to-end tests through cmd_watch
     # ------------------------------------------------------------------
