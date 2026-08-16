@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -253,6 +254,16 @@ class TestDuGrouping:
         assert (sd / "status").read_text() == before_status
         assert sd.exists()
         assert ld.exists()
+
+    @pytest.mark.parametrize("root_kind", ["state", "log"])
+    def test_du_ignores_top_level_symlink(self, isolated_runs_root, isolated_log_root, root_kind):
+        outside = isolated_log_root.parent / f"outside-{root_kind}"
+        outside.mkdir()
+        (outside / "payload").write_bytes(b"x" * 123)
+        root = isolated_runs_root if root_kind == "state" else isolated_log_root
+        (root / "linked").symlink_to(outside, target_is_directory=True)
+
+        assert all(row.key != "linked" for row in agent_run._du_collect_rows())
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +622,17 @@ class TestParseLaunchArgv:
         assert r.name == "myrun"
         assert r.command == ["list", "foo"]
         assert r.subcommand_tokens is None
+
+    @pytest.mark.parametrize("name", sorted(agent_run._KNOWN_SUBCOMMANDS))
+    def test_dashdash_allows_subcommand_name_as_run_name(self, name):
+        r = self._parse([name, "--", "echo", "hi"])
+        assert r.name == name
+        assert r.command == ["echo", "hi"]
+        assert r.subcommand_tokens is None
+
+    def test_dashdash_subcommand_name_still_rejects_empty_command(self):
+        with pytest.raises(agent_run._LaunchArgvError, match="empty command"):
+            self._parse(["list", "--"])
 
     def test_dashdash_flags_before_name(self):
         r = self._parse(["--echo", "--idle-timeout", "30", "myrun", "--", "some-cmd", "--flag"])

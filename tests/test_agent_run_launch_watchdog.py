@@ -36,7 +36,7 @@ def _alive_for(count: int):
 
 
 def _run_watchdog(state: Path, log_dir: Path, idle_timeout: float) -> None:
-    agent_run._idle_watchdog_loop(state, log_dir, 4242, idle_timeout)
+    agent_run._idle_watchdog_loop(state, log_dir, 4242, "linux:runner", idle_timeout)
 
 
 # --- idle watchdog ---------------------------------------------------------
@@ -56,6 +56,8 @@ def test_watchdog_terminates_a_run_whose_log_stopped_growing(
     signals: list[tuple[int, int]] = []
     monkeypatch.setenv("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "0.5")
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:runner")
+    monkeypatch.setattr(agent_run, "_send_signal_to_verified_pid", lambda pid, sig, _identity: signals.append((pid, sig)))
     monkeypatch.setattr(agent_run.os, "kill", lambda pid, sig: signals.append((pid, sig)))
     monkeypatch.setattr(agent_run, "KILL_ESCALATION_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(agent_run, "_watchdog_escalate", lambda *_args: None)
@@ -83,6 +85,8 @@ def test_watchdog_does_not_fire_before_first_output_within_startup_grace(
     signals: list[tuple[int, int]] = []
     monkeypatch.setenv("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "600")
     monkeypatch.setattr(agent_run, "_pid_alive", _alive_for(3))
+    identities = iter(["linux:runner"] * 3 + [None])
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: next(identities))
     monkeypatch.setattr(agent_run.os, "kill", lambda pid, sig: signals.append((pid, sig)))
 
     _run_watchdog(state, log_dir, 1.0)
@@ -101,15 +105,19 @@ def test_watchdog_does_not_fire_while_the_log_keeps_growing(
     log.write_text("tick\n")
 
     signals: list[tuple[int, int]] = []
-    alive = _alive_for(3)
+    identity_calls = 0
 
-    def _growing(pid: int) -> bool:
+    def _identity(_pid: int):
+        nonlocal identity_calls
+        identity_calls += 1
+        if identity_calls > 3:
+            return None
         with log.open("a") as handle:
             handle.write("tick\n")
-        return alive(pid)
+        return "linux:runner"
 
     monkeypatch.setenv("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "0.5")
-    monkeypatch.setattr(agent_run, "_pid_alive", _growing)
+    monkeypatch.setattr(agent_run, "_process_identity", _identity)
     monkeypatch.setattr(agent_run.os, "kill", lambda pid, sig: signals.append((pid, sig)))
 
     _run_watchdog(state, log_dir, 1.0)
@@ -137,6 +145,8 @@ def test_watchdog_still_signals_when_the_marker_write_fails(
 
     monkeypatch.setenv("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "0.5")
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:runner")
+    monkeypatch.setattr(agent_run, "_send_signal_to_verified_pid", lambda pid, sig, _identity: signals.append((pid, sig)))
     monkeypatch.setattr(agent_run, "_write", _refuse_write)
     monkeypatch.setattr(agent_run.os, "kill", lambda pid, sig: signals.append((pid, sig)))
     monkeypatch.setattr(agent_run, "KILL_ESCALATION_TIMEOUT_SECONDS", 0.1)
@@ -161,10 +171,12 @@ def test_watchdog_escalates_when_the_runner_ignores_sigterm(
     escalated: list[int] = []
     monkeypatch.setenv("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "0.5")
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:runner")
+    monkeypatch.setattr(agent_run, "_send_signal_to_verified_pid", lambda *_args: None)
     monkeypatch.setattr(agent_run.os, "kill", lambda _pid, _sig: None)
     monkeypatch.setattr(agent_run, "KILL_ESCALATION_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(
-        agent_run, "_watchdog_escalate", lambda _state, pid: escalated.append(pid)
+        agent_run, "_watchdog_escalate", lambda _state, pid, _identity: escalated.append(pid)
     )
 
     _run_watchdog(state, log_dir, 1.0)
@@ -177,9 +189,11 @@ def test_watchdog_escalation_publishes_killed_with_a_reason(
 ):
     state = _seed_run(isolated_runs_root)
     (state / agent_run.IDLE_TIMEOUT_MARKER).write_text("42\n")
-    monkeypatch.setattr(agent_run.os, "kill", lambda _pid, _sig: None)
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:runner")
+    monkeypatch.setattr(agent_run, "_pid_parent_pid", lambda _pid: 4242)
+    monkeypatch.setattr(agent_run, "_send_signal_to_verified_pid", lambda *_args: None)
 
-    agent_run._watchdog_escalate(state, 4242)
+    agent_run._watchdog_escalate(state, 4242, "linux:runner")
 
     assert (state / "status").read_text().strip() == "killed"
     assert "42" in (state / "reap_reason").read_text()
@@ -220,6 +234,66 @@ def test_force_kill_legacy_sends_catchable_signals_to_the_runner_alone(
     agent_run._force_kill_legacy("run", state, 123, signal.SIGTERM)
 
     assert sent == [(123, signal.SIGTERM)]
+
+
+def test_force_kill_legacy_refuses_mismatched_recorded_group(
+    isolated_runs_root, monkeypatch
+):
+    state = _seed_run(isolated_runs_root)
+    (state / "pgid").write_text("999\n")
+    monkeypatch.setattr(agent_run.os, "getpgid", lambda _pid: 998)
+    monkeypatch.setattr(
+        agent_run.os, "killpg", lambda *_args: pytest.fail("signalled unrelated group")
+    )
+
+    with pytest.raises(SystemExit, match="does not contain pid"):
+        agent_run._force_kill_legacy("run", state, 123, signal.SIGKILL)
+
+
+def test_watchdog_stops_when_runner_identity_changes(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    state = _seed_run(isolated_runs_root)
+    log_dir = isolated_log_root / "run"
+    log_dir.mkdir()
+    (log_dir / "log").write_text("started\n")
+    monkeypatch.setattr(agent_run.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:replacement")
+    monkeypatch.setattr(
+        agent_run, "_send_signal_to_verified_pid", lambda *_args: pytest.fail("signalled replacement")
+    )
+
+    _run_watchdog(state, log_dir, 1.0)
+
+    assert not (state / agent_run.IDLE_TIMEOUT_MARKER).exists()
+
+
+def test_watchdog_recognizes_output_before_first_poll(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    state = _seed_run(isolated_runs_root)
+    log_dir = isolated_log_root / "run"
+    log_dir.mkdir()
+    log = log_dir / "log"
+    log.write_text("output\n")
+    old = time.time() - 600
+    os.utime(log, (old, old))
+    current = log.stat()
+    baseline = (current.st_dev, current.st_ino, 0, current.st_mtime_ns - 1)
+    sent = []
+    monkeypatch.setenv("AGENT_RUN_WATCHDOG_STARTUP_GRACE_SECS", "600")
+    monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: "linux:runner")
+    monkeypatch.setattr(
+        agent_run, "_send_signal_to_verified_pid", lambda pid, sig, _identity: sent.append((pid, sig))
+    )
+    monkeypatch.setattr(agent_run, "KILL_ESCALATION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(agent_run, "_watchdog_escalate", lambda *_args: None)
+
+    agent_run._idle_watchdog_loop(
+        state, log_dir, 4242, "linux:runner", 1.0, baseline
+    )
+
+    assert (4242, signal.SIGTERM) in sent
 
 
 # --- launch diagnostics ----------------------------------------------------

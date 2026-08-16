@@ -1043,6 +1043,13 @@ class TestReapBudget:
         deferred = _summary_field(line, "deferred")
         assert deferred > 0
 
+    def test_help_describes_budget_as_soft(self):
+        help_text = agent_run._build_parser()._subparsers._group_actions[0].choices[
+            "reap"
+        ].format_help()
+        assert "soft candidate-admission budget" in help_text
+        assert "may overrun" in help_text
+
 
 # ---------------------------------------------------------------------------
 # Linux signal-path proof: pidfd branch used and recorded end-to-end

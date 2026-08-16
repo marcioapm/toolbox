@@ -29,6 +29,7 @@ same `process_identity`/`_process_identity` primitives and the same
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import os
 import signal
 import shutil
@@ -2325,6 +2326,63 @@ class TestReapLogMinAgeThreshold:
 
         assert rc == 0
         assert ld.exists()
+
+    def test_old_empty_preserved_log_is_collected(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        ld = isolated_log_root / "emptyold"
+        ld.mkdir()
+        old = time.time() - 48 * 3600
+        os.utime(ld, (old, old))
+
+        agent_run.cmd_reap(_reap_args(include_logs=True, log_min_age_hours=24))
+
+        assert not ld.exists()
+
+    def test_preserved_log_replacement_after_age_scan_survives(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        ld = _make_preserved_log(isolated_log_root, "logswap", age_secs=48 * 3600)
+        original = isolated_log_root / "old-logswap"
+
+        @contextmanager
+        def replacing_lock(_name):
+            ld.rename(original)
+            ld.mkdir()
+            (ld / "fresh").write_text("new data\n")
+            yield -1
+
+        monkeypatch.setattr(agent_run, "_launch_lock", replacing_lock)
+
+        agent_run.cmd_reap(_reap_args(include_logs=True, log_min_age_hours=24))
+
+        assert (ld / "fresh").read_text() == "new data\n"
+
+
+    def test_orphan_scratch_replacement_after_age_scan_survives(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        ld = isolated_log_root / "scratchswap"
+        scratch = ld / "tmp"
+        scratch.mkdir(parents=True)
+        (scratch / "old").write_text("old\n")
+        old = time.time() - 48 * 3600
+        os.utime(scratch / "old", (old, old))
+        os.utime(scratch, (old, old))
+        original = ld / "old-tmp"
+
+        @contextmanager
+        def replacing_lock(_name):
+            scratch.rename(original)
+            scratch.mkdir()
+            (scratch / "fresh").write_text("new data\n")
+            yield -1
+
+        monkeypatch.setattr(agent_run, "_launch_lock", replacing_lock)
+
+        agent_run.cmd_reap(_reap_args(min_age_hours=24))
+
+        assert (scratch / "fresh").read_text() == "new data\n"
 
 
 # ---------------------------------------------------------------------------

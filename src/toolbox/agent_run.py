@@ -364,6 +364,7 @@ WATCH_GIT_TOTAL_BUDGET_SECONDS: float = 5.0
 WATCH_TAIL_READ_BLOCK_BYTES: int = 65536
 # Cap how far the tail scan walks back, however few newlines it has found.
 WATCH_TAIL_MAX_BYTES: int = 256 * 1024
+WATCH_LINE_COUNT_MAX_BYTES: int = 16 * 1024 * 1024
 
 # Git env vars that redirect a command at a different repo/index than the one
 # named on the command line; a poll must not inherit these from its caller.
@@ -377,6 +378,7 @@ WATCH_GIT_ENV_VARS_TO_STRIP: frozenset[str] = frozenset(
         "GIT_NAMESPACE",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_CEILING_DIRECTORIES",
+        "GIT_REPLACE_REF_BASE",
     }
 )
 
@@ -1422,6 +1424,8 @@ def _prune_old_logs(max_age_days: int = PRUNE_AFTER_DAYS) -> None:
 
 
 def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -1518,18 +1522,12 @@ def _runner_state_root(pid: int) -> Optional[Path]:
     ``cmd_reap`` covers only the post-discovery action phase and does not bound
     this read.
 
-    On Darwin reading another process's environment requires a privileged API;
-    ``STATE_ROOT`` is returned unconditionally.  This means a runner launched
-    with a non-default ``AGENT_RUN_STATE_DIR`` on macOS is still evaluated
-    against the reaper's root (residual S3 exposure).  The log-dir corroboration
-    check upstream rejects any process whose recovered name has no ``LOG_ROOT``
-    entry, limiting but not eliminating that exposure.
+    Darwin does not expose another process's environment through an
+    unprivileged boundary-preserving API, so it returns ``None``. Destructive
+    orphan discovery must skip a candidate whose state root is unknown.
     """
     if platform.system() != "Linux":
-        # Conservative fallback: assume the runner shares our root.  The
-        # log-dir corroboration upstream already rejects any process whose
-        # recovered name has no LOG_ROOT entry, limiting the exposure.
-        return STATE_ROOT
+        return None
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
@@ -1932,10 +1930,10 @@ def _watch_effective_status(state_dir: Path, idle_threshold: Optional[float] = N
     matching identity is not evidence of liveness here.
     """
     status = _effective_status(state_dir, idle_threshold)
-    if status not in {"running", "stalled"}:
+    if status not in {"starting", "running", "stalled"}:
         return status
     pid = _safe_int(_read(state_dir / "pid"))
-    if pid is None:
+    if pid is None or pid <= 0:
         return "unverified"
     if _watch_pid_is_zombie(pid):
         return "died"
@@ -2405,6 +2403,7 @@ def _watch_run_git_checked(
     }
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     try:
         result = subprocess.run(
             [
@@ -2509,7 +2508,7 @@ def _watch_git_facts_checked(repo: Path, launch_head: Optional[str]) -> _WatchGi
             repo, git_args, timeout=min(WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS, max(0.05, remaining))
         )
 
-    head_outcome = run_git(["rev-parse", "--short", "HEAD"])
+    head_outcome = run_git(["rev-parse", "HEAD"])
     if head_outcome.stdout is None:
         # A non-zero exit is ambiguous between "not a repo" (already
         # classified) and "repo exists, zero commits yet", and git's stderr
@@ -2523,7 +2522,7 @@ def _watch_git_facts_checked(repo: Path, launch_head: Optional[str]) -> _WatchGi
             if refs_outcome.stdout is not None and refs_outcome.stdout.strip() == "0":
                 return _WatchGitFactsResult(None, "no_commits")
         return _WatchGitFactsResult(None, head_outcome.error)
-    head = head_outcome.stdout
+    head_oid = head_outcome.stdout.strip()
 
     # Mandatory: the stat-cache-driven reads below (status, diff) can skip
     # re-reading a tracked file's blob when its mtime still matches the
@@ -2533,21 +2532,20 @@ def _watch_git_facts_checked(repo: Path, launch_head: Optional[str]) -> _WatchGi
     if fsck_outcome.stdout is None:
         return _WatchGitFactsResult(None, fsck_outcome.error)
 
-    porcelain_outcome = run_git(["status", "--porcelain"])
+    porcelain_outcome = run_git(["status", "--porcelain", "-z", "--untracked-files=all"])
     if porcelain_outcome.stdout is None:
         return _WatchGitFactsResult(None, porcelain_outcome.error)
     porcelain = porcelain_outcome.stdout
-    # `status --porcelain` omits ignored paths by default, so counting "??"
-    # lines counts exactly the untracked-and-not-ignored set.
-    untracked_files = sum(1 for line in porcelain.splitlines() if line.startswith("??"))
-    shortstat_outcome = run_git(["diff", "HEAD", "--shortstat"])
+    records = [record for record in porcelain.split("\0") if record]
+    untracked_files = sum(1 for record in records if record.startswith("?? "))
+    shortstat_outcome = run_git(["diff", head_oid, "--shortstat"])
     if shortstat_outcome.stdout is None:
         return _WatchGitFactsResult(None, shortstat_outcome.error)
     files_changed, insertions, deletions = _watch_parse_shortstat(shortstat_outcome.stdout)
 
     commits_since_start: Optional[int] = None
     if launch_head is not None:
-        count_outcome = run_git(["rev-list", "--count", f"{launch_head}..HEAD"])
+        count_outcome = run_git(["rev-list", "--count", f"{launch_head}..{head_oid}"])
         if count_outcome.stdout is None:
             return _WatchGitFactsResult(None, count_outcome.error)
         try:
@@ -2555,7 +2553,7 @@ def _watch_git_facts_checked(repo: Path, launch_head: Optional[str]) -> _WatchGi
         except ValueError:
             return _WatchGitFactsResult(None, "git_failed")
 
-    last_commit_outcome = run_git(["log", "-1", "--format=%ct", "HEAD"])
+    last_commit_outcome = run_git(["log", "-1", "--format=%ct", head_oid])
     if last_commit_outcome.stdout is None:
         return _WatchGitFactsResult(None, last_commit_outcome.error)
     last_commit_age_s: Optional[float] = None
@@ -2575,9 +2573,15 @@ def _watch_git_facts_checked(repo: Path, launch_head: Optional[str]) -> _WatchGi
     if toplevel_outcome.stdout is not None:
         toplevel = str(Path(toplevel_outcome.stdout.strip()).resolve())
 
+    final_head = run_git(["rev-parse", "HEAD"])
+    if final_head.stdout is None:
+        return _WatchGitFactsResult(None, final_head.error)
+    if final_head.stdout.strip() != head_oid:
+        return _WatchGitFactsResult(None, "changed_during_observation")
+
     return _WatchGitFactsResult(
         {
-            "head": head.strip(),
+            "head": head_oid[:7],
             "dirty": bool(porcelain.strip()),
             "files_changed": files_changed,
             "insertions": insertions,
@@ -2734,7 +2738,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     ``git_error`` is ``null`` whenever ``git`` is populated, and otherwise
     exactly one of ``"no_repo_path"``, ``"not_a_repo"``, ``"no_commits"``,
-    ``"timeout"``, ``"git_missing"``, ``"git_failed"`` — a poller that fails
+    ``"timeout"``, ``"git_missing"``, ``"git_failed"``, or
+    ``"changed_during_observation"`` — a poller that fails
     toward escalating on unknown state must be able to tell "cannot observe
     this repo" (alarming) apart from "observed it, there is nothing there"
     (benign), which a bare ``git: null`` cannot express on its own. See
@@ -2843,15 +2848,16 @@ def _cmd_watch_observe(
 
     def observed(repo: Optional[str], launch_head: Optional[str]) -> dict:
         git, git_error = _watch_repo_git(repo, launch_head)
+        log_facts, signals = _watch_log_observation(log)
         return {
             "launch_error": (
                 _read(state_dir / "launch_error") or _read(log_dir / "launch_error") or None
             ),
-            "log": _watch_log_facts(log),
+            "log": log_facts,
             "repo": repo,
             "git": git,
             "git_error": git_error,
-            "signals": _watch_signals(log),
+            "signals": signals,
         }
 
     if not state_dir.is_dir():
@@ -2872,6 +2878,8 @@ def _cmd_watch_observe(
     status = _watch_effective_status(state_dir)
     terminal = _watch_is_terminal(status)
     pid = _safe_int(_read(state_dir / "pid"))
+    if pid is not None and pid <= 0:
+        pid = None
     started_raw = _read(state_dir / "started_at") or None
     ended_raw = _read(state_dir / "ended_at") or None
     started_dt = _watch_parse_iso(started_raw)
@@ -2917,23 +2925,71 @@ def _watch_log_facts(log: Optional[Path]) -> Optional[dict]:
         if f is None:
             return None
         st = os.fstat(f.fileno())
-        delta = time.time() - st.st_mtime
-        if delta < -WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS:
-            # Clock skew, not freshness: a log claiming to be from the
-            # future is unobservable, not confidently growing.
-            mtime_age_s: Optional[float] = None
-            growing = False
-        else:
-            mtime_age_s = max(0.0, delta)
-            growing = mtime_age_s < WATCH_LOG_GROWING_MAX_AGE_SECONDS
-        lines = sum(1 for _ in f)
-        return {
-            "path": str(log),
-            "bytes": st.st_size,
-            "lines": lines,
-            "mtime_age_s": mtime_age_s,
-            "growing": growing,
-        }
+        return _watch_log_facts_from_file(f, log, st)
+
+
+def _watch_log_facts_from_file(f, log: Path, st: os.stat_result) -> dict:
+    delta = time.time() - st.st_mtime
+    if delta < -WATCH_LOG_FUTURE_MTIME_TOLERANCE_SECONDS:
+        mtime_age_s: Optional[float] = None
+        growing = False
+    else:
+        mtime_age_s = max(0.0, delta)
+        growing = mtime_age_s < WATCH_LOG_GROWING_MAX_AGE_SECONDS
+    lines: Optional[int] = None
+    if st.st_size <= WATCH_LINE_COUNT_MAX_BYTES:
+        f.seek(0)
+        remaining = st.st_size
+        lines = 0
+        last = b""
+        while remaining:
+            chunk = f.read(min(WATCH_TAIL_READ_BLOCK_BYTES, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            lines += chunk.count(b"\n")
+            last = chunk[-1:]
+        if st.st_size and last != b"\n":
+            lines += 1
+    return {
+        "path": str(log),
+        "bytes": st.st_size,
+        "lines": lines,
+        "mtime_age_s": mtime_age_s,
+        "growing": growing,
+    }
+
+
+def _watch_tail_lines_from_file(f, end: int, n: int) -> List[str]:
+    chunks: List[bytes] = []
+    pos = end
+    newline_count = 0
+    bytes_read = 0
+    while pos > 0 and newline_count <= n and bytes_read < WATCH_TAIL_MAX_BYTES:
+        read_size = min(WATCH_TAIL_READ_BLOCK_BYTES, pos, WATCH_TAIL_MAX_BYTES - bytes_read)
+        pos -= read_size
+        f.seek(pos)
+        chunk = f.read(read_size)
+        newline_count += chunk.count(b"\n")
+        bytes_read += len(chunk)
+        chunks.append(chunk)
+    data = b"".join(reversed(chunks))
+    return data.decode("utf-8", errors="replace").splitlines()[-n:]
+
+
+def _watch_log_observation(log: Optional[Path]) -> tuple[Optional[dict], dict]:
+    with _watch_open_validated_log(log) as f:
+        if f is None or log is None:
+            return None, _watch_signals_from_lines([])
+        try:
+            st = os.fstat(f.fileno())
+            facts = _watch_log_facts_from_file(f, log, st)
+            lines = _watch_normalize_lines(
+                _watch_tail_lines_from_file(f, st.st_size, WATCH_TAIL_LINES)
+            )
+        except OSError:
+            return None, _watch_signals_from_lines([])
+    return facts, _watch_signals_from_lines(lines)
 
 
 def _watch_signals(log: Optional[Path]) -> dict:
@@ -2942,6 +2998,10 @@ def _watch_signals(log: Optional[Path]) -> dict:
     signals object with all-null fields when the log is unreadable is still
     a valid, well-formed fact."""
     lines = _watch_normalize_lines(_watch_tail_lines(log, WATCH_TAIL_LINES))
+    return _watch_signals_from_lines(lines)
+
+
+def _watch_signals_from_lines(lines: List[str]) -> dict:
     distinct_files_read, top_repeated_read = _watch_read_signals(lines)
     return {
         "repeated_error": _watch_repeated_error(lines),
@@ -3392,7 +3452,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
     reap_budget: float = (
         max_seconds_arg if max_seconds_arg is not None else _parse_reap_max_seconds()
     )
-    reap_start = time.time()
+    reap_start = time.monotonic()
 
     # A previous SIGKILL can leave a dot-prefixed deletion sentinel. Finish it
     # before scanning named runs; each failure remains per-sentinel so one
@@ -3453,7 +3513,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
 
     # Pass 1: stale-running reconciliation and identity-verified idle kill.
     for d in state_candidates:
-        if time.time() - reap_start > reap_budget:
+        if time.monotonic() - reap_start > reap_budget:
             deferred_count += 1
             continue
         name = d.name
@@ -3550,7 +3610,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
     # crash between finalization writes cannot make a run reconciled in pass 1
     # eligible for deletion in pass 2 of the same invocation.
     for d in state_candidates:
-        if time.time() - reap_start > reap_budget:
+        if time.monotonic() - reap_start > reap_budget:
             deferred_count += 1
             continue
         name = d.name
@@ -3696,7 +3756,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
     # non-directories, and entries that cannot be stat'd.  The lstat snapshot
     # here is a pre-scan only; both pass 2.5 and pass 3 re-lstat under their
     # own per-name lock before any deletion.
-    validated_logs: List[Path] = []
+    validated_logs: List[tuple[Path, os.stat_result]] = []
     for _ld in log_candidates:
         if _ld.name.startswith("."):
             continue
@@ -3706,7 +3766,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         except (OSError, SystemExit):
             continue
         if _stat_module.S_ISDIR(_ld_st.st_mode):
-            validated_logs.append(_ld)
+            validated_logs.append((_ld, _ld_st))
 
     # Pass 2.5 (--include-logs only): whole-log-dir GC for preserved-log-only
     # runs (state dir gone). Runs after pass 2 so a run whose state dir pass 2
@@ -3716,8 +3776,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
     # loop already treats as "nothing to do" — no double counting, no error
     # spam over an already-gone path.
     if include_logs:
-        for log_d in validated_logs:
-            if time.time() - reap_start > reap_budget:
+        for log_d, log_before in validated_logs:
+            if time.monotonic() - reap_start > reap_budget:
                 deferred_count += 1
                 continue
             name = log_d.name
@@ -3729,7 +3789,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 skip_top_dir_mtime=True,
             )
             if newest is None:
-                continue
+                newest = log_before.st_mtime
             age_secs = time.time() - newest
             if age_secs < log_min_age_threshold:
                 continue
@@ -3754,7 +3814,20 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     log_current = log_d.lstat()
                     if not _stat_module.S_ISDIR(log_current.st_mode):
                         raise SystemExit("log path is not a real directory")
-                    _crash_safe_rmtree(log_d, LOG_ROOT, expected=log_current)
+                    if (log_current.st_dev, log_current.st_ino) != (
+                        log_before.st_dev, log_before.st_ino
+                    ):
+                        continue
+                    newest_current = _newest_mtime_recursive(
+                        log_d,
+                        cutoff=time.time() - log_min_age_threshold,
+                        skip_top_dir_mtime=True,
+                    )
+                    if newest_current is None:
+                        newest_current = log_current.st_mtime
+                    if time.time() - newest_current < log_min_age_threshold:
+                        continue
+                    _crash_safe_rmtree(log_d, LOG_ROOT, expected=log_before)
                 except (OSError, SystemExit) as exc:
                     print(f"  {name}: gc skipped: {exc}")
                     gc_skipped_count += 1
@@ -3765,8 +3838,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
     # Pass 3: a reboot wipes STATE_ROOT (normally tmpfs) while persistent
     # LOG_ROOT/<name>/tmp survives. Sweep those orphaned scratch dirs once
     # their own recursive contents have been quiet for the GC threshold (H3).
-    for log_d in validated_logs:
-        if time.time() - reap_start > reap_budget:
+    for log_d, _log_before in validated_logs:
+        if time.monotonic() - reap_start > reap_budget:
             deferred_count += 1
             continue
         name = log_d.name
@@ -3815,7 +3888,16 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     raise SystemExit("log path is not a real directory")
                 if not _stat_module.S_ISDIR(scratch_current.st_mode):
                     raise SystemExit("orphan scratch path is not a real directory")
-                _safe_rmtree(scratch_dir, log_d, expected=scratch_current)
+                if (scratch_current.st_dev, scratch_current.st_ino) != (
+                    scratch_before.st_dev, scratch_before.st_ino
+                ):
+                    continue
+                newest_current = _newest_mtime_recursive(
+                    scratch_dir, cutoff=time.time() - min_age_threshold
+                )
+                if newest_current is None or time.time() - newest_current < min_age_threshold:
+                    continue
+                _safe_rmtree(scratch_dir, log_d, expected=scratch_before)
             except (OSError, SystemExit) as exc:
                 print(f"  {name}: gc skipped: {exc}")
                 gc_skipped_count += 1
@@ -3857,7 +3939,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             orphan_procs_skipped += 1
 
         for cand in orphan_candidates:
-            if time.time() - reap_start > reap_budget:
+            if time.monotonic() - reap_start > reap_budget:
                 deferred_count += 1
                 continue
             age_h = (now - cand.start_time) / 3600
@@ -4041,7 +4123,8 @@ def _du_collect_rows() -> List[_DuRow]:
     if STATE_ROOT.is_dir():
         try:
             state_names = {
-                p.name for p in STATE_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")
+                p.name for p in STATE_ROOT.iterdir()
+                if not p.name.startswith(".") and _stat_module.S_ISDIR(p.lstat().st_mode)
             }
         except OSError:
             state_names = set()
@@ -4049,7 +4132,8 @@ def _du_collect_rows() -> List[_DuRow]:
     if LOG_ROOT.is_dir():
         try:
             log_names = {
-                p.name for p in LOG_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")
+                p.name for p in LOG_ROOT.iterdir()
+                if not p.name.startswith(".") and _stat_module.S_ISDIR(p.lstat().st_mode)
             }
         except OSError:
             log_names = set()
@@ -4552,6 +4636,16 @@ def _force_kill_legacy(name: str, state_dir: Path, pid: int, sig: int) -> None:
             f"agent-run: refusing to force-kill '{name}': caller shares the "
             f"run's process group ({pgid}) and would signal itself"
         )
+    if sig == signal.SIGKILL and pgid is not None:
+        try:
+            live_pgid = os.getpgid(pid)
+        except OSError as exc:
+            sys.exit(f"agent-run: refusing to force-kill '{name}': cannot verify process group ({exc})")
+        if live_pgid != pgid:
+            sys.exit(
+                f"agent-run: refusing to force-kill '{name}': recorded pgid {pgid} "
+                f"does not contain pid {pid} (current pgid {live_pgid})"
+            )
     try:
         # Only the uncatchable SIGKILL targets the group: a catchable signal
         # sent group-wide reaches the runner's children directly, racing the
@@ -4840,17 +4934,17 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         print(f"agent-run: logs:   agent-run tail {name}")
         return 0
 
-    # Intermediate child: become session leader and fork once more.  Keep the
+    # Intermediate child: fork once more. Keep the
     # inherited lock descriptor: flock ownership survives launcher death until
     # the runner has published identity and resolved readiness.
     os.close(r_ack)
-    os.setsid()
     grand = os.fork()
     if grand != 0:
         # Intermediate exits; parent's waitpid reaps it.
         os._exit(0)
 
-    # Grandchild: actually run the agent.
+    # Grandchild: detach as the session/process-group leader and run the agent.
+    os.setsid()
     _runner(
         d,
         log_d,
@@ -4926,13 +5020,15 @@ def _idle_timeout_reason(state_dir: Path) -> str:
     return f"{measured} (idle-timeout watchdog)"
 
 
-def _watchdog_escalate(state_dir: Path, runner_pid: int) -> None:
+def _watchdog_escalate(state_dir: Path, runner_pid: int, runner_identity: str) -> None:
     """SIGKILL the runner and its recorded children after SIGTERM was ignored.
 
     The watchdog is a sibling of those processes rather than their parent, so
     it can signal but never reap them. Terminal state is published here because
     a runner killed outright never publishes its own.
     """
+    if _process_identity(runner_pid) != runner_identity:
+        return
     own_pid = os.getpid()
     for field in _AUX_PID_FIELDS:
         raw = _read(state_dir / field)
@@ -4944,19 +5040,26 @@ def _watchdog_escalate(state_dir: Path, runner_pid: int) -> None:
             continue
         if pid <= 0 or pid == own_pid:
             continue
+        if _pid_parent_pid(pid) != runner_pid:
+            continue
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
     try:
-        os.kill(runner_pid, signal.SIGKILL)
-    except OSError:
-        pass
+        _send_signal_to_verified_pid(runner_pid, signal.SIGKILL, runner_identity)
+    except (OSError, RuntimeError):
+        return
     _publish_forced_kill(state_dir, _idle_timeout_reason(state_dir))
 
 
 def _idle_watchdog_loop(
-    state_dir: Path, log_dir: Path, runner_pid: int, idle_timeout: float
+    state_dir: Path,
+    log_dir: Path,
+    runner_pid: int,
+    runner_identity: str,
+    idle_timeout: float,
+    initial_log_stat: Optional[tuple[int, int, int, int]] = None,
 ) -> None:
     """Terminate ``runner_pid`` once the run log has stopped growing for
     ``idle_timeout`` seconds.
@@ -4978,16 +5081,20 @@ def _idle_watchdog_loop(
     startup_grace = _parse_watchdog_startup_grace_seconds()
     started_monotonic = time.monotonic()
     last_change_monotonic = started_monotonic
-    last_mtime: Optional[float] = None
+    last_signature = initial_log_stat
     saw_output = False
 
     while True:
         time.sleep(poll)
-        if not _pid_alive(runner_pid):
+        if _process_identity(runner_pid) != runner_identity:
             return
         now_monotonic = time.monotonic()
         try:
-            mtime: Optional[float] = log_path.stat().st_mtime
+            log_stat = log_path.stat()
+            signature: Optional[tuple[int, int, int, int]] = (
+                log_stat.st_dev, log_stat.st_ino, log_stat.st_size, log_stat.st_mtime_ns
+            )
+            mtime: Optional[float] = log_stat.st_mtime
         except OSError:
             # A log that cannot be stat'd is not producing output. Keep the run
             # guarded rather than looping inertly, but only once enough time has
@@ -4996,10 +5103,10 @@ def _idle_watchdog_loop(
             if now_monotonic - last_change_monotonic < max(idle_timeout, startup_grace):
                 continue
         if mtime is not None:
-            if last_mtime is None:
-                last_mtime = mtime
-            elif mtime != last_mtime:
-                last_mtime = mtime
+            if last_signature is None:
+                last_signature = signature
+            elif signature != last_signature:
+                last_signature = signature
                 last_change_monotonic = now_monotonic
                 saw_output = True
             idle_wall = time.time() - mtime
@@ -5018,15 +5125,15 @@ def _idle_watchdog_loop(
     except OSError:
         pass
     try:
-        os.kill(runner_pid, signal.SIGTERM)
-    except OSError:
+        _send_signal_to_verified_pid(runner_pid, signal.SIGTERM, runner_identity)
+    except (OSError, RuntimeError):
         return
     deadline = time.monotonic() + KILL_ESCALATION_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        if not _pid_alive(runner_pid):
+        if _process_identity(runner_pid) != runner_identity:
             return
         time.sleep(KILL_POLL_INTERVAL_SECONDS)
-    _watchdog_escalate(state_dir, runner_pid)
+    _watchdog_escalate(state_dir, runner_pid, runner_identity)
 
 
 def _publish_or_reap_child(state_dir: Path, field: str, pid: int) -> None:
@@ -5304,6 +5411,13 @@ def _runner(
         # Opt-in stall guard: a sibling child watching log mtime, so a wedged
         # agent reaches a terminal status instead of running forever.
         if idle_timeout is not None:
+            try:
+                initial = os.fstat(log_fd)
+                initial_log_stat = (
+                    initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns
+                )
+            except OSError:
+                initial_log_stat = None
             with _block_handled_runner_signals():
                 watchdog_pid = os.fork()
                 if watchdog_pid != 0:
@@ -5317,7 +5431,9 @@ def _runner(
                 except OSError:
                     pass
                 try:
-                    _idle_watchdog_loop(state_dir, log_dir, my_pid, idle_timeout)
+                    _idle_watchdog_loop(
+                        state_dir, log_dir, my_pid, identity, idle_timeout, initial_log_stat
+                    )
                 finally:
                     os._exit(0)
     except Exception as exc:  # setup failed before readiness
@@ -5991,8 +6107,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         dest="max_seconds",
-        help="wall-clock budget for the entire reap invocation (seconds, float, "
-        "must be finite and > 0); when exceeded, remaining candidates in any pass "
+        help="soft candidate-admission budget for reap (seconds, float, must be "
+        "finite and > 0); an in-progress scan, lock wait, or kill may overrun it; "
+        "when exceeded, remaining candidates in any pass "
         "are deferred and a count is printed; exit 0 so the next timer tick resumes. "
         "Default from AGENT_RUN_REAP_MAX_SECONDS, or 600 s (10 min, comfortably "
         "under the 30-minute systemd timer period).",
@@ -6165,7 +6282,8 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     # argparse.  Returning here keeps the subcommand check out of main()'s
     # own conditional chain without duplicating the flag-state test.
     any_launch_flag = interactive or prompt_file or echo or submit_mode is not None or idle_timeout is not None
-    if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
+    explicit_launch = len(tokens) >= 2 and tokens[1] == "--"
+    if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag and not explicit_launch:
         return _LaunchArgv(
             interactive=False, prompt_file=None, echo=False, echo_interval=2.0,
             submit_mode=None, idle_timeout=None, name="", command=[],
@@ -6240,7 +6358,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Subcommand dispatch: argparse handles help for each subcommand.
     if parsed.subcommand_tokens is not None:
         parser = _build_parser()
-        args = parser.parse_args(parsed.subcommand_tokens)
+        try:
+            args = parser.parse_args(parsed.subcommand_tokens)
+        except SystemExit as exc:
+            if parsed.subcommand_tokens[0] == "watch" and exc.code == 2:
+                raise SystemExit(1) from exc
+            raise
         return int(args.func(args) or 0)
 
     if not parsed.name:

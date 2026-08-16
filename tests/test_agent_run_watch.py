@@ -120,6 +120,47 @@ def _init_repo(path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 class TestStatusMapping:
+    @pytest.mark.parametrize(
+        "zombie,live_identity,expected",
+        [(True, "linux:old", "died"), (False, "linux:new", "died"), (False, None, "unverified")],
+    )
+    def test_starting_pid_is_verified(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys,
+        zombie, live_identity, expected,
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "startingcheck",
+            status="starting", pid=111, process_identity="linux:old",
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(agent_run, "_watch_pid_is_zombie", lambda _pid: zombie)
+        monkeypatch.setattr(agent_run, "_process_identity", lambda _pid: live_identity)
+
+        agent_run.cmd_watch(_watch_args("startingcheck"))
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == expected
+        assert payload["terminal"] is (expected == "died")
+
+    @pytest.mark.parametrize("raw_pid", ["0", "-1", "-42"])
+    def test_nonpositive_pid_is_not_probed_or_published(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys, raw_pid
+    ):
+        sd, _ = _make_run(
+            isolated_runs_root, isolated_log_root, "badpid", status="running"
+        )
+        (sd / "pid").write_text(raw_pid)
+        monkeypatch.setattr(
+            agent_run.os, "kill", lambda *_args: pytest.fail("used special PID semantics")
+        )
+
+        agent_run.cmd_watch(_watch_args("badpid"))
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "died"
+        assert payload["pid"] is None
+        assert payload["terminal"] is True
+
     def test_verified_alive_pid_reports_running_and_not_terminal(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
     ):
@@ -866,6 +907,49 @@ class TestGitErrorDiscriminator:
 # ---------------------------------------------------------------------------
 
 class TestGitHardening:
+    def test_replacement_refs_are_disabled(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        (repo / "a.txt").write_text("second\n")
+        _git(repo, "add", "a.txt")
+        _git(repo, "commit", "-q", "-m", "second")
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        parent = subprocess.run(
+            ["git", "rev-parse", "HEAD^"], cwd=repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        namespace = "refs/advrev-replace/"
+        _git(repo, "update-ref", namespace + head, parent)
+        monkeypatch.setenv("GIT_REPLACE_REF_BASE", namespace)
+
+        result = agent_run._watch_git_facts_checked(repo, None)
+
+        assert result.facts["dirty"] is False
+        assert result.facts["files_changed"] == 0
+
+    def test_head_change_during_observation_degrades(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        real = agent_run._watch_run_git_checked
+        changed = False
+
+        def run_git(path, args, timeout=agent_run.WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS):
+            nonlocal changed
+            outcome = real(path, args, timeout)
+            if args == ["rev-parse", "HEAD"] and not changed:
+                changed = True
+                (repo / "b.txt").write_text("new\n")
+                _git(repo, "add", "b.txt")
+                _git(repo, "commit", "-q", "-m", "new")
+            return outcome
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", run_git)
+
+        result = agent_run._watch_git_facts_checked(repo, None)
+
+        assert result.facts is None
+        assert result.git_error == "changed_during_observation"
     def test_fsmonitor_is_not_executed(self, tmp_path):
         repo = tmp_path / "repo"
         _init_repo(repo)
@@ -951,7 +1035,7 @@ class TestGitTotalBudget:
             agent_run.subprocess, "run", _fake_git_run(record=seen_timeouts),
         )
         assert agent_run._watch_git_facts_checked(repo, "0" * 40).facts is not None
-        assert len(seen_timeouts) == 7
+        assert len(seen_timeouts) == 8
         assert all(t <= agent_run.WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS for t in seen_timeouts)
 
     def test_budget_exhaustion_returns_none(self, tmp_path, monkeypatch):
@@ -990,6 +1074,18 @@ class TestGitTotalBudget:
 
 
 class TestGitUntrackedFiles:
+    def test_untracked_files_below_one_directory_are_counted_individually(self, tmp_path):
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        new_dir = repo / "newdir"
+        new_dir.mkdir()
+        for index in range(3):
+            (new_dir / f"file-{index}").write_text("work\n")
+
+        result = agent_run._watch_git_facts_checked(repo, None)
+
+        assert result.facts["untracked_files"] == 3
+
     def test_untracked_file_is_counted_and_repo_reads_dirty(
         self, isolated_runs_root, isolated_log_root, tmp_path, capsys
     ):
@@ -1069,6 +1165,33 @@ class TestGitToplevel:
 # ---------------------------------------------------------------------------
 
 class TestLogFacts:
+    def test_one_observation_opens_log_once(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "oneopen",
+            status="done", log_text="Error: boom\n" * 3,
+        )
+        real_open = agent_run._watch_open_validated_log
+        calls = []
+
+        def counted(path):
+            calls.append(path)
+            return real_open(path)
+
+        monkeypatch.setattr(agent_run, "_watch_open_validated_log", counted)
+        agent_run.cmd_watch(_watch_args("oneopen"))
+        capsys.readouterr()
+
+        assert len(calls) == 1
+
+    def test_large_log_line_count_is_unknown_instead_of_scanned(self, tmp_path, monkeypatch):
+        log = tmp_path / "log"
+        log.write_text("one\ntwo\n")
+        monkeypatch.setattr(agent_run, "WATCH_LINE_COUNT_MAX_BYTES", 1)
+
+        assert agent_run._watch_log_facts(log)["lines"] is None
+
     @pytest.mark.parametrize(
         "log_age_secs, check_age, expected_growing",
         [
@@ -1582,6 +1705,12 @@ class TestExitCodes:
         with pytest.raises(SystemExit) as exc_info:
             agent_run.cmd_status(argparse.Namespace(name="does-not-exist"))
         assert exc_info.value.code != 0
+
+    @pytest.mark.parametrize("argv", [["watch"], ["watch", "--bad"], ["watch", "run", "--repo"]])
+    def test_watch_parse_errors_exit_1(self, argv):
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.main(argv)
+        assert exc_info.value.code == 1
 
 
 def _launch(name: str) -> None:
