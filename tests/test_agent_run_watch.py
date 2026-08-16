@@ -2346,33 +2346,54 @@ class TestScratchFacts:
         assert result["scanned"] is None
 
     def test_outer_deadline_check_fires(self, tmp_path, monkeypatch):
-        """The outer per-queue-item deadline check must fire when the budget expires.
+        """The outer per-queue-item deadline check must set truncated=True.
 
-        Disabling the check must cause this test to fail (truncated stays False
-        and the scan processes all files).  Mutation: comment out the outer
-        deadline check.
+        The outer check runs at the top of the while-queue loop before each
+        directory is processed.  To isolate it from the inner per-entry check:
+        two empty subdirectories are used (no entries → inner check never runs for
+        them).  The deadline expires precisely on the outer check for the second
+        empty subdirectory; with the outer check active, truncated=True.  With it
+        disabled the scan processes both empty subdirs and exits with truncated=False.
+
+        time.monotonic() call sequence (2 empty subdirs in root):
+          call 1: setup (now = ...)
+          call 2: outer check — root (proceed: return real time, deadline not yet)
+          call 3: inner check — root entry 1 (aaa_sub1, dir, not a file, no stat)
+          call 4: inner check — root entry 2 (zzz_sub2, dir, not a file, no stat)
+          call 5: outer check — zzz_sub2 (proceed: empty, real time)
+          call 6: outer check — aaa_sub1 (HERE: return past deadline → truncated=True)
+        Without the outer check: call 6 does not happen; aaa_sub1 is processed
+        (0 entries), queue empties, exits with truncated=False.
+
+        Mutation: disable the outer ``if time.monotonic() >= deadline: break``
+        block — this test then gets truncated=False and fails.
         """
-        # One directory with files so the outer loop runs at least once.
-        subdir = tmp_path / "sub"
-        subdir.mkdir()
-        for i in range(3):
-            (subdir / f"f{i}.txt").write_text("data\n")
+        import time as _time
+
+        # Two empty subdirectories: no files, so the inner per-entry check
+        # for sub dirs never fires (their entries are dirs, counted but not
+        # stat-called; the inner check does fire once per entry in root).
+        (tmp_path / "aaa_sub1").mkdir()
+        (tmp_path / "zzz_sub2").mkdir()
 
         call_count = [0]
-        real_monotonic = time.monotonic
+        real_monotonic = _time.monotonic
 
         def patched_monotonic():
             call_count[0] += 1
-            # First two calls (deadline setup + root is_dir) are normal;
-            # subsequent calls return a value past the deadline.
-            if call_count[0] <= 2:
-                return real_monotonic()
-            return real_monotonic() + 1000.0
+            val = real_monotonic()
+            # Call 6 is the outer check for aaa_sub1 (3rd queue item).
+            # Returning past deadline here causes the outer check to truncate
+            # before aaa_sub1 is processed.
+            if call_count[0] >= 6:
+                return val + 1000.0
+            return val
 
         monkeypatch.setattr(agent_run.time, "monotonic", patched_monotonic)
         result = agent_run._watch_scratch_facts(str(tmp_path))
         assert result["truncated"] is True, (
-            "Outer deadline check must fire; if it is disabled, truncated stays False"
+            "Outer deadline check must set truncated=True; with it disabled the "
+            "scan processes both empty directories and exits with truncated=False"
         )
 
     def test_slow_enumeration_hits_budget_before_iterator_exhausted(self, tmp_path, monkeypatch):
@@ -2669,6 +2690,37 @@ class TestScratchFacts:
         assert result["files_modified_recent"] is None
         assert result["newest_mtime_age_s"] is None
         assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_directory_symlinks_are_not_followed(self, tmp_path):
+        """A directory symlink inside the scan root must not be descended.
+
+        entry.is_dir(follow_symlinks=False) must be False for a symlink-to-dir,
+        so the scanner skips it without following into the target.  Mutation:
+        change follow_symlinks=False to follow_symlinks=True (or remove it) —
+        the symlink is then classified as a directory and the external file is
+        scanned, making this test fail because scanned > 0 from outside the root.
+        """
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "external.txt").write_text("external data\n")
+
+        scanroot = tmp_path / "scanroot"
+        scanroot.mkdir()
+        # Symlink to the outside directory — must not be followed.
+        (scanroot / "link_to_outside").symlink_to(outside)
+        # No regular files inside scanroot itself.
+
+        result = agent_run._watch_scratch_facts(str(scanroot))
+        assert result["error"] is None, (
+            "A directory symlink must be skipped cleanly, not cause an error"
+        )
+        # No file inside scanroot (the symlink is not followed), so scanned=0
+        # and no truncation.
+        assert result["scanned"] == 0, (
+            "Symlink-to-dir must not be followed; external file must not be scanned"
+        )
+        assert result["files_modified_recent"] == 0
         assert result["truncated"] is False
 
     # ------------------------------------------------------------------
