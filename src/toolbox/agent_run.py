@@ -368,6 +368,26 @@ WATCH_TAIL_MAX_BYTES: int = 256 * 1024
 # 16 MiB covers a full day of typical PTY capture at ~180 bytes/s.
 WATCH_LINE_COUNT_MAX_BYTES: int = 16 * 1024 * 1024
 
+# Scratch-scan bounds: keep each poll cheap and safe when scanning a working
+# directory that includes gitignored paths (the whole point of the scan).
+# Max files to stat before truncating: large enough to catch typical review
+# output, small enough that a tree with millions of files doesn't stall a poll.
+WATCH_SCRATCH_MAX_FILES: int = 2000
+# Max directory depth to descend into below the working directory root.
+WATCH_SCRATCH_MAX_DEPTH: int = 8
+# Wall-clock budget for the entire scan; abort and set truncated=True if hit.
+WATCH_SCRATCH_BUDGET_SECONDS: float = 2.0
+# "Recent" window for files_modified_recent: how long ago counts as recent
+# activity (60 s matches the log growing window so pollers see consistent
+# freshness semantics across both facts).
+WATCH_SCRATCH_RECENT_SECONDS: float = 60.0
+# Directory names pruned from every descent level — heavy generated trees
+# that an agent never writes to and that would dominate the file count.
+WATCH_SCRATCH_PRUNE_DIRS: frozenset[str] = frozenset({
+    ".git", "node_modules", "__pycache__", ".venv",
+    "target", "dist", "build",
+})
+
 # Git env vars that redirect a command at a different repo/index than the one
 # named on the command line; a poll must not inherit these from its caller.
 WATCH_GIT_ENV_VARS_TO_STRIP: frozenset[str] = frozenset(
@@ -2807,6 +2827,125 @@ def _watch_emit(payload: dict, as_json: bool, human: str) -> None:
     print(json.dumps(payload) if as_json else human)
 
 
+def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
+    """Scan *working_dir* for recent file-write activity, including gitignored paths.
+
+    Read-only review runs write their findings to gitignored scratch (e.g.
+    ``.taskdocs/probe/``, ``.taskdocs/findings-*.md``) and produce no git
+    facts at all, so git-only evidence treats them as stalled.  This scan
+    gives the watchdog an additional signal that is blind to git status.
+
+    The scan is bounded by WATCH_SCRATCH_MAX_FILES, WATCH_SCRATCH_MAX_DEPTH,
+    and WATCH_SCRATCH_BUDGET_SECONDS so it stays cheap on every poll over SSH.
+    Heavy generated trees listed in WATCH_SCRATCH_PRUNE_DIRS are skipped.
+
+    Returns a dict with keys:
+      newest_mtime_age_s   – age of the most-recently-modified file (float|null)
+      files_modified_recent – count of files modified within WATCH_SCRATCH_RECENT_SECONDS (int|null)
+      scanned              – files actually examined (int|null)
+      truncated            – True when a bound was hit before the scan finished (bool)
+      error                – why the result is unknown, if it is (str|null)
+
+    On any error the numeric fields are null (never 0) with *error* set, so a
+    poller cannot confuse "scan failed" with "no activity".
+    """
+    null_result = {
+        "newest_mtime_age_s": None,
+        "files_modified_recent": None,
+        "scanned": None,
+        "truncated": False,
+        "error": None,
+    }
+
+    if not working_dir:
+        return {**null_result, "error": "no_working_dir"}
+
+    root = Path(working_dir)
+    try:
+        if not root.is_dir():
+            return {**null_result, "error": "not_a_directory"}
+    except OSError as exc:
+        return {**null_result, "error": f"stat_error: {exc!s}"[:200]}
+
+    now = time.time()
+    deadline = now + WATCH_SCRATCH_BUDGET_SECONDS
+
+    newest_mtime: Optional[float] = None  # epoch seconds of the most-recently modified file
+    files_modified_recent: int = 0
+    scanned: int = 0
+    truncated: bool = False
+
+    # Iterative BFS over the directory tree so we can enforce depth limits
+    # without recursion depth concerns.  Each queue entry is (path, depth).
+    queue: list[tuple[Path, int]] = [(root, 0)]
+
+    try:
+        while queue:
+            if time.time() >= deadline:
+                truncated = True
+                break
+
+            current_dir, depth = queue.pop()
+
+            try:
+                entries = list(os.scandir(current_dir))
+            except OSError:
+                # Permission denied or the directory vanished mid-scan; skip it.
+                continue
+
+            for entry in entries:
+                if time.time() >= deadline:
+                    truncated = True
+                    break
+
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name not in WATCH_SCRATCH_PRUNE_DIRS and depth < WATCH_SCRATCH_MAX_DEPTH:
+                        queue.append((Path(entry.path), depth + 1))
+                    continue
+
+                # Only regular files contribute to the activity signal.
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+
+                try:
+                    mtime = entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    continue
+
+                scanned += 1
+                if newest_mtime is None or mtime > newest_mtime:
+                    newest_mtime = mtime
+                age = now - mtime
+                if 0.0 <= age < WATCH_SCRATCH_RECENT_SECONDS:
+                    files_modified_recent += 1
+
+                if scanned >= WATCH_SCRATCH_MAX_FILES:
+                    truncated = True
+                    break
+
+            if truncated:
+                break
+
+    except OSError as exc:
+        # Unexpected OS error mid-scan: degrade to null rather than a confident 0.
+        return {**null_result, "scanned": scanned or None, "error": f"scan_error: {exc!s}"[:200]}
+
+    if newest_mtime is None:
+        newest_mtime_age_s: Optional[float] = None
+    else:
+        delta = now - newest_mtime
+        # A future mtime (clock skew) degrades to null rather than a negative age.
+        newest_mtime_age_s = max(0.0, delta) if delta >= 0.0 else None
+
+    return {
+        "newest_mtime_age_s": newest_mtime_age_s,
+        "files_modified_recent": files_modified_recent,
+        "scanned": scanned,
+        "truncated": truncated,
+        "error": None,
+    }
+
+
 def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
     """Build the watch contract with every field at its null/unknown default,
     overridden by *fields*. The key set is fixed here so it cannot vary
@@ -2835,6 +2974,13 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
             "top_repeated_read": None,
         },
         "observation_error": None,
+        "scratch": {
+            "newest_mtime_age_s": None,
+            "files_modified_recent": None,
+            "scanned": None,
+            "truncated": False,
+            "error": "not_observed",
+        },
     }
     unknown = set(fields) - set(payload)
     if unknown:
@@ -2871,7 +3017,7 @@ def _cmd_watch_observe(
     # names can change between this line and the actual read.
     log = _log_file_for(name)
 
-    def observed(repo: Optional[str], launch_head: Optional[str]) -> dict:
+    def observed(repo: Optional[str], launch_head: Optional[str], cwd: Optional[str]) -> dict:
         git, git_error = _watch_repo_git(repo, launch_head)
         log_facts, signals = _watch_log_observation(log)
         return {
@@ -2883,6 +3029,7 @@ def _cmd_watch_observe(
             "git": git,
             "git_error": git_error,
             "signals": signals,
+            "scratch": _watch_scratch_facts(cwd),
         }
 
     if not state_dir.is_dir():
@@ -2891,7 +3038,7 @@ def _cmd_watch_observe(
         # it, so git facts need an explicit --repo and every process fact is
         # unknowable.
         payload = _watch_payload(
-            name, observed_at, WATCH_STATUS_LOG_PRESERVED, **observed(repo_arg, None)
+            name, observed_at, WATCH_STATUS_LOG_PRESERVED, **observed(repo_arg, None, repo_arg)
         )
         _watch_emit(
             payload,
@@ -2927,7 +3074,7 @@ def _cmd_watch_observe(
         started_at=started_raw,
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
-        **observed(repo_str, _read(state_dir / "launch_head") or None),
+        **observed(repo_str, _read(state_dir / "launch_head") or None, repo_str),
     )
     _watch_emit(
         payload,

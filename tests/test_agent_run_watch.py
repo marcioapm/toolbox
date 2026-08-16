@@ -22,6 +22,7 @@ WATCH_CONTRACT_KEYS = {
     "schema", "name", "observed_at", "status", "exit_code", "pid",
     "interactive", "started_at", "ended_at", "elapsed_s", "terminal",
     "launch_error", "log", "repo", "git", "git_error", "signals", "observation_error",
+    "scratch",
 }
 
 # The `signals` object emitted whenever the log could not be read at all.
@@ -2030,3 +2031,243 @@ class TestIsDirSafe:
         assert rc == 0
         out = capsys.readouterr().out
         assert "not running (log preserved)" in out
+
+
+# ---------------------------------------------------------------------------
+# scratch file-activity facts
+# ---------------------------------------------------------------------------
+
+class TestScratchFacts:
+    """Tests for _watch_scratch_facts and scratch field in the watch contract."""
+
+    SCRATCH_KEYS = {"newest_mtime_age_s", "files_modified_recent", "scanned", "truncated", "error"}
+
+    # ------------------------------------------------------------------
+    # unit-level tests of _watch_scratch_facts
+    # ------------------------------------------------------------------
+
+    def test_file_under_working_dir_is_reflected(self, tmp_path):
+        """A file written under the working dir shows up in the scratch facts."""
+        f = tmp_path / "findings.md"
+        f.write_text("review output\n")
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert set(result.keys()) == self.SCRATCH_KEYS
+        assert result["error"] is None
+        assert result["scanned"] >= 1
+        assert result["newest_mtime_age_s"] is not None
+        assert result["newest_mtime_age_s"] >= 0.0
+        # File was just written so it must count as recent.
+        assert result["files_modified_recent"] >= 1
+
+    def test_gitignored_scratch_file_is_included(self, tmp_path):
+        """The scan deliberately includes gitignored paths — that is the point.
+
+        Regression test for the blind spot: zero git facts but real activity.
+        Zero commits, clean worktree, no untracked files per git, yet a
+        gitignored scratch file just written must produce scratch activity.
+        """
+        # Set up a real git repo with a .gitignore covering the scratch dir.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        (repo / "a.txt").write_text("tracked\n")
+        (repo / ".gitignore").write_text(".taskdocs/\n")
+        _git(repo, "add", "a.txt", ".gitignore")
+        _git(repo, "commit", "-q", "-m", "initial")
+
+        # Write a gitignored finding file.
+        findings_dir = repo / ".taskdocs" / "probe"
+        findings_dir.mkdir(parents=True)
+        scratch_file = findings_dir / "findings-001.md"
+        scratch_file.write_text("analysis\n" * 1000)
+
+        # Git confirms zero activity: no commits since start, no untracked files.
+        launch_head = agent_run._watch_run_git_checked(
+            repo, ["rev-parse", "HEAD"]
+        ).stdout.strip()
+        git_result = agent_run._watch_git_facts_checked(repo, launch_head)
+        assert git_result.facts is not None
+        assert git_result.facts["commits_since_start"] == 0
+        assert git_result.facts["untracked_files"] == 0
+        assert git_result.facts["files_changed"] == 0
+
+        # Scratch scan must see the finding despite git seeing nothing.
+        result = agent_run._watch_scratch_facts(str(repo))
+        assert result["error"] is None
+        assert result["scanned"] is not None
+        assert result["scanned"] >= 1
+        # The scratch file was just written: it must count as recent.
+        assert result["files_modified_recent"] >= 1
+        assert result["newest_mtime_age_s"] is not None
+        assert result["newest_mtime_age_s"] < agent_run.WATCH_SCRATCH_RECENT_SECONDS
+
+    def test_pruned_dirs_are_not_descended(self, tmp_path):
+        """Directories in WATCH_SCRATCH_PRUNE_DIRS must not be entered."""
+        for dirname in agent_run.WATCH_SCRATCH_PRUNE_DIRS:
+            pruned = tmp_path / dirname
+            pruned.mkdir()
+            (pruned / "heavy.json").write_text("x" * 100)
+
+        # Put one real file outside the pruned dirs so we scan something.
+        (tmp_path / "real.py").write_text("code\n")
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] is None
+        # Only the one real file outside pruned dirs counts.
+        assert result["scanned"] == 1
+
+    def test_file_count_bound_sets_truncated(self, tmp_path, monkeypatch):
+        """Hitting WATCH_SCRATCH_MAX_FILES sets truncated=True and still returns."""
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_MAX_FILES", 3)
+        for i in range(10):
+            (tmp_path / f"f{i}.txt").write_text("data\n")
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] is None
+        assert result["truncated"] is True
+        assert result["scanned"] == 3
+
+    def test_missing_or_unreadable_dir_returns_null_with_error_not_zero(self, tmp_path):
+        """A missing working directory must degrade to null fields + error string, never 0."""
+        missing = tmp_path / "does-not-exist"
+        result = agent_run._watch_scratch_facts(str(missing))
+        assert result["error"] is not None
+        assert isinstance(result["error"], str)
+        # The numeric fields must be null, not a confident 0.
+        assert result["newest_mtime_age_s"] is None
+        assert result["files_modified_recent"] is None
+        assert result["scanned"] is None
+
+    def test_no_working_dir_returns_null_with_error(self):
+        """A None or empty working_dir degrades gracefully."""
+        for bad in (None, ""):
+            result = agent_run._watch_scratch_facts(bad)
+            assert result["error"] is not None
+            assert result["newest_mtime_age_s"] is None
+            assert result["files_modified_recent"] is None
+            assert result["scanned"] is None
+
+    def test_idle_working_dir_reports_large_age_not_error(self, tmp_path):
+        """A real directory with only old files reports a large age, not an error."""
+        old_file = tmp_path / "old.txt"
+        old_file.write_text("old\n")
+        # Age it to 1 hour ago.
+        old_time = time.time() - 3600
+        os.utime(old_file, (old_time, old_time))
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] is None
+        assert result["scanned"] == 1
+        assert result["newest_mtime_age_s"] is not None
+        assert result["newest_mtime_age_s"] >= agent_run.WATCH_SCRATCH_RECENT_SECONDS
+        assert result["files_modified_recent"] == 0
+
+    def test_wall_clock_budget_sets_truncated_before_exhaustion(self, tmp_path, monkeypatch):
+        """When the wall-clock budget is effectively zero the scan truncates immediately."""
+        # Create enough files that we would need multiple iterations.
+        for i in range(5):
+            (tmp_path / f"f{i}.txt").write_text("data\n")
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_BUDGET_SECONDS", 0.0)
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["truncated"] is True
+
+    # ------------------------------------------------------------------
+    # end-to-end tests through cmd_watch
+    # ------------------------------------------------------------------
+
+    def test_scratch_key_present_in_normal_branch(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        """Normal branch: scratch key is present and has the correct sub-keys."""
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        _make_run(
+            isolated_runs_root, isolated_log_root, "sc1",
+            status="running", pid=111, log_age_secs=1, cwd=str(repo),
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("sc1"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert set(payload["scratch"].keys()) == self.SCRATCH_KEYS
+
+    def test_scratch_key_present_in_missing_state_dir_branch(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """Missing-state-dir branch: scratch key is also present."""
+        _make_run(
+            isolated_runs_root, isolated_log_root, "sc2",
+            write_state=False, log_text="line1\n",
+        )
+        agent_run.cmd_watch(_watch_args("sc2"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert set(payload["scratch"].keys()) == self.SCRATCH_KEYS
+
+    def test_scratch_key_present_in_observation_error_branch(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """Observation-error branch: scratch key falls back to the null default."""
+        _make_run(
+            isolated_runs_root, isolated_log_root, "sc3",
+            status="running", pid=111, log_age_secs=1,
+        )
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("synthetic crash")
+
+        monkeypatch.setattr(agent_run, "_effective_status", _boom)
+        agent_run.cmd_watch(_watch_args("sc3"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        # Observation-error path uses _watch_payload defaults.
+        assert "scratch" in payload
+
+    def test_review_shaped_regression(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        """Full end-to-end regression: reviewer run with zero git evidence must
+        still show scratch activity from a gitignored file just written.
+
+        This is the canonical blind-spot scenario: zero commits, clean
+        worktree, no untracked files per git, but a gitignored file written
+        during the review run must produce scratch activity in the contract.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        (repo / "a.txt").write_text("tracked\n")
+        (repo / ".gitignore").write_text(".taskdocs/\n")
+        _git(repo, "add", "a.txt", ".gitignore")
+        _git(repo, "commit", "-q", "-m", "initial")
+        launch_head = agent_run._watch_run_git_checked(
+            repo, ["rev-parse", "HEAD"]
+        ).stdout.strip()
+
+        # Write a gitignored finding — no git activity, only scratch activity.
+        findings_dir = repo / ".taskdocs" / "findings"
+        findings_dir.mkdir(parents=True)
+        (findings_dir / "findings-001.md").write_text("analysis\n" * 1000)
+
+        _make_run(
+            isolated_runs_root, isolated_log_root, "sc4",
+            status="running", pid=111, log_age_secs=1,
+            cwd=str(repo), launch_head=launch_head,
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("sc4"))
+        payload = json.loads(capsys.readouterr().out)
+
+        # Confirm git sees nothing: no commits, no dirty files.
+        git = payload["git"]
+        assert git is not None
+        assert git["commits_since_start"] == 0
+        assert git["untracked_files"] == 0
+        assert git["files_changed"] == 0
+
+        # Scratch must report the gitignored file.
+        scratch = payload["scratch"]
+        assert scratch["error"] is None
+        assert scratch["files_modified_recent"] >= 1
+        assert scratch["newest_mtime_age_s"] is not None
+        assert scratch["newest_mtime_age_s"] < agent_run.WATCH_SCRATCH_RECENT_SECONDS
