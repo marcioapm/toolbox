@@ -3018,6 +3018,15 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
                         # exists: abort rather than report them confidently.
                         raise _ScratchScanError("stat_error")
 
+                    # NaN and infinities cannot represent a real timestamp:
+                    # NaN makes every ordered comparison false (max(0.0, NaN)
+                    # returns 0.0); -inf reads as infinitely old; +inf reaches
+                    # clock_skew only incidentally.  Reject all three uniformly
+                    # so hostile or faulty FUSE/NFS stat data cannot manufacture
+                    # a confident zero.
+                    if not math.isfinite(mtime):
+                        raise _ScratchScanError("invalid_mtime")
+
                     scanned += 1
                     if newest_mtime is None or mtime > newest_mtime:
                         newest_mtime = mtime

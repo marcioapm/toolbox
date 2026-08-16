@@ -2325,6 +2325,116 @@ class TestScratchFacts:
             "A file with minor future jitter must count as recent"
         )
 
+    def test_nan_mtime_degrades_to_null_with_invalid_mtime(self, tmp_path, monkeypatch):
+        """A NaN st_mtime must degrade to null fields + error='invalid_mtime'.
+
+        NaN makes every ordered comparison false: the file is neither recent
+        nor clock-skewed, and max(0.0, NaN) returns 0.0.  Without the
+        isfinite guard this produces a confident zero, which can trigger
+        escalation of a healthy run.  Mutation: remove the math.isfinite
+        guard and the test fails because error is None and scanned=1.
+        """
+        import math as _math
+
+        (tmp_path / "real.txt").write_text("data\n")
+
+        class NaNMtimeEntry:
+            """Proxy a real DirEntry but return NaN from stat().st_mtime."""
+
+            def __init__(self, entry):
+                self._entry = entry
+
+            def stat(self, **kw):
+                s = self._entry.stat(**kw)
+                return type("FakeStat", (), {
+                    "st_mtime": float("nan"),
+                    "st_mode": s.st_mode,
+                })()
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+        _patch_scandir(monkeypatch, NaNMtimeEntry)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "invalid_mtime", (
+            f"NaN mtime must set error='invalid_mtime' (got {result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_positive_infinity_mtime_degrades_to_null_with_invalid_mtime(self, tmp_path, monkeypatch):
+        """+inf st_mtime must degrade to null fields + error='invalid_mtime'.
+
+        Positive infinity reaches the clock_skew guard incidentally, but one
+        uniform invalid_mtime category for all non-finite values is simpler
+        and deterministic.  Mutation: remove the isfinite guard and the test
+        fails because error changes to 'clock_skew' instead of 'invalid_mtime'.
+        """
+        (tmp_path / "real.txt").write_text("data\n")
+
+        class PosInfMtimeEntry:
+            def __init__(self, entry):
+                self._entry = entry
+
+            def stat(self, **kw):
+                s = self._entry.stat(**kw)
+                return type("FakeStat", (), {
+                    "st_mtime": float("inf"),
+                    "st_mode": s.st_mode,
+                })()
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+        _patch_scandir(monkeypatch, PosInfMtimeEntry)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "invalid_mtime", (
+            f"+inf mtime must set error='invalid_mtime' (got {result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
+    def test_negative_infinity_mtime_degrades_to_null_with_invalid_mtime(self, tmp_path, monkeypatch):
+        """-inf st_mtime must degrade to null fields + error='invalid_mtime'.
+
+        Negative infinity is treated as infinitely old without the guard:
+        the file is not recent, age > 0, and the scan completes with a
+        confident zero.  Mutation: remove the isfinite guard and the test
+        fails because error is None and files_modified_recent=0.
+        """
+        (tmp_path / "real.txt").write_text("data\n")
+
+        class NegInfMtimeEntry:
+            def __init__(self, entry):
+                self._entry = entry
+
+            def stat(self, **kw):
+                s = self._entry.stat(**kw)
+                return type("FakeStat", (), {
+                    "st_mtime": float("-inf"),
+                    "st_mode": s.st_mode,
+                })()
+
+            def __getattr__(self, name):
+                return getattr(self._entry, name)
+
+        _patch_scandir(monkeypatch, NegInfMtimeEntry)
+
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["error"] == "invalid_mtime", (
+            f"-inf mtime must set error='invalid_mtime' (got {result['error']!r})"
+        )
+        assert result["files_modified_recent"] is None
+        assert result["newest_mtime_age_s"] is None
+        assert result["scanned"] is None
+        assert result["truncated"] is False
+
     def test_wall_clock_budget_sets_truncated_before_exhaustion(self, tmp_path, monkeypatch):
         """When the wall-clock budget is zero the scan truncates with error=timeout.
 
