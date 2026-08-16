@@ -373,10 +373,19 @@ WATCH_LINE_COUNT_MAX_BYTES: int = 16 * 1024 * 1024
 # Max files to stat before truncating: large enough to catch typical review
 # output, small enough that a tree with millions of files doesn't stall a poll.
 WATCH_SCRATCH_MAX_FILES: int = 2000
+# Max directory *entries visited* across all descended directories, regardless
+# of type.  Bounds enumeration work on wide directories of non-file entries
+# (symlinks, FIFOs, empty sub-dirs) independently of the regular-file cap.
+WATCH_SCRATCH_MAX_ENTRIES: int = 10_000
 # Max directory depth to descend into below the working directory root.
 WATCH_SCRATCH_MAX_DEPTH: int = 8
-# Wall-clock budget for the entire scan; abort and set truncated=True if hit.
-WATCH_SCRATCH_BUDGET_SECONDS: float = 2.0
+# Wall-clock budget for the entire scan.  A 30-second watchdog poll runs five
+# serial watches plus a 5-second aggregate git budget; at 0.5 s per scan the
+# scratch phase consumes at most 1.7% of a poll interval per watched run, and
+# five concurrent watches stay well within the 30-second cycle even under SSH.
+# The old 2.0 s ceiling made scratch alone 6.7% per run and five watches could
+# exceed the whole cycle without any SSH overhead.
+WATCH_SCRATCH_BUDGET_SECONDS: float = 0.5
 # "Recent" window for files_modified_recent: how long ago counts as recent
 # activity (60 s matches the log growing window so pollers see consistent
 # freshness semantics across both facts).
@@ -2835,9 +2844,10 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
     facts at all, so git-only evidence treats them as stalled.  This scan
     gives the watchdog an additional signal that is blind to git status.
 
-    The scan is bounded by WATCH_SCRATCH_MAX_FILES, WATCH_SCRATCH_MAX_DEPTH,
-    and WATCH_SCRATCH_BUDGET_SECONDS so it stays cheap on every poll over SSH.
-    Heavy generated trees listed in WATCH_SCRATCH_PRUNE_DIRS are skipped.
+    The scan is bounded by WATCH_SCRATCH_MAX_FILES, WATCH_SCRATCH_MAX_ENTRIES,
+    WATCH_SCRATCH_MAX_DEPTH, and WATCH_SCRATCH_BUDGET_SECONDS so it stays cheap
+    on every poll over SSH.  Heavy generated trees listed in
+    WATCH_SCRATCH_PRUNE_DIRS are skipped.
 
     Returns a dict with keys:
       newest_mtime_age_s   – age of the most-recently-modified file (float|null)
@@ -2873,6 +2883,7 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
     newest_mtime: Optional[float] = None  # epoch seconds of the most-recently modified file
     files_modified_recent: int = 0
     scanned: int = 0
+    entries_visited: int = 0
     truncated: bool = False
 
     # Iterative BFS over the directory tree so we can enforce depth limits
@@ -2888,40 +2899,50 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
             current_dir, depth = queue.pop()
 
             try:
-                entries = list(os.scandir(current_dir))
+                # Stream the context manager directly — never call list() on it.
+                # Checking the budget inside the for-loop ensures each entry is
+                # deadline-checked before being yielded, so slow NFS or contended
+                # storage cannot block arbitrarily between the first check and the
+                # actual iteration.
+                with os.scandir(current_dir) as it:
+                    for entry in it:
+                        if time.time() >= deadline:
+                            truncated = True
+                            break
+
+                        entries_visited += 1
+                        if entries_visited >= WATCH_SCRATCH_MAX_ENTRIES:
+                            truncated = True
+                            break
+
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name not in WATCH_SCRATCH_PRUNE_DIRS and depth < WATCH_SCRATCH_MAX_DEPTH:
+                                queue.append((Path(entry.path), depth + 1))
+                            continue
+
+                        # Only regular files contribute to the activity signal.
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+
+                        try:
+                            mtime = entry.stat(follow_symlinks=False).st_mtime
+                        except OSError:
+                            continue
+
+                        scanned += 1
+                        if newest_mtime is None or mtime > newest_mtime:
+                            newest_mtime = mtime
+                        age = now - mtime
+                        if 0.0 <= age < WATCH_SCRATCH_RECENT_SECONDS:
+                            files_modified_recent += 1
+
+                        if scanned >= WATCH_SCRATCH_MAX_FILES:
+                            truncated = True
+                            break
+
             except OSError:
                 # Permission denied or the directory vanished mid-scan; skip it.
                 continue
-
-            for entry in entries:
-                if time.time() >= deadline:
-                    truncated = True
-                    break
-
-                if entry.is_dir(follow_symlinks=False):
-                    if entry.name not in WATCH_SCRATCH_PRUNE_DIRS and depth < WATCH_SCRATCH_MAX_DEPTH:
-                        queue.append((Path(entry.path), depth + 1))
-                    continue
-
-                # Only regular files contribute to the activity signal.
-                if not entry.is_file(follow_symlinks=False):
-                    continue
-
-                try:
-                    mtime = entry.stat(follow_symlinks=False).st_mtime
-                except OSError:
-                    continue
-
-                scanned += 1
-                if newest_mtime is None or mtime > newest_mtime:
-                    newest_mtime = mtime
-                age = now - mtime
-                if 0.0 <= age < WATCH_SCRATCH_RECENT_SECONDS:
-                    files_modified_recent += 1
-
-                if scanned >= WATCH_SCRATCH_MAX_FILES:
-                    truncated = True
-                    break
 
             if truncated:
                 break

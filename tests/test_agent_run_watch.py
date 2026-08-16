@@ -2171,6 +2171,87 @@ class TestScratchFacts:
         result = agent_run._watch_scratch_facts(str(tmp_path))
         assert result["truncated"] is True
 
+    def test_slow_enumeration_hits_budget_before_iterator_exhausted(self, tmp_path, monkeypatch):
+        """A slow-per-entry iterator must be cut off by the budget, not list()-materialised.
+
+        Safety property: WATCH_SCRATCH_BUDGET_SECONDS bounds wall-clock time even when
+        each scandir entry is slow to yield.  If list(scandir(...)) is used, all entries
+        are materialised before the first deadline check, so this test would take
+        len(entries) * entry_delay_s regardless of budget.
+
+        This test fails if the implementation calls list(os.scandir(...)).
+        """
+        import os as _os
+        import time as _time
+
+        # Each entry introduces a small sleep so the iterator is "slow".
+        ENTRY_DELAY = 0.02   # 20 ms per entry
+        ENTRY_COUNT = 20     # total would be 400 ms if list()-materialised
+        BUDGET = 0.05        # 50 ms — enough for ~2 entries, not all 20
+
+        for i in range(ENTRY_COUNT):
+            (tmp_path / f"slow_{i}.txt").write_text("data\n")
+
+        real_scandir = _os.scandir
+
+        class SlowIterator:
+            """Wraps a real DirEntry iterator and sleeps before yielding each entry."""
+
+            def __init__(self, it):
+                self._it = it
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                _time.sleep(ENTRY_DELAY)
+                return next(self._it)
+
+            def __enter__(self):
+                self._it.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._it.__exit__(*args)
+
+        def slow_scandir(path):
+            return SlowIterator(real_scandir(path))
+
+        monkeypatch.setattr(_os, "scandir", slow_scandir)
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_BUDGET_SECONDS", BUDGET)
+
+        start = _time.monotonic()
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        elapsed = _time.monotonic() - start
+
+        # Must respect the budget: must not take nearly as long as list()-materialising all entries.
+        assert elapsed < ENTRY_DELAY * ENTRY_COUNT * 0.5, (
+            f"Scan took {elapsed:.3f}s; list()-materialisation would have taken "
+            f"~{ENTRY_DELAY * ENTRY_COUNT:.3f}s — the budget is not being checked during enumeration"
+        )
+        assert result["truncated"] is True, "Budget hit must set truncated=True"
+
+    def test_entries_visited_cap_truncates_independently_of_file_count(self, tmp_path, monkeypatch):
+        """A cap on directory entries visited must truncate even when few regular files are found.
+
+        Safety property: WATCH_SCRATCH_MAX_ENTRIES bounds directory enumeration work
+        independently of WATCH_SCRATCH_MAX_FILES.  Without this cap a wide directory of
+        non-regular files (symlinks, FIFOs, empty dirs) enumerates without bound.
+
+        This test fails if no WATCH_SCRATCH_MAX_ENTRIES constant exists or is not enforced.
+        """
+        # Create entries that are not regular files (empty sub-dirs) so the file cap won't trigger.
+        for i in range(20):
+            (tmp_path / f"subdir_{i}").mkdir()
+        # One real file so we can confirm the scan ran at all.
+        (tmp_path / "real.txt").write_text("data\n")
+
+        monkeypatch.setattr(agent_run, "WATCH_SCRATCH_MAX_ENTRIES", 5)
+        result = agent_run._watch_scratch_facts(str(tmp_path))
+        assert result["truncated"] is True, (
+            "Entries-visited cap must set truncated=True when exceeded by non-file entries"
+        )
+
     # ------------------------------------------------------------------
     # end-to-end tests through cmd_watch
     # ------------------------------------------------------------------
