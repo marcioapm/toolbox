@@ -23,7 +23,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pytest-timeout>=2"]
 
 [project.urls]
 Homepage = "https://github.com/marcioapm/toolbox"
@@ -44,6 +44,11 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# No single test in this suite legitimately runs for a minute. A per-test
+# cap turns a hang -- a regression that stops a loop terminating, or a
+# detach flush that waits forever on a backpressured agent -- into a named
+# failing test instead of a stalled CI job with nothing to point at.
+timeout = 120
 
 [dependency-groups]
 dev = [

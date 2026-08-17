@@ -13,7 +13,7 @@ A collection of lightweight CLI tools for AI content generation and chat operati
 | `gemini-vision` | Analyze images/videos via Gemini (supports YouTube, Instagram, TikTok) | `GEMINI_API_KEY` |
 | `slackcli` | Lightweight Slack client (channels, messages, search, reactions) | `SLACK_USER_TOKEN` |
 | `llm-usage` | Monitor LLM token usage, costs, and quotas across providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` |
-| `agent-run` | Background wrapper for coding agents (Claude Code, OpenCode, Codex) with PTY steering, live log streaming, and managed mode (`--harness`) for deterministic session-id capture | — |
+| `agent-run` | Background wrapper for coding agents (Claude Code, OpenCode, Codex) with PTY steering, interactive attach, live log streaming, and managed mode (`--harness`) for deterministic session-id capture | — |
 
 ## Install
 
@@ -750,6 +750,7 @@ agent-run status <name>                   # one-line status
 agent-run logs <name> [N]                 # last N lines (default 50)
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
+agent-run attach <name>                   # attach interactively (Ctrl-C detaches)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
                 [--include-logs] [--log-min-age-hours N]
@@ -757,6 +758,24 @@ agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown
                 [--max-seconds N]
 agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage; read-only
 ```
+
+Unlike `tail`, which only streams output, `attach` gives live keyboard and
+terminal-resize passthrough to an interactive run — it adopts the attached
+terminal's size immediately and after every subsequent resize. Ctrl-C
+detaches the attach client locally, exiting 0, without touching the wrapped
+agent, which keeps running. Text pasted with bracketed paste is forwarded
+verbatim: a `0x03` byte or a literal Ctrl-C escape sequence inside a paste
+is content, not a detach keystroke. Multiple simultaneous attaches are
+allowed and all of them see the output, but only one should type at a time
+— each write is atomic up to `PIPE_BUF`, but a longer burst is split across
+several writes that another client can interleave between, so an escape
+sequence can still tear mid-sequence. The PTY size tracks whichever client
+resized most recently.
+
+Attaching from inside another attach session shares one terminal between
+two raw-mode owners: the inner session restores the outer session's raw
+mode when it exits, so exit them in reverse order or the terminal is left
+raw (`reset` fixes it).
 
 `kill` sends TERM/INT/HUP straight to the identity-verified runner, which
 catches it and runs its own teardown (kill/reap the workload, publish
@@ -1065,6 +1084,7 @@ Ephemeral, under `$AGENT_RUN_STATE_DIR/<name>/` (default `/tmp/agent-runs`):
 | `argv` | JSON-encoded argv (authoritative form for replay) |
 | `started_at`, `ended_at` | ISO-8601 UTC timestamps |
 | `stdin` | FIFO for `steer` (only when launched with `-i`) |
+| `resize` | FIFO for terminal-resize records used by `attach` (only when launched with `-i`) |
 | `pty_pid` | PID of the PTY child (interactive only) |
 | `keeper_pid` | PID of the FIFO keeper (interactive only) |
 | `interactive` | `1` if launched with `-i`, else `0` |

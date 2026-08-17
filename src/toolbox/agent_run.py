@@ -54,6 +54,7 @@ Usage::
               [-i] [--model <model>] [--agent-mode <name>]
               [--session-id <id>] [--harness-arg <flag>]...
               <name>
+    agent-run attach <name>              # live keyboard + resize passthrough (Ctrl-C detaches)
     agent-run tail <name>                # follow log in real time
     agent-run logs <name> [N]            # last N lines (default 50)
     agent-run status <name>              # one-line status
@@ -137,7 +138,8 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
                  a git repo (used by `watch` to count commits made during the
                  run without trusting commit timestamps; absent when `cwd`
                  wasn't a repo, and on legacy runs)
-    stdin        FIFO for steering (interactive only)
+    stdin        FIFO for steering / attach keyboard input (interactive only)
+    resize       FIFO for attach terminal-resize records (interactive only)
     reap_reason  set by `agent-run reap` when it changes status (died/killed)
     tmp_dir      absolute path to this run's scratch dir (see below)
 
@@ -271,11 +273,14 @@ import shutil
 import signal
 import socket
 import stat as _stat_module
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 import traceback
+import tty
 import platform
 import urllib.error
 import urllib.request
@@ -291,6 +296,29 @@ PRUNE_AFTER_DAYS = 21
 SUBMIT_MODE_CR = "cr"
 SUBMIT_MODE_CRLF = "crlf"
 MAX_PTY_INPUT_BUFFER = 1024 * 1024
+# Each resize record is framed by a magic first byte, tagged with a format
+# version, and closed by a checksum over the payload. The resize FIFO has no
+# per-writer arbitration, so a torn or replaced record can otherwise desync
+# the stream permanently -- and the magic byte alone is not enough, because
+# 0xA7 is also an ordinary column count (167) that reappears inside the
+# payload at that width. The checksum makes a mis-anchored boundary
+# detectable rather than silently decoding as garbage dimensions.
+#
+# The version byte keeps a mixed-version pairing (a session launched by one
+# release, attached by another) from decoding the other side's layout as
+# dimensions. Bump it whenever the record layout or the checksum changes.
+RESIZE_RECORD_MAGIC = 0xA7
+RESIZE_RECORD_VERSION = 1
+RESIZE_RECORD_FORMAT = ">BBHHB"
+RESIZE_RECORD_SIZE = struct.calcsize(RESIZE_RECORD_FORMAT)
+# Name of the state-dir marker a runner writes to advertise which resize
+# record version it can read, so attach can detect the mismatch before
+# writing records the runner would silently discard.
+RESIZE_PROTOCOL_MARKER = "resize_protocol"
+# Upper bound on a dimension carried in a resize record. Terminals do not
+# get near this, so anything above it is corrupt framing that happened to
+# satisfy the checksum rather than a real size worth applying.
+MAX_TERMINAL_DIMENSION = 2000
 MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
 FINAL_RENDER_TIMEOUT_SECONDS = 10.0
 FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
@@ -3488,6 +3516,117 @@ def _reset_terminal_modes() -> None:
         pass
 
 
+def _discard_unflushable_stdout() -> None:
+    """Point stdout at /dev/null after its real destination has died.
+
+    CPython flushes stdout during interpreter shutdown. When the terminal is
+    already gone that flush fails again, past any handler we control, and
+    turns an otherwise clean exit into status 120 plus a stderr message.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError):
+        pass
+    finally:
+        os.close(devnull)
+
+
+def _is_peer_gone(exc: OSError) -> bool:
+    """True when ``exc`` means the terminal on the other end is gone.
+
+    EPIPE is a closed pipe reader; EIO is a PTY whose master has closed.
+    Nothing else qualifies: ENOSPC (full disk) and EAGAIN (full non-blocking
+    pipe) are also OSError subclasses, and treating them as peer-gone would
+    exit 0 with silently truncated output where the shell expects a
+    failure. Those propagate instead."""
+    return exc.errno in (errno.EPIPE, errno.EIO)
+
+
+_TERMINAL_DEATH_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+
+
+def _report_from_signal_handler(message: str) -> None:
+    """Write ``message`` to stderr from inside a signal handler without
+    ever blocking.
+
+    A plain write is not safe here: if stderr is a pipe whose reader has
+    stopped consuming, it blocks until drained, and a handler that hangs is
+    worse than the silence it was added to replace -- the process never
+    reaches the SIG_DFL re-raise and never dies. Write once to the raw fd
+    with O_NONBLOCK set, restore the flag, and accept a truncated or
+    dropped message as the cost of always returning."""
+    try:
+        fd = sys.stderr.fileno()
+    except (AttributeError, ValueError, OSError):
+        return
+    try:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    except OSError:
+        return
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        os.write(fd, message.encode("utf-8", "replace"))
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+        except OSError:
+            pass
+
+
+@contextmanager
+def _terminal_restored_on_signal_death(restore):
+    """Run ``restore`` before dying from SIGTERM/SIGHUP/SIGQUIT.
+
+    Those three default to killing the process outright, so neither the
+    ``finally`` block nor the KeyboardInterrupt path ever runs and the
+    terminal is left however the command left it -- raw mode for `attach`,
+    and for both commands whatever DEC private modes (alt-screen, mouse
+    tracking) the replayed PTY bytes turned on. The handler restores, puts
+    the default disposition back and re-raises, so the exit status still
+    reports death by that signal.
+    """
+
+    def handle(signum, _frame):
+        # A failing restore must not cancel the signal: the process still
+        # has to die from it, or a SIGTERM silently becomes exit 1 and the
+        # caller's kill looks like it did nothing. It is still reported --
+        # the terminal is left raw and/or on the alt screen, and the user
+        # needs to know to run `reset`.
+        try:
+            restore()
+        except Exception as exc:
+            _report_from_signal_handler(
+                f"agent-run: could not restore terminal modes ({exc}) -- "
+                "run 'reset' if the terminal misbehaves\r\n"
+            )
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    previous = {}
+    for signum in _TERMINAL_DEATH_SIGNALS:
+        # ValueError when not on the main thread; OSError for a signal this
+        # platform refuses to trap. Either way the command still works, it
+        # just loses this cleanup path.
+        try:
+            previous[signum] = signal.signal(signum, handle)
+        except (OSError, ValueError):
+            pass
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
     n = max(1, args.n)
@@ -3523,43 +3662,725 @@ def cmd_tail(args: argparse.Namespace) -> int:
         pid = int(pid_raw) if pid_raw else None
     except ValueError:
         pid = None
+
+    def emit(data: bytes) -> bool:
+        """Write replayed log bytes to stdout. False means the terminal peer
+        is gone (closed window, dropped SSH: EIO on a PTY, EPIPE on a pipe)
+        and tail should exit rather than keep looping against a dead fd.
+
+        Any other OSError -- a full disk, a full non-blocking pipe --
+        propagates: exiting 0 with silently truncated output would hide a
+        real write failure that the shell expects to see as a failure."""
+        try:
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        except OSError as exc:
+            if not _is_peer_gone(exc):
+                raise
+            _discard_unflushable_stdout()
+            return False
+        return True
+
     # Stream the whole file then tail until the agent dies or log stops growing.
     # Ctrl-C is the normal way to stop following (same as `tail -f`): catch it
     # here so it exits quietly with the conventional 128+SIGINT status instead
     # of dumping a traceback, while still running the terminal-mode reset.
     try:
-        with log.open("rb") as f:
-            while True:
-                chunk = f.read(8192)
-                if chunk:
-                    try:
-                        sys.stdout.buffer.write(chunk)
-                        sys.stdout.buffer.flush()
-                    except BrokenPipeError:
+        with _terminal_restored_on_signal_death(_reset_terminal_modes):
+            with log.open("rb") as f:
+                while True:
+                    chunk = f.read(8192)
+                    if chunk:
+                        if not emit(chunk):
+                            return 0
+                        continue
+                    # EOF. A preserved-log-only or otherwise non-live run has
+                    # nothing left to follow; after printing existing content,
+                    # exit immediately.
+                    if pid is None:
                         return 0
-                    continue
-                # EOF. A preserved-log-only or otherwise non-live run has
-                # nothing left to follow; after printing existing content,
-                # exit immediately.
-                if pid is None:
-                    return 0
-                if not _pid_alive(pid):
-                    # One more drain to catch final writes from a process
-                    # that was live when tail started.
-                    time.sleep(0.1)
-                    remaining = f.read()
-                    if remaining:
-                        try:
-                            sys.stdout.buffer.write(remaining)
-                            sys.stdout.buffer.flush()
-                        except BrokenPipeError:
-                            pass
-                    return 0
-                time.sleep(0.2)
+                    if not _pid_alive(pid):
+                        # One more drain to catch final writes from a process
+                        # that was live when tail started.
+                        time.sleep(0.1)
+                        remaining = f.read()
+                        if remaining:
+                            emit(remaining)
+                        return 0
+                    time.sleep(0.2)
     except KeyboardInterrupt:
         return 128 + signal.SIGINT
     finally:
         _reset_terminal_modes()
+
+
+# Terminals that negotiate the "disambiguate escape codes" keyboard protocol
+# encode Ctrl-C as a CSI sequence instead of the raw 0x03 byte -- Claude
+# Code's TUI requests this protocol (`ESC[>1u`) on startup, and terminals
+# that honor it (iTerm2, kitty, wezterm, ghostty, ...) then send every
+# modified/disambiguated key, including Ctrl-C, as an escape sequence rather
+# than a legacy control byte. A plain search for 0x03 misses this entirely,
+# so the keystroke leaks straight through attach into the wrapped agent's
+# stdin instead of detaching. Recognize both encodings: the legacy xterm
+# "modifyOtherKeys" form (`ESC[27;<mod>;99~`) and the kitty-native CSI-u
+# form (`ESC[99;<mod>u`). <mod> is 1 + a bitmask of held modifiers
+# (Shift=1, Alt=2, Ctrl=4, ...); 99 is the codepoint for 'c'. Only trigger
+# when the Ctrl bit is set.
+#
+# Every parameter accepts colon-separated subparameters (alternate key
+# codes, press/repeat/release event type, associated text) and an
+# unbounded modifier value: terminals emit those even when the client
+# requested only the base protocol flag, and an empty subparameter means
+# "use the default" per ECMA-48. A stricter match would silently miss
+# conforming input and reintroduce the leak-through this detector prevents.
+_CTRL_C_CSI_RE = re.compile(
+    rb"\x1b\[(?:27(?::\d*)*;(\d+)(?::\d*)*;99(?::\d*)*~"
+    rb"|99(?::\d*)*;(\d+)(?::\d*)*(?:;[\d:]*)?u)"
+)
+
+# Bracketed-paste delimiters. Everything between them is pasted content,
+# never keystrokes, so no detach trigger inside them counts.
+_PASTE_START = b"\x1b[200~"
+_PASTE_END = b"\x1b[201~"
+
+# Upper bound on a single bracketed paste before the in-paste state gives
+# up and treats input as typed again. Without it, an ESC[201~ that never
+# arrives (paste aborted, terminal reset, emulator drops the closer) makes
+# Ctrl-C unreachable for the rest of the attach session -- and Ctrl-C is
+# the only documented way out. Far above any realistic paste, so a genuine
+# one is never cut short.
+_MAX_PASTE_BYTES = 8 * 1024 * 1024
+
+# Idle bound on the same state: how long the in-paste latch may sit with no
+# further payload before giving up. A terminal writes a paste as a
+# continuous burst, so a gap this long with no closing marker means the
+# paste is never going to finish -- and unlike the byte budget, this
+# recovers an aborted paste that sent very little data, which is the
+# common case (Ctrl-C mid-paste, tmux dropping the closer).
+#
+# Idle rather than total duration: a large paste over a slow link trickles
+# in for far longer than this, and expiring mid-stream would rescan the
+# remaining payload as typed input, so an embedded 0x03 would truncate it.
+_MAX_PASTE_IDLE_SECONDS = 5.0
+
+# Ceiling on the whole latch, measured from the opening marker regardless of
+# how busy the stream stays. The idle bound alone cannot end a paste that
+# never stops receiving bytes -- and inside a paste every byte is payload by
+# definition, so the Ctrl-C a user presses to escape a stuck paste is itself
+# what renews the idle window. Without this, input arriving more often than
+# once per _MAX_PASTE_IDLE_SECONDS pins the latch open for the rest of the
+# session and pressing the escape key harder only holds it tighter.
+#
+# Anchored to the byte budget rather than guessed: _MAX_PASTE_BYTES at
+# ~15 KB/s -- slower than any link that would still be usable
+# interactively -- arrives in about nine minutes, so a paste that could
+# legitimately complete within the byte cap always fits inside this. Past it
+# the payload could not have been a real paste, and an escape the user can
+# actually reach matters more than bracketing a paste that will never end.
+_MAX_PASTE_TOTAL_SECONDS = 600.0
+
+# How long a partial paste marker is held waiting for its remaining bytes.
+# Longer than _ESCAPE_HOLD_TIMEOUT_SECONDS because releasing one of these
+# as literal input destroys the marker outright, whereas releasing an
+# ordinary escape prefix merely forwards a keystroke slightly late.
+_PASTE_MARKER_HOLD_SECONDS = 2.0
+
+# Longest trailing unterminated CSI prefix held back waiting for its
+# terminator. Comfortably above any real single-keystroke sequence
+# (including the kitty form's full subparameter set), so input is never
+# withheld indefinitely by bytes that will never resolve into one.
+_MAX_PENDING_ESCAPE_BYTES = 64
+
+# How long a possibly-incomplete escape sequence is held back waiting for
+# more bytes before being flushed through as literal input. A CSI sequence
+# split across reads must not be torn, but a bare ESC keypress (Alt-prefix,
+# or Escape itself, which TUIs use to cancel) never gets follow-up bytes.
+# Sized to absorb SSH round-trip latency and a loaded scheduler -- too
+# short and a split CSI Ctrl-C leaks into the agent instead of detaching --
+# while staying below the point where a solitary Escape feels delayed.
+_ESCAPE_HOLD_TIMEOUT_SECONDS = 0.3
+
+# FIFO writes of at most PIPE_BUF bytes are atomic, so bounding each write
+# keeps concurrent attach clients from interleaving bytes mid-sequence.
+_FIFO_ATOMIC_WRITE_BYTES = getattr(select, "PIPE_BUF", 4096)
+
+
+def _find_ctrl_c_trigger(data: bytes) -> tuple:
+    """Return the ``(start, end)`` byte range of the earliest Ctrl-C detach
+    trigger in ``data``, or ``(-1, -1)`` if there is none. Recognizes the
+    raw 0x03 byte and the CSI forms matched by _CTRL_C_CSI_RE.
+
+    Earliest wins because every byte before the trigger has already been
+    committed to forwarding: picking a later match would forward an
+    earlier, intact trigger sequence into the agent's stdin as a side
+    effect of detaching."""
+    best_start = -1
+    best_end = -1
+    raw_idx = data.find(b"\x03")
+    if raw_idx != -1:
+        best_start, best_end = raw_idx, raw_idx + 1
+    for m in _CTRL_C_CSI_RE.finditer(data):
+        if not (int(m.group(1) or m.group(2)) - 1) & 4:
+            continue
+        # finditer runs left to right, so this first Ctrl-held match is
+        # already the earliest CSI trigger; only the raw byte can precede it.
+        if best_start == -1 or m.start() < best_start:
+            best_start, best_end = m.start(), m.end()
+        break
+    return best_start, best_end
+
+
+def _split_trailing_incomplete_escape(data: bytes) -> tuple:
+    """Split ``data`` into ``(forwardable, held_back)`` so a CSI sequence
+    straddling two reads from the local terminal is never torn: a trailing
+    ESC that has not yet received its 0x40-0x7E terminator is held back to
+    be prepended to the next read.
+
+    Only a genuinely unterminated trailing sequence is held. A complete
+    sequence is forwarded whatever its length, and an over-long
+    unterminated run (past _MAX_PENDING_ESCAPE_BYTES, so not a real
+    keystroke) is forwarded rather than held -- dropping local input is
+    never an acceptable outcome, since the bytes in question are usually a
+    paste payload rather than an escape sequence at all."""
+    esc_at = data.rfind(b"\x1b")
+    if esc_at == -1:
+        return data, b""
+    tail = data[esc_at:]
+    if len(tail) == 1:
+        return data[:esc_at], tail
+    if tail[1:2] != b"[":
+        return data, b""
+    # CSI parameter/intermediate bytes are 0x20-0x3F; a byte in 0x40-0x7E
+    # terminates the sequence.
+    if any(0x40 <= byte <= 0x7E for byte in tail[2:]):
+        return data, b""
+    if len(tail) > _MAX_PENDING_ESCAPE_BYTES:
+        return data, b""
+    return data[:esc_at], tail
+
+
+def _is_paste_marker_prefix(data: bytes) -> bool:
+    """True when ``data`` could still grow into ``ESC[200~``/``ESC[201~``
+    and is long enough to be distinctive.
+
+    Releasing such a prefix as literal input destroys the marker: the next
+    read then starts mid-sequence, so the paste bracket is never recognized
+    and the payload is scanned for detach triggers as if it were typed.
+
+    ``ESC`` and ``ESC[`` are excluded deliberately. Both are far more often
+    the Escape key or an arrow key -- neither of which gets follow-up bytes
+    -- than the first bytes of a split marker, and holding them for the
+    longer paste window would make those keys feel stuck. From ``ESC[2`` on
+    no competing single keystroke exists, so the extended hold is
+    unambiguous. The two excluded split points are covered instead by
+    _resync_paste_marker on the following read.
+    """
+    if len(data) < 3:
+        return False
+    return any(
+        marker.startswith(data) for marker in (_PASTE_START, _PASTE_END)
+    )
+
+
+def _resync_paste_marker(data: bytes, released: bytes) -> tuple:
+    """Re-attach ``released`` to ``data`` when the two together start a
+    paste marker that the hold timer split apart. Returns
+    ``(new_data, consumed)`` -- ``consumed`` is True only when ``released``
+    was actually rejoined, so the caller knows whether it still owes those
+    bytes to the agent.
+
+    The flag has to be reported rather than inferred from ``new_data``: a
+    following read that independently starts with ESC looks exactly like a
+    rejoined prefix, and treating it as one drops the held byte outright.
+
+    ``ESC`` and ``ESC[`` are released after the ordinary escape timeout so
+    Escape and the arrow keys stay responsive. When the bytes that follow
+    turn out to complete a paste marker, the marker has to be reassembled
+    before scanning or the payload is treated as typed input -- which is
+    what makes a `0x03` inside it detach mid-paste."""
+    if not released or not data:
+        return data, False
+    joined = released + data
+    for marker in (_PASTE_START, _PASTE_END):
+        if joined.startswith(marker) or marker.startswith(joined):
+            return joined, True
+    return data, False
+
+
+def _release_expired_held_escape(
+    held_escape: bytes, held_escape_deadline: Optional[float]
+) -> tuple:
+    """If ``held_escape`` has sat unresolved past ``held_escape_deadline``
+    with no follow-up bytes, release it. Returns
+    ``(new_held_escape, new_held_escape_deadline, released_bytes)`` --
+    ``released_bytes`` is empty unless the deadline has actually passed.
+
+    A prefix that could still become a bracketed-paste marker is held past
+    the deadline rather than released, up to _PASTE_MARKER_HOLD_SECONDS:
+    the terminal writes those markers in one burst, so a partial one means
+    the rest is in flight, and releasing it is what turns a split marker
+    into a spurious mid-paste detach."""
+    if not held_escape or held_escape_deadline is None:
+        return held_escape, held_escape_deadline, b""
+    now = time.monotonic()
+    if now < held_escape_deadline:
+        return held_escape, held_escape_deadline, b""
+    if _is_paste_marker_prefix(held_escape) and now < (
+        held_escape_deadline - _ESCAPE_HOLD_TIMEOUT_SECONDS + _PASTE_MARKER_HOLD_SECONDS
+    ):
+        return held_escape, held_escape_deadline, b""
+    return b"", None, held_escape
+
+
+def _scan_local_input_for_detach(
+    data: bytes,
+    in_paste: bool = False,
+    paste_bytes: int = 0,
+    paste_idle_since: Optional[float] = None,
+    paste_started: Optional[float] = None,
+) -> tuple:
+    """Given raw bytes read from the local terminal (with any previously
+    held-back escape prefix already merged in by the caller), decide what to
+    forward. Returns ``(forwardable, new_held_escape, detached,
+    new_in_paste, new_paste_bytes, new_paste_idle_since,
+    new_paste_started)``.
+
+    Detach triggers are recognized only outside a bracketed paste: between
+    ``ESC[200~`` and ``ESC[201~`` the terminal is transmitting pasted
+    content, so a 0x03 byte or the literal text of a CSI Ctrl-C sequence is
+    data, not a keypress, and must be forwarded like any other byte. On a
+    trigger, ``forwardable`` is everything strictly before it -- neither the
+    trigger nor anything racing in behind it is forwarded.
+
+    The in-paste state is bounded three ways, because an ``ESC[201~`` that
+    never arrives would otherwise make Ctrl-C unreachable for the rest of
+    the session and Ctrl-C is the only documented way out.
+
+    ``paste_bytes`` caps total payload. ``paste_idle_since`` caps the gap
+    since payload last arrived, tracking idleness rather than total duration
+    so a large payload trickling in over a slow link -- which can
+    legitimately take minutes -- is never cut off mid-stream.
+    ``paste_started`` caps the latch's whole lifetime: the idle bound alone
+    cannot end a paste that keeps receiving bytes, and since every byte
+    inside a paste is payload, a user pressing Ctrl-C to escape a stuck
+    paste renews the idle window with each press. The ceiling is what makes
+    the escape reachable in bounded time no matter how busy the stream is."""
+    forwardable, held_escape = _split_trailing_incomplete_escape(data)
+    now = time.monotonic()
+    if in_paste and (
+        (
+            paste_idle_since is not None
+            and now - paste_idle_since > _MAX_PASTE_IDLE_SECONDS
+        )
+        or (
+            paste_started is not None
+            and now - paste_started > _MAX_PASTE_TOTAL_SECONDS
+        )
+    ):
+        in_paste, paste_bytes = False, 0
+        paste_idle_since, paste_started = None, None
+    pos = 0
+    while pos < len(forwardable):
+        if in_paste:
+            end = forwardable.find(_PASTE_END, pos)
+            if end != -1:
+                pos = end + len(_PASTE_END)
+                in_paste, paste_bytes = False, 0
+                paste_idle_since, paste_started = None, None
+                continue
+            paste_bytes += len(forwardable) - pos
+            # Payload arrived, so the paste is still live: restart the idle
+            # window rather than letting it run from the opening marker.
+            # paste_started deliberately keeps its original value -- the
+            # ceiling must not be renewable, or it would be a second idle
+            # bound rather than a bound on the whole latch.
+            paste_idle_since = now
+            if paste_bytes <= _MAX_PASTE_BYTES:
+                break
+            # Latch expired: fall through and rescan the tail as typed
+            # input so the detach key works again.
+            in_paste, paste_bytes = False, 0
+            paste_idle_since, paste_started = None, None
+            continue
+        paste_at = forwardable.find(_PASTE_START, pos)
+        trigger_at, _trigger_end = _find_ctrl_c_trigger(forwardable[pos:])
+        if trigger_at != -1 and (paste_at == -1 or pos + trigger_at < paste_at):
+            return (
+                forwardable[: pos + trigger_at],
+                b"",
+                True,
+                in_paste,
+                paste_bytes,
+                paste_idle_since,
+                paste_started,
+            )
+        if paste_at == -1:
+            break
+        pos = paste_at + len(_PASTE_START)
+        in_paste, paste_bytes = True, 0
+        paste_idle_since, paste_started = now, now
+    return (
+        forwardable,
+        held_escape,
+        False,
+        in_paste,
+        paste_bytes,
+        paste_idle_since,
+        paste_started,
+    )
+
+
+def _append_bounded(pending: bytes, extra: bytes, warn) -> bytes:
+    """Append ``extra`` to ``pending``, discarding it and reporting via
+    ``warn`` if it would push the buffer past MAX_PTY_INPUT_BUFFER.
+
+    The bound exists because a paste larger than the wrapped agent can
+    consume would otherwise grow this buffer without limit. Dropping the
+    overflowing chunk with a visible warning beats an unhandled exception
+    dumping a traceback over the user's terminal mid-session."""
+    if len(pending) + len(extra) > MAX_PTY_INPUT_BUFFER:
+        warn(
+            f"input buffer full ({MAX_PTY_INPUT_BUFFER} bytes) -- "
+            f"discarded {len(extra)} bytes of input"
+        )
+        return pending
+    return pending + extra
+
+
+def _flush_fifo_write(fd: int, data: bytes) -> int:
+    """Write up to _FIFO_ATOMIC_WRITE_BYTES of ``data`` to a non-blocking
+    FIFO and return the byte count actually written.
+
+    Bounding each write to PIPE_BUF keeps the write itself atomic, so two
+    attach clients cannot tear each other apart *within* one write. It is
+    not a whole-keystroke guarantee: a pending buffer larger than PIPE_BUF
+    is delivered in several writes, and another client can interleave
+    between them, so a long escape sequence can still be split. Concurrent
+    typing from multiple clients is documented as unreliable for exactly
+    this reason.
+    """
+    try:
+        return os.write(fd, data[:_FIFO_ATOMIC_WRITE_BYTES])
+    except BlockingIOError:
+        return 0
+
+
+_DETACH_FLUSH_TIMEOUT_SECONDS = 1.0
+
+
+def _drain_fifo_write(fd: int, data: bytes) -> bytes:
+    """Write all of ``data`` to a non-blocking FIFO before detaching,
+    returning whatever could not be delivered within
+    _DETACH_FLUSH_TIMEOUT_SECONDS.
+
+    The bytes typed before Ctrl-C are already committed to the agent, so a
+    single PIPE_BUF-sized write is not enough -- but the reader may be
+    backpressured, and detach must not hang waiting for it."""
+    deadline = time.monotonic() + _DETACH_FLUSH_TIMEOUT_SECONDS
+    while data:
+        written = _flush_fifo_write(fd, data)
+        if written:
+            data = data[written:]
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        select.select([], [fd], [], remaining)
+    return data
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    name = _validate_run_name(args.name)
+    state_dir, pid = _require_live_interactive_run(name)
+    log = _require_log(name)
+    stdin_path = state_dir / "stdin"
+    resize_path = state_dir / "resize"
+    if not stdin_path.is_fifo():
+        sys.exit(f"agent-run: no stdin FIFO at {stdin_path}")
+    # A session launched before resize support has no resize FIFO. Fall
+    # back to keyboard-only passthrough rather than refusing to attach to
+    # an otherwise-live run.
+    has_resize = resize_path.is_fifo()
+    if not has_resize:
+        print(
+            f"agent-run: no resize FIFO at {resize_path} (session predates "
+            "resize support) -- attaching without resize forwarding",
+            file=sys.stderr,
+        )
+    elif not _resize_protocol_matches(state_dir):
+        # A runner from another release reads a different record layout and
+        # would discard (or worse, mis-decode) what this client writes.
+        has_resize = False
+        print(
+            "agent-run: this session's runner speaks a different resize "
+            f"record format (this build speaks version {RESIZE_RECORD_VERSION}) "
+            "-- attaching without resize forwarding",
+            file=sys.stderr,
+        )
+
+    if not sys.stdin.isatty():
+        sys.exit(
+            "agent-run: attach requires an interactive terminal "
+            "(use 'agent-run tail' instead)"
+        )
+    local_fd = sys.stdin.fileno()
+    saved_termios = termios.tcgetattr(local_fd)
+    try:
+        stdin_fd = os.open(str(stdin_path), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        sys.exit(f"agent-run: failed to open stdin FIFO at {stdin_path}: {exc}")
+    resize_fd: Optional[int] = None
+    if has_resize:
+        try:
+            resize_fd = os.open(str(resize_path), os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            os.close(stdin_fd)
+            sys.exit(f"agent-run: failed to open resize FIFO at {resize_path}: {exc}")
+    pending_input = b""
+    pending_resize = b""
+    resize_requested = True
+    last_sent_size: Optional[tuple] = None
+    winch_installed = False
+    previous_winch = None
+    held_escape = b""
+    held_escape_deadline: Optional[float] = None
+    in_paste = False
+    paste_bytes = 0
+    paste_idle_since: Optional[float] = None
+    paste_started: Optional[float] = None
+    # A released escape prefix is forwarded immediately and kept here only
+    # so the next read can be rescanned as the paste marker it may complete;
+    # already_sent counts the leading bytes of that rescan the agent has
+    # therefore already received.
+    resync_prefix = b""
+    resync_deadline = 0.0
+    already_sent = 0
+
+    def restore_terminal() -> None:
+        try:
+            termios.tcsetattr(local_fd, termios.TCSADRAIN, saved_termios)
+        except termios.error:
+            # The controlling terminal itself is already gone (window closed,
+            # SSH dropped): tcsetattr on the now-invalid fd raises, and must
+            # not stop _reset_terminal_modes from running -- otherwise DEC
+            # private modes the replayed PTY bytes turned on (alt-screen,
+            # mouse tracking) stay stuck enabled.
+            pass
+        _reset_terminal_modes()
+
+    def emit(data: bytes) -> bool:
+        """Write replayed PTY bytes to the local terminal. False means the
+        terminal peer is gone (EIO on a closed PTY, EPIPE on a pipe), so
+        attach should return through its normal cleanup rather than let the
+        exception unwind past the terminal-restore ordering in `finally`.
+
+        Discards whatever is still buffered on the way out: CPython flushes
+        stdout again at interpreter shutdown, and a second failure there
+        turns a clean exit into status 120 with a message on stderr.
+
+        Any other OSError -- a full disk, a full non-blocking pipe --
+        propagates rather than being mistaken for a dead terminal."""
+        try:
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        except OSError as exc:
+            if not _is_peer_gone(exc):
+                raise
+            _discard_unflushable_stdout()
+            return False
+        return True
+
+    def warn(message: str) -> None:
+        # CRLF because the local terminal is in raw mode: a bare LF would
+        # leave the cursor in the current column.
+        try:
+            sys.stderr.write(f"agent-run: {message}\r\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+
+    # attach replays raw PTY bytes to a real terminal exactly like tail/logs
+    # do (see _reset_terminal_modes above), so it must reset DEC private
+    # modes on the way out, and an external SIGINT (kill -INT on this
+    # process, distinct from the in-band Ctrl-C byte handled below) must
+    # exit quietly with the conventional 128+SIGINT status instead of a
+    # traceback.
+    try:
+        with _terminal_restored_on_signal_death(restore_terminal):
+            tty.setraw(local_fd)
+
+            def on_winch(_signum, _frame):
+                nonlocal resize_requested
+                resize_requested = True
+
+            previous_winch = signal.signal(signal.SIGWINCH, on_winch)
+            winch_installed = True
+            with log.open("rb") as log_file:
+                while True:
+                    # Drain the log at full speed while output is pending, but
+                    # still fall through to service local input, resize, and
+                    # the liveness check every iteration (via a zero-length
+                    # select() when more log data is queued). A bare
+                    # `continue` back to the log read would let a wrapped
+                    # agent emitting output continuously starve keystroke
+                    # forwarding, Ctrl-C detach, and resize delivery for as
+                    # long as the burst lasts.
+                    chunk = log_file.read(8192)
+                    if chunk and not emit(chunk):
+                        return 0
+
+                    if has_resize and resize_requested:
+                        resize_requested = False
+                        size = os.get_terminal_size(local_fd)
+                        # A 0x0 size is a legitimate transient read (a PTY
+                        # whose winsize was never set, a terminal mid-
+                        # teardown), not an error -- _pack_resize rejects 0 as
+                        # out of range, so skip this iteration's resize
+                        # rather than crashing. A partially-written record is
+                        # replaced rather than completed: only the latest size
+                        # matters, and the reader resynchronizes on the next
+                        # record's magic byte, discarding the orphaned prefix.
+                        #
+                        # Only send when this client's size actually changed.
+                        # SIGWINCH fires for reasons other than a real resize,
+                        # and with several clients attached the PTY is
+                        # last-writer-wins: a redundant send would drag every
+                        # other client's view back to this one's size.
+                        #
+                        # Dimensions past the record's range are clamped, not
+                        # rejected: this size comes from the environment (a
+                        # very wide display, a tmux pane on an ultrawide), so
+                        # raising here would take attach down mid-session and
+                        # leave the terminal raw. A clamped size is slightly
+                        # wrong; a dead attach is unusable.
+                        if size.columns and size.lines and (size.columns, size.lines) != last_sent_size:
+                            last_sent_size = (size.columns, size.lines)
+                            cols = min(size.columns, MAX_TERMINAL_DIMENSION)
+                            rows = min(size.lines, MAX_TERMINAL_DIMENSION)
+                            if (cols, rows) != (size.columns, size.lines):
+                                warn(
+                                    f"terminal is {size.columns}x{size.lines}; "
+                                    f"clamping the reported size to "
+                                    f"{cols}x{rows}"
+                                )
+                            pending_resize = _pack_resize(cols, rows)
+
+                    want_write = []
+                    if pending_input:
+                        want_write.append(stdin_fd)
+                    if resize_fd is not None and pending_resize:
+                        want_write.append(resize_fd)
+                    select_timeout = 0.0 if chunk else 0.2
+                    if held_escape_deadline is not None:
+                        select_timeout = max(
+                            0.0, min(select_timeout, held_escape_deadline - time.monotonic())
+                        )
+                    readable, writable, _ = select.select(
+                        [local_fd], want_write, [], select_timeout
+                    )
+
+                    if not _pid_alive(pid):
+                        time.sleep(0.1)
+                        remaining = log_file.read()
+                        if remaining:
+                            emit(remaining)
+                        return 0
+
+                    if local_fd not in readable:
+                        held_escape, held_escape_deadline, released = (
+                            _release_expired_held_escape(held_escape, held_escape_deadline)
+                        )
+                        if released:
+                            # Forward straight away -- the prefix is a real
+                            # keystroke and withholding it costs latency and
+                            # risks losing it if the agent dies next. Keep a
+                            # copy only so the following read can be scanned
+                            # as the paste marker it may complete.
+                            pending_input = _append_bounded(
+                                pending_input, released[already_sent:], warn
+                            )
+                            already_sent = 0
+                            resync_prefix = released
+                            resync_deadline = (
+                                time.monotonic() + _ESCAPE_HOLD_TIMEOUT_SECONDS
+                            )
+
+                    # Nothing arrived in time to complete a marker, so the
+                    # prefix stands on its own; it is already forwarded.
+                    if resync_prefix and time.monotonic() >= resync_deadline:
+                        resync_prefix = b""
+
+                    if local_fd in readable:
+                        data = os.read(local_fd, 4096)
+                        if not data:
+                            return 0
+                        if held_escape:
+                            data = held_escape + data
+                            held_escape = b""
+                            held_escape_deadline = None
+                        elif resync_prefix:
+                            data, rejoined = _resync_paste_marker(data, resync_prefix)
+                            if rejoined:
+                                # Scanned as one sequence, but the prefix has
+                                # already gone to the agent: forward only the
+                                # bytes past it.
+                                already_sent = len(resync_prefix)
+                            resync_prefix = b""
+                        (
+                            forwardable,
+                            held_escape,
+                            detached,
+                            in_paste,
+                            paste_bytes,
+                            paste_idle_since,
+                            paste_started,
+                        ) = _scan_local_input_for_detach(
+                            data, in_paste, paste_bytes, paste_idle_since, paste_started
+                        )
+                        new_bytes = forwardable[already_sent:]
+                        # Whatever the scan held back still carries the tail of
+                        # an already-forwarded prefix when the rejoined marker
+                        # is not complete yet.
+                        already_sent = max(0, already_sent - len(forwardable))
+                        if detached:
+                            pending_input = _append_bounded(pending_input, new_bytes, warn)
+                            undelivered = _drain_fifo_write(stdin_fd, pending_input)
+                            if undelivered:
+                                warn(
+                                    f"detaching with {len(undelivered)} bytes of typed "
+                                    "input undelivered (agent not reading)"
+                                )
+                            return 0
+                        if held_escape:
+                            held_escape_deadline = (
+                                time.monotonic() + _ESCAPE_HOLD_TIMEOUT_SECONDS
+                            )
+                        pending_input = _append_bounded(pending_input, new_bytes, warn)
+
+                    if stdin_fd in writable and pending_input:
+                        pending_input = pending_input[_flush_fifo_write(stdin_fd, pending_input):]
+
+                    if resize_fd is not None and resize_fd in writable and pending_resize:
+                        pending_resize = pending_resize[
+                            _flush_fifo_write(resize_fd, pending_resize):
+                        ]
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 128 + signal.SIGINT
+    finally:
+        if winch_installed:
+            # SIG_DFL rather than the raw return value when SIGWINCH had no
+            # Python-level handler: signal.signal returns None for that and
+            # rejects None as a new handler.
+            signal.signal(
+                signal.SIGWINCH,
+                previous_winch if previous_winch is not None else signal.SIG_DFL,
+            )
+        os.close(stdin_fd)
+        if resize_fd is not None:
+            os.close(resize_fd)
+        restore_terminal()
 
 
 # ---------------------------------------------------------------------------
@@ -4767,8 +5588,7 @@ def cmd_du(args: argparse.Namespace) -> int:
 # steer / kill
 # ---------------------------------------------------------------------------
 
-def cmd_steer(args: argparse.Namespace) -> int:
-    name = _validate_run_name(args.name)
+def _require_live_interactive_run(name: str) -> tuple[Path, int]:
     d = _require_state(name)
     if _read(d / "interactive") != "1":
         # Keyed on the interactive state file, not the FIFO's existence: a
@@ -4777,23 +5597,33 @@ def cmd_steer(args: argparse.Namespace) -> int:
             f"agent-run: '{name}' was launched one-shot (not interactive) and cannot be steered. "
             f"Relaunch with -i or --harness ... -i to make it steerable."
         )
-    # The codex app-server adapter dispatches on the submit terminator, which
-    # --raw omits, so the bytes would sit in its buffer forever and steer would
-    # still exit 0. Fail loudly instead of silently losing the message.
-    if args.raw:
-        try:
-            run_json_data = json.loads((_log_dir(name) / "run.json").read_text())
-        except (OSError, json.JSONDecodeError, ValueError):
-            run_json_data = {}
-        if isinstance(run_json_data, dict) and run_json_data.get("harness") == "codex":
-            sys.exit(
-                "agent-run: '--raw' is not supported for managed codex runs; "
-                "the codex app-server adapter requires a newline terminator to dispatch input. "
-                "Use plain 'steer' (without --raw) instead."
-            )
     pid = _require_positive_state_int(d, "pid", name)
     if not _pid_alive(pid):
-        sys.exit(f"agent-run: '{args.name}' is not running")
+        sys.exit(f"agent-run: '{name}' is not running")
+    return d, pid
+
+
+def _reject_raw_steer_for_codex(name: str) -> None:
+    """The codex app-server adapter dispatches on the submit terminator, which
+    --raw omits, so the bytes would sit in its buffer forever and steer would
+    still exit 0. Fail loudly instead of silently losing the message."""
+    try:
+        run_json_data = json.loads((_log_dir(name) / "run.json").read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        run_json_data = {}
+    if isinstance(run_json_data, dict) and run_json_data.get("harness") == "codex":
+        sys.exit(
+            "agent-run: '--raw' is not supported for managed codex runs; "
+            "the codex app-server adapter requires a newline terminator to dispatch input. "
+            "Use plain 'steer' (without --raw) instead."
+        )
+
+
+def cmd_steer(args: argparse.Namespace) -> int:
+    name = _validate_run_name(args.name)
+    d, pid = _require_live_interactive_run(name)
+    if args.raw:
+        _reject_raw_steer_for_codex(name)
     fifo = d / "stdin"
     if not fifo.is_fifo():
         sys.exit(f"agent-run: no stdin FIFO at {fifo}")
@@ -5315,19 +6145,30 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     # Create resources that can fail (fifo, pipe) before publishing
     # "starting" wherever possible: a failure here means the run never
     # appeared active, so there is no stranded state to clean up.
-    fifo_path: Optional[Path] = None
+    fifo_paths: tuple[Path, ...] = ()
     if args.interactive:
-        fifo_path = d / "stdin"
-        if fifo_path.exists():
-            fifo_path.unlink()
+        fifo_paths = (d / "stdin", d / "resize")
         try:
-            os.mkfifo(str(fifo_path))
+            for fifo_path in fifo_paths:
+                # _safe_rmtree can leave the old state dir, and so an old
+                # FIFO, in place on a partial/early-return path. Unlink
+                # first or os.mkfifo raises FileExistsError on relaunch.
+                if fifo_path.exists():
+                    fifo_path.unlink()
+                os.mkfifo(str(fifo_path))
         except OSError as exc:
+            for fifo_path in fifo_paths:
+                try:
+                    fifo_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
             sys.exit(f"agent-run: failed to create control fifo: {exc}")
     try:
         r_ack, w_ack = os.pipe()
     except OSError as exc:
-        if fifo_path is not None:
+        for fifo_path in fifo_paths:
             try:
                 fifo_path.unlink()
             except OSError:
@@ -6263,14 +7104,177 @@ def _drain_pty_input(master_fd: int, buffered: bytes) -> bytes:
     return buffered
 
 
+def _resize_checksum(cols: int, rows: int) -> int:
+    """Checksum byte closing a resize record.
+
+    Distinguishes a correctly-anchored record from a coincidental magic
+    byte inside another record's payload -- 0xA7 is also column 167, so at
+    that width the magic reappears in the payload and magic-alone anchoring
+    mis-frames. Each byte is weighted by position, so a window shifted
+    within a record produces a different sum rather than an XOR that folds
+    back to the same value.
+
+    The weights are odd: an even one is singular modulo 256, so it discards
+    the top bit of its byte and lets a shifted window collide with a valid
+    record for whole families of dimensions."""
+    total = RESIZE_RECORD_MAGIC * 31 + RESIZE_RECORD_VERSION
+    for weight, byte in enumerate(
+        (cols >> 8, cols & 0xFF, rows >> 8, rows & 0xFF), start=1
+    ):
+        total = (total * 31 + byte * (2 * weight - 1)) & 0xFF
+    return total
+
+
+def _pack_resize(cols: int, rows: int) -> bytes:
+    if not (1 <= cols <= MAX_TERMINAL_DIMENSION and 1 <= rows <= MAX_TERMINAL_DIMENSION):
+        raise ValueError(
+            f"terminal dimensions must be between 1 and {MAX_TERMINAL_DIMENSION}"
+        )
+    return struct.pack(
+        RESIZE_RECORD_FORMAT,
+        RESIZE_RECORD_MAGIC,
+        RESIZE_RECORD_VERSION,
+        cols,
+        rows,
+        _resize_checksum(cols, rows),
+    )
+
+
+def _apply_resize(master_fd: int, cols: int, rows: int) -> None:
+    try:
+        fcntl.ioctl(
+            master_fd,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", rows, cols, 0, 0),
+        )
+    except OSError as exc:
+        if exc.errno not in {errno.EBADF, errno.EIO, errno.EINVAL, errno.ENOTTY}:
+            raise
+
+
+def _drain_resize_records(master_fd: int, buffered: bytes, warn=None) -> bytes:
+    """Apply the LAST complete resize record found in ``buffered``,
+    discarding earlier complete records in the same batch, and return any
+    trailing partial record for the next call.
+
+    A single ``os.read(resize_fd, 4096)`` can return many queued records at
+    once -- dragging a window edge emits a burst of intermediate sizes
+    faster than the runner's select() loop drains them. Applying each would
+    issue a TIOCSWINSZ ioctl, and therefore a SIGWINCH to the wrapped
+    agent, per already-stale intermediate size: one full TUI repaint each
+    instead of one repaint at the size that actually matters.
+
+    Bytes that don't parse as a well-formed record are skipped one at a
+    time until one does. Without that, a torn write, a replaced record, or
+    a second attach client writing concurrently desyncs the stream
+    permanently and every subsequent record decodes as garbage dimensions.
+    Validation is the checksum plus in-range dimensions, not the magic byte
+    alone: 0xA7 is also column 167, so at that width the magic reappears
+    inside the payload and anchoring on it alone mis-frames the record.
+
+    A record whose magic byte is right but whose version is not this
+    build's is reported through ``warn`` and skipped rather than decoded:
+    an attach client from another release writes a different layout, and
+    reading its bytes as dimensions drives the agent's terminal to a
+    garbage size."""
+    last_record = None
+    foreign_version = None
+    while len(buffered) >= RESIZE_RECORD_SIZE:
+        candidate = buffered[:RESIZE_RECORD_SIZE]
+        rest = buffered[RESIZE_RECORD_SIZE:]
+        if _valid_resize_record(candidate) and _resize_record_prefix_possible(
+            rest, allow_empty=True
+        ):
+            last_record = candidate
+            buffered = rest
+            continue
+        if (
+            candidate[0] == RESIZE_RECORD_MAGIC
+            and candidate[1] != RESIZE_RECORD_VERSION
+        ):
+            foreign_version = candidate[1]
+        # Advance a single byte: a candidate boundary can be any offset, so
+        # every offset has to be tried. Skipping ahead to the next magic
+        # byte would be equivalent here only because a record must start
+        # with one -- it is not a weaker check, just a faster path this
+        # code does not need.
+        buffered = buffered[1:]
+    # Keep only a trailing run that could still complete into a record.
+    while buffered and not _resize_record_prefix_possible(buffered):
+        buffered = buffered[1:]
+    if foreign_version is not None and last_record is None and warn is not None:
+        warn(
+            f"ignoring resize record with unsupported format version "
+            f"{foreign_version} (this build speaks version "
+            f"{RESIZE_RECORD_VERSION}); terminal size not updated"
+        )
+    if last_record is not None:
+        _magic, _version, cols, rows, _sum = struct.unpack(
+            RESIZE_RECORD_FORMAT, last_record
+        )
+        _apply_resize(master_fd, cols, rows)
+    return buffered
+
+
+def _valid_resize_record(candidate: bytes) -> bool:
+    if len(candidate) != RESIZE_RECORD_SIZE or candidate[0] != RESIZE_RECORD_MAGIC:
+        return False
+    _magic, version, cols, rows, checksum = struct.unpack(
+        RESIZE_RECORD_FORMAT, candidate
+    )
+    if version != RESIZE_RECORD_VERSION:
+        return False
+    if not (1 <= cols <= MAX_TERMINAL_DIMENSION and 1 <= rows <= MAX_TERMINAL_DIMENSION):
+        return False
+    return checksum == _resize_checksum(cols, rows)
+
+
+def _resize_record_prefix_possible(buffered: bytes, allow_empty: bool = False) -> bool:
+    """True when ``buffered`` could still be the start of a valid record
+    once more bytes arrive -- i.e. it begins with the magic byte.
+
+    ``allow_empty`` accepts an exhausted buffer as well, which is what the
+    boundary check after a candidate record needs: whatever follows a real
+    record is either nothing yet or the next record's magic byte."""
+    if not buffered:
+        return allow_empty
+    return buffered[:1] == bytes([RESIZE_RECORD_MAGIC])
+
+
+def _resize_protocol_matches(state_dir: Path) -> bool:
+    """True when this build can exchange resize records with the runner
+    that owns ``state_dir``.
+
+    An absent marker means a runner that predates resize versioning. Those
+    read the original unversioned 5-byte record, so a versioned one is
+    garbage to them -- treat it as a mismatch rather than assuming
+    compatibility, since silently driving the agent's terminal to a bogus
+    size is worse than forwarding no resizes at all.
+
+    An unreadable or non-UTF-8 marker is a mismatch for the same reason:
+    whatever wrote those bytes is not a runner speaking this format, and a
+    corrupt state file must not take attach down with a traceback."""
+    try:
+        recorded = (state_dir / RESIZE_PROTOCOL_MARKER).read_text().strip()
+    except (OSError, ValueError):
+        return False
+    return recorded == str(RESIZE_RECORD_VERSION)
+
+
 def _fork_fifo_keeper(state_dir: Path) -> int:
-    """Fork a child that holds the run's FIFO open for writing, and return its pid.
+    """Fork a child that holds the run's control FIFOs open for writing, and
+    return its pid.
 
     Without it the FIFO reader sees EOF whenever no steer is in flight. The child
     opens O_RDWR (which never blocks), acks over a pipe so the caller knows the
     write end is held before opening the read end, then sleeps until reaped.
+
+    Both the stdin and resize FIFOs are held: attach writes resize records to
+    the second one, and a reader that saw EOF there would stop tracking the
+    client's terminal size for the rest of the session.
     """
-    fifo_path = state_dir / "stdin"
+    stdin_path = state_dir / "stdin"
+    resize_path = state_dir / "resize"
     keeper_r, keeper_w = os.pipe()
     with _block_handled_runner_signals():
         keeper_pid = os.fork()
@@ -6281,7 +7285,31 @@ def _fork_fifo_keeper(state_dir: Path) -> int:
     if keeper_pid == 0:
         _reset_runner_signal_handlers()
         os.close(keeper_r)
-        fd = os.open(str(fifo_path), os.O_RDWR)
+        # Open FIFOs for writing (blocks until a reader appears, that's us below).
+        # Use a background-safe open: O_RDWR avoids the reader-blocking behavior.
+        #
+        # Both opens are guarded: this keeper is a real fork() of the
+        # runner, sharing its Python call stack, not an exec'd child. An
+        # unguarded OSError here (ENOENT from a racing FIFO removal,
+        # EMFILE/ENFILE under fd pressure) would propagate straight up
+        # that shared stack into _runner's own `except Exception` handler
+        # -- but running *inside this keeper process*, not the real
+        # runner. That handler releases the per-name launch lock
+        # (`fcntl.flock(lock_fd, LOCK_UN)`) on the assumption it's the
+        # runner cleaning up after itself; here it would release the lock
+        # prematurely, before the real runner has reached readiness,
+        # letting a concurrent relaunch/reap act on state that's still
+        # mid-setup. Fail this process directly instead: os._exit without
+        # acking leaves keeper_r's read at the parent returning empty,
+        # which is already handled below as "keeper failed to open
+        # control FIFOs" -- the intended, single, unambiguous failure
+        # path.
+        try:
+            fd = os.open(str(stdin_path), os.O_RDWR)
+            resize_fd_keeper = os.open(str(resize_path), os.O_RDWR)
+        except OSError:
+            os._exit(1)
+        # Ack and go to sleep.
         try:
             os.write(keeper_w, b".")
         finally:
@@ -6296,14 +7324,23 @@ def _fork_fifo_keeper(state_dir: Path) -> int:
                 os.close(fd)
             except OSError:
                 pass
+            try:
+                os.close(resize_fd_keeper)
+            except OSError:
+                pass
         os._exit(0)
 
     os.close(keeper_w)
+    # Wait for keeper to open the FIFOs. An empty read means the keeper died
+    # (e.g. failed to open one of the control FIFOs) before acking; proceeding
+    # would hang forever on the blocking FIFO opens below.
     try:
-        os.read(keeper_r, 1)  # keeper has the write end open once this returns
+        ack = os.read(keeper_r, 1)
     except OSError:
-        pass
+        ack = b""
     os.close(keeper_r)
+    if not ack:
+        raise RuntimeError("keeper failed to open control FIFOs")
     return keeper_pid
 
 
@@ -6328,6 +7365,7 @@ def _open_fifo_reader(fifo_path: Path) -> int:
     return fifo_fd
 
 
+
 def _run_interactive(
     state_dir: Path,
     argv: Sequence[str],
@@ -6336,7 +7374,8 @@ def _run_interactive(
     prompt_file: Optional[str] = None,
     submit_mode: str = SUBMIT_MODE_CR,
 ) -> int:
-    fifo_path = state_dir / "stdin"
+    stdin_path = state_dir / "stdin"
+    resize_path = state_dir / "resize"
     keeper_pid = _fork_fifo_keeper(state_dir)
 
     # Fork + PTY for the agent.
@@ -6387,13 +7426,13 @@ def _run_interactive(
                 # even if the first one races input-buffer reset.
                 submit_writes = _prompt_submission_writes(data, submit_mode)
                 try:
-                    fd = os.open(str(fifo_path), os.O_WRONLY)
+                    fd = os.open(str(stdin_path), os.O_WRONLY)
                     try:
                         os.write(fd, submit_writes[0])
                     finally:
                         os.close(fd)
                     time.sleep(0.5)
-                    fd = os.open(str(fifo_path), os.O_WRONLY)
+                    fd = os.open(str(stdin_path), os.O_WRONLY)
                     try:
                         os.write(fd, submit_writes[1])
                     finally:
@@ -6406,22 +7445,37 @@ def _run_interactive(
             finally:
                 os._exit(0)
 
-    # Open FIFO read end (blocks until the keeper has opened for writing,
-    # which it has by the time we got the ack).
-    fifo_fd = _open_fifo_reader(fifo_path)
+    # Open FIFO read ends (blocks until the keeper has opened for writing,
+    # which it has by the time we got the ack). Both are non-blocking; the
+    # select loop below gates every read.
+    fifo_fd = _open_fifo_reader(stdin_path)
+    resize_fd = _open_fifo_reader(resize_path)
 
     # Make master non-blocking so reads don't stall when select lies briefly.
     flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    # Advertise the resize record layout this runner reads, so an attach
+    # client from a different release can warn instead of writing records
+    # this loop would discard.
+    _write(state_dir / RESIZE_PROTOCOL_MARKER, f"{RESIZE_RECORD_VERSION}\n")
     _write(state_dir / "status", "running\n")
     ready()
 
+    def warn_resize(message: str) -> None:
+        # The runner's stdout/stderr is the log file, which is where an
+        # operator looks when the terminal size stops tracking.
+        try:
+            os.write(log_fd, f"agent-run: {message}\r\n".encode())
+        except OSError:
+            pass
+
     exit_code: Optional[int] = None
     buf_in = b""
+    buf_resize = b""
     while True:
         try:
             writable = [master_fd] if buf_in else []
-            r, w, _ = select.select([master_fd, fifo_fd], writable, [], 0.5)
+            r, w, _ = select.select([master_fd, fifo_fd, resize_fd], writable, [], 0.5)
         except (OSError, select.error) as exc:
             if isinstance(exc, OSError) and exc.errno == errno.EINTR:
                 continue
@@ -6470,6 +7524,17 @@ def _run_interactive(
                     )
                 buf_in += chunk
 
+        if resize_fd in r:
+            try:
+                chunk = os.read(resize_fd, 4096)
+            except BlockingIOError:
+                chunk = b""
+            except OSError:
+                chunk = b""
+            if chunk:
+                buf_resize += chunk
+            buf_resize = _drain_resize_records(master_fd, buf_resize, warn_resize)
+
         if master_fd in w and buf_in:
             buf_in = _drain_pty_input(master_fd, buf_in)
 
@@ -6500,6 +7565,10 @@ def _run_interactive(
     # Clean up.
     try:
         os.close(fifo_fd)
+    except OSError:
+        pass
+    try:
+        os.close(resize_fd)
     except OSError:
         pass
     try:
@@ -7600,6 +8669,30 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_tail.add_argument("name")
     sp_tail.set_defaults(func=cmd_tail)
 
+    sp_attach = sub.add_parser(
+        "attach",
+        help="attach interactively (live keyboard + resize; Ctrl-C detaches, exit 0)",
+        description=(
+            "Attach a real terminal to an interactive run: keystrokes are "
+            "forwarded to the agent's stdin and terminal resizes are relayed "
+            "to its PTY. Ctrl-C detaches without stopping the agent and exits "
+            "0. Several clients may attach at once; output is mirrored to all "
+            "of them, but only one should type at a time -- concurrent "
+            "keyboard input from multiple clients is not reliable: each "
+            "write is atomic up to PIPE_BUF, but a longer burst is split "
+            "across writes that another client can interleave between, so "
+            "an escape sequence can still tear. The PTY size is last-writer-"
+            "wins: each client sends its size on connect and whenever that "
+            "size changes, so the most recent resize governs for everyone. "
+            "Attaching from inside another "
+            "attach session shares one terminal between two raw-mode owners: "
+            "the inner session restores the outer session's raw mode on exit, "
+            "so exit them in reverse order or the terminal is left raw."
+        ),
+    )
+    sp_attach.add_argument("name")
+    sp_attach.set_defaults(func=cmd_attach)
+
     sp_clean = sub.add_parser(
         "clean",
         help="render PTY-captured TUI log into a readable transcript via pyte",
@@ -7877,7 +8970,7 @@ class _LaunchArgv(NamedTuple):
 
 
 _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
-    "status", "watch", "logs", "tail", "clean", "steer", "kill",
+    "status", "watch", "logs", "tail", "attach", "clean", "steer", "kill",
     "list", "reap", "du", "help",
 })
 
