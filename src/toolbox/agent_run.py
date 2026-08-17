@@ -4349,16 +4349,16 @@ def cmd_du(args: argparse.Namespace) -> int:
 def cmd_steer(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     d = _require_state(name)
-    interactive_val = _read(d / "interactive")
-    if interactive_val != "1":
-        # Requirement §5: steer on a one-shot run exits non-zero with a clear
-        # message. Check the interactive state file, not the FIFO's existence.
+    if _read(d / "interactive") != "1":
+        # Keyed on the interactive state file, not the FIFO's existence: a
+        # one-shot run may still have a FIFO but nothing reading it.
         sys.exit(
             f"agent-run: '{name}' was launched one-shot (not interactive) and cannot be steered. "
             f"Relaunch with -i or --harness ... -i to make it steerable."
         )
-    # For managed codex runs, --raw sends no terminator so the adapter never
-    # dispatches the bytes — the steer is provably undelivered. Reject loudly.
+    # The codex app-server adapter dispatches on the submit terminator, which
+    # --raw omits, so the bytes would sit in its buffer forever and steer would
+    # still exit 0. Fail loudly instead of silently losing the message.
     if args.raw:
         try:
             run_json_data = json.loads((_log_dir(name) / "run.json").read_text())
@@ -4814,22 +4814,18 @@ def cmd_launch(args: argparse.Namespace) -> int:
 
 def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int:
     """Perform launch setup while ``lock_fd`` serializes this run name."""
-    # Managed mode: build argv from harness + flags; raw mode uses args.command.
+    # Managed mode builds its own argv below; raw mode takes args.command verbatim.
     harness: Optional[str] = getattr(args, "harness", None)
     is_managed = harness is not None
-
-    if is_managed:
-        argv: List[str] = []  # Built by _build_managed_argv below.
-    else:
-        argv = list(args.command)
+    argv: List[str] = [] if is_managed else list(args.command)
     if not is_managed and not argv:
         sys.exit("agent-run: missing command")
     prompt_file: Optional[str] = getattr(args, "prompt_file", None)
     if prompt_file and not Path(prompt_file).is_file():
         sys.exit(f"agent-run: prompt file not found: {prompt_file}")
-    # Guard against callers that construct a Namespace directly (e.g. tests):
-    # --model is not forwarded for codex regardless of how cmd_launch is reached.
-    if is_managed and harness == "codex" and getattr(args, "model", None):
+    # _parse_launch_argv rejects this too; repeated here because cmd_launch is
+    # also called with a hand-built Namespace, which bypasses the parser.
+    if harness == "codex" and getattr(args, "model", None):
         sys.exit(
             "agent-run: --model is not supported for --harness codex; "
             "use --harness-arg -c model=<model> to set the model via codex config"
@@ -4945,23 +4941,23 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         # by a watchdog at all, and post-mortem can reconstruct the launch.
         _write(d / "idle_timeout", f"{idle_timeout}\n")
 
-    # Managed mode: build argv, acquire session id, and write session.json.
-    # All acquisition happens before the fork so the runner's argv is complete
-    # at fork time and session.json is written before status=running is published.
+    # Managed mode: build argv, acquire the session id, write session.json.
+    # All acquisition happens pre-fork so the runner's argv is complete at fork
+    # time and session.json exists before status=running is published.
     acquire_log = log_d / "session-acquire.log"
-    opencode_port: Optional[int] = None
     managed_prompt: Optional[str] = None
-    managed_model: Optional[str] = None
     managed_harness_args: List[str] = []
     if is_managed:
+        opencode_port: Optional[int] = None
         managed_prompt = getattr(args, "prompt", None)
         managed_model = getattr(args, "model", None)
         managed_agent_mode: Optional[str] = getattr(args, "agent_mode", None)
         managed_session_id_arg: Optional[str] = getattr(args, "session_id", None)
         managed_harness_args = getattr(args, "harness_args", [])
+        managed_session_id: Optional[str] = None
 
-        # Materialise an inline prompt into a file so every interactive path
-        # uses prompt_file, keeping the delivery code uniform.
+        # Materialise an inline prompt into a file so every delivery path
+        # (stdin for one-shot, FIFO for interactive) reads from prompt_file.
         if managed_prompt and not prompt_file:
             try:
                 prompt_path = log_d / "prompt"
@@ -4971,104 +4967,61 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                 _acquire_log_write(acquire_log, f"could not write prompt file: {exc}")
 
         if harness == "claude":
-            # Push acquisition: use caller-supplied UUID4 or generate one.
-            # UUID validation already happened in _parse_launch_argv.
-            claude_session_id = managed_session_id_arg or str(uuid.uuid4())
-            _acquire_session_claude(log_d, claude_session_id, acquire_log)
+            # Push acquisition: caller-supplied UUID4 (validated in
+            # _parse_launch_argv) or a fresh one.
+            managed_session_id = managed_session_id_arg or str(uuid.uuid4())
+            _record_session(log_d, acquire_log, "claude", managed_session_id, "pushed", "certain")
+
+        elif harness == "opencode":
+            # Mint-then-attach, identical in both modes: pick a free port, start a
+            # temporary opencode there, poll /global/health, POST /session, kill the
+            # temporary process. The id is known before exec, so --session goes into
+            # the real argv. Only interactive keeps the port (the TUI serves its HTTP
+            # API on it); one-shot's `opencode run` does not take --port.
+            try:
+                opencode_port = _find_free_port()
+                _acquire_log_write(acquire_log, f"opencode port={opencode_port} selected")
+            except RuntimeError as exc:
+                _record_session(log_d, acquire_log, "opencode", None, "missing", "missing", str(exc))
+                opencode_port = None
+
+            if opencode_port is not None:
+                managed_session_id = _opencode_prefork_mint(
+                    opencode_port, name, str(Path.cwd()), acquire_log, state_dir=d
+                )
+                if managed_session_id:
+                    _record_session(log_d, acquire_log, "opencode", managed_session_id,
+                                    "minted", "certain")
+                else:
+                    _record_session(log_d, acquire_log, "opencode", None, "missing", "missing",
+                                    "prefork mint failed (health poll or POST /session)")
+            if not args.interactive:
+                opencode_port = None
+
+        if harness == "codex":
+            # Both modes run entirely through app-server JSON-RPC. thread/start
+            # mints the id post-fork in the runner, so session.json is written
+            # there, not here. This argv is recorded for postmortem, never exec'd.
+            _acquire_log_write(
+                acquire_log,
+                f"codex {'interactive' if args.interactive else 'one-shot'}: "
+                "using app-server for mint+run",
+            )
+            argv = ["codex", "app-server"]
+        else:
             argv = _build_managed_argv(
                 harness,
                 interactive=args.interactive,
-                prompt=managed_prompt,
-                prompt_file=prompt_file,
+                # Interactive opencode delivers the prompt post-attach via the
+                # FIFO; --prompt alongside --session is silently swallowed.
+                prompt=None if args.interactive else managed_prompt,
+                prompt_file=None if args.interactive else prompt_file,
                 model=managed_model,
                 agent_mode=managed_agent_mode,
-                session_id=claude_session_id,
+                session_id=managed_session_id,
                 harness_args=managed_harness_args,
+                opencode_port=opencode_port,
             )
-
-        elif harness == "opencode":
-            if args.interactive:
-                # Mint-then-attach: start a temporary opencode process on a free port,
-                # poll /global/health, POST /session to mint an id, kill the temp process,
-                # then start the real TUI with --session <id> --port <N>.
-                # The id is known before exec, so --session is in the actual argv.
-                try:
-                    opencode_port = _find_free_port()
-                    _acquire_log_write(acquire_log, f"opencode port={opencode_port} selected")
-                except RuntimeError as exc:
-                    _acquire_session_missing(log_d, "opencode", str(exc), acquire_log)
-                    opencode_port = None
-
-                opencode_session_id: Optional[str] = None
-                if opencode_port is not None:
-                    cwd_str = str(Path.cwd())
-                    opencode_session_id = _opencode_prefork_mint(
-                        opencode_port, name, cwd_str, acquire_log, state_dir=d
-                    )
-                    if opencode_session_id:
-                        _acquire_session_opencode_minted(log_d, opencode_session_id, acquire_log)
-                    else:
-                        _acquire_session_missing(
-                            log_d, "opencode",
-                            "prefork mint failed (health poll or POST /session)",
-                            acquire_log,
-                        )
-
-                argv = _build_managed_argv(
-                    harness,
-                    interactive=True,
-                    prompt=None,  # delivered post-attach via FIFO
-                    prompt_file=None,
-                    model=managed_model,
-                    agent_mode=managed_agent_mode,
-                    session_id=opencode_session_id,
-                    harness_args=managed_harness_args,
-                    opencode_port=opencode_port,
-                )
-            else:
-                # One-shot: mint-then-attach using the same HTTP flow, no TUI.
-                # opencode run --session <id> resumes the pre-minted session.
-                try:
-                    oneshot_port = _find_free_port()
-                    _acquire_log_write(acquire_log, f"opencode oneshot port={oneshot_port} selected")
-                except RuntimeError as exc:
-                    _acquire_session_missing(log_d, "opencode", str(exc), acquire_log)
-                    oneshot_port = None
-
-                oneshot_session_id: Optional[str] = None
-                if oneshot_port is not None:
-                    cwd_str = str(Path.cwd())
-                    oneshot_session_id = _opencode_prefork_mint(
-                        oneshot_port, name, cwd_str, acquire_log, state_dir=d
-                    )
-                    if oneshot_session_id:
-                        _acquire_session_opencode_minted(log_d, oneshot_session_id, acquire_log)
-                    else:
-                        _acquire_session_missing(
-                            log_d, "opencode",
-                            "prefork mint failed (health poll or POST /session)",
-                            acquire_log,
-                        )
-
-                argv = _build_managed_argv(
-                    harness,
-                    interactive=False,
-                    prompt=managed_prompt,
-                    prompt_file=prompt_file,
-                    model=managed_model,
-                    agent_mode=managed_agent_mode,
-                    session_id=oneshot_session_id,
-                    harness_args=managed_harness_args,
-                )
-
-        elif harness == "codex":
-            # Both one-shot and interactive run entirely through app-server JSON-RPC:
-            # thread/start mints the id, turn/start runs the prompt. The argv here is
-            # descriptive only (for postmortem); it is never exec'd.
-            _acquire_log_write(acquire_log, f"codex {'interactive' if args.interactive else 'one-shot'}: using app-server for mint+run")
-            argv = ["codex", "app-server"]  # descriptive; not exec'd directly
-            # session.json is written from inside _run_managed_*_codex_appserver
-            # (post-fork in the runner) after the thread id is minted.
 
     _write(d / "command", _pretty_command(argv) + "\n")
     _write(d / "argv", json.dumps(argv))
@@ -5076,10 +5029,9 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         d, argv, getattr(args, "submit_mode", None)
     )
 
-    # Duplicate immutable launch facts into the persistent log dir so they
-    # survive a reboot that wipes the ephemeral /tmp state dir. run.json is
-    # a copy for postmortem — nothing reads it as a liveness signal.
-    _launch_run_json: dict = {
+    # Copy the launch facts into the persistent log dir so postmortem survives a
+    # reboot that wipes the ephemeral /tmp state. Never a liveness signal.
+    launch_run_json: dict = {
         "name": name,
         "argv": argv,
         "command": _pretty_command(argv),
@@ -5089,10 +5041,10 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         "harness": harness,
     }
     if is_managed:
-        _launch_run_json["model"] = getattr(args, "model", None)
-        _launch_run_json["agent_mode"] = getattr(args, "agent_mode", None)
+        launch_run_json["model"] = getattr(args, "model", None)
+        launch_run_json["agent_mode"] = getattr(args, "agent_mode", None)
     try:
-        _write_run_json(log_d, _launch_run_json)
+        _write_run_json(log_d, launch_run_json)
     except Exception:  # noqa: BLE001
         pass  # never fail the run
 
@@ -5172,10 +5124,8 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         tmp_dir=scratch_dir,
         idle_timeout=getattr(args, "idle_timeout", None),
         managed_harness=harness,
-        opencode_port=opencode_port,
         codex_appserver_args=managed_harness_args if is_managed else None,
         managed_prompt=managed_prompt if is_managed else None,
-        managed_model=managed_model if is_managed else None,
     )
     return 0  # never reached
 
@@ -5471,17 +5421,15 @@ def _runner(
     tmp_dir: Optional[Path] = None,
     idle_timeout: Optional[float] = None,
     managed_harness: Optional[str] = None,
-    opencode_port: Optional[int] = None,
     codex_appserver_args: Optional[List[str]] = None,
     managed_prompt: Optional[str] = None,
-    managed_model: Optional[str] = None,
 ) -> None:
     """Execute in the detached session-leader process.
 
-    Writes pid/pgid then either execs the agent directly (non-interactive)
-    or forks a PTY child and shuttles FIFO <-> PTY master <-> log (interactive).
-    The prompt (if any) has already been materialised to prompt_file by the
-    launcher; this function just delivers it via the PTY/FIFO mechanism.
+    Writes pid/pgid then either execs the agent directly (non-interactive), forks
+    a PTY child and shuttles FIFO <-> PTY master <-> log (interactive), or drives
+    codex over app-server JSON-RPC (managed_harness == "codex"). Any prompt has
+    already been materialised to prompt_file by the launcher.
     """
     my_pid = os.getpid()
     log_fd = -1
@@ -5708,53 +5656,31 @@ def _runner(
 
     try:
         agent_started_monotonic = time.monotonic()
-        if managed_harness is not None:
-            # Managed mode: harness-specific execution path.
-            acquire_log = log_dir / "session-acquire.log"
-            if interactive and managed_harness == "opencode" and opencode_port is not None:
-                # Interactive opencode: session id is already in argv; PTY/FIFO delivers prompt.
-                exit_code = _run_interactive(state_dir, list(argv), log_fd, _ready, prompt_file, submit_mode)
-            elif managed_harness == "codex" and not interactive:
-                # One-shot codex: run entirely through app-server JSON-RPC.
-                # The grandchild inherits cwd from the parent (same as _cmd_launch_locked).
-                try:
-                    cwd_str = os.getcwd()
-                except OSError:
-                    cwd_str = "/"
-                exit_code = _run_managed_oneshot_codex_appserver(
-                    state_dir, log_dir,
-                    prompt=managed_prompt,
-                    prompt_file=prompt_file,
-                    cwd=cwd_str,
-                    harness_args=codex_appserver_args or [],
-                    model=managed_model,
-                    log_fd=log_fd,
-                    ready=_ready,
-                    acquire_log=acquire_log,
-                )
-            elif managed_harness == "codex" and interactive:
-                # Interactive codex: app-server stays alive; steer input from FIFO
-                # is forwarded as turn/steer JSON-RPC calls; text deltas stream to log.
-                try:
-                    cwd_str = os.getcwd()
-                except OSError:
-                    cwd_str = "/"
-                exit_code = _run_managed_interactive_codex_appserver(
-                    state_dir, log_dir,
-                    prompt=managed_prompt,
-                    prompt_file=prompt_file,
-                    cwd=cwd_str,
-                    harness_args=codex_appserver_args or [],
-                    model=managed_model,
-                    log_fd=log_fd,
-                    ready=_ready,
-                    acquire_log=acquire_log,
-                )
-            elif interactive:
-                exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
-            else:
-                exit_code = _run_oneshot(state_dir, argv, log_fd, _ready, prompt_file)
+        if managed_harness == "codex":
+            # Codex never execs an argv: both modes drive `codex app-server`
+            # over JSON-RPC. The grandchild inherits cwd from the launcher.
+            try:
+                cwd_str = os.getcwd()
+            except OSError:
+                cwd_str = "/"
+            codex_runner = (
+                _run_managed_interactive_codex_appserver if interactive
+                else _run_managed_oneshot_codex_appserver
+            )
+            exit_code = codex_runner(
+                state_dir, log_dir,
+                prompt=managed_prompt,
+                prompt_file=prompt_file,
+                cwd=cwd_str,
+                harness_args=codex_appserver_args or [],
+                log_fd=log_fd,
+                ready=_ready,
+                acquire_log=log_dir / "session-acquire.log",
+            )
         elif interactive:
+            # Managed claude/opencode use the same PTY path as raw runs: the
+            # session id is already in argv, and the prompt is delivered through
+            # the FIFO after the TUI comes up.
             exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
         else:
             exit_code = _run_oneshot(state_dir, argv, log_fd, _ready, prompt_file)
@@ -5905,19 +5831,14 @@ def _drain_pty_input(master_fd: int, buffered: bytes) -> bytes:
     return buffered
 
 
-def _run_interactive(
-    state_dir: Path,
-    argv: Sequence[str],
-    log_fd: int,
-    ready: callable,
-    prompt_file: Optional[str] = None,
-    submit_mode: str = SUBMIT_MODE_CR,
-) -> int:
-    fifo_path = state_dir / "stdin"
+def _fork_fifo_keeper(state_dir: Path) -> int:
+    """Fork a child that holds the run's FIFO open for writing, and return its pid.
 
-    # Persistent keeper process: holds the FIFO open for writing so the reader
-    # (the PTY runner) never sees EOF between steers. We fork a dedicated
-    # child that blocks on a long sleep while holding the write end open.
+    Without it the FIFO reader sees EOF whenever no steer is in flight. The child
+    opens O_RDWR (which never blocks), acks over a pipe so the caller knows the
+    write end is held before opening the read end, then sleeps until reaped.
+    """
+    fifo_path = state_dir / "stdin"
     keeper_r, keeper_w = os.pipe()
     with _block_handled_runner_signals():
         keeper_pid = os.fork()
@@ -5928,10 +5849,7 @@ def _run_interactive(
     if keeper_pid == 0:
         _reset_runner_signal_handlers()
         os.close(keeper_r)
-        # Open FIFO for writing (blocks until a reader appears, that's us below).
-        # Use a background-safe open: O_RDWR avoids the reader-blocking behavior.
         fd = os.open(str(fifo_path), os.O_RDWR)
-        # Ack and go to sleep.
         try:
             os.write(keeper_w, b".")
         finally:
@@ -5949,12 +5867,45 @@ def _run_interactive(
         os._exit(0)
 
     os.close(keeper_w)
-    # Wait for keeper to open the FIFO.
     try:
-        os.read(keeper_r, 1)
+        os.read(keeper_r, 1)  # keeper has the write end open once this returns
     except OSError:
         pass
     os.close(keeper_r)
+    return keeper_pid
+
+
+def _reap_fifo_keeper(keeper_pid: Optional[int]) -> None:
+    """Terminate and reap the FIFO keeper child."""
+    if keeper_pid is None:
+        return
+    try:
+        os.kill(keeper_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(keeper_pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def _open_fifo_reader(fifo_path: Path) -> int:
+    """Open the FIFO read end non-blocking; reads are gated by select."""
+    fifo_fd = os.open(str(fifo_path), os.O_RDONLY)
+    fcntl.fcntl(fifo_fd, fcntl.F_SETFL, fcntl.fcntl(fifo_fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+    return fifo_fd
+
+
+def _run_interactive(
+    state_dir: Path,
+    argv: Sequence[str],
+    log_fd: int,
+    ready: callable,
+    prompt_file: Optional[str] = None,
+    submit_mode: str = SUBMIT_MODE_CR,
+) -> int:
+    fifo_path = state_dir / "stdin"
+    keeper_pid = _fork_fifo_keeper(state_dir)
 
     # Fork + PTY for the agent.
     with _block_handled_runner_signals():
@@ -6025,14 +5976,11 @@ def _run_interactive(
 
     # Open FIFO read end (blocks until the keeper has opened for writing,
     # which it has by the time we got the ack).
-    fifo_fd = os.open(str(fifo_path), os.O_RDONLY)
-    # Make non-blocking for the select loop below? Keep blocking; we gate on select.
+    fifo_fd = _open_fifo_reader(fifo_path)
 
     # Make master non-blocking so reads don't stall when select lies briefly.
     flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-    flags = fcntl.fcntl(fifo_fd, fcntl.F_GETFL)
-    fcntl.fcntl(fifo_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
     _write(state_dir / "status", "running\n")
     ready()
 
@@ -6119,10 +6067,6 @@ def _run_interactive(
 
     # Clean up.
     try:
-        os.kill(keeper_pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
         os.close(fifo_fd)
     except OSError:
         pass
@@ -6130,10 +6074,7 @@ def _run_interactive(
         os.close(master_fd)
     except OSError:
         pass
-    try:
-        os.waitpid(keeper_pid, 0)
-    except ChildProcessError:
-        pass
+    _reap_fifo_keeper(keeper_pid)
     return exit_code if exit_code is not None else 0
 
 
@@ -6144,32 +6085,29 @@ def _run_interactive(
 # Valid harness names for --harness.
 MANAGED_HARNESSES: frozenset[str] = frozenset({"claude", "opencode", "codex"})
 
-# Port-scan range for opencode's --port.
-# Health poll: how long to wait for opencode to become healthy (seconds).
+# How long to wait for opencode's HTTP API to report healthy, and how often to ask.
 _OPENCODE_HEALTH_TIMEOUT = 30.0
 _OPENCODE_HEALTH_POLL_INTERVAL = 0.25
 
-# codex app-server: timeout for the full initialize+thread/start handshake (seconds).
+# Timeout for the codex app-server initialize + thread/start handshake (seconds).
 _CODEX_APPSERVER_TIMEOUT = 20.0
 
-# Path to codex auth file which stores the API key used by the llmproxy provider.
 _CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 
 
 def _codex_subprocess_env() -> Optional[dict]:
-    """Return an environment dict for codex app-server subprocesses.
+    """Return an environment for codex app-server subprocesses, or None to inherit.
 
-    Codex reads its API key from the env var named by config.env_key (typically
-    OPENAI_API_KEY). When agent-run is launched from a shell that does not export
-    this variable, the subprocess inherits nothing and fails immediately with
-    "Missing environment variable". This helper reads the key from
-    ~/.codex/auth.json (codex's own credential store) and injects it, leaving
-    all other inherited variables intact. Returns None to let Popen inherit the
-    environment as-is when the key is already set or auth.json is unreadable.
+    Codex reads its API key from the variable named by config.env_key (typically
+    OPENAI_API_KEY). agent-run double-forks into a detached runner, so a launching
+    shell that never exported it leaves the subprocess with nothing and codex dies
+    with "Missing environment variable". Read the key from codex's own credential
+    store instead, leaving every other inherited variable intact. ~/.codex/auth.json
+    is opened read-only and only when the variable is unset.
     """
     key_name = "OPENAI_API_KEY"
     if os.environ.get(key_name):
-        return None  # already set; nothing to do
+        return None
     try:
         auth = json.loads(_CODEX_AUTH_PATH.read_text())
         api_key = auth.get(key_name)
@@ -6276,37 +6214,37 @@ def _opencode_prefork_mint(
 ) -> Optional[str]:
     """Start a temporary opencode process, mint a session, return the session id.
 
-    Launches opencode --port <port> --auto (bare TUI, headless) so its HTTP API
-    is available at /global/health and /session, polls until healthy, posts
-    /session to mint an id, then kills the temporary process and returns the id.
+    Launches `opencode --port <port> --auto` so its HTTP API is reachable, polls
+    until healthy, POSTs /session, then kills the temporary process. The minted
+    session is registered in opencode's database and is continued when the real
+    invocation runs with --session <id>. Returns None if any step fails; the
+    caller must degrade to confidence=missing.
 
-    The minted session is pre-registered in the opencode database and will be
-    continued when the real TUI is started with --session <id>. Returns None
-    if any step fails; the caller must degrade to confidence=missing.
-
-    state_dir, when provided, lets the signal handler resolve the phantom
-    status=starting run left if the launcher is killed during the health poll.
+    state_dir lets the signal handler resolve the phantom status=starting run
+    that would otherwise be left behind if the launcher is killed mid-poll.
     """
-    import subprocess as _subprocess
-
     try:
         proc = subprocess.Popen(
             ["opencode", "--port", str(port), "--auto"],
-            stdout=_subprocess.DEVNULL,
-            stderr=_subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             cwd=cwd,
         )
     except OSError as exc:
         _acquire_log_write(acquire_log, f"could not start opencode for mint: {exc}")
         return None
 
-    # Install signal handlers for SIGTERM, SIGINT, and SIGHUP that kill the
-    # mint process and resolve the phantom status=starting run before re-raising.
-    # Matches _runner's own _on_signal which handles all three.
+    # SIGTERM/SIGINT/SIGHUP (the same set _runner's _on_signal handles) must kill
+    # the mint process and write a terminal status before re-raising: a run stuck
+    # at status=starting with no pid is never healed or reaped, so watch reports
+    # terminal:false forever and the run name stays occupied.
     _mint_proc_ref = [proc]
-    _orig_term = signal.getsignal(signal.SIGTERM)
-    _orig_int = signal.getsignal(signal.SIGINT)
-    _orig_hup = signal.getsignal(signal.SIGHUP)
+    _handled_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    _orig_handlers = [signal.getsignal(sig) for sig in _handled_signals]
+
+    def _restore_handlers() -> None:
+        for sig, orig in zip(_handled_signals, _orig_handlers):
+            signal.signal(sig, orig)
 
     def _mint_cleanup_handler(signum, frame):
         p = _mint_proc_ref[0]
@@ -6322,8 +6260,6 @@ def _opencode_prefork_mint(
                     p.kill()
                 except OSError:
                     pass
-        # Resolve the phantom status=starting run so list/watch do not show a
-        # non-terminal run that will never progress. Mirror the fork-failure path.
         if state_dir is not None:
             try:
                 _write(state_dir / "exit_code", "1\n")
@@ -6331,27 +6267,20 @@ def _opencode_prefork_mint(
                 _write(state_dir / "status", "failed\n")
             except OSError:
                 pass
-        # Restore and re-raise so the caller's normal signal handling takes over.
-        signal.signal(signal.SIGTERM, _orig_term)
-        signal.signal(signal.SIGINT, _orig_int)
-        signal.signal(signal.SIGHUP, _orig_hup)
+        # Re-raise so the caller's normal signal handling takes over.
+        _restore_handlers()
         os.kill(os.getpid(), signum)
 
     try:
-        signal.signal(signal.SIGTERM, _mint_cleanup_handler)
-        signal.signal(signal.SIGINT, _mint_cleanup_handler)
-        signal.signal(signal.SIGHUP, _mint_cleanup_handler)
+        for sig in _handled_signals:
+            signal.signal(sig, _mint_cleanup_handler)
 
-        health_ok = _opencode_health_poll(port, _OPENCODE_HEALTH_TIMEOUT, acquire_log)
-        if not health_ok:
+        if not _opencode_health_poll(port, _OPENCODE_HEALTH_TIMEOUT, acquire_log):
             _acquire_log_write(acquire_log, "opencode server did not become healthy for mint")
             return None
-        session_id = _opencode_mint_session(port, run_name, cwd, acquire_log)
-        return session_id
+        return _opencode_mint_session(port, run_name, cwd, acquire_log)
     finally:
-        signal.signal(signal.SIGTERM, _orig_term)
-        signal.signal(signal.SIGINT, _orig_int)
-        signal.signal(signal.SIGHUP, _orig_hup)
+        _restore_handlers()
         _mint_proc_ref[0] = None
         try:
             proc.terminate()
@@ -6402,18 +6331,14 @@ def _read_session_json(log_dir: Path) -> Optional[dict]:
 
 
 def _write_run_json(log_dir: Path, data: dict) -> None:
-    """Atomically merge data into run.json in log_dir.
+    """Merge data into run.json in log_dir, atomically. Never raises.
 
-    If run.json already exists (e.g. the exit-time update merging into the
-    launch-time record), existing keys are preserved and data keys overwrite.
-    Never raises — failure must not affect the run.
-
-    run.json stores immutable launch facts (name, argv, command, cwd,
-    started_at, harness, interactive) and exit facts (ended_at, exit_code,
-    status). It lives in the persistent log dir so all fields survive a reboot
-    that wipes the ephemeral /tmp state. It is a copy for postmortem, not a
-    relocation: the /tmp files are still written exactly as before and nothing
-    reads run.json as a liveness signal.
+    run.json records immutable launch facts (name, argv, command, cwd,
+    started_at, harness, interactive) at launch and exit facts (ended_at,
+    exit_code, status) from _finalize, hence the read-merge-replace. It lives in
+    the persistent log dir so postmortem survives a reboot that wipes the
+    ephemeral /tmp state; the /tmp files are still written exactly as before and
+    run.json is never a liveness signal.
     """
     path = log_dir / "run.json"
     try:
@@ -6432,15 +6357,27 @@ def _write_run_json(log_dir: Path, data: dict) -> None:
             pass
 
 
+def _appserver_split_lines(buf: bytes) -> tuple[list[bytes], bytes]:
+    """Split buf into complete newline-terminated lines plus the remainder."""
+    lines: list[bytes] = []
+    while b"\n" in buf:
+        nl = buf.index(b"\n")
+        lines.append(buf[:nl])
+        buf = buf[nl + 1:]
+    return lines, buf
+
+
 def _appserver_read_lines(out_fd: int, buf: bytes, timeout: float) -> tuple[list[bytes], bytes, bool]:
     """Drain all available bytes from raw fd out_fd, return (complete_lines, remainder, eof).
 
     If timeout > 0, waits up to that many seconds for data to arrive. Then
     drains all bytes currently available in the kernel buffer so frames are
     never stranded due to a BufferedReader/select mismatch.
-    eof is True when the write end of the pipe has been closed; the caller
-    must break its read loop when eof is True (spinning would busy-loop because
-    a closed pipe fd stays permanently readable).
+
+    eof is True when the write end of the pipe has been closed. It is a distinct
+    return value because ([], buf) alone cannot tell "closed" from "nothing yet",
+    and a closed pipe fd stays permanently readable — callers that cannot
+    distinguish the two busy-loop at 100% CPU. Break the read loop when eof.
     """
     if timeout > 0:
         try:
@@ -6448,12 +6385,7 @@ def _appserver_read_lines(out_fd: int, buf: bytes, timeout: float) -> tuple[list
         except OSError:
             ready = []
         if not ready:
-            # Return any lines we can extract from the existing buffer.
-            lines: list[bytes] = []
-            while b"\n" in buf:
-                nl = buf.index(b"\n")
-                lines.append(buf[:nl])
-                buf = buf[nl + 1:]
+            lines, buf = _appserver_split_lines(buf)
             return lines, buf, False
 
     # Drain all available bytes without blocking further.
@@ -6467,11 +6399,10 @@ def _appserver_read_lines(out_fd: int, buf: bytes, timeout: float) -> tuple[list
             eof = True
             break
         if not chunk:
-            # os.read returns b"" when the write end of the pipe is closed (EOF).
+            # os.read returns b"" when the write end of the pipe is closed.
             eof = True
             break
         buf += chunk
-        # Check if more data is immediately available.
         try:
             more, _, _ = select.select([out_fd], [], [], 0)
         except OSError:
@@ -6479,12 +6410,231 @@ def _appserver_read_lines(out_fd: int, buf: bytes, timeout: float) -> tuple[list
         if not more:
             break
 
-    lines = []
-    while b"\n" in buf:
-        nl = buf.index(b"\n")
-        lines.append(buf[:nl])
-        buf = buf[nl + 1:]
+    lines, buf = _appserver_split_lines(buf)
     return lines, buf, eof
+
+
+def _managed_prompt_text(prompt: Optional[str], prompt_file: Optional[str]) -> str:
+    """Resolve the managed-mode prompt, preferring prompt_file when both are set."""
+    if prompt_file:
+        try:
+            return Path(prompt_file).read_text(errors="replace")
+        except OSError as exc:
+            return f"(prompt file unreadable: {exc})"
+    return prompt or ""
+
+
+def _log_write(log_fd: int, data: bytes) -> None:
+    """Write agent output to the run log, ignoring write failures."""
+    try:
+        os.write(log_fd, data)
+    except OSError:
+        pass
+
+
+class _CodexAppServer:
+    """JSON-RPC client for one ``codex app-server`` subprocess.
+
+    Shared by the managed-codex one-shot and interactive runners: both need the
+    same initialize/thread-start handshake, the same non-blocking frame reader,
+    and the same pid publication and teardown. The app-server must stay alive
+    across ``thread/start`` and ``turn/start`` because ``thread/start`` only
+    allocates the id — the rollout file is not written until the turn runs.
+
+    JSON-RPC chatter goes to session-acquire.log only, never the PTY log.
+    """
+
+    def __init__(self, state_dir: Path, log_dir: Path, acquire_log: Path, tag: str) -> None:
+        self.state_dir = state_dir
+        self.log_dir = log_dir
+        self.acquire_log = acquire_log
+        self.tag = tag
+        self.proc: Optional[subprocess.Popen] = None
+        self.out_fd = -1
+        self.thread_id: Optional[str] = None
+        self._buf = b""
+        self._rpc_id = 0
+
+    def log(self, message: str) -> None:
+        _acquire_log_write(self.acquire_log, f"{self.tag}: {message}")
+
+    def _record_missing(self, reason: str, ready: "callable") -> None:
+        """Degrade to confidence=missing and let the run proceed to a terminal state."""
+        _record_session(self.log_dir, self.acquire_log, "codex", None, "missing", "missing", reason)
+        _write(self.state_dir / "status", "running\n")
+        ready()
+
+    def start(self, harness_args: List[str], cwd: str, ready: "callable") -> bool:
+        """Spawn the app-server and publish its pid. False means acquisition failed."""
+        try:
+            self.proc = subprocess.Popen(
+                ["codex", "app-server"] + list(harness_args),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                cwd=cwd,
+                env=_codex_subprocess_env(),
+            )
+        except OSError as exc:
+            self.log(f"launch failed: {exc}")
+            self._record_missing(f"codex app-server launch failed: {exc}", ready)
+            return False
+        # appserver_pid must land in the state dir immediately: it is the only
+        # channel _teardown_children, _force_kill and _watchdog_escalate read,
+        # and the runner may be killed before any finally block runs.
+        # _publish_or_reap_child kills and reaps the child if the write fails.
+        try:
+            _publish_or_reap_child(self.state_dir, "appserver_pid", self.proc.pid)
+        except OSError:
+            self._record_missing("could not publish app-server pid", ready)
+            return False
+        # Raw fd, non-blocking: a BufferedReader's userspace buffer would make
+        # select report not-ready with frames already pending.
+        self.out_fd = self.proc.stdout.fileno()
+        fcntl.fcntl(
+            self.out_fd, fcntl.F_SETFL,
+            fcntl.fcntl(self.out_fd, fcntl.F_GETFL) | os.O_NONBLOCK,
+        )
+        return True
+
+    def send(self, obj: dict) -> None:
+        self.proc.stdin.write((json.dumps(obj) + "\n").encode())
+        self.proc.stdin.flush()
+
+    def call(self, method: str, params: dict, rpc_id: Optional[int] = None) -> int:
+        """Send a request and return its rpc id."""
+        if rpc_id is None:
+            self._rpc_id += 1
+            rpc_id = self._rpc_id
+        self.send({"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": params})
+        return rpc_id
+
+    def next_id(self) -> int:
+        self._rpc_id += 1
+        return self._rpc_id
+
+    def read_frames(self, timeout: float) -> tuple[list[dict], bool, bool]:
+        """Return (decoded frames, whether any line arrived, eof).
+
+        ``saw_lines`` is reported separately from the frame list so callers can
+        tell "nothing arrived" from "a frame arrived but did not decode".
+        """
+        lines, self._buf, eof = _appserver_read_lines(self.out_fd, self._buf, timeout)
+        frames: list[dict] = []
+        for line_bytes in lines:
+            try:
+                frames.append(json.loads(line_bytes.decode("utf-8", errors="replace")))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+        return frames, bool(lines), eof
+
+    def mint_thread(self, cwd: str) -> Optional[str]:
+        """Run initialize + thread/start and write session.json. Returns the thread id."""
+        self.call("initialize", {
+            "clientInfo": {"name": "codex_exec", "title": "agent-run", "version": "0"},
+        })
+        self.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        thread_rpc_id = self.call("thread/start", {"cwd": cwd})
+
+        deadline = time.monotonic() + _CODEX_APPSERVER_TIMEOUT
+        while time.monotonic() < deadline and self.thread_id is None:
+            if self.proc.poll() is not None:
+                break
+            frames, _, eof = self.read_frames(0.2)
+            for msg in frames:
+                if msg.get("id") != thread_rpc_id:
+                    continue
+                if "result" in msg:
+                    result = msg["result"]
+                    if not isinstance(result, dict):
+                        self.log(f"unexpected thread/start result type: {type(result)}")
+                        break
+                    thread = result.get("thread") or result
+                    if not isinstance(thread, dict):
+                        self.log(f"unexpected thread object type: {type(thread)}")
+                        break
+                    self.thread_id = thread.get("id") or thread.get("sessionId")
+                    if self.thread_id:
+                        self.log(
+                            f"minted thread_id={self.thread_id!r} "
+                            f"rollout={thread.get('path', '?')!r}"
+                        )
+                        _record_session(
+                            self.log_dir, self.acquire_log, "codex",
+                            self.thread_id, "minted", "certain",
+                        )
+                elif "error" in msg:
+                    self.log(f"thread/start error: {msg['error']}")
+                    break
+            if eof:
+                break
+
+        if self.thread_id is None:
+            self.log("thread/start failed or timed out")
+            _record_session(self.log_dir, self.acquire_log, "codex", None, "missing", "missing",
+                            "thread/start failed or timed out")
+        return self.thread_id
+
+    def start_turn(self, text: str, rpc_id: Optional[int] = None) -> int:
+        return self.call("turn/start", {
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": text}],
+        }, rpc_id=rpc_id)
+
+    def steer_turn(self, text: str, expected_turn_id: str, rpc_id: Optional[int] = None) -> int:
+        return self.call("turn/steer", {
+            "threadId": self.thread_id,
+            "expectedTurnId": expected_turn_id,
+            "input": [{"type": "text", "text": text}],
+        }, rpc_id=rpc_id)
+
+    def close(self) -> None:
+        if self.proc is None:
+            return
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5.0)
+        except Exception:  # noqa: BLE001
+            try:
+                self.proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        # Drop the marker once reaped so it cannot name a recycled pid.
+        try:
+            (self.state_dir / "appserver_pid").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _publish_running(state_dir: Path, ready: "callable") -> None:
+    """Publish status=running and signal readiness if it has not happened yet."""
+    status_path = state_dir / "status"
+    if not status_path.exists() or status_path.read_text().strip() == "starting":
+        _write(status_path, "running\n")
+        ready()
+
+
+def _turn_delta_text(msg: dict) -> Optional[str]:
+    """Return the agent text of an item/agentMessage/delta frame, if it is one."""
+    if msg.get("method") != "item/agentMessage/delta":
+        return None
+    delta = (msg.get("params") or {}).get("delta")
+    return delta if isinstance(delta, str) and delta else None
+
+
+def _result_turn_id(msg: dict) -> Optional[str]:
+    """Extract result.turn.id from an rpc response, or None if not a turn result."""
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        return None
+    turn = result.get("turn")
+    if not isinstance(turn, dict):
+        return None
+    return turn.get("id")
 
 
 def _run_managed_oneshot_codex_appserver(
@@ -6494,228 +6644,89 @@ def _run_managed_oneshot_codex_appserver(
     prompt_file: Optional[str],
     cwd: str,
     harness_args: List[str],
-    model: Optional[str],
     log_fd: int,
     ready: "callable",
     acquire_log: Path,
 ) -> int:
-    """One-shot codex run via app-server JSON-RPC: mint thread, send turn, stream output.
+    """One-shot codex run: mint a thread, run one turn, stream its text to the log.
 
-    Keeps the app-server process running across initialize/thread.start/turn.start
-    so the rollout file exists before the turn runs. Extracts human-readable text
-    from item/agentMessage/delta events and writes it to log_fd so tail/watch/
-    idle-timeout observe incremental progress. JSON-RPC chatter goes only to
-    session-acquire.log, never the PTY log.
-
-    session.json is written after thread/start (before the first model call) with
-    acquisition="minted", confidence="certain".
+    Agent text from item/agentMessage/delta is written to log_fd so tail, watch
+    and the idle timeout observe incremental progress. session.json is written
+    after thread/start, before the first model call.
     """
-    import subprocess as _subprocess
-
-    rpc_id_counter = [0]
-
-    def _next_id() -> int:
-        rpc_id_counter[0] += 1
-        return rpc_id_counter[0]
-
-    def _send(proc, obj: dict) -> None:
-        proc.stdin.write((json.dumps(obj) + "\n").encode())
-        proc.stdin.flush()
-
-    def _read_prompt() -> str:
-        if prompt_file:
-            try:
-                return Path(prompt_file).read_text(errors="replace")
-            except OSError as exc:
-                return f"(prompt file unreadable: {exc})"
-        return prompt or ""
-
-    try:
-        proc = _subprocess.Popen(
-            ["codex", "app-server"] + list(harness_args),
-            stdin=_subprocess.PIPE,
-            stdout=_subprocess.PIPE,
-            stderr=_subprocess.DEVNULL,
-            env=_codex_subprocess_env(),
-        )
-    except OSError as exc:
-        _acquire_log_write(acquire_log, f"codex app-server: launch failed: {exc}")
-        _record_session(log_dir, acquire_log, "codex", None, "missing", "missing",
-                        f"codex app-server launch failed: {exc}")
-        _write(state_dir / "status", "running\n")
-        ready()
+    server = _CodexAppServer(state_dir, log_dir, acquire_log, "codex app-server")
+    if not server.start(harness_args, cwd, ready):
         return 1
 
-    # Publish the pid immediately so signal teardown, _force_kill, and the
-    # watchdog can all reach the app-server — even if the runner is killed
-    # before the finally block runs.
-    try:
-        _publish_or_reap_child(state_dir, "appserver_pid", proc.pid)
-    except OSError:
-        # If pid publication fails the process is already killed and reaped by
-        # _publish_or_reap_child; return as a failed acquisition.
-        _record_session(log_dir, acquire_log, "codex", None, "missing", "missing",
-                        "could not publish app-server pid")
-        _write(state_dir / "status", "running\n")
-        ready()
-        return 1
-
-    # Use the raw file descriptor so select reflects actual kernel readiness.
-    # A BufferedReader's internal buffer would cause select to report not-ready
-    # even with frames already buffered in userspace.
-    out_fd = proc.stdout.fileno()
-    # Set non-blocking so the drain loop in _appserver_read_lines terminates
-    # instead of hanging when no more data is available.
-    _saved_flags = fcntl.fcntl(out_fd, fcntl.F_GETFL)
-    fcntl.fcntl(out_fd, fcntl.F_SETFL, _saved_flags | os.O_NONBLOCK)
-
-    thread_id: Optional[str] = None
     exit_code = 1
-
     try:
-        # ---- initialize ----
-        init_id = _next_id()
-        _send(proc, {
-            "jsonrpc": "2.0", "id": init_id, "method": "initialize",
-            "params": {"clientInfo": {"name": "codex_exec", "title": "agent-run", "version": "0"}},
-        })
-        _send(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        thread_id = server.mint_thread(cwd)
 
-        # ---- thread/start: mint the thread id ----
-        thread_rpc_id = _next_id()
-        _send(proc, {
-            "jsonrpc": "2.0", "id": thread_rpc_id, "method": "thread/start",
-            "params": {"cwd": cwd},
-        })
-
-        # Read until thread/start result arrives.
-        buf = b""
-        deadline = time.monotonic() + _CODEX_APPSERVER_TIMEOUT
-        while time.monotonic() < deadline and thread_id is None:
-            if proc.poll() is not None:
-                break
-            lines, buf, eof = _appserver_read_lines(out_fd, buf, 0.2)
-            for line_bytes in lines:
-                try:
-                    msg = json.loads(line_bytes.decode("utf-8", errors="replace"))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                if msg.get("id") == thread_rpc_id and "result" in msg:
-                    result = msg["result"]
-                    if not isinstance(result, dict):
-                        _acquire_log_write(acquire_log, f"codex app-server: unexpected thread/start result type: {type(result)}")
-                        break
-                    t = result.get("thread") or result
-                    if not isinstance(t, dict):
-                        _acquire_log_write(acquire_log, f"codex app-server: unexpected thread object type: {type(t)}")
-                        break
-                    thread_id = t.get("id") or t.get("sessionId")
-                    rollout = t.get("path", "?")
-                    if thread_id:
-                        _acquire_log_write(acquire_log, f"codex app-server: minted thread_id={thread_id!r} rollout={rollout!r}")
-                        _record_session(log_dir, acquire_log, "codex", thread_id, "minted", "certain")
-                elif msg.get("id") == thread_rpc_id and "error" in msg:
-                    _acquire_log_write(acquire_log, f"codex app-server: thread/start error: {msg['error']}")
-                    break
-            if eof:
-                break
-
-        if thread_id is None:
-            _acquire_log_write(acquire_log, "codex app-server: thread/start failed or timed out")
-            _record_session(log_dir, acquire_log, "codex", None, "missing", "missing",
-                            "thread/start failed or timed out")
-
-        # Signal readiness (session.json written, status transitions to running).
         _write(state_dir / "status", "running\n")
         ready()
-        # Prompt was submitted via turn/start below; mark it now so _finalize
-        # does not misclassify a codex failure as a launch failure.
+        # The prompt goes out via turn/start below; mark it now so _finalize does
+        # not misclassify a codex failure as a launch failure.
         _write(state_dir / "prompt_submitted", "1\n")
-
         if thread_id is None:
             return 1
 
-        # ---- turn/start: run the prompt on the minted thread ----
-        turn_rpc_id = _next_id()
-        prompt_text = _read_prompt()
-        _send(proc, {
-            "jsonrpc": "2.0", "id": turn_rpc_id, "method": "turn/start",
-            "params": {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt_text}],
-            },
-        })
+        turn_rpc_id = server.start_turn(_managed_prompt_text(prompt, prompt_file))
 
-        # Stream events: write agent text deltas to log_fd; wait for turn/completed.
         turn_done = False
-        deadline = time.monotonic() + 600  # 10-minute hard cap for a one-shot turn
+        deadline = time.monotonic() + 600  # hard cap for a one-shot turn
         while time.monotonic() < deadline and not turn_done:
-            lines, buf, eof = _appserver_read_lines(out_fd, buf, 0.2)
-            for line_bytes in lines:
-                try:
-                    msg = json.loads(line_bytes.decode("utf-8", errors="replace"))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                method = msg.get("method", "")
-                params = msg.get("params") or {}
-                if method == "item/agentMessage/delta":
-                    # Stream agent text to the run log for live tail.
-                    delta = params.get("delta")
-                    if isinstance(delta, str) and delta:
-                        try:
-                            os.write(log_fd, delta.encode("utf-8", errors="replace"))
-                        except OSError:
-                            pass
-                elif method == "turn/completed":
+            frames, saw_lines, eof = server.read_frames(0.2)
+            for msg in frames:
+                delta = _turn_delta_text(msg)
+                if delta is not None:
+                    _log_write(log_fd, delta.encode("utf-8", errors="replace"))
+                elif msg.get("method") == "turn/completed":
                     turn_done = True
-                    turn_status = (params.get("turn") or {}).get("status", "")
+                    turn_status = ((msg.get("params") or {}).get("turn") or {}).get("status", "")
                     exit_code = 0 if turn_status == "completed" else 1
-                    _acquire_log_write(acquire_log, f"codex app-server: turn completed status={turn_status!r}")
-                    try:
-                        os.write(log_fd, b"\n")
-                    except OSError:
-                        pass
+                    server.log(f"turn completed status={turn_status!r}")
+                    _log_write(log_fd, b"\n")
                 elif msg.get("id") == turn_rpc_id and "error" in msg:
-                    # turn/start was rejected: log it and treat as a failed turn.
-                    _acquire_log_write(acquire_log, f"codex app-server: turn/start error: {msg['error']}")
+                    server.log(f"turn/start error: {msg['error']}")
                     turn_done = True
                     exit_code = 1
-            # Drain before checking process exit so frames buffered in the pipe
-            # after the app-server exits are not discarded.
-            if eof or (not lines and proc.poll() is not None):
+            # Drain before checking process exit, otherwise frames still buffered
+            # in the pipe after the app-server exits are discarded.
+            if eof or (not saw_lines and server.proc.poll() is not None):
                 break
 
         if not turn_done:
-            _acquire_log_write(acquire_log, "codex app-server: turn did not complete (timeout or process died)")
+            server.log("turn did not complete (timeout or process died)")
             exit_code = 1
 
     except OSError as exc:
-        _acquire_log_write(acquire_log, f"codex app-server: I/O error: {exc}")
-        if not (state_dir / "status").exists() or (state_dir / "status").read_text().strip() == "starting":
-            _write(state_dir / "status", "running\n")
-            ready()
+        server.log(f"I/O error: {exc}")
+        _publish_running(state_dir, ready)
         exit_code = 1
     finally:
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            proc.terminate()
-            proc.wait(timeout=5.0)
-        except Exception:  # noqa: BLE001
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
-        # Remove the appserver_pid marker once the process is reaped so the
-        # field does not point at a dead (and potentially recycled) pid.
-        try:
-            (state_dir / "appserver_pid").unlink(missing_ok=True)
-        except OSError:
-            pass
+        server.close()
 
     return exit_code
+
+
+def _split_steer_message(buf: bytes) -> tuple[Optional[bytes], bytes]:
+    r"""Split off one steer message at the rightmost terminator in buf.
+
+    Each ``cmd_steer`` write is one logical message ended by the run's submit
+    sequence (\r\n, \n or \r). Splitting at the *last* terminator keeps a
+    multi-line steer as a single message instead of one per embedded newline.
+    Returns (message, remainder); message is None when no terminator is present.
+    """
+    last_crlf = buf.rfind(b"\r\n")
+    last_lf = buf.rfind(b"\n")
+    last_cr = buf.rfind(b"\r")
+    if last_crlf >= 0 and last_crlf >= max(last_lf, last_cr):
+        return buf[:last_crlf], buf[last_crlf + 2:]
+    if last_lf >= 0 and last_lf >= last_cr:
+        return buf[:last_lf], buf[last_lf + 1:]
+    if last_cr >= 0:
+        return buf[:last_cr], buf[last_cr + 1:]
+    return None, buf
 
 
 def _run_managed_interactive_codex_appserver(
@@ -6725,304 +6736,111 @@ def _run_managed_interactive_codex_appserver(
     prompt_file: Optional[str],
     cwd: str,
     harness_args: List[str],
-    model: Optional[str],
     log_fd: int,
     ready: "callable",
     acquire_log: Path,
 ) -> int:
-    """Interactive codex run via app-server JSON-RPC: mint thread, relay steer via turn/steer.
+    """Interactive codex run: one long-lived app-server relaying steer input.
 
-    Keeps a single codex app-server process alive for the session lifetime.
-    Sequence: initialize → thread/start (mints id, writes session.json) → turn/start
-    (delivers initial prompt) → select loop relaying FIFO steer input as turn/steer or
-    turn/start calls and streaming item/agentMessage/delta text to log_fd.
-
-    The FIFO (state_dir/stdin) is created pre-fork by the launcher; this function opens
-    it for reading and sets up a keeper child to hold the write end open (preventing EOF
-    between steers), matching the interactive PTY mechanism but without a PTY.
-
-    JSON-RPC chatter goes to session-acquire.log only; agent text deltas go to log_fd.
+    After mint_thread and the initial turn/start, selects on the app-server's
+    stdout and the run's FIFO. FIFO text becomes turn/steer while a turn is
+    running and turn/start when the agent is idle; agent text deltas stream to
+    log_fd. The keeper child holds the FIFO write end open so the read end never
+    sees EOF between steers — the same mechanism _run_interactive uses, without
+    a PTY.
     """
-    import subprocess as _subprocess
-
-    rpc_id_counter = [0]
-
-    def _next_id() -> int:
-        rpc_id_counter[0] += 1
-        return rpc_id_counter[0]
-
-    def _send(proc, obj: dict) -> None:
-        proc.stdin.write((json.dumps(obj) + "\n").encode())
-        proc.stdin.flush()
-
-    def _read_prompt() -> str:
-        if prompt_file:
-            try:
-                return Path(prompt_file).read_text(errors="replace")
-            except OSError as exc:
-                return f"(prompt file unreadable: {exc})"
-        return prompt or ""
-
-    # Start the long-lived app-server process.
-    try:
-        proc = _subprocess.Popen(
-            ["codex", "app-server"] + list(harness_args),
-            stdin=_subprocess.PIPE,
-            stdout=_subprocess.PIPE,
-            stderr=_subprocess.DEVNULL,
-            cwd=cwd,
-            env=_codex_subprocess_env(),
-        )
-    except OSError as exc:
-        _acquire_log_write(acquire_log, f"codex app-server interactive: launch failed: {exc}")
-        _record_session(log_dir, acquire_log, "codex", None, "missing", "missing",
-                        f"codex app-server launch failed: {exc}")
-        _write(state_dir / "status", "running\n")
-        ready()
+    server = _CodexAppServer(state_dir, log_dir, acquire_log, "codex app-server interactive")
+    if not server.start(harness_args, cwd, ready):
         return 1
 
-    # Publish the pid immediately so signal teardown, _force_kill, and the
-    # watchdog can all reach the app-server even if the runner is killed
-    # before the finally block runs.
-    try:
-        _publish_or_reap_child(state_dir, "appserver_pid", proc.pid)
-    except OSError:
-        _record_session(log_dir, acquire_log, "codex", None, "missing", "missing",
-                        "could not publish app-server pid")
-        _write(state_dir / "status", "running\n")
-        ready()
-        return 1
-
-    # Use the raw fd to avoid select/BufferedReader mismatch.
-    out_fd = proc.stdout.fileno()
-    _saved_flags = fcntl.fcntl(out_fd, fcntl.F_GETFL)
-    fcntl.fcntl(out_fd, fcntl.F_SETFL, _saved_flags | os.O_NONBLOCK)
-
-    thread_id: Optional[str] = None
     exit_code = 1
-    # Active turn id: set when turn/start result arrives, cleared on turn/completed.
     # None means the agent is idle between turns.
     active_turn_id: Optional[str] = None
-    # Rpc ids for pending turn/steer calls: used to detect error responses.
+    # Rpc ids of turn/steer calls awaiting a response, so errors can be matched.
     pending_steer_rpc_ids: set = set()
 
-    # Keeper child: holds the FIFO write end open so the runner never sees EOF.
-    fifo_path = state_dir / "stdin"
-    keeper_pid: Optional[int] = None
-    keeper_r, keeper_w = os.pipe()
-
-    with _block_handled_runner_signals():
-        keeper_pid = os.fork()
-        if keeper_pid != 0:
-            _publish_or_reap_child(state_dir, "keeper_pid", keeper_pid)
-        else:
-            _reset_runner_signal_handlers()
-
-    if keeper_pid == 0:
-        # Keeper child: open FIFO for writing then sleep indefinitely.
-        _reset_runner_signal_handlers()
-        os.close(keeper_r)
-        fd = os.open(str(fifo_path), os.O_RDWR)
-        try:
-            os.write(keeper_w, b".")
-        finally:
-            os.close(keeper_w)
-        try:
-            while True:
-                time.sleep(3600)
-        except (KeyboardInterrupt, SystemExit):
-            pass
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        os._exit(0)
-
-    os.close(keeper_w)
-    # Wait for keeper to open the FIFO before we open the read end.
-    try:
-        os.read(keeper_r, 1)
-    except OSError:
-        pass
-    os.close(keeper_r)
-
-    # FIFO read end (non-blocking after open, gated by select).
-    fifo_fd = os.open(str(fifo_path), os.O_RDONLY)
-    flags = fcntl.fcntl(fifo_fd, fcntl.F_GETFL)
-    fcntl.fcntl(fifo_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    keeper_pid = _fork_fifo_keeper(state_dir)
+    fifo_fd = _open_fifo_reader(state_dir / "stdin")
 
     try:
-        # ---- initialize ----
-        init_id = _next_id()
-        _send(proc, {
-            "jsonrpc": "2.0", "id": init_id, "method": "initialize",
-            "params": {"clientInfo": {"name": "codex_exec", "title": "agent-run", "version": "0"}},
-        })
-        _send(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
-
-        # ---- thread/start: mint the thread id ----
-        thread_rpc_id = _next_id()
-        _send(proc, {
-            "jsonrpc": "2.0", "id": thread_rpc_id, "method": "thread/start",
-            "params": {"cwd": cwd},
-        })
-
-        # Read until thread/start result arrives.
-        buf = b""
-        deadline = time.monotonic() + _CODEX_APPSERVER_TIMEOUT
-        while time.monotonic() < deadline and thread_id is None:
-            if proc.poll() is not None:
-                break
-            lines, buf, eof = _appserver_read_lines(out_fd, buf, 0.2)
-            for line_bytes in lines:
-                try:
-                    msg = json.loads(line_bytes.decode("utf-8", errors="replace"))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                if msg.get("id") == thread_rpc_id and "result" in msg:
-                    result = msg["result"]
-                    if not isinstance(result, dict):
-                        _acquire_log_write(acquire_log, f"codex app-server interactive: unexpected thread/start result type: {type(result)}")
-                        break
-                    t = result.get("thread") or result
-                    if not isinstance(t, dict):
-                        _acquire_log_write(acquire_log, f"codex app-server interactive: unexpected thread object type: {type(t)}")
-                        break
-                    thread_id = t.get("id") or t.get("sessionId")
-                    rollout = t.get("path", "?")
-                    if thread_id:
-                        _acquire_log_write(acquire_log, f"codex app-server interactive: minted thread_id={thread_id!r} rollout={rollout!r}")
-                        _record_session(log_dir, acquire_log, "codex", thread_id, "minted", "certain")
-                elif msg.get("id") == thread_rpc_id and "error" in msg:
-                    _acquire_log_write(acquire_log, f"codex app-server interactive: thread/start error: {msg['error']}")
-                    break
-            if eof:
-                break
-
+        thread_id = server.mint_thread(cwd)
         if thread_id is None:
-            _acquire_log_write(acquire_log, "codex app-server interactive: thread/start failed or timed out")
-            _record_session(log_dir, acquire_log, "codex", None, "missing", "missing",
-                            "thread/start failed or timed out")
             _write(state_dir / "status", "running\n")
             ready()
             return 1
 
-        # ---- turn/start: deliver the initial prompt ----
-        turn_rpc_id = _next_id()
-        prompt_text = _read_prompt()
-        _send(proc, {
-            "jsonrpc": "2.0", "id": turn_rpc_id, "method": "turn/start",
-            "params": {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt_text}],
-            },
-        })
+        turn_rpc_id = server.start_turn(_managed_prompt_text(prompt, prompt_file))
 
-        # Signal readiness: session.json written, status transitions to running.
         _write(state_dir / "status", "running\n")
         ready()
-        # Prompt was submitted via turn/start; mark it so _finalize does not
+        # The prompt went out via turn/start; mark it so _finalize does not
         # misclassify a failure as launch_failed.
         _write(state_dir / "prompt_submitted", "1\n")
 
-        # ---- main select loop ----
-        # Sources: proc stdout (app-server events), fifo_fd (steer input).
-        # Events: item/agentMessage/delta → log_fd; turn/completed → clear active_turn_id;
-        # turn/start or turn/steer result → set active_turn_id; error → log and retry.
-        # FIFO → steer text → turn/steer (if active turn) or turn/start (if idle).
         steer_buf = b""
-        # True once any turn/completed with status="completed" has been received,
-        # used to distinguish clean app-server exit from mid-session transport failure.
+        # Distinguishes a clean app-server exit from a mid-session transport failure.
         had_completed_turn = False
         session_deadline = time.monotonic() + 86400
 
         while time.monotonic() < session_deadline:
-            if proc.poll() is not None:
-                break  # app-server exited
+            if server.proc.poll() is not None:
+                break
 
             try:
-                readable, _, _ = select.select([out_fd, fifo_fd], [], [], 0.3)
+                readable, _, _ = select.select([server.out_fd, fifo_fd], [], [], 0.3)
             except (OSError, select.error) as exc:
                 if isinstance(exc, OSError) and exc.errno == errno.EINTR:
                     continue
                 break
 
-            if out_fd in readable:
-                lines, buf, eof = _appserver_read_lines(out_fd, buf, 0)
-                for line_bytes in lines:
-                    try:
-                        msg = json.loads(line_bytes.decode("utf-8", errors="replace"))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    method = msg.get("method", "")
-                    params = msg.get("params") or {}
+            if server.out_fd in readable:
+                frames, _, eof = server.read_frames(0)
+                for msg in frames:
                     msg_id = msg.get("id")
 
-                    if method == "item/agentMessage/delta":
-                        # Stream agent text to the run log.
-                        delta = params.get("delta")
-                        if isinstance(delta, str) and delta:
-                            try:
-                                os.write(log_fd, delta.encode("utf-8", errors="replace"))
-                            except OSError:
-                                pass
+                    delta = _turn_delta_text(msg)
+                    if delta is not None:
+                        _log_write(log_fd, delta.encode("utf-8", errors="replace"))
 
-                    elif method == "turn/completed":
-                        # Clear active turn on any completion, including when the
-                        # server omits the turn id (prevents stale expectedTurnId).
-                        turn_info = params.get("turn") or {}
-                        completed_id = turn_info.get("id")
-                        if active_turn_id and (completed_id == active_turn_id or completed_id is None):
+                    elif msg.get("method") == "turn/completed":
+                        turn = (msg.get("params") or {}).get("turn") or {}
+                        completed_id = turn.get("id")
+                        # Clear on any completion, including when the server omits
+                        # the turn id, so the next steer cannot carry a stale
+                        # expectedTurnId.
+                        if active_turn_id and completed_id in (active_turn_id, None):
                             active_turn_id = None
-                        turn_status = turn_info.get("status", "")
-                        _acquire_log_write(acquire_log, f"codex app-server interactive: turn completed id={completed_id!r} status={turn_status!r}")
+                        turn_status = turn.get("status", "")
+                        server.log(f"turn completed id={completed_id!r} status={turn_status!r}")
                         if turn_status == "completed":
                             exit_code = 0
                             had_completed_turn = True
-                        try:
-                            os.write(log_fd, b"\n")
-                        except OSError:
-                            pass
+                        _log_write(log_fd, b"\n")
 
                     elif "error" in msg and msg_id is not None:
-                        # JSON-RPC error response: log it and handle steer failures.
-                        err = msg["error"]
-                        _acquire_log_write(acquire_log, f"codex app-server interactive: rpc error id={msg_id} error={err!r}")
+                        server.log(f"rpc error id={msg_id} error={msg['error']!r}")
                         if msg_id in pending_steer_rpc_ids:
-                            # Steer was rejected (e.g. stale expectedTurnId): clear
-                            # active_turn_id so the next steer starts a fresh turn.
-                            # The steer text is already gone from the FIFO; log the loss.
+                            # The steer text is already consumed from the FIFO and
+                            # cannot be resent; clear the turn so the next one starts
+                            # fresh and record the loss.
                             pending_steer_rpc_ids.discard(msg_id)
                             active_turn_id = None
-                            _acquire_log_write(acquire_log, "codex app-server interactive: steer rejected — turn already completed; steer was lost")
+                            server.log("steer rejected — turn already completed; steer was lost")
 
                     elif msg_id == turn_rpc_id and "result" in msg:
-                        # turn/start response: capture the turn id from result.turn.id.
-                        result = msg["result"]
-                        if isinstance(result, dict):
-                            turn_info = result.get("turn")
-                            if isinstance(turn_info, dict):
-                                new_turn_id = turn_info.get("id")
-                                if new_turn_id:
-                                    active_turn_id = new_turn_id
-                                    _acquire_log_write(acquire_log, f"codex app-server interactive: turn started id={active_turn_id!r}")
-                        # Reset so subsequent steer responses are matched by their own ids.
+                        new_turn_id = _result_turn_id(msg)
+                        if new_turn_id:
+                            active_turn_id = new_turn_id
+                            server.log(f"turn started id={active_turn_id!r}")
+                        # Later responses are matched by their own rpc ids.
                         turn_rpc_id = -1
 
                     elif msg_id in pending_steer_rpc_ids and "result" in msg:
-                        # Response to a pending turn/steer or idle-path turn/start.
-                        # Only update active_turn_id when the result is a turn object,
-                        # never from an unrelated result that happens to carry an id.
                         pending_steer_rpc_ids.discard(msg_id)
-                        result = msg["result"]
-                        if isinstance(result, dict):
-                            turn_info = result.get("turn")
-                            if isinstance(turn_info, dict):
-                                new_turn_id = turn_info.get("id")
-                                if new_turn_id:
-                                    active_turn_id = new_turn_id
-                                    _acquire_log_write(acquire_log, f"codex app-server interactive: turn id updated to {active_turn_id!r}")
+                        new_turn_id = _result_turn_id(msg)
+                        if new_turn_id:
+                            active_turn_id = new_turn_id
+                            server.log(f"turn id updated to {active_turn_id!r}")
                 # Stdout EOF means the app-server closed its write end; stop
                 # selecting on it — continuing would busy-loop at 100% CPU.
                 if eof:
@@ -7033,104 +6851,46 @@ def _run_managed_interactive_codex_appserver(
                     chunk = os.read(fifo_fd, 4096)
                 except (BlockingIOError, OSError):
                     chunk = b""
-                if chunk:
-                    steer_buf += chunk
-                # Each cmd_steer write is one logical message terminated by the
-                # submit_mode sequence (\r\n or \n). Treat the entire write as one
-                # message: find the final terminator and send everything before it
-                # as a single turn/steer or turn/start, not split per embedded newline.
+                steer_buf += chunk
                 while steer_buf:
-                    # Find the last terminator (the submit sequence appended by cmd_steer).
-                    last_crlf = steer_buf.rfind(b"\r\n")
-                    last_lf = steer_buf.rfind(b"\n")
-                    last_cr = steer_buf.rfind(b"\r")
-                    # Pick the rightmost terminator.
-                    if last_crlf >= 0 and last_crlf >= max(last_lf, last_cr):
-                        msg_bytes = steer_buf[:last_crlf]
-                        steer_buf = steer_buf[last_crlf + 2:]
-                    elif last_lf >= 0 and last_lf >= last_cr:
-                        msg_bytes = steer_buf[:last_lf]
-                        steer_buf = steer_buf[last_lf + 1:]
-                    elif last_cr >= 0:
-                        msg_bytes = steer_buf[:last_cr]
-                        steer_buf = steer_buf[last_cr + 1:]
-                    else:
-                        break  # no complete message yet
+                    msg_bytes, steer_buf = _split_steer_message(steer_buf)
+                    if msg_bytes is None:
+                        break
                     steer_text = msg_bytes.decode("utf-8", errors="replace").strip()
                     if not steer_text:
                         continue
-                    steer_rpc_id = _next_id()
+                    steer_rpc_id = server.next_id()
                     if active_turn_id is not None:
-                        # Mid-turn: steer the running turn.
                         pending_steer_rpc_ids.add(steer_rpc_id)
-                        _send(proc, {
-                            "jsonrpc": "2.0", "id": steer_rpc_id, "method": "turn/steer",
-                            "params": {
-                                "threadId": thread_id,
-                                "expectedTurnId": active_turn_id,
-                                "input": [{"type": "text", "text": steer_text}],
-                            },
-                        })
-                        _acquire_log_write(acquire_log, f"codex app-server interactive: turn/steer expectedTurnId={active_turn_id!r} text={steer_text[:80]!r}")
+                        server.steer_turn(steer_text, active_turn_id, rpc_id=steer_rpc_id)
+                        server.log(
+                            f"turn/steer expectedTurnId={active_turn_id!r} "
+                            f"text={steer_text[:80]!r}"
+                        )
                     else:
-                        # Idle between turns: start a new turn.
                         turn_rpc_id = steer_rpc_id
-                        _send(proc, {
-                            "jsonrpc": "2.0", "id": steer_rpc_id, "method": "turn/start",
-                            "params": {
-                                "threadId": thread_id,
-                                "input": [{"type": "text", "text": steer_text}],
-                            },
-                        })
-                        _acquire_log_write(acquire_log, f"codex app-server interactive: turn/start (steer idle) text={steer_text[:80]!r}")
+                        server.start_turn(steer_text, rpc_id=steer_rpc_id)
+                        server.log(f"turn/start (steer idle) text={steer_text[:80]!r}")
 
-        # For interactive runs, any non-zero app-server exit is a transport
-        # failure regardless of whether a turn completed — the session is gone
-        # and further steers cannot reach the agent. Only a clean exit (rc=0)
-        # after a completed turn is a normal outcome.
-        rc = proc.poll()
-        if rc is not None and rc != 0:
+        # Any non-zero app-server exit is a transport failure even after a
+        # completed turn: the session is gone and further steers cannot land.
+        # Only a clean exit after a completed turn is a normal outcome.
+        rc = server.proc.poll()
+        if rc is not None and (rc != 0 or not had_completed_turn):
             exit_code = 1
-        elif not had_completed_turn and rc is not None:
-            exit_code = 1
-        _acquire_log_write(acquire_log, f"codex app-server interactive: session loop ended exit_code={exit_code}")
+        server.log(f"session loop ended exit_code={exit_code}")
 
     except OSError as exc:
-        _acquire_log_write(acquire_log, f"codex app-server interactive: I/O error: {exc}")
-        if not (state_dir / "status").exists() or (state_dir / "status").read_text().strip() == "starting":
-            _write(state_dir / "status", "running\n")
-            ready()
+        server.log(f"I/O error: {exc}")
+        _publish_running(state_dir, ready)
         exit_code = 1
     finally:
         try:
             os.close(fifo_fd)
         except OSError:
             pass
-        if keeper_pid is not None:
-            try:
-                os.kill(keeper_pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(keeper_pid, 0)
-            except ChildProcessError:
-                pass
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            proc.terminate()
-            proc.wait(timeout=5.0)
-        except Exception:  # noqa: BLE001
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            (state_dir / "appserver_pid").unlink(missing_ok=True)
-        except OSError:
-            pass
+        _reap_fifo_keeper(keeper_pid)
+        server.close()
 
     return exit_code
 
@@ -7147,16 +6907,15 @@ def _build_managed_argv(
     harness_args: List[str],
     opencode_port: Optional[int] = None,
 ) -> List[str]:
-    """Build the command argv for the given harness and mode.
+    """Build the argv for the given harness and mode. Returns [] for codex.
 
-    For one-shot runs, the inline prompt is added as a positional arg ONLY when
-    prompt_file is not set — if prompt_file is set, _run_oneshot delivers it via
-    stdin, so adding it positionally would duplicate it. For opencode interactive,
-    the prompt is never included (delivered post-attach via the FIFO steer path).
-    harness_args are appended last, after all agent-run-managed flags.
+    An inline prompt becomes a positional argument only when prompt_file is
+    unset: with a prompt_file, _run_oneshot opens it as the agent's stdin, so a
+    positional would send the text twice. harness_args are appended last, after
+    every agent-run-managed flag, so callers can override.
 
-    Codex runs always use the app-server JSON-RPC path; this function is not called
-    for codex.
+    Codex is not built here — both its modes drive `codex app-server` over
+    JSON-RPC rather than exec'ing an argv.
     """
     argv: List[str] = []
 
@@ -7166,22 +6925,15 @@ def _build_managed_argv(
             argv.extend(["--model", model])
         if session_id:
             argv.extend(["--session-id", session_id])
+        # bypassPermissions is what makes unattended operation possible; callers
+        # can override it with --harness-arg --permission-mode <mode>.
         if not interactive:
-            # One-shot: claude --print. Prompt as positional arg or via stdin (--prompt-file).
-            # --permission-mode bypassPermissions enables unattended operation; callers can
-            # override via --harness-arg --permission-mode <mode>.
-            argv.append("--print")
-            argv.extend(["--permission-mode", "bypassPermissions"])
+            argv.extend(["--print", "--permission-mode", "bypassPermissions"])
             if prompt and not prompt_file:
-                # Inline prompt only: add as positional. When prompt_file is set,
-                # _run_oneshot opens it as stdin so the positional arg is not needed
-                # and adding it would send the text twice.
                 argv.append(prompt)
         else:
-            # Interactive TUI: bare claude with permission bypass for unattended use.
             argv.extend(["--permission-mode", "bypassPermissions"])
-        if harness_args:
-            argv.extend(harness_args)
+        argv.extend(harness_args)
 
     elif harness == "opencode":
         argv.append("opencode")
@@ -7190,26 +6942,22 @@ def _build_managed_argv(
         if agent_mode:
             argv.extend(["--agent", agent_mode])
         if not interactive:
-            # One-shot: opencode run --session <id> [message].
             argv.append("run")
             if session_id:
                 argv.extend(["--session", session_id])
             if prompt and not prompt_file:
-                # Only add the positional when there is no prompt_file; _run_oneshot
-                # delivers prompt_file via stdin.
                 argv.append(prompt)
         else:
-            # Interactive TUI: bare opencode attached to the pre-minted session.
-            # --port exposes the HTTP API on a known port for health and mint.
-            # --auto enables unattended approval of permissions (interactive only).
-            # NEVER add --prompt here: --session silently swallows it.
+            # Bare TUI attached to the pre-minted session. --port keeps the HTTP
+            # API reachable, --auto approves permissions unattended.
+            # NEVER add --prompt here: --session silently swallows it, which is
+            # how 24 runs were lost.
             if opencode_port is not None:
                 argv.extend(["--port", str(opencode_port)])
             if session_id:
                 argv.extend(["--session", session_id])
             argv.append("--auto")
-        if harness_args:
-            argv.extend(harness_args)
+        argv.extend(harness_args)
 
     return argv
 
@@ -7248,26 +6996,6 @@ def _record_session(
         _write_session_json(log_dir, data)
     except OSError as exc:
         _acquire_log_write(acquire_log, f"could not write session.json: {exc}")
-
-
-# Per-harness session record helpers, each preset with its harness's acquisition type.
-def _acquire_session_claude(log_dir: Path, session_id: str, acquire_log: Path) -> None:
-    """Write session.json for a claude run (pushed acquisition)."""
-    _record_session(log_dir, acquire_log, "claude", session_id, "pushed", "certain")
-
-
-def _acquire_session_opencode_minted(
-    log_dir: Path, session_id: str, acquire_log: Path
-) -> None:
-    """Write session.json for opencode (minted via POST /session)."""
-    _record_session(log_dir, acquire_log, "opencode", session_id, "minted", "certain")
-
-
-def _acquire_session_missing(
-    log_dir: Path, harness: str, reason: str, acquire_log: Path
-) -> None:
-    """Write a session.json with confidence=missing when acquisition fails."""
-    _record_session(log_dir, acquire_log, harness, None, "missing", "missing", reason)
 
 
 # ---------------------------------------------------------------------------
@@ -7619,6 +7347,12 @@ _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
     "list", "reap", "du", "help",
 })
 
+# Managed-mode flags that take a value. Each accepts "--flag value" and
+# "--flag=value"; --harness-arg accumulates, the rest keep the last value.
+_MANAGED_VALUE_FLAGS: Tuple[str, ...] = (
+    "--harness", "--prompt", "--model", "--agent-mode", "--session-id", "--harness-arg",
+)
+
 
 def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     """Parse agent-run's own flags, the run name, and the launch command.
@@ -7633,13 +7367,8 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
       --echo / --echo=N
       --submit-mode=cr|crlf
       --idle-timeout N / --idle-timeout=N
-      --harness <claude|opencode|codex>
-      --prompt <text>
-      --model <model>
-      --agent-mode <name>
-      --session-id <id>
-      --harness-arg <raw>  (repeatable)
-      --cwd <dir>  (accepted by the parser and validated; use is not yet implemented)
+      the managed-mode flags in _MANAGED_VALUE_FLAGS
+      --cwd <dir>  (recognised only to reject it; not implemented)
 
     Preserves the -- separator semantics: name must precede --, everything
     after -- is taken verbatim.  Without --, a leading-dash token immediately
@@ -7718,79 +7447,39 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                 raise _LaunchArgvError(f"agent-run: --idle-timeout {exc}") from exc
             tokens = tokens[1:]
             continue
-        # Managed-mode flags.
-        if tokens[0] in ("--harness",):
-            if len(tokens) < 2:
-                raise _LaunchArgvError("agent-run: --harness requires a value (claude|opencode|codex)")
-            harness = tokens[1]
-            if harness not in MANAGED_HARNESSES:
-                raise _LaunchArgvError(
-                    f"agent-run: --harness {harness!r} is not valid; "
-                    f"choose one of: {', '.join(sorted(MANAGED_HARNESSES))}"
-                )
-            tokens = tokens[2:]
+        # Managed-mode flags (see _MANAGED_VALUE_FLAGS).
+        managed_flag = None
+        for name_ in _MANAGED_VALUE_FLAGS:
+            if tokens[0] == name_:
+                if len(tokens) < 2:
+                    raise _LaunchArgvError(f"agent-run: {name_} requires a value")
+                managed_flag, value, tokens = name_, tokens[1], tokens[2:]
+                break
+            if tokens[0].startswith(name_ + "="):
+                managed_flag, value, tokens = name_, tokens[0].split("=", 1)[1], tokens[1:]
+                break
+        if managed_flag is not None:
+            if managed_flag == "--harness":
+                if value not in MANAGED_HARNESSES:
+                    raise _LaunchArgvError(
+                        f"agent-run: --harness {value!r} is not valid; "
+                        f"choose one of: {', '.join(sorted(MANAGED_HARNESSES))}"
+                    )
+                harness = value
+            elif managed_flag == "--prompt":
+                prompt = value
+            elif managed_flag == "--model":
+                model = value
+            elif managed_flag == "--agent-mode":
+                agent_mode = value
+            elif managed_flag == "--session-id":
+                session_id = value
+            elif managed_flag == "--harness-arg":
+                harness_args = harness_args + [value]
             continue
-        if tokens[0].startswith("--harness="):
-            harness = tokens[0].split("=", 1)[1]
-            if harness not in MANAGED_HARNESSES:
-                raise _LaunchArgvError(
-                    f"agent-run: --harness {harness!r} is not valid; "
-                    f"choose one of: {', '.join(sorted(MANAGED_HARNESSES))}"
-                )
-            tokens = tokens[1:]
-            continue
-        if tokens[0] == "--prompt":
-            if len(tokens) < 2:
-                raise _LaunchArgvError("agent-run: --prompt requires a text argument")
-            prompt = tokens[1]
-            tokens = tokens[2:]
-            continue
-        if tokens[0].startswith("--prompt="):
-            prompt = tokens[0].split("=", 1)[1]
-            tokens = tokens[1:]
-            continue
-        if tokens[0] == "--model":
-            if len(tokens) < 2:
-                raise _LaunchArgvError("agent-run: --model requires a value")
-            model = tokens[1]
-            tokens = tokens[2:]
-            continue
-        if tokens[0].startswith("--model="):
-            model = tokens[0].split("=", 1)[1]
-            tokens = tokens[1:]
-            continue
-        if tokens[0] == "--agent-mode":
-            if len(tokens) < 2:
-                raise _LaunchArgvError("agent-run: --agent-mode requires a value")
-            agent_mode = tokens[1]
-            tokens = tokens[2:]
-            continue
-        if tokens[0].startswith("--agent-mode="):
-            agent_mode = tokens[0].split("=", 1)[1]
-            tokens = tokens[1:]
-            continue
-        if tokens[0] == "--session-id":
-            if len(tokens) < 2:
-                raise _LaunchArgvError("agent-run: --session-id requires a value")
-            session_id = tokens[1]
-            tokens = tokens[2:]
-            continue
-        if tokens[0].startswith("--session-id="):
-            session_id = tokens[0].split("=", 1)[1]
-            tokens = tokens[1:]
-            continue
-        if tokens[0] == "--harness-arg":
-            if len(tokens) < 2:
-                raise _LaunchArgvError("agent-run: --harness-arg requires a value")
-            harness_args = harness_args + [tokens[1]]
-            tokens = tokens[2:]
-            continue
-        if tokens[0].startswith("--harness-arg="):
-            harness_args = harness_args + [tokens[0].split("=", 1)[1]]
-            tokens = tokens[1:]
-            continue
-        # --cwd is not yet implemented; reject it clearly so callers know.
-        if tokens[0] in ("--cwd",) or tokens[0].startswith("--cwd="):
+        # --cwd is parsed only to reject it: accepting and ignoring it would
+        # silently run in the wrong directory.
+        if tokens[0] == "--cwd" or tokens[0].startswith("--cwd="):
             raise _LaunchArgvError(
                 "agent-run: --cwd is not yet implemented; "
                 "run the command from the target directory instead"
@@ -7841,8 +7530,8 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             agent_mode=agent_mode, session_id=session_id, harness_args=harness_args,
         )
 
-    # In managed mode (--harness), the name is the only remaining token.
-    # There is no trailing command — managed mode builds its own argv.
+    # Managed mode: the name is the only remaining token — agent-run builds the
+    # command itself, so there is no trailing command to parse.
     if harness is not None:
         name = tokens[0] if tokens else ""
         rest = tokens[1:]
@@ -7854,37 +7543,32 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                 "in managed mode agent-run builds the command itself"
             )
         if rest:
-            # Any remaining tokens after the name in managed mode are an error.
             raise _LaunchArgvError(
                 f"agent-run: unexpected tokens after run name in managed mode: "
                 f"{rest!r}; use --harness-arg to pass extra flags to the harness"
             )
-        # Validate prompt and prompt_file mutual exclusion.
         if prompt and prompt_file:
             raise _LaunchArgvError("agent-run: --prompt and --prompt-file are mutually exclusive")
-        # One of --prompt or --prompt-file is required for managed mode.
         if not prompt and not prompt_file:
             raise _LaunchArgvError(
                 "agent-run: managed mode requires exactly one of --prompt <text> or --prompt-file <path>"
             )
-        # Harness-specific argument validation (pure, before any state is created).
-        _FORBIDDEN_HARNESS_ARGS_SET = {"--session", "-s", "--session-id", "--port", "--prompt"}
+        # Everything below runs before any run state exists, so a rejected launch
+        # cannot strand a phantom run at status=starting.
         for ha in harness_args:
             flag = ha.split("=", 1)[0]
-            if flag in _FORBIDDEN_HARNESS_ARGS_SET:
+            if flag in {"--session", "-s", "--session-id", "--port", "--prompt"}:
                 raise _LaunchArgvError(
                     f"agent-run: --harness-arg {flag!r} is managed internally; "
                     f"use the corresponding agent-run flag instead"
                 )
-        # --session-id is only honoured for claude (push acquisition via --session-id flag).
-        # Opencode always mints a fresh session; codex always starts a fresh thread.
+        # Only claude can be told which id to use; opencode mints a session and
+        # codex starts a thread, both unconditionally.
         if session_id is not None and harness in ("opencode", "codex"):
             raise _LaunchArgvError(
                 f"agent-run: --session-id is not supported for --harness {harness}; "
                 f"it cannot be honoured because {harness} always creates a new session"
             )
-        # claude requires the session id to be a UUID4; validate early so a bad value
-        # cannot strand a phantom run at status=starting.
         if session_id is not None and harness == "claude":
             try:
                 uuid.UUID(session_id)
@@ -7893,8 +7577,8 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                     f"agent-run: --session-id {session_id!r} is not a valid UUID; "
                     "claude requires a UUID4"
                 )
-        # --model is not forwarded for codex (the app-server protocol currently has
-        # no standard field for it in thread/start); reject it explicitly.
+        # thread/start has no model field, so a forwarded --model would be
+        # silently ignored rather than applied.
         if model is not None and harness == "codex":
             raise _LaunchArgvError(
                 "agent-run: --model is not supported for --harness codex; "
@@ -7990,35 +7674,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _build_parser().print_help()
         return 2
 
-    if parsed.harness is not None:
-        # Managed mode: build Namespace for cmd_launch with harness fields.
-        ns = argparse.Namespace(
-            name=parsed.name,
-            command=[],  # built by cmd_launch from harness + flags
-            interactive=parsed.interactive,
-            prompt_file=parsed.prompt_file,
-            echo=parsed.echo,
-            echo_interval=parsed.echo_interval,
-            submit_mode=parsed.submit_mode,
-            idle_timeout=parsed.idle_timeout if parsed.idle_timeout is not None else _idle_timeout_env_seconds(),
-            harness=parsed.harness,
-            prompt=parsed.prompt,
-            model=parsed.model,
-            agent_mode=parsed.agent_mode,
-            session_id=parsed.session_id,
-            harness_args=list(parsed.harness_args),
-        )
-    else:
-        ns = argparse.Namespace(
-            name=parsed.name,
-            command=parsed.command,
-            interactive=parsed.interactive,
-            prompt_file=parsed.prompt_file,
-            echo=parsed.echo,
-            echo_interval=parsed.echo_interval,
-            submit_mode=parsed.submit_mode,
-            idle_timeout=parsed.idle_timeout if parsed.idle_timeout is not None else _idle_timeout_env_seconds(),
-        )
+    # Managed-mode fields are always present and are None/empty for raw runs;
+    # cmd_launch keys off `harness` alone.
+    ns = argparse.Namespace(
+        name=parsed.name,
+        command=parsed.command,
+        interactive=parsed.interactive,
+        prompt_file=parsed.prompt_file,
+        echo=parsed.echo,
+        echo_interval=parsed.echo_interval,
+        submit_mode=parsed.submit_mode,
+        idle_timeout=parsed.idle_timeout if parsed.idle_timeout is not None else _idle_timeout_env_seconds(),
+        harness=parsed.harness,
+        prompt=parsed.prompt,
+        model=parsed.model,
+        agent_mode=parsed.agent_mode,
+        session_id=parsed.session_id,
+        harness_args=list(parsed.harness_args),
+    )
     return cmd_launch(ns)
 
 

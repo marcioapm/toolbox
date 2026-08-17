@@ -4,7 +4,7 @@ Covers:
 - _parse_launch_argv: --harness flag parsing, mutually exclusive constraints,
   prompt/prompt-file requirement, --harness + -- mutual exclusion.
 - _build_managed_argv: correct argv construction per harness × mode.
-- session.json: written atomically by _write_session_json/_acquire_session_*.
+- session.json: written atomically by _write_session_json/_record_session.
 - watch --json session field: additive, null when no session.json present.
 - steer guard: exits non-zero on one-shot runs (checks interactive state file).
 - Backward compatibility: raw-mode runs are unchanged.
@@ -415,7 +415,7 @@ class TestSessionJson:
         log_dir = isolated_log_root / "run1"
         log_dir.mkdir(parents=True, exist_ok=True)
         acquire_log = log_dir / "session-acquire.log"
-        agent_run._acquire_session_claude(log_dir, "uuid-1234", acquire_log)
+        agent_run._record_session(log_dir, acquire_log, "claude", "uuid-1234", "pushed", "certain")
         data = agent_run._read_session_json(log_dir)
         assert data is not None
         assert data["session_id"] == "uuid-1234"
@@ -427,7 +427,7 @@ class TestSessionJson:
         log_dir = isolated_log_root / "run2"
         log_dir.mkdir(parents=True, exist_ok=True)
         acquire_log = log_dir / "session-acquire.log"
-        agent_run._acquire_session_opencode_minted(log_dir, "ses_abc", acquire_log)
+        agent_run._record_session(log_dir, acquire_log, "opencode", "ses_abc", "minted", "certain")
         data = agent_run._read_session_json(log_dir)
         assert data is not None
         assert data["session_id"] == "ses_abc"
@@ -439,7 +439,7 @@ class TestSessionJson:
         log_dir = isolated_log_root / "run3"
         log_dir.mkdir(parents=True, exist_ok=True)
         acquire_log = log_dir / "session-acquire.log"
-        agent_run._acquire_session_missing(log_dir, "codex", "no id found", acquire_log)
+        agent_run._record_session(log_dir, acquire_log, "codex", None, "missing", "missing", "no id found")
         data = agent_run._read_session_json(log_dir)
         assert data is not None
         assert data["session_id"] is None
@@ -454,13 +454,13 @@ class TestSessionJson:
         log_dir.mkdir(parents=True, exist_ok=True)
         acquire_log = log_dir / "session-acquire.log"
         # The missing path must never write certain.
-        agent_run._acquire_session_missing(log_dir, "opencode", "reason", acquire_log)
+        agent_run._record_session(log_dir, acquire_log, "opencode", None, "missing", "missing", "reason")
         data = agent_run._read_session_json(log_dir)
         assert data["confidence"] == "missing"
         assert data["confidence"] != "certain"
 
     def test_write_session_json_oserror_does_not_propagate(self, isolated_log_root, monkeypatch):
-        """_record_session (and its wrappers) must never raise; spec §6."""
+        """_record_session must never raise; spec §6."""
         log_dir = isolated_log_root / "run5"
         log_dir.mkdir(parents=True, exist_ok=True)
         acquire_log = log_dir / "session-acquire.log"
@@ -470,8 +470,8 @@ class TestSessionJson:
             raise OSError(28, "No space left on device")
         monkeypatch.setattr(agent_run, "_write_session_json", _raise)
         # Must not raise.
-        agent_run._acquire_session_claude(log_dir, "some-uuid", acquire_log)
-        agent_run._acquire_session_missing(log_dir, "codex", "test", acquire_log)
+        agent_run._record_session(log_dir, acquire_log, "claude", "some-uuid", "pushed", "certain")
+        agent_run._record_session(log_dir, acquire_log, "codex", None, "missing", "missing", "test")
         # The acquire log should mention the failure.
         log_text = acquire_log.read_text() if acquire_log.exists() else ""
         assert "could not write session.json" in log_text
@@ -616,7 +616,7 @@ UUID4_RE = re.compile(
 
 class TestClaudeSessionIdGeneration:
     def test_generates_uuid4_when_no_caller_id(self):
-        """_acquire_session_claude writes a UUID4 session_id."""
+        """_record_session writes a UUID4 session_id for claude."""
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             log_dir = Path(td)
@@ -624,7 +624,7 @@ class TestClaudeSessionIdGeneration:
             # Use a fresh UUID4 directly (the function that generates it is inlined).
             import uuid
             sid = str(uuid.uuid4())
-            agent_run._acquire_session_claude(log_dir, sid, acquire_log)
+            agent_run._record_session(log_dir, acquire_log, "claude", sid, "pushed", "certain")
             data = agent_run._read_session_json(log_dir)
             assert data is not None
             assert UUID4_RE.match(data["session_id"]), f"Not a UUID4: {data['session_id']!r}"
