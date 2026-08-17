@@ -79,6 +79,8 @@ SUBAGENT_PROMPTS = {
                "'Reply with exactly: SUBPONG'. Wait for it to finish."),
     "opencode": ("Spawn an explore sub-agent with the instruction: "
                  "'Reply with exactly: SUBPONG'. Wait for it to finish."),
+    "codex": ("Spawn a sub-agent and have it reply with exactly: SUBPONG. "
+              "Wait for the child to finish."),
 }
 
 # agent-run mints UUIDs or ses_… strings; validating before interpolation keeps
@@ -386,6 +388,25 @@ def _verify_codex_disk(session_id: str) -> tuple[bool, str]:
     return False, f"no rollout file matching rollout-*-{session_id}.jsonl under {sessions_root}"
 
 
+def _find_codex_child_rollout(root_id: str) -> tuple[Optional[str], str]:
+    """Find a Codex child rollout whose recorded parent is ``root_id``, read-only."""
+    sessions_root = Path.home() / ".codex" / "sessions"
+    if not sessions_root.is_dir():
+        return None, "~/.codex/sessions not found"
+    for path in sessions_root.rglob("rollout-*.jsonl"):
+        try:
+            first_event = json.loads(path.open(errors="replace").readline())
+        except (OSError, json.JSONDecodeError):
+            continue
+        payload = first_event.get("payload") if isinstance(first_event, dict) else None
+        if not isinstance(payload, dict) or payload.get("parent_thread_id") != root_id:
+            continue
+        child_id = payload.get("id")
+        if child_id:
+            return child_id, f"{path}: parent_thread_id={root_id!r}"
+    return None, f"no child rollout with parent_thread_id={root_id!r} under {sessions_root}"
+
+
 def _verify_disk(harness: str, session_id: str, cwd: str) -> tuple[bool, str]:
     if harness == "claude":
         return _verify_claude_disk(session_id, cwd)
@@ -630,6 +651,20 @@ def cell_subagent(harness: str, run_name: str, expected_client: str, cwd: str,
         return
     root_id, links = chain
 
+    if harness == "codex":
+        child_id, child_rollout = _find_codex_child_rollout(root_id)
+        if child_id is None:
+            result.fail("link3-child-rollout", child_rollout)
+            return
+        _log(f"  [link3-child] PASS rollout: {child_rollout}")
+        links["link3-child"] = child_rollout
+
+    # A child rollout or DB row alone doesn't prove the sub-agent completed.
+    if "subpong" not in _read_log(run_name).lower():
+        result.fail("link5-subagent-reply", "sub-agent never produced 'SUBPONG' in the run log")
+        return
+    _log("  [link5+] PASS sub-agent reply 'SUBPONG' confirmed in log")
+
     _log(f"  Polling DB for child row (parent={root_id!r}, timeout={DB_POLL_TIMEOUT}s)…")
     child = _poll_db("parent_client_session_id", root_id)
     if isinstance(child, _DbError):
@@ -644,34 +679,8 @@ def cell_subagent(harness: str, run_name: str, expected_client: str, cwd: str,
     parent_id = child.get("parent_client_session_id", "?")
     _log(f"  [link5] PASS child={child_id!r} parent={parent_id!r} → resolves to root")
 
-    # A child row alone doesn't prove the sub-agent ran to completion.
-    if "subpong" not in _read_log(run_name).lower():
-        result.fail("link5-subagent-reply", "sub-agent never produced 'SUBPONG' in the run log")
-        return
-    _log("  [link5+] PASS sub-agent reply 'SUBPONG' confirmed in log")
-
     result.pass_(root_id, {"link1": "done", **links,
                            "link5": f"child={child_id!r} parent={parent_id!r}"})
-
-
-def cell_subagent_codex(result: CellResult) -> None:
-    """codex sub-agent — the only SKIP in the suite.
-
-    codex sends one id under three header names and no parent header. The
-    app-server schema has Thread.parentThreadId and MultiAgentMode, but
-    ThreadStartParams has no parentThreadId input and TurnStartParams has no
-    multiAgentMode: the AgentControl orchestration that would set them is
-    internal, not reachable from a user prompt. Prompting codex to delegate
-    yields text but never a child thread with a parent link.
-    Evidence: ACCEPTANCE-EVIDENCE.md §4 and the app-server v2 JSON schema.
-    """
-    result.skip(
-        "codex sub-agent SKIP: no reliably triggerable sub-agent mechanism. "
-        "The app-server schema has Thread.parentThreadId and MultiAgentMode "
-        "but no ThreadStartParams.parentThreadId input and no TurnStartParams.multiAgentMode — "
-        "internal AgentControl orchestration only. Prompting codex to delegate "
-        "does not create a child thread with a parent link."
-    )
 
 
 # Cell name → (harness, mode, expected client value in client_sessions)
@@ -703,17 +712,14 @@ def run_cell(cell_name: str, keep: bool) -> CellResult:
             cell_oneshot(harness, rname, expected_client, cwd, result)
         elif mode == "interactive":
             cell_interactive(harness, rname, expected_client, cwd, result)
-        elif harness == "codex":
-            cell_subagent_codex(result)
-        else:
+        elif mode == "subagent":
             cell_subagent(harness, rname, expected_client, cwd, result)
     except Exception as exc:
         import traceback
         result.fail("unexpected-exception", f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
     finally:
         # Single teardown for every exit path — pass, fail, launch timeout or
-        # exception. Cells never reap themselves. (codex-subagent launches
-        # nothing, so its name is never in _active_runs.)
+        # exception. Cells never reap themselves.
         if rname in _active_runs:
             _kill_and_reap(rname, keep)
 
@@ -743,7 +749,7 @@ cells:
   codex-interactive    codex app-server interactive
   opencode-subagent    opencode: assert child parent linkage in DB (link 5)
   claude-subagent      claude: assert child parent linkage via ??-fallback (link 5)
-  codex-subagent       SKIP — no triggerable sub-agent surface (see --help)
+  codex-subagent       codex: assert child rollout and DB parent linkage (links 3, 5)
 
 DB access: ssh VIBES_HOST → ssh LLMPROXY_HOST → docker exec psql
   Set VIBES_HOST, LLMPROXY_HOST, POSTGRES_USER, POSTGRES_DB to override.
@@ -813,7 +819,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Fail loud and fast if the DB path is down, so no cell has to report
     # "no row" for what is really a broken tunnel.
-    if [c for c in cells_to_run if c != "codex-subagent"]:
+    if cells_to_run:
         _log("Checking DB path (preflight SELECT 1)…")
         db_err = _db_preflight()
         if db_err:

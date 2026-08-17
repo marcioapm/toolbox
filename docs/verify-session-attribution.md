@@ -22,7 +22,7 @@ root client_sessions row  ←  parent_client_session_id  ←  child client_sessi
 ```
 
 It covers all three harnesses (claude, opencode, codex) in both one-shot and
-interactive modes, plus sub-agent cells for opencode and claude.
+interactive modes, plus sub-agent cells for all three harnesses.
 
 ## How to run
 
@@ -89,7 +89,7 @@ The script opens `~/.local/share/opencode/opencode.db` read-only via
 | `codex-interactive` | codex | app-server interactive | 1, 2, 3, 4 |
 | `opencode-subagent` | opencode | build agent with explore sub-agent | 1–5 |
 | `claude-subagent` | claude | Task sub-agent | 1–5 |
-| `codex-subagent` | codex | — | **SKIP** (see below) |
+| `codex-subagent` | codex | app-server prompt-spawned sub-agent | 1–5; child rollout `parent_thread_id` |
 
 ## What each failure means
 
@@ -105,7 +105,8 @@ The script opens `~/.local/share/opencode/opencode.db` read-only via
 | `link3-disk-record` | no transcript / no session row / no rollout | session not written to harness state |
 | `link4-db-row` | no client_sessions row after Ns | proxy never received the session id |
 | `link4-db-row` | client mismatch | wrong harness identified by proxy |
-| `link5-parent-linkage` | no child row with parent=root | sub-agent requests not carrying parent header |
+| `link3-child-rollout` | no child rollout with parent_thread_id=root | Codex did not record a child rollout linked to the root |
+| `link5-parent-linkage` | no child row with parent=root | sub-agent requests not carrying parent header, or proxy not ingesting it |
 
 ### Harness-specific link-3 checks
 
@@ -114,23 +115,29 @@ The script opens `~/.local/share/opencode/opencode.db` read-only via
   the id **and at least one `message` row** (an empty decoy session is a FAIL)
 - **codex**: `~/.codex/sessions/YYYY/MM/DD/rollout-*-<session-id>.jsonl` must exist
 
-## codex sub-agent: SKIP rationale
+## codex sub-agent
 
-codex sends one id under three header names (`x-client-request-id`, `session-id`,
-`thread-id`) and no parent header. The app-server JSON-RPC schema has
-`Thread.parentThreadId` and `MultiAgentMode`, but:
+Codex has a prompt-triggerable sub-agent surface. A managed prompt asking it to spawn a
+sub-agent that replies exactly `SUBPONG` creates a root rollout and a child rollout. The
+child's `session_meta.payload.parent_thread_id` is the root rollout id, and its request
+carries:
 
-- `ThreadStartParams` has no `parentThreadId` input field
-- `TurnStartParams` has no `multiAgentMode` field
-- The `AgentControl` orchestration that sets `agentNickname`/`agentRole`/`parentThreadId`
-  is internal to the codex runtime, not triggerable via a user prompt
+```
+x-client-request-id       = <child id>
+x-codex-parent-thread-id  = <root id>
+x-openai-subagent         = collab_spawn
+thread-id                 = <child id>
+session-id                = <root id>
+```
 
-Prompting codex to "spawn a sub-agent" produces a text response but never creates a
-second thread with a `parentThreadId`. The schema confirms the plumbing exists; the
-triggering surface does not. Cell is SKIP with a stated reason, not deleted.
+The cell verifies the root's links 1–4, then reads Codex rollout storage without writing
+it to require a child rollout whose `parent_thread_id` is the root. Finally it requires a
+`client_sessions` child row whose `parent_client_session_id` is the root and confirms
+`SUBPONG` appears in the root run log.
 
-Evidence: `ACCEPTANCE-EVIDENCE.md §4`; schema inspection of `ThreadStartParams.json`
-and `TurnStartParams.json` in `codex app-server generate-json-schema --out DIR`.
+Before the llm-proxy deployment that ingests `x-codex-parent-thread-id`, this real cell is
+expected to fail at `link5-parent-linkage`: Codex has created and linked the child, but the
+proxy stores its DB row as a root. After that deployment it must PASS.
 
 ## DB schema reference
 
@@ -156,7 +163,7 @@ created_at               -- timestamp of first request for this csid
 | `DB_POLL_TIMEOUT` | `15` | Seconds to poll DB for a new row |
 | `RUN_TIMEOUT` | `120` | Seconds to wait for a run to reach done |
 | `INTERACTIVE_FIRST_REPLY_TIMEOUT` | `90` | Seconds to wait for first interactive reply |
-| `INTERACTIVE_SECOND_REPLY_TIMEOUT` | `90` | Seconds to wait for second interactive reply |
+| `INTERACTIVE_SECOND_REPLY_TIMEOUT` | `180` | Seconds to wait for second interactive reply |
 | `CLAUDE_MODEL` | `claude-haiku-4-5` | Model for claude cells |
 | `OPENCODE_MODEL` | `llmproxy-anthropic/claude-haiku-4.5` | Model for opencode cells |
 | `CODEX_MODEL` | `gpt-5.4` | Model for codex cells |
