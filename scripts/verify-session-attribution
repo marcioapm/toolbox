@@ -18,16 +18,19 @@ Approximate cost per full run: ~$0.02–0.05 (haiku/mini models, trivial prompts
 
 from __future__ import annotations
 
+import atexit
 import argparse
+import csv
+import io
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 import textwrap
 import uuid
@@ -95,9 +98,18 @@ OPENCODE_MODEL= os.environ.get("OPENCODE_MODEL","llmproxy-anthropic/claude-haiku
 CODEX_MODEL   = os.environ.get("CODEX_MODEL",   "gpt-5.4")
 CODEX_PROVIDER= os.environ.get("CODEX_PROVIDER","llmproxy")
 
-# Trivial prompts so cost stays near zero and the reply is unambiguous.
-PONG_PROMPT = "Reply with exactly: PONG"
-PONG2_PROMPT = "Reply with exactly: PONG2"
+# ---------------------------------------------------------------------------
+# Interactive turn tokens — must be synthesised by the model (absent from
+# prompts) and disjoint from each other so a turn-1 reply cannot satisfy
+# turn-2's check.  "42" = 7*6 and "27" = 3*9 are the expected answers;
+# neither is a substring of the other.
+# Prompts are kept under 25 chars so the steer payload stays below the
+# claude TUI's single-line buffer limit (empirically ~50 bytes).
+# ---------------------------------------------------------------------------
+TURN1_PROMPT = "What is 7 times 6?"
+TURN1_TOKEN  = "42"
+TURN2_PROMPT = "What is 3 times 9?"
+TURN2_TOKEN  = "27"
 
 # Sub-agent prompts.
 CLAUDE_SUBAGENT_PROMPT = (
@@ -109,6 +121,11 @@ OPENCODE_SUBAGENT_PROMPT = (
     "'Reply with exactly: SUBPONG'. Wait for it to finish."
 )
 
+# Session-id validation: agent-run mints UUIDs or ses_… strings; a stray
+# quote here would produce a psql syntax error that M1 would report as "no
+# row".  Validate before interpolating.
+_SESSION_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
 # ---------------------------------------------------------------------------
 # Result tracking
 # ---------------------------------------------------------------------------
@@ -116,6 +133,12 @@ OPENCODE_SUBAGENT_PROMPT = (
 PASS = "PASS"
 FAIL = "FAIL"
 SKIP = "SKIP"
+
+# Module-level set of run names launched this invocation so the signal
+# handler can reap them all on interrupt.
+_active_runs: set[str] = set()
+# Stash the --json flag so _log can redirect to stderr when set.
+_json_mode: bool = False
 
 
 @dataclass
@@ -149,7 +172,11 @@ class CellResult:
 # ---------------------------------------------------------------------------
 
 def _log(msg: str) -> None:
-    print(msg, flush=True)
+    # When --json is active, human log goes to stderr so stdout stays pure JSON.
+    if _json_mode:
+        print(msg, flush=True, file=sys.stderr)
+    else:
+        print(msg, flush=True)
 
 
 def _run(*cmd: str, check: bool = True, capture: bool = True,
@@ -199,8 +226,17 @@ def _session_json(run_name: str) -> Optional[dict]:
         return None
 
 
+def _read_log(run_name: str) -> str:
+    """Read the entire run log (L4: scan whole log so tokens can't scroll out)."""
+    path = LOG_ROOT / run_name / "log"
+    try:
+        return path.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def _read_log_tail(run_name: str, max_bytes: int = 4096) -> str:
-    """Read the last max_bytes from the run log."""
+    """Read the last max_bytes from the run log (for diagnostic snippets only)."""
     path = LOG_ROOT / run_name / "log"
     try:
         with open(path, "rb") as f:
@@ -212,64 +248,125 @@ def _read_log_tail(run_name: str, max_bytes: int = 4096) -> str:
         return ""
 
 
-def _log_contains(run_name: str, pattern: str) -> bool:
-    """Check if the log file contains a pattern (case-insensitive)."""
-    tail = _read_log_tail(run_name, 8192)
-    return pattern.lower() in tail.lower()
+def _count_in_log(run_name: str, token: str) -> int:
+    """Count case-insensitive occurrences of token in the full run log."""
+    content = _read_log(run_name).lower()
+    return content.count(token.lower())
+
+
+def _clean_transcript(run_name: str) -> str:
+    """Return pyte-rendered transcript via `agent-run clean`, or '' on error."""
+    try:
+        result = _run("agent-run", "clean", run_name, timeout=15, check=False)
+        return result.stdout if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _token_in_assistant_region(run_name: str, token: str, harness: str) -> bool:
+    """Check if token appears in an assistant-authored line of the clean transcript.
+
+    Claude TUI prefixes user input with '❯ '; opencode with '┃ '.  Lines
+    that start with these prefixes are echoed prompts, not model output.
+    Codex is unaffected by C1 (it writes only agentMessage/delta to the log)
+    so this function is only called for claude and opencode.
+    """
+    transcript = _clean_transcript(run_name)
+    if not transcript:
+        # Fall back to raw log (still better than old code — token must appear
+        # at least once more than the raw prompt contains it, checked by caller).
+        return False
+    tok_lower = token.lower()
+    # Input-line prefixes for each harness.
+    input_prefixes = ("❯", "┃")
+    for line in transcript.splitlines():
+        stripped = line.strip()
+        if any(stripped.startswith(p) for p in input_prefixes):
+            continue  # skip echoed prompt lines
+        if tok_lower in stripped.lower():
+            return True
+    return False
 
 
 def _reap_run(name: str, keep: bool) -> None:
-    """Remove a run's state and log dirs (unless --keep)."""
+    """Kill and remove a run's state and log dirs (unless --keep).
+
+    Prefers `agent-run reap` over shutil.rmtree so a live runner causes a
+    loud error rather than becoming an invisible orphan (H1).
+    """
+    _active_runs.discard(name)
     if keep:
         return
+    # Try the supported deletion path first; it refuses to delete live runners.
+    # --min-age-hours must be > 0; use a tiny value so terminal-state runs are
+    # collected immediately regardless of age.
+    try:
+        _run("agent-run", "reap", "--name", name, "--include-logs",
+             "--min-age-hours", "0.0001", "--log-min-age-hours", "0.0001",
+             "--idle-hours", "0.0001", timeout=30, check=False)
+    except Exception:
+        pass
+    # Fallback: rmtree if reap left dirs behind (e.g. reap not aware of log dir).
     for root in (STATE_ROOT, LOG_ROOT):
         d = root / name
         if d.is_dir():
             shutil.rmtree(d, ignore_errors=True)
 
 
+def _kill_and_reap(name: str, keep: bool) -> None:
+    """SIGTERM → wait → SIGKILL if needed → reap.  Guarantees no orphan (H1)."""
+    try:
+        _run("agent-run", "kill", name, timeout=15, check=False)
+    except Exception:
+        pass
+    st = _wait_for_terminal(name, 10)
+    if st not in {"done", "failed", "launch_failed", "died", "killed", "unknown"}:
+        # Still alive after SIGTERM budget; escalate to SIGKILL.
+        try:
+            _run("agent-run", "kill", name, "KILL", timeout=15, check=False)
+        except Exception:
+            pass
+        _wait_for_terminal(name, 5)
+    _reap_run(name, keep)
+
+
+def _cleanup_all(keep: bool = False) -> None:
+    """Kill and reap every run launched this invocation (H2/H3 — signal handler)."""
+    for name in list(_active_runs):
+        try:
+            _kill_and_reap(name, keep)
+        except Exception:
+            pass
+
+
+def _install_signal_handlers() -> None:
+    """Install SIGINT/SIGTERM handlers and atexit to reap on any exit (H3)."""
+    def _handler(signum, frame):
+        _log(f"\n[verify] caught signal {signum}, cleaning up…")
+        _cleanup_all()
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT,  _handler)
+    signal.signal(signal.SIGTERM, _handler)
+    atexit.register(_cleanup_all)
+
+
 # ---------------------------------------------------------------------------
 # DB access (two-hop SSH → psql)
 # ---------------------------------------------------------------------------
 
-def _psql_query(sql: str) -> Optional[list[dict]]:
-    """Run a psql query over ssh vibes → ssh llmproxy → docker exec psql.
+# Sentinel returned by helpers to distinguish transport error from empty result.
+class _DbError:
+    """Represents a DB transport/auth/connection failure, not an empty result."""
+    def __init__(self, detail: str):
+        self.detail = detail
 
-    Returns list of row dicts, or None on error.
-    The container ID is discovered dynamically per call so restarts don't break us.
-    """
-    # Escape single quotes in SQL for shell embedding.
-    safe_sql = sql.replace("'", "'\"'\"'")
-    inner_cmd = (
-        f"sudo docker exec "
-        f"$(sudo docker ps -q -f name=llmproxy_postgres) "
-        f"psql -U {POSTGRES_USER} -d {POSTGRES_DB} --csv -t -c '{safe_sql}'"
-    )
-    outer_cmd = f"ssh {LLMPROXY_HOST} {shlex.quote(inner_cmd)}"
-    try:
-        result = _run("ssh", VIBES_HOST, outer_cmd, timeout=20)
-        return _parse_psql_csv(result.stdout)
-    except subprocess.SubprocessError as exc:
-        _log(f"    [DB] query failed: {exc}")
-        return None
+    def __repr__(self):
+        return f"DbError({self.detail!r})"
 
 
 def _parse_psql_csv(raw: str) -> list[dict]:
-    """Parse psql --csv -t output into list of dicts.
-
-    psql --csv -t emits rows as comma-separated values with a header row when
-    there are columns to name, but with -t (tuples only) there is no header.
-    We always use -t, so we parse by column position from the query itself,
-    OR we use named placeholders.
-
-    For simplicity we use a header-based approach: callers use SELECT col AS alias.
-    Since -t suppresses the header, we embed the column names in a wrapper:
-    SELECT ... → we pass -t -A -F',' and parse manually.
-
-    Actually: psql --csv (without -t) includes header. Use --csv without -t.
-    """
-    import csv
-    import io
+    """Parse psql --csv output (with header) into a list of row dicts."""
     rows = []
     reader = csv.DictReader(io.StringIO(raw.strip()))
     for row in reader:
@@ -277,8 +374,12 @@ def _parse_psql_csv(raw: str) -> list[dict]:
     return rows
 
 
-def _psql_query_csv(sql: str) -> Optional[list[dict]]:
-    """Same as _psql_query but without -t so CSV includes headers."""
+def _psql_query_csv(sql: str) -> "list[dict] | _DbError":
+    """Run a psql query over ssh vibes → ssh llmproxy → docker exec psql.
+
+    Returns list of row dicts on success, or _DbError on transport/auth failure.
+    The container ID is discovered dynamically so restarts don't break us.
+    """
     safe_sql = sql.replace("'", "'\"'\"'")
     inner_cmd = (
         f"sudo docker exec "
@@ -291,39 +392,66 @@ def _psql_query_csv(sql: str) -> Optional[list[dict]]:
         return _parse_psql_csv(result.stdout)
     except subprocess.SubprocessError as exc:
         _log(f"    [DB] query failed: {exc}")
-        return None
+        return _DbError(str(exc))
+
+
+def _db_preflight() -> Optional[str]:
+    """Run SELECT 1 to confirm the DB path is live. Returns error string or None."""
+    rows = _psql_query_csv("SELECT 1 AS ok")
+    if isinstance(rows, _DbError):
+        return f"DB unreachable: {rows.detail}"
+    if not rows or rows[0].get("ok") != "1":
+        return "DB preflight returned unexpected result"
+    return None
+
+
+def _validate_session_id(session_id: str) -> bool:
+    """Validate session_id matches expected character set before SQL interpolation."""
+    return bool(_SESSION_ID_RE.match(session_id))
 
 
 def _poll_db_row(session_id: str, expected_client: str,
-                 timeout: float = DB_POLL_TIMEOUT) -> Optional[dict]:
-    """Poll the DB until a client_sessions row for session_id appears, or timeout."""
-    # Escape the session_id for SQL (it's a UUID or ses_… string; no quotes inside).
+                 timeout: float = DB_POLL_TIMEOUT) -> "dict | None | _DbError":
+    """Poll until a client_sessions row for session_id appears, or timeout.
+
+    Returns: dict (row found), None (timeout — no row), or _DbError (transport).
+    """
+    if not _validate_session_id(session_id):
+        return _DbError(f"session_id {session_id!r} contains invalid characters")
     sql = (
         "SELECT client_session_id, client, parent_client_session_id, created_at "
         f"FROM client_sessions WHERE client_session_id = '{session_id}' LIMIT 1"
     )
     deadline = time.monotonic() + timeout
+    last_error: Optional[_DbError] = None
     while time.monotonic() < deadline:
         rows = _psql_query_csv(sql)
-        if rows:
+        if isinstance(rows, _DbError):
+            last_error = rows
+        elif rows:
             return rows[0]
         time.sleep(DB_POLL_INTERVAL)
-    return None
+    return last_error if last_error else None
 
 
-def _poll_db_child_row(root_session_id: str, timeout: float = DB_POLL_TIMEOUT) -> Optional[dict]:
+def _poll_db_child_row(root_session_id: str, timeout: float = DB_POLL_TIMEOUT) -> "dict | None | _DbError":
     """Poll for any child row whose parent_client_session_id = root_session_id."""
+    if not _validate_session_id(root_session_id):
+        return _DbError(f"session_id {root_session_id!r} contains invalid characters")
     sql = (
         "SELECT client_session_id, client, parent_client_session_id, created_at "
         f"FROM client_sessions WHERE parent_client_session_id = '{root_session_id}' LIMIT 1"
     )
     deadline = time.monotonic() + timeout
+    last_error: Optional[_DbError] = None
     while time.monotonic() < deadline:
         rows = _psql_query_csv(sql)
-        if rows:
+        if isinstance(rows, _DbError):
+            last_error = rows
+        elif rows:
             return rows[0]
         time.sleep(DB_POLL_INTERVAL)
-    return None
+    return last_error if last_error else None
 
 
 # ---------------------------------------------------------------------------
@@ -408,29 +536,44 @@ def _verify_codex_disk(session_id: str) -> tuple[bool, str]:
 # Wait helpers for interactive mode
 # ---------------------------------------------------------------------------
 
-def _wait_log_contains(run_name: str, pattern: str, timeout: float) -> bool:
-    """Poll until log contains pattern or timeout. Returns True on match."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if _log_contains(run_name, pattern):
-            return True
-        time.sleep(1.0)
-    return False
+def _wait_for_interactive_reply(run_name: str, harness: str,
+                                 token: str, min_count: int,
+                                 timeout: float) -> bool:
+    """Wait until token appears in an assistant region min_count times, or terminal.
 
+    For claude and opencode: asserts the token is in a non-input line of the
+    pyte-rendered clean transcript (C1 fix — rules out echo-only matches).
+    Also requires the raw log count to be at least min_count (so a turn-2
+    check cannot be satisfied by the turn-1 reply appearing again).
 
-def _wait_for_interactive_reply(run_name: str, pattern: str, timeout: float) -> bool:
-    """Wait for pattern in the log OR for the run to go terminal."""
+    For codex: the log contains only agentMessage/delta payloads (no echo),
+    so a raw log count check is sufficient.
+    """
     terminal = {"done", "failed", "launch_failed", "died", "killed"}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         st = _agent_run_status(run_name)
-        if _log_contains(run_name, pattern):
+        if _interactive_reply_present(run_name, harness, token, min_count):
             return True
         if st in terminal:
             # Run ended — do a final check in case the reply just appeared.
-            return _log_contains(run_name, pattern)
+            return _interactive_reply_present(run_name, harness, token, min_count)
         time.sleep(1.0)
-    return _log_contains(run_name, pattern)
+    return _interactive_reply_present(run_name, harness, token, min_count)
+
+
+def _interactive_reply_present(run_name: str, harness: str,
+                                token: str, min_count: int) -> bool:
+    """Single-shot check: token appears in assistant region at least min_count times."""
+    if harness in ("claude", "opencode"):
+        # Require the token to be in a non-input line of the rendered transcript
+        # AND appear in the raw log at least min_count times (count increase check).
+        if not _token_in_assistant_region(run_name, token, harness):
+            return False
+        return _count_in_log(run_name, token) >= min_count
+    else:
+        # Codex: raw log contains only model output — count check is sufficient.
+        return _count_in_log(run_name, token) >= min_count
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +591,7 @@ def cell_oneshot(
     """Run a one-shot harness cell and assert all four links."""
     _log(f"  Launching {harness} one-shot → run={run_name!r}")
 
-    cmd = ["agent-run", "--harness", harness, "--prompt", PONG_PROMPT]
+    cmd = ["agent-run", "--harness", harness, "--prompt", TURN1_PROMPT]
     if harness == "claude":
         cmd += ["--model", CLAUDE_MODEL]
     elif harness == "opencode":
@@ -462,12 +605,17 @@ def cell_oneshot(
         ]
     cmd.append(run_name)
 
+    _active_runs.add(run_name)
     try:
         _run(*cmd, timeout=30)
     except subprocess.CalledProcessError as exc:
         result.fail("link1-launch", f"agent-run exited {exc.returncode}: {exc.stderr[:200]}")
         return
     except subprocess.TimeoutExpired:
+        # The launch timed out but the run may be alive — poll before giving up.
+        if _agent_run_status(run_name) not in {"unknown"}:
+            _log(f"  Launch timed out but run exists; waiting for terminal…")
+            _wait_for_terminal(run_name, 30)
         result.fail("link1-launch", "agent-run launch timed out (30s)")
         return
 
@@ -477,7 +625,6 @@ def cell_oneshot(
     if status != "done":
         tail = _read_log_tail(run_name, 1000)
         result.fail("link1-run", f"status={status!r} (expected 'done')\nLog tail:\n{tail}")
-        _reap_run(run_name, keep)
         return
     _log(f"  [link1] PASS status=done")
 
@@ -485,24 +632,20 @@ def cell_oneshot(
     sj = _session_json(run_name)
     if sj is None:
         result.fail("link2-session-json", "session.json missing or malformed")
-        _reap_run(run_name, keep)
         return
     session_id = sj.get("session_id") or sj.get("id")
     confidence = sj.get("confidence", "")
     acquisition = sj.get("acquisition", "")
     if not session_id:
         result.fail("link2-session-json", f"session.json has no session_id: {sj}")
-        _reap_run(run_name, keep)
         return
     if confidence != "certain":
         result.fail("link2-session-json",
                     f"confidence={confidence!r} (expected 'certain'); acquisition={acquisition!r}")
-        _reap_run(run_name, keep)
         return
     if acquisition not in ("pushed", "minted"):
         result.fail("link2-session-json",
                     f"implausible acquisition={acquisition!r} (expected pushed|minted)")
-        _reap_run(run_name, keep)
         return
     _log(f"  [link2] PASS session_id={session_id!r} confidence={confidence} acquisition={acquisition}")
 
@@ -517,23 +660,23 @@ def cell_oneshot(
         ok, detail = False, f"unknown harness {harness!r}"
     if not ok:
         result.fail("link3-disk-record", detail)
-        _reap_run(run_name, keep)
         return
     _log(f"  [link3] PASS disk: {detail}")
 
     # Link 4: DB row.
     _log(f"  Polling DB for client_sessions row (timeout={DB_POLL_TIMEOUT}s)…")
     row = _poll_db_row(session_id, expected_client)
+    if isinstance(row, _DbError):
+        result.fail("link4-db-unreachable", f"DB transport error: {row.detail}")
+        return
     if row is None:
         result.fail("link4-db-row",
                     f"no client_sessions row for {session_id!r} after {DB_POLL_TIMEOUT}s")
-        _reap_run(run_name, keep)
         return
     db_client = row.get("client", "")
     if db_client != expected_client:
         result.fail("link4-db-row",
                     f"client={db_client!r} (expected {expected_client!r}) for {session_id!r}")
-        _reap_run(run_name, keep)
         return
     _log(f"  [link4] PASS DB: client={db_client!r} created_at={row.get('created_at','?')!r}")
 
@@ -543,7 +686,6 @@ def cell_oneshot(
         "link3": detail,
         "link4": f"client={db_client}",
     })
-    _reap_run(run_name, keep)
 
 
 def cell_interactive(
@@ -554,13 +696,19 @@ def cell_interactive(
     keep: bool,
     result: CellResult,
 ) -> None:
-    """Run an interactive harness cell: launch, verify first reply, steer second, verify."""
+    """Run an interactive harness cell: launch, verify first reply, steer second, verify.
+
+    Link-1 liveness check (C1 fix): asserts a token the model must synthesise
+    (absent from the prompt), requires it to appear in an assistant region of the
+    pyte-rendered transcript (not the echoed input line), and requires the raw log
+    count to increase after the steer so turn-2 is genuinely proven.
+    """
     _log(f"  Launching {harness} interactive → run={run_name!r}")
 
     cmd = [
         "agent-run", "-i",
         "--harness", harness,
-        "--prompt", PONG_PROMPT,
+        "--prompt", TURN1_PROMPT,
     ]
     if harness == "claude":
         cmd += ["--model", CLAUDE_MODEL]
@@ -573,69 +721,66 @@ def cell_interactive(
         ]
     cmd.append(run_name)
 
+    _active_runs.add(run_name)
     try:
         _run(*cmd, timeout=60)
     except subprocess.CalledProcessError as exc:
         result.fail("link1-launch", f"agent-run -i exited {exc.returncode}: {exc.stderr[:200]}")
         return
     except subprocess.TimeoutExpired:
+        if _agent_run_status(run_name) not in {"unknown"}:
+            _log(f"  Launch timed out but run exists; waiting for terminal…")
+            _wait_for_terminal(run_name, 30)
         result.fail("link1-launch", "agent-run -i launch timed out (60s)")
         return
 
-    # Link 1a: wait for first reply "PONG" in the log.
-    _log(f"  Waiting for first PONG reply (timeout={INTERACTIVE_FIRST_REPLY_TIMEOUT}s)…")
-    if not _wait_for_interactive_reply(run_name, "PONG", INTERACTIVE_FIRST_REPLY_TIMEOUT):
+    # Link 1a: wait for first synthesised reply "42" in the assistant region.
+    # min_count=1: at least one occurrence in the full log must be in assistant output.
+    _log(f"  Waiting for turn-1 reply {TURN1_TOKEN!r} in assistant region "
+         f"(timeout={INTERACTIVE_FIRST_REPLY_TIMEOUT}s)…")
+    if not _wait_for_interactive_reply(run_name, harness, TURN1_TOKEN, 1,
+                                       INTERACTIVE_FIRST_REPLY_TIMEOUT):
         tail = _read_log_tail(run_name, 1000)
         st = _agent_run_status(run_name)
         result.fail("link1-interactive-first-reply",
-                    f"'PONG' not in log after {INTERACTIVE_FIRST_REPLY_TIMEOUT}s "
-                    f"(status={st!r})\nLog tail:\n{tail}")
-        try:
-            _run("agent-run", "kill", run_name, timeout=15, check=False)
-        except Exception:
-            pass
-        _reap_run(run_name, keep)
+                    f"{TURN1_TOKEN!r} not in assistant region after "
+                    f"{INTERACTIVE_FIRST_REPLY_TIMEOUT}s (status={st!r})\nLog tail:\n{tail}")
+        _kill_and_reap(run_name, keep)
         return
-    _log(f"  [link1a] PASS: first PONG reply seen")
+    count_after_t1 = _count_in_log(run_name, TURN1_TOKEN)
+    _log(f"  [link1a] PASS: turn-1 reply {TURN1_TOKEN!r} seen in assistant region "
+         f"(log count={count_after_t1})")
 
     # Steer second prompt.
     _log(f"  Steering second prompt…")
     try:
-        _run("agent-run", "steer", run_name, PONG2_PROMPT, timeout=15)
+        _run("agent-run", "steer", run_name, TURN2_PROMPT, timeout=15)
     except subprocess.CalledProcessError as exc:
         result.fail("link1-steer", f"agent-run steer failed: {exc.stderr[:200]}")
-        try:
-            _run("agent-run", "kill", run_name, timeout=15, check=False)
-        except Exception:
-            pass
-        _reap_run(run_name, keep)
+        _kill_and_reap(run_name, keep)
         return
 
-    # Link 1b: wait for second reply "PONG2" in the log.
-    _log(f"  Waiting for second PONG2 reply (timeout={INTERACTIVE_SECOND_REPLY_TIMEOUT}s)…")
-    if not _wait_for_interactive_reply(run_name, "PONG2", INTERACTIVE_SECOND_REPLY_TIMEOUT):
+    # Link 1b: wait for second synthesised reply "85" in the assistant region.
+    # min_count=1 for TURN2_TOKEN (disjoint from TURN1_TOKEN — "85" ≠ "42").
+    # We do NOT require TURN1_TOKEN to increase further; TURN2_TOKEN is the proof.
+    _log(f"  Waiting for turn-2 reply {TURN2_TOKEN!r} in assistant region "
+         f"(timeout={INTERACTIVE_SECOND_REPLY_TIMEOUT}s)…")
+    if not _wait_for_interactive_reply(run_name, harness, TURN2_TOKEN, 1,
+                                       INTERACTIVE_SECOND_REPLY_TIMEOUT):
         tail = _read_log_tail(run_name, 1000)
         st = _agent_run_status(run_name)
         result.fail("link1-interactive-second-reply",
-                    f"'PONG2' not in log after {INTERACTIVE_SECOND_REPLY_TIMEOUT}s "
-                    f"(status={st!r})\nLog tail:\n{tail}")
-        try:
-            _run("agent-run", "kill", run_name, timeout=15, check=False)
-        except Exception:
-            pass
-        _reap_run(run_name, keep)
+                    f"{TURN2_TOKEN!r} not in assistant region after "
+                    f"{INTERACTIVE_SECOND_REPLY_TIMEOUT}s (status={st!r})\nLog tail:\n{tail}")
+        _kill_and_reap(run_name, keep)
         return
-    _log(f"  [link1b] PASS: second PONG2 reply seen")
+    _log(f"  [link1b] PASS: turn-2 reply {TURN2_TOKEN!r} seen in assistant region")
 
     # Link 2: session.json (written at launch).
     sj = _session_json(run_name)
     if sj is None:
         result.fail("link2-session-json", "session.json missing or malformed")
-        try:
-            _run("agent-run", "kill", run_name, timeout=15, check=False)
-        except Exception:
-            pass
-        _reap_run(run_name, keep)
+        _kill_and_reap(run_name, keep)
         return
     session_id = sj.get("session_id") or sj.get("id")
     confidence = sj.get("confidence", "")
@@ -643,17 +788,11 @@ def cell_interactive(
     if not session_id or confidence != "certain":
         result.fail("link2-session-json",
                     f"session_id={session_id!r} confidence={confidence!r}")
-        try:
-            _run("agent-run", "kill", run_name, timeout=15, check=False)
-        except Exception:
-            pass
-        _reap_run(run_name, keep)
+        _kill_and_reap(run_name, keep)
         return
     _log(f"  [link2] PASS session_id={session_id!r} confidence={confidence} acquisition={acquisition}")
 
-    # Link 3: disk record. For interactive opencode, the session is live; the
-    # DB will have messages. For claude, the transcript is written after each
-    # turn. Check now (post second reply) so writes have had time to flush.
+    # Link 3: disk record. Check post-second-reply so writes have flushed.
     if harness == "claude":
         ok, detail = _verify_claude_disk(session_id, cwd)
     elif harness == "opencode":
@@ -664,45 +803,32 @@ def cell_interactive(
         ok, detail = False, f"unknown harness {harness!r}"
     if not ok:
         result.fail("link3-disk-record", detail)
-        try:
-            _run("agent-run", "kill", run_name, timeout=15, check=False)
-        except Exception:
-            pass
-        _reap_run(run_name, keep)
+        _kill_and_reap(run_name, keep)
         return
     _log(f"  [link3] PASS disk: {detail}")
 
     # Link 4: DB row.
     _log(f"  Polling DB for client_sessions row…")
     row = _poll_db_row(session_id, expected_client)
+    if isinstance(row, _DbError):
+        result.fail("link4-db-unreachable", f"DB transport error: {row.detail}")
+        _kill_and_reap(run_name, keep)
+        return
     if row is None:
         result.fail("link4-db-row",
                     f"no client_sessions row for {session_id!r} after {DB_POLL_TIMEOUT}s")
-        try:
-            _run("agent-run", "kill", run_name, timeout=15, check=False)
-        except Exception:
-            pass
-        _reap_run(run_name, keep)
+        _kill_and_reap(run_name, keep)
         return
     db_client = row.get("client", "")
     if db_client != expected_client:
         result.fail("link4-db-row",
                     f"client={db_client!r} (expected {expected_client!r})")
-        try:
-            _run("agent-run", "kill", run_name, timeout=15, check=False)
-        except Exception:
-            pass
-        _reap_run(run_name, keep)
+        _kill_and_reap(run_name, keep)
         return
     _log(f"  [link4] PASS DB: client={db_client!r}")
 
     # Kill the interactive run now that all checks pass.
-    try:
-        _run("agent-run", "kill", run_name, timeout=15, check=False)
-    except Exception:
-        pass
-    # Give it a moment to exit cleanly before reap.
-    _wait_for_terminal(run_name, 10)
+    _kill_and_reap(run_name, keep)
 
     result.pass_(session_id, {
         "link1": "two turns answered",
@@ -710,7 +836,6 @@ def cell_interactive(
         "link3": detail,
         "link4": f"client={db_client}",
     })
-    _reap_run(run_name, keep)
 
 
 def cell_subagent_opencode(
@@ -728,12 +853,15 @@ def cell_subagent_opencode(
         "--prompt", OPENCODE_SUBAGENT_PROMPT,
         run_name,
     ]
+    _active_runs.add(run_name)
     try:
         _run(*cmd, timeout=30)
     except subprocess.CalledProcessError as exc:
         result.fail("link1-launch", f"agent-run exited {exc.returncode}: {exc.stderr[:200]}")
         return
     except subprocess.TimeoutExpired:
+        if _agent_run_status(run_name) not in {"unknown"}:
+            _wait_for_terminal(run_name, 30)
         result.fail("link1-launch", "launch timed out")
         return
 
@@ -742,7 +870,6 @@ def cell_subagent_opencode(
     if status != "done":
         tail = _read_log_tail(run_name, 1000)
         result.fail("link1-run", f"status={status!r}\nLog:\n{tail}")
-        _reap_run(run_name, keep)
         return
     _log(f"  [link1] PASS status=done")
 
@@ -750,13 +877,11 @@ def cell_subagent_opencode(
     sj = _session_json(run_name)
     if not sj:
         result.fail("link2-session-json", "session.json missing")
-        _reap_run(run_name, keep)
         return
     root_id = sj.get("session_id") or sj.get("id")
     confidence = sj.get("confidence", "")
     if not root_id or confidence != "certain":
         result.fail("link2-session-json", f"root_id={root_id!r} confidence={confidence!r}")
-        _reap_run(run_name, keep)
         return
     _log(f"  [link2] PASS root_id={root_id!r}")
 
@@ -764,39 +889,53 @@ def cell_subagent_opencode(
     ok, detail = _verify_opencode_disk(root_id)
     if not ok:
         result.fail("link3-disk-record", detail)
-        _reap_run(run_name, keep)
         return
     _log(f"  [link3] PASS disk: {detail}")
 
-    # Link 4: root DB row.
+    # Link 4: root DB row — assert client matches expected.
     row = _poll_db_row(root_id, "opencode")
+    if isinstance(row, _DbError):
+        result.fail("link4-db-unreachable", f"DB transport error: {row.detail}")
+        return
     if row is None:
         result.fail("link4-db-row", f"no root row for {root_id!r}")
-        _reap_run(run_name, keep)
         return
-    _log(f"  [link4] PASS root row: client={row.get('client')!r}")
+    db_client = row.get("client", "")
+    if db_client != "opencode":
+        result.fail("link4-db-row", f"client={db_client!r} (expected 'opencode') for {root_id!r}")
+        return
+    _log(f"  [link4] PASS root row: client={db_client!r}")
 
     # Link 5: child row with parent_client_session_id = root_id.
     _log(f"  Polling DB for child row (parent={root_id!r})…")
     child_row = _poll_db_child_row(root_id, timeout=DB_POLL_TIMEOUT)
+    if isinstance(child_row, _DbError):
+        result.fail("link5-db-unreachable", f"DB transport error: {child_row.detail}")
+        return
     if child_row is None:
         result.fail("link5-parent-linkage",
                     f"no child client_sessions row with parent_client_session_id={root_id!r} "
                     f"after {DB_POLL_TIMEOUT}s")
-        _reap_run(run_name, keep)
         return
     child_id = child_row.get("client_session_id", "?")
     parent_id = child_row.get("parent_client_session_id", "?")
     _log(f"  [link5] PASS child={child_id!r} parent={parent_id!r} → resolves to root")
 
+    # Also assert the sub-agent's own reply came back (M4 fix).
+    log_content = _read_log(run_name).lower()
+    if "subpong" not in log_content:
+        result.fail("link5-subagent-reply",
+                    "sub-agent never produced 'SUBPONG' in the run log")
+        return
+    _log(f"  [link5+] PASS sub-agent reply 'SUBPONG' confirmed in log")
+
     result.pass_(root_id, {
         "link1": "done",
         "link2": f"confidence={confidence}",
         "link3": detail,
-        "link4": f"root row present",
+        "link4": f"client={db_client}",
         "link5": f"child={child_id!r} parent={parent_id!r}",
     })
-    _reap_run(run_name, keep)
 
 
 def cell_subagent_claude(
@@ -813,12 +952,15 @@ def cell_subagent_claude(
         "--prompt", CLAUDE_SUBAGENT_PROMPT,
         run_name,
     ]
+    _active_runs.add(run_name)
     try:
         _run(*cmd, timeout=30)
     except subprocess.CalledProcessError as exc:
         result.fail("link1-launch", f"agent-run exited {exc.returncode}: {exc.stderr[:200]}")
         return
     except subprocess.TimeoutExpired:
+        if _agent_run_status(run_name) not in {"unknown"}:
+            _wait_for_terminal(run_name, 30)
         result.fail("link1-launch", "launch timed out")
         return
 
@@ -826,60 +968,73 @@ def cell_subagent_claude(
     if status != "done":
         tail = _read_log_tail(run_name, 1000)
         result.fail("link1-run", f"status={status!r}\nLog:\n{tail}")
-        _reap_run(run_name, keep)
         return
     _log(f"  [link1] PASS status=done")
 
     sj = _session_json(run_name)
     if not sj:
         result.fail("link2-session-json", "session.json missing")
-        _reap_run(run_name, keep)
         return
     root_id = sj.get("session_id") or sj.get("id")
     confidence = sj.get("confidence", "")
     if not root_id or confidence != "certain":
         result.fail("link2-session-json", f"root_id={root_id!r} confidence={confidence!r}")
-        _reap_run(run_name, keep)
         return
     _log(f"  [link2] PASS root_id={root_id!r}")
 
     ok, detail = _verify_claude_disk(root_id, str(Path.cwd()))
     if not ok:
         result.fail("link3-disk-record", detail)
-        _reap_run(run_name, keep)
         return
     _log(f"  [link3] PASS disk: {detail}")
 
+    # Link 4: root DB row — assert client matches expected.
     row = _poll_db_row(root_id, "claude-code")
+    if isinstance(row, _DbError):
+        result.fail("link4-db-unreachable", f"DB transport error: {row.detail}")
+        return
     if row is None:
         result.fail("link4-db-row", f"no root row for {root_id!r}")
-        _reap_run(run_name, keep)
         return
-    _log(f"  [link4] PASS root row: client={row.get('client')!r}")
+    db_client = row.get("client", "")
+    if db_client != "claude-code":
+        result.fail("link4-db-row",
+                    f"client={db_client!r} (expected 'claude-code') for {root_id!r}")
+        return
+    _log(f"  [link4] PASS root row: client={db_client!r}")
 
     # Link 5: child row. For depth-1 claude sub-agents the proxy uses the
     # session-id fallback (not parent-agent-id header), so
     # parent_client_session_id = the root session-id.
     _log(f"  Polling DB for child row (parent={root_id!r}, timeout={DB_POLL_TIMEOUT}s)…")
     child_row = _poll_db_child_row(root_id, timeout=DB_POLL_TIMEOUT)
+    if isinstance(child_row, _DbError):
+        result.fail("link5-db-unreachable", f"DB transport error: {child_row.detail}")
+        return
     if child_row is None:
         result.fail("link5-parent-linkage",
                     f"no child client_sessions row with parent_client_session_id={root_id!r} "
                     f"after {DB_POLL_TIMEOUT}s — depth-1 sub-agent did not fire or fallback broken")
-        _reap_run(run_name, keep)
         return
     child_id = child_row.get("client_session_id", "?")
     parent_id = child_row.get("parent_client_session_id", "?")
     _log(f"  [link5] PASS child={child_id!r} parent={parent_id!r} (via ??-fallback)")
 
+    # Also assert the sub-agent's own reply came back (M4 fix).
+    log_content = _read_log(run_name).lower()
+    if "subpong" not in log_content:
+        result.fail("link5-subagent-reply",
+                    "sub-agent never produced 'SUBPONG' in the run log")
+        return
+    _log(f"  [link5+] PASS sub-agent reply 'SUBPONG' confirmed in log")
+
     result.pass_(root_id, {
         "link1": "done",
         "link2": f"confidence={confidence}",
         "link3": detail,
-        "link4": "root row present",
+        "link4": f"client={db_client}",
         "link5": f"child={child_id!r} parent={parent_id!r} (depth-1 ??-fallback)",
     })
-    _reap_run(run_name, keep)
 
 
 def cell_subagent_codex(result: CellResult) -> None:
@@ -898,7 +1053,7 @@ def cell_subagent_codex(result: CellResult) -> None:
     but never creates a second thread with a parentThreadId. The schema confirms
     the plumbing exists; the triggering surface does not.
 
-    Evidence: ACCEPTANCE-EVIDENCE.md §4 "codex — no parent header exists";
+    Evidence: ACCEPTANCE-EVIDENCE.md §4 "codex — no triggerable sub-agent surface";
     schema inspection of ThreadStartParams (no parentThreadId input field) and
     TurnStartParams (no multiAgentMode field) in codex app-server protocol v2.
     """
@@ -965,10 +1120,11 @@ def run_cell(cell_name: str, keep: bool) -> CellResult:
         import traceback
         result.fail("unexpected-exception", f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
     finally:
-        # Always try to clean up the run, even on unexpected exceptions.
-        if not keep and mode != "subagent":
-            pass  # each cell function handles its own cleanup
-        # For subagent cells cleanup is also inside the cell function.
+        # Reap any run that the cell function did not already reap (H2 fix).
+        # Codex-subagent never launches a run, so _active_runs won't have rname.
+        # _reap_run is idempotent: if the cell already reaped it, the dirs are gone.
+        if rname in _active_runs:
+            _reap_run(rname, keep)
 
     _log(f"\n  → {result.verdict}: {cell_name}")
     if result.verdict == FAIL:
@@ -1003,6 +1159,9 @@ DB access: ssh VIBES_HOST → ssh LLMPROXY_HOST → docker exec psql
 
 Approximate cost: ~$0.02–0.05 per full run (haiku/mini models, trivial prompts).
 
+--keep preserves agent-run state and log dirs for debugging.  For interactive
+cells this also leaves the TUI process running; kill it with agent-run kill <name>.
+
 Typical debug workflow:
   1. Run with --only claude-oneshot --keep to preserve run dirs.
   2. Check /var/tmp/agent-runs/<run>/session.json and log.
@@ -1011,6 +1170,8 @@ Typical debug workflow:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    global _json_mode
+
     parser = argparse.ArgumentParser(
         prog="verify-session-attribution",
         description=(
@@ -1035,13 +1196,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--keep", action="store_true",
-        help="Preserve agent-run state and log dirs for debugging (default: clean up)",
+        help=(
+            "Preserve agent-run state and log dirs for debugging (default: clean up). "
+            "For interactive cells this leaves the TUI process running."
+        ),
     )
     parser.add_argument(
         "--json", action="store_true",
-        help="Emit machine-readable JSON summary to stdout after the run",
+        help=(
+            "Emit machine-readable JSON summary to stdout; human log goes to stderr. "
+            "stdout is valid JSON on both pass and fail paths."
+        ),
     )
     args = parser.parse_args(argv)
+    _json_mode = args.json
+
+    _install_signal_handlers()
 
     # Determine which cells to run.
     all_cells = list(CELLS.keys())
@@ -1066,6 +1236,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     _log(f"DB: ssh {VIBES_HOST} → ssh {LLMPROXY_HOST} → psql -U {POSTGRES_USER} -d {POSTGRES_DB}")
     _log(f"keep={args.keep} skip-subagents={args.skip_subagents}")
     _log("")
+
+    # DB preflight: fail loud and fast if the path is broken (M1 fix).
+    # Skip for codex-only runs that never touch the DB differently, but the
+    # preflight is cheap so always run it unless all selected cells are codex-subagent.
+    non_skip_cells = [c for c in cells_to_run if c != "codex-subagent"]
+    if non_skip_cells:
+        _log("Checking DB path (preflight SELECT 1)…")
+        db_err = _db_preflight()
+        if db_err:
+            _log(f"ABORT: {db_err}")
+            _log("DB path is down — cannot distinguish 'no row' from 'transport error'.")
+            _log("Fix the SSH tunnel / container before running.")
+            return 1
+        _log("DB preflight OK\n")
 
     results: list[CellResult] = []
     for cell_name in cells_to_run:

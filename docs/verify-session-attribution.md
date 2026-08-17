@@ -42,7 +42,7 @@ python3 scripts/verify-session-attribution --skip-subagents
 # Preserve run dirs for debugging
 python3 scripts/verify-session-attribution --only claude-oneshot --keep
 
-# Machine-readable JSON output (appended after human output)
+# Machine-readable JSON output (stdout is pure JSON; human log goes to stderr)
 python3 scripts/verify-session-attribution --json
 ```
 
@@ -97,9 +97,9 @@ The script opens `~/.local/share/opencode/opencode.db` read-only via
 |------|----------------|------------|
 | `link1-launch` | agent-run exited N / timed out | harness binary not found, or bad arg |
 | `link1-run` | status='launch_failed'/'failed' | harness crashed, auth/model error |
-| `link1-interactive-first-reply` | 'PONG' not in log | TUI not starting, model not responding |
+| `link1-interactive-first-reply` | '42' not in assistant region | TUI not starting, model not responding |
 | `link1-steer` | agent-run steer failed | interactive FIFO not set up |
-| `link1-interactive-second-reply` | 'PONG2' not in log | steer not reaching agent |
+| `link1-interactive-second-reply` | '27' not in assistant region | steer not reaching agent |
 | `link2-session-json` | session.json missing/malformed | agent-run acquisition failed |
 | `link2-session-json` | confidence != 'certain' | mint/push was uncertain or absent |
 | `link3-disk-record` | no transcript / no session row / no rollout | session not written to harness state |
