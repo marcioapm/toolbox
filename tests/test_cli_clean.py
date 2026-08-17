@@ -101,10 +101,17 @@ def test_logs_does_not_reset_terminal_modes_when_not_a_tty(
 
 
 def test_tail_resets_terminal_modes_after_ctrl_c(isolated_runs_root, monkeypatch):
+    """Exercises the non-TTY fallback path explicitly (sys.stdin.isatty
+    forced False) rather than relying on the real invoking environment's
+    stdin happening to not be a TTY (e.g. under default pytest capture) --
+    `tail` never touches terminal modes, so this is the only path: the
+    KeyboardInterrupt handler must still run the DEC private-mode reset
+    that the replayed PTY bytes made necessary."""
     run = _make_run(isolated_runs_root, "following", b"")
     (run / "pid").write_text("123\n")
     stdout = _FakeStdout(tty=True)
     monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(agent_run.sys.stdin, "isatty", lambda: False)
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(
         agent_run.time,
