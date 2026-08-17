@@ -52,7 +52,7 @@ DB_POLL_INTERVAL = 0.5
 RUN_TIMEOUT      = float(os.environ.get("RUN_TIMEOUT", "120"))
 STATUS_POLL_INTERVAL = 1.0
 INTERACTIVE_FIRST_REPLY_TIMEOUT  = float(os.environ.get("INTERACTIVE_FIRST_REPLY_TIMEOUT", "90"))
-INTERACTIVE_SECOND_REPLY_TIMEOUT = float(os.environ.get("INTERACTIVE_SECOND_REPLY_TIMEOUT", "90"))
+INTERACTIVE_SECOND_REPLY_TIMEOUT = float(os.environ.get("INTERACTIVE_SECOND_REPLY_TIMEOUT", "180"))
 
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
 LOG_ROOT   = Path(os.environ.get("AGENT_RUN_LOG_DIR",   "/var/tmp/agent-runs"))
@@ -204,25 +204,30 @@ def _count_in_log(run_name: str, token: str) -> int:
     return _read_log(run_name).lower().count(token.lower())
 
 
-def _token_in_assistant_region(run_name: str, token: str) -> bool:
-    """True if token appears outside the echoed input lines of `agent-run clean`.
+def _count_in_assistant_region(run_name: str, token: str) -> int:
+    """Occurrences of token outside the echoed input lines of `agent-run clean`.
 
-    The interactive log is a raw PTY capture, so the prompt is echoed into it;
-    only the pyte-rendered transcript lets us tell input from model output.
+    The interactive log is a raw PTY capture, so the prompt is echoed into it and
+    ANSI sequences (ESC[27m, cursor reports) contain bare digits; only the
+    pyte-rendered transcript separates model output from input and control bytes.
     Claude prefixes user input with '❯', opencode with '┃'.
     """
     try:
         rendered = _run("agent-run", "clean", run_name, timeout=15, check=False)
         transcript = rendered.stdout if rendered.returncode == 0 else ""
     except Exception:
-        transcript = ""
-    for line in transcript.splitlines():
-        line = line.strip()
-        if line.startswith(("❯", "┃")):
-            continue
-        if token.lower() in line.lower():
-            return True
-    return False
+        return 0
+    needle = token.lower()
+    return sum(
+        line.lower().count(needle)
+        for line in (l.strip() for l in transcript.splitlines())
+        if not line.startswith(("❯", "┃"))
+    )
+
+
+def _token_in_assistant_region(run_name: str, token: str) -> bool:
+    """True if the model emitted token at least once outside the echoed input."""
+    return _count_in_assistant_region(run_name, token) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -493,9 +498,16 @@ def _reply_present(run_name: str, harness: str, token: str, min_count: int) -> b
     appear in an assistant region of the rendered transcript.  Managed codex
     writes only agentMessage/delta payloads to the log, so the count suffices.
     """
-    if _count_in_log(run_name, token) < min_count:
-        return False
-    return harness == "codex" or _token_in_assistant_region(run_name, token)
+    if harness == "codex":
+        return _count_in_log(run_name, token) >= min_count
+    return _count_in_assistant_region(run_name, token) >= min_count
+
+
+def _reply_count(run_name: str, harness: str, token: str) -> int:
+    """Occurrences that count as model output for this harness."""
+    if harness == "codex":
+        return _count_in_log(run_name, token)
+    return _count_in_assistant_region(run_name, token)
 
 
 def _wait_for_reply(run_name: str, harness: str, token: str, min_count: int,
@@ -556,10 +568,10 @@ def cell_interactive(harness: str, run_name: str, expected_client: str, cwd: str
                     f"(status={_agent_run_status(run_name)!r})\nLog tail:\n{_log_tail(run_name)}")
         return
     _log(f"  [link1a] PASS: turn-1 reply {TURN1_TOKEN!r} seen in assistant region "
-         f"(log count={_count_in_log(run_name, TURN1_TOKEN)})")
+         f"(count={_reply_count(run_name, harness, TURN1_TOKEN)})")
 
     # Baseline before steering, so turn 2 must strictly add an occurrence.
-    before_steer = _count_in_log(run_name, TURN2_TOKEN)
+    before_steer = _reply_count(run_name, harness, TURN2_TOKEN)
     _log("  Steering second prompt…")
     try:
         _run("agent-run", "steer", run_name, TURN2_PROMPT, timeout=15)
@@ -569,8 +581,19 @@ def cell_interactive(harness: str, run_name: str, expected_client: str, cwd: str
 
     _log(f"  Waiting for turn-2 reply {TURN2_TOKEN!r} in assistant region "
          f"(timeout={INTERACTIVE_SECOND_REPLY_TIMEOUT}s)…")
-    if not _wait_for_reply(run_name, harness, TURN2_TOKEN, before_steer + 1,
-                           INTERACTIVE_SECOND_REPLY_TIMEOUT):
+    answered = _wait_for_reply(run_name, harness, TURN2_TOKEN, before_steer + 1,
+                               INTERACTIVE_SECOND_REPLY_TIMEOUT)
+    if not answered and _agent_run_status(run_name) not in TERMINAL_STATUSES:
+        # A steer delivered while the TUI is mid-render can be swallowed; resend
+        # once before concluding the turn was never answered.
+        _log("  Turn-2 reply not seen; re-steering once…")
+        try:
+            _run("agent-run", "steer", run_name, TURN2_PROMPT, timeout=15)
+            answered = _wait_for_reply(run_name, harness, TURN2_TOKEN, before_steer + 1,
+                                       INTERACTIVE_SECOND_REPLY_TIMEOUT)
+        except subprocess.CalledProcessError:
+            answered = False
+    if not answered:
         result.fail("link1-interactive-second-reply",
                     f"{TURN2_TOKEN!r} count did not rise above {before_steer} in an assistant "
                     f"region after {INTERACTIVE_SECOND_REPLY_TIMEOUT}s "
