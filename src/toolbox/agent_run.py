@@ -1624,11 +1624,35 @@ def _mark_terminal(state_dir: Path, status: str, reason: str) -> None:
     directly) must not have that timestamp overwritten by a later
     reconciliation pass — doing so would reset the reap min-age clock and
     reopen the same-pass double-action hole this fix closes (see H1).
+
+    Also mirrors the terminal facts to run.json in the persistent log dir so
+    the reboot-durable record reflects abnormal exits, not just clean ones
+    from _finalize. Failure to write run.json never affects the run.
     """
     _write(state_dir / "status", status + "\n")
-    if not (state_dir / "ended_at").exists():
-        _write(state_dir / "ended_at", _now_iso() + "\n")
+    ended_at_path = state_dir / "ended_at"
+    if not ended_at_path.exists():
+        ended_at = _now_iso()
+        _write(ended_at_path, ended_at + "\n")
+    else:
+        try:
+            ended_at = ended_at_path.read_text().strip()
+        except OSError:
+            ended_at = _now_iso()
     _write(state_dir / "reap_reason", reason + "\n")
+    # Mirror to run.json; exit_code is read from the state dir if present so the
+    # same record used by _finalize is reflected here when available.
+    try:
+        exit_code_raw = (state_dir / "exit_code").read_text().strip()
+        exit_code: Optional[int] = int(exit_code_raw)
+    except (OSError, ValueError):
+        exit_code = None
+    log_dir = LOG_ROOT / state_dir.name
+    if log_dir.is_dir():
+        run_json_data: dict = {"status": status, "ended_at": ended_at}
+        if exit_code is not None:
+            run_json_data["exit_code"] = exit_code
+        _write_run_json(log_dir, run_json_data)
 
 
 def _newest_mtime(d: Path) -> Optional[float]:
@@ -4622,9 +4646,18 @@ def _force_kill(name: str, state_dir: Path, pid: int, expected_identity: str) ->
         survivors = [p for p in survivors if _pid_alive(p)]
 
     if not _run_is_terminal(state_dir):
+        ended_at = _now_iso()
         _write(state_dir / "exit_code", f"{128 + signal.SIGKILL}\n")
-        _write(state_dir / "ended_at", _now_iso() + "\n")
+        _write(state_dir / "ended_at", ended_at + "\n")
         _write(state_dir / "status", "failed\n")
+        # Mirror to run.json: a SIGKILL'd runner never runs _finalize.
+        log_dir = LOG_ROOT / state_dir.name
+        if log_dir.is_dir():
+            _write_run_json(log_dir, {
+                "ended_at": ended_at,
+                "exit_code": 128 + signal.SIGKILL,
+                "status": "failed",
+            })
 
     if survivors:
         print(
@@ -5009,6 +5042,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             )
             argv = ["codex", "app-server"]
         else:
+            managed_permissions: str = getattr(args, "permissions", _PERMISSIONS_BYPASS)
             argv = _build_managed_argv(
                 harness,
                 interactive=args.interactive,
@@ -5021,6 +5055,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                 session_id=managed_session_id,
                 harness_args=managed_harness_args,
                 opencode_port=opencode_port,
+                permissions=managed_permissions,
             )
 
     _write(d / "command", _pretty_command(argv) + "\n")
@@ -6895,6 +6930,12 @@ def _run_managed_interactive_codex_appserver(
     return exit_code
 
 
+# Valid values for the --permissions managed-mode flag.
+_PERMISSIONS_BYPASS = "bypass"
+_PERMISSIONS_PROMPT = "prompt"
+_VALID_PERMISSIONS: frozenset[str] = frozenset({_PERMISSIONS_BYPASS, _PERMISSIONS_PROMPT})
+
+
 def _build_managed_argv(
     harness: str,
     *,
@@ -6906,6 +6947,7 @@ def _build_managed_argv(
     session_id: Optional[str],
     harness_args: List[str],
     opencode_port: Optional[int] = None,
+    permissions: str = _PERMISSIONS_BYPASS,
 ) -> List[str]:
     """Build the argv for the given harness and mode. Returns [] for codex.
 
@@ -6916,6 +6958,11 @@ def _build_managed_argv(
 
     Codex is not built here — both its modes drive `codex app-server` over
     JSON-RPC rather than exec'ing an argv.
+
+    permissions controls whether unattended-operation flags are added:
+    "bypass" (default) appends --permission-mode bypassPermissions for claude
+    and --auto for interactive opencode; "prompt" omits them so the harness's
+    own permission UI is used.
     """
     argv: List[str] = []
 
@@ -6925,14 +6972,20 @@ def _build_managed_argv(
             argv.extend(["--model", model])
         if session_id:
             argv.extend(["--session-id", session_id])
-        # bypassPermissions is what makes unattended operation possible; callers
-        # can override it with --harness-arg --permission-mode <mode>.
-        if not interactive:
-            argv.extend(["--print", "--permission-mode", "bypassPermissions"])
-            if prompt and not prompt_file:
-                argv.append(prompt)
+        # bypassPermissions makes unattended operation possible. Omitted when
+        # --permissions prompt so the harness's own permission UI is used instead.
+        if permissions == _PERMISSIONS_BYPASS:
+            if not interactive:
+                argv.extend(["--print", "--permission-mode", "bypassPermissions"])
+                if prompt and not prompt_file:
+                    argv.append(prompt)
+            else:
+                argv.extend(["--permission-mode", "bypassPermissions"])
         else:
-            argv.extend(["--permission-mode", "bypassPermissions"])
+            if not interactive:
+                argv.append("--print")
+                if prompt and not prompt_file:
+                    argv.append(prompt)
         argv.extend(harness_args)
 
     elif harness == "opencode":
@@ -6949,14 +7002,16 @@ def _build_managed_argv(
                 argv.append(prompt)
         else:
             # Bare TUI attached to the pre-minted session. --port keeps the HTTP
-            # API reachable, --auto approves permissions unattended.
+            # API reachable. --auto approves permissions unattended; omitted when
+            # --permissions prompt so the harness's own permission UI is used.
             # NEVER add --prompt here: --session silently swallows it, which is
             # how 24 runs were lost.
             if opencode_port is not None:
                 argv.extend(["--port", str(opencode_port)])
             if session_id:
                 argv.extend(["--session", session_id])
-            argv.append("--auto")
+            if permissions == _PERMISSIONS_BYPASS:
+                argv.append("--auto")
         argv.extend(harness_args)
 
     return argv
@@ -7340,6 +7395,9 @@ class _LaunchArgv(NamedTuple):
     agent_mode: Optional[str] = None
     session_id: Optional[str] = None
     harness_args: Tuple[str, ...] = ()
+    # "bypass" (default) appends --permission-mode bypassPermissions / --auto.
+    # "prompt" omits those flags so the harness's own permission UI is used.
+    permissions: str = _PERMISSIONS_BYPASS
 
 
 _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
@@ -7351,6 +7409,7 @@ _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
 # "--flag=value"; --harness-arg accumulates, the rest keep the last value.
 _MANAGED_VALUE_FLAGS: Tuple[str, ...] = (
     "--harness", "--prompt", "--model", "--agent-mode", "--session-id", "--harness-arg",
+    "--permissions",
 )
 
 
@@ -7395,6 +7454,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     agent_mode: Optional[str] = None
     session_id: Optional[str] = None
     harness_args: List[str] = []
+    permissions: str = _PERMISSIONS_BYPASS
 
     # Consume flags in any order before the name.
     while tokens:
@@ -7476,6 +7536,13 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                 session_id = value
             elif managed_flag == "--harness-arg":
                 harness_args = harness_args + [value]
+            elif managed_flag == "--permissions":
+                if value not in _VALID_PERMISSIONS:
+                    raise _LaunchArgvError(
+                        f"agent-run: --permissions {value!r} is not valid; "
+                        f"choose one of: {', '.join(sorted(_VALID_PERMISSIONS))}"
+                    )
+                permissions = value
             continue
         # --cwd is parsed only to reject it: accepting and ignoring it would
         # silently run in the wrong directory.
@@ -7490,9 +7557,10 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     if harness is None and (
         prompt is not None or model is not None or agent_mode is not None
         or session_id is not None or bool(harness_args)
+        or permissions != _PERMISSIONS_BYPASS
     ):
         raise _LaunchArgvError(
-            "agent-run: --prompt/--model/--agent-mode/--session-id/--harness-arg "
+            "agent-run: --prompt/--model/--agent-mode/--session-id/--harness-arg/--permissions "
             "require --harness <claude|opencode|codex>"
         )
 
@@ -7510,7 +7578,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         interactive or prompt_file or echo or submit_mode is not None
         or idle_timeout is not None or harness is not None or prompt is not None
         or model is not None or agent_mode is not None or session_id is not None
-        or bool(harness_args)
+        or bool(harness_args) or permissions != _PERMISSIONS_BYPASS
     )
     if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
         return _LaunchArgv(
@@ -7600,6 +7668,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             agent_mode=agent_mode,
             session_id=session_id,
             harness_args=tuple(harness_args),
+            permissions=permissions,
         )
 
     # Raw mode.
@@ -7691,6 +7760,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         agent_mode=parsed.agent_mode,
         session_id=parsed.session_id,
         harness_args=list(parsed.harness_args),
+        permissions=parsed.permissions,
     )
     return cmd_launch(ns)
 

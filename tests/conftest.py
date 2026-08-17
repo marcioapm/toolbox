@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import signal
+import time
 from pathlib import Path
 
 import pytest
@@ -32,11 +34,16 @@ def print_log_bytes(fixtures_dir: Path) -> bytes:
 
 
 @pytest.fixture
-def isolated_runs_root(tmp_path, monkeypatch) -> Path:
+def isolated_runs_root(request, tmp_path, monkeypatch) -> Path:
     """Point agent-run's state/log roots at fresh temp dirs so tests don't
     collide with real /tmp/agent-runs/ or /var/tmp/agent-runs/. Reaches into
     both the env vars (which the CLI reads at import time) and the
-    module-level constants."""
+    module-level constants.
+
+    Registers a finalizer that kills every harness process still alive in the
+    state root after the test ends — both pass and fail paths — so an
+    interrupted or slow test cannot leave orphaned processes behind.
+    """
     state = tmp_path / "agent-runs-state"
     logs = tmp_path / "agent-runs-log"
     state.mkdir()
@@ -47,6 +54,51 @@ def isolated_runs_root(tmp_path, monkeypatch) -> Path:
     from toolbox import agent_run
     monkeypatch.setattr(agent_run, "STATE_ROOT", state)
     monkeypatch.setattr(agent_run, "LOG_ROOT", logs)
+
+    own_pid = os.getpid()
+
+    def _reap_all() -> None:
+        """Kill every harness runner pid still recorded in the state root.
+
+        Only targets runs whose status is non-terminal (running or starting) —
+        tests that use the pid file for other purposes (e.g. steer tests that
+        write the test process's own pid) are not affected. Never signals the
+        current process or pid 0/negatives.
+        """
+        if not state.is_dir():
+            return
+        for run_dir in state.iterdir():
+            if not run_dir.is_dir():
+                continue
+            # Only reap runs still in a non-terminal state.
+            try:
+                run_status = (run_dir / "status").read_text().strip()
+            except OSError:
+                continue
+            if run_status not in {"running", "starting"}:
+                continue
+            pid_file = run_dir / "pid"
+            if not pid_file.exists():
+                continue
+            try:
+                pid = int(pid_file.read_text().strip())
+            except (ValueError, OSError):
+                continue
+            # Safety guard: never signal the test runner itself.
+            if pid <= 0 or pid == own_pid:
+                continue
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    break
+                except OSError:
+                    break
+                # Brief wait for SIGTERM to take effect before escalating.
+                if sig == signal.SIGTERM:
+                    time.sleep(0.3)
+
+    request.addfinalizer(_reap_all)
     return state
 
 

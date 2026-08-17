@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 import time
 from pathlib import Path
@@ -639,6 +640,27 @@ class TestClaudeSessionIdGeneration:
 # Managed mode launch integration (subprocess runs with real commands)
 # ---------------------------------------------------------------------------
 
+def _kill_run_pid(state_dir: Path) -> None:
+    """Send SIGTERM then SIGKILL to the runner pid recorded in state_dir.
+
+    Silently does nothing if the pid file is absent or the process is already
+    gone — so callers can invoke this unconditionally on both pass and fail.
+    """
+    try:
+        pid = int((state_dir / "pid").read_text().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return
+    if pid <= 0:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        if sig == signal.SIGTERM:
+            time.sleep(0.3)
+
+
 def _launch_and_wait(
     state_root: Path,
     log_root: Path,
@@ -653,7 +675,8 @@ def _launch_and_wait(
 ) -> tuple[str, Optional[dict]]:
     """Launch a managed run using a fake harness command and wait for terminal status.
 
-    Returns (final_status, session_json_data).
+    Returns (final_status, session_json_data). Kills the runner on timeout so
+    a slow fake harness cannot leave an orphaned process after the test ends.
     """
     ns = argparse.Namespace(
         name=name,
@@ -670,6 +693,7 @@ def _launch_and_wait(
         agent_mode=None,
         session_id=None,
         harness_args=[],
+        permissions="bypass",
     )
     rc = agent_run.cmd_launch(ns)
     assert rc == 0
@@ -686,6 +710,11 @@ def _launch_and_wait(
         if status in agent_run.TERMINAL_STATUSES:
             break
         time.sleep(0.05)
+
+    if status not in agent_run.TERMINAL_STATUSES:
+        # Timed out: kill whatever we started so the process does not outlive
+        # the test, then let the caller's assertion fail with the last status.
+        _kill_run_pid(state_dir)
 
     session_data = agent_run._read_session_json(log_dir)
     return status, session_data
@@ -1123,7 +1152,9 @@ class TestManagedCodexInteractiveAppServer:
         return str(fake_dir)
 
     def _wait_for_running(self, state_dir: Path, timeout: float = 10.0) -> bool:
-        """Wait until the run's status file shows 'running'. Returns True if reached."""
+        """Wait until the run's status file shows 'running'. Returns True if reached.
+        Kills the runner on timeout so a wedged fake binary cannot outlive the test.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -1135,10 +1166,13 @@ class TestManagedCodexInteractiveAppServer:
             except FileNotFoundError:
                 pass
             time.sleep(0.05)
+        _kill_run_pid(state_dir)
         return False
 
     def _wait_for_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
-        """Wait for terminal status. Returns final status string."""
+        """Wait for terminal status. Returns final status string.
+        Kills the runner on timeout so a wedged fake binary cannot outlive the test.
+        """
         deadline = time.monotonic() + timeout
         status = "starting"
         while time.monotonic() < deadline:
@@ -1149,6 +1183,8 @@ class TestManagedCodexInteractiveAppServer:
             if status in agent_run.TERMINAL_STATUSES:
                 break
             time.sleep(0.05)
+        if status not in agent_run.TERMINAL_STATUSES:
+            _kill_run_pid(state_dir)
         return status
 
     def test_interactive_codex_minted_session_json(
@@ -1325,6 +1361,101 @@ class TestManagedOpencodeOneshotSession:
         # With a fake binary that doesn't serve HTTP, the mint fails → missing.
         # A real opencode would produce certain.
         assert session["confidence"] == "missing"
+
+
+# ---------------------------------------------------------------------------
+# Opencode session-directory identity check — guards against port-race attack
+# ---------------------------------------------------------------------------
+
+class TestOpencodeSessionIdentityCheck:
+    """The session-directory identity check in _opencode_mint_session is the
+    fix for a critical vulnerability: a foreign opencode server that wins the
+    port race would otherwise get its session id recorded as certain.
+
+    These tests verify that a responder returning a session whose directory
+    does not match the launch cwd produces None (confidence=missing), never
+    a session id. Deleting the identity check causes this class to fail.
+    """
+
+    def _start_session_server(self, tmp_path: Path, session_directory: str) -> tuple[int, object]:
+        """Spin up a minimal HTTP server that responds to POST /session.
+
+        Returns (port, server) where server.shutdown() stops it. The server
+        runs in a background daemon thread so the test can call
+        _opencode_mint_session without blocking.
+        """
+        import http.server
+        import threading
+
+        response_body = json.dumps({
+            "id": "ses_foreign_0001",
+            "directory": session_directory,
+        }).encode()
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+
+            def log_message(self, *args):
+                pass  # suppress access log noise
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return port, server
+
+    def test_foreign_directory_yields_none(self, tmp_path):
+        """A responder whose session directory does not match the launch cwd must
+        yield None, never a session id (confidence must be missing, not certain).
+
+        This guards against a foreign opencode process that wins the port race:
+        without this check it would be recorded as certain. Deleting the identity
+        check (the ``if os.path.realpath(session_dir) != os.path.realpath(expected_cwd)``
+        branch in _opencode_mint_session) causes this test to fail.
+        """
+        expected_cwd = str(tmp_path / "my-launch-dir")
+        foreign_dir = str(tmp_path / "foreign-server-dir")
+        assert os.path.realpath(expected_cwd) != os.path.realpath(foreign_dir)
+
+        acquire_log = tmp_path / "acquire.log"
+        port, server = self._start_session_server(tmp_path, foreign_dir)
+        try:
+            result = agent_run._opencode_mint_session(
+                port, "test-run", expected_cwd, acquire_log
+            )
+        finally:
+            server.shutdown()
+
+        assert result is None, (
+            f"_opencode_mint_session returned {result!r} for a server whose "
+            "directory does not match the launch cwd — the identity check is "
+            "missing or broken. confidence must be missing, never certain."
+        )
+
+    def test_matching_directory_yields_session_id(self, tmp_path):
+        """When the server's session directory equals the expected cwd,
+        _opencode_mint_session must return the session id (not None).
+        Verifies the identity check does not over-reject legitimate responses.
+        """
+        expected_cwd = str(tmp_path)
+        acquire_log = tmp_path / "acquire.log"
+        port, server = self._start_session_server(tmp_path, expected_cwd)
+        try:
+            result = agent_run._opencode_mint_session(
+                port, "test-run", expected_cwd, acquire_log
+            )
+        finally:
+            server.shutdown()
+
+        assert result == "ses_foreign_0001", (
+            f"Expected session id from a matching-directory server, got {result!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1553,6 +1684,7 @@ class TestEndToEndThroughMain:
         return str(fake_dir)
 
     def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
+        """Wait for terminal status. Kills the runner on timeout."""
         deadline = time.monotonic() + timeout
         status = "starting"
         while time.monotonic() < deadline:
@@ -1563,6 +1695,8 @@ class TestEndToEndThroughMain:
             if status in agent_run.TERMINAL_STATUSES:
                 break
             time.sleep(0.05)
+        if status not in agent_run.TERMINAL_STATUSES:
+            _kill_run_pid(state_dir)
         return status
 
     def test_main_claude_oneshot_produces_session_json(
@@ -1715,6 +1849,9 @@ class TestAppServerTeardown:
             return []
 
     def _wait_for_status(self, state_dir: Path, target: str, timeout: float = 10.0) -> bool:
+        """Wait for a specific status, returning True if reached within timeout.
+        Kills the runner on timeout so a wedged process cannot outlive the test.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -1726,6 +1863,7 @@ class TestAppServerTeardown:
             except FileNotFoundError:
                 pass
             time.sleep(0.05)
+        _kill_run_pid(state_dir)
         return False
 
     def test_appserver_killed_on_sigterm_to_runner(
@@ -1927,6 +2065,7 @@ class TestCodexRpcEdgeCases:
         return str(fake_dir)
 
     def _wait_running(self, state_dir: Path, timeout: float = 10.0) -> bool:
+        """Wait for running status. Kills the runner on timeout."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -1938,9 +2077,11 @@ class TestCodexRpcEdgeCases:
             except FileNotFoundError:
                 pass
             time.sleep(0.05)
+        _kill_run_pid(state_dir)
         return False
 
     def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
+        """Wait for terminal status. Kills the runner on timeout."""
         deadline = time.monotonic() + timeout
         status = "starting"
         while time.monotonic() < deadline:
@@ -1951,6 +2092,8 @@ class TestCodexRpcEdgeCases:
             if status in agent_run.TERMINAL_STATUSES:
                 break
             time.sleep(0.05)
+        if status not in agent_run.TERMINAL_STATUSES:
+            _kill_run_pid(state_dir)
         return status
 
     def test_result_null_frame_does_not_crash_interactive_runner(
