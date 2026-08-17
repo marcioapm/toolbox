@@ -388,23 +388,55 @@ def _verify_codex_disk(session_id: str) -> tuple[bool, str]:
     return False, f"no rollout file matching rollout-*-{session_id}.jsonl under {sessions_root}"
 
 
-def _find_codex_child_rollout(root_id: str) -> tuple[Optional[str], str]:
-    """Find a Codex child rollout whose recorded parent is ``root_id``, read-only."""
+def _find_codex_child_rollout(root_id: str) -> "tuple[Optional[str], str, Optional[str]]":
+    """Find a Codex child rollout whose recorded parent is ``root_id``, read-only.
+
+    Returns (child_id, detail_string, rollout_path).  ``child_id`` and
+    ``rollout_path`` are None when no match is found.
+    """
     sessions_root = Path.home() / ".codex" / "sessions"
     if not sessions_root.is_dir():
-        return None, "~/.codex/sessions not found"
+        return None, "~/.codex/sessions not found", None
     for path in sessions_root.rglob("rollout-*.jsonl"):
         try:
             first_event = json.loads(path.open(errors="replace").readline())
         except (OSError, json.JSONDecodeError):
             continue
-        payload = first_event.get("payload") if isinstance(first_event, dict) else None
+        if not isinstance(first_event, dict) or first_event.get("type") != "session_meta":
+            continue
+        payload = first_event.get("payload")
         if not isinstance(payload, dict) or payload.get("parent_thread_id") != root_id:
             continue
         child_id = payload.get("id")
-        if child_id:
-            return child_id, f"{path}: parent_thread_id={root_id!r}"
-    return None, f"no child rollout with parent_thread_id={root_id!r} under {sessions_root}"
+        # Guard against a rollout that records itself as its own parent.
+        if child_id and child_id != root_id:
+            return child_id, f"{path}: parent_thread_id={root_id!r}", str(path)
+    return None, f"no child rollout with parent_thread_id={root_id!r} under {sessions_root}", None
+
+
+def _codex_child_last_message(child_rollout_path: str) -> Optional[str]:
+    """Return the child rollout's final agent message, or None if not found.
+
+    The child's ``task_complete`` event carries ``last_agent_message``, which
+    is the verbatim text the child model produced as its final answer.  This
+    is the only signal that proves the child itself — not the root's narration
+    — produced the expected token.
+    """
+    try:
+        with open(child_rollout_path, errors="replace") as f:
+            for raw in f:
+                try:
+                    ev = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(ev, dict) or ev.get("type") != "event_msg":
+                    continue
+                payload = ev.get("payload")
+                if isinstance(payload, dict) and payload.get("type") == "task_complete":
+                    return payload.get("last_agent_message")
+    except OSError:
+        pass
+    return None
 
 
 def _verify_disk(harness: str, session_id: str, cwd: str) -> tuple[bool, str]:
@@ -652,18 +684,36 @@ def cell_subagent(harness: str, run_name: str, expected_client: str, cwd: str,
     root_id, links = chain
 
     if harness == "codex":
-        child_id, child_rollout = _find_codex_child_rollout(root_id)
-        if child_id is None:
+        rollout_child_id, child_rollout, child_rollout_path = _find_codex_child_rollout(root_id)
+        if rollout_child_id is None:
             result.fail("link3-child-rollout", child_rollout)
             return
         _log(f"  [link3-child] PASS rollout: {child_rollout}")
         links["link3-child"] = child_rollout
 
-    # A child rollout or DB row alone doesn't prove the sub-agent completed.
-    if "subpong" not in _read_log(run_name).lower():
-        result.fail("link5-subagent-reply", "sub-agent never produced 'SUBPONG' in the run log")
-        return
-    _log("  [link5+] PASS sub-agent reply 'SUBPONG' confirmed in log")
+    # For codex, assert on the child rollout's own task_complete message — the
+    # child's verbatim final answer — rather than on the root log.  The root's
+    # narration can mention the token without the child ever having said it.
+    # For claude/opencode no child disk record is available, so the check uses
+    # the root log, which is the strongest signal accessible without a child
+    # disk record; that limitation is acknowledged here and in the docs.
+    if harness == "codex":
+        child_last = _codex_child_last_message(child_rollout_path)
+        if child_last is None or "subpong" not in child_last.lower():
+            result.fail("link5-subagent-reply",
+                        f"child rollout did not produce 'SUBPONG' as its final answer "
+                        f"(child={rollout_child_id!r}, last_agent_message={child_last!r})")
+            return
+        _log(f"  [link5+] PASS sub-agent reply 'SUBPONG' confirmed in child rollout "
+             f"(last_agent_message={child_last!r})")
+    else:
+        # Root log check: the best available signal for harnesses that write no
+        # child disk record.  The root's narration can in principle echo the
+        # token, but the shipped prompt gives the root no reason to do so.
+        if "subpong" not in _read_log(run_name).lower():
+            result.fail("link5-subagent-reply", "sub-agent never produced 'SUBPONG' in the run log")
+            return
+        _log("  [link5+] PASS sub-agent reply 'SUBPONG' confirmed in log")
 
     _log(f"  Polling DB for child row (parent={root_id!r}, timeout={DB_POLL_TIMEOUT}s)…")
     child = _poll_db("parent_client_session_id", root_id)
@@ -671,16 +721,30 @@ def cell_subagent(harness: str, run_name: str, expected_client: str, cwd: str,
         result.fail("link5-db-unreachable", f"DB transport error: {child.detail}")
         return
     if child is None:
-        result.fail("link5-parent-linkage",
-                    f"no child client_sessions row with parent_client_session_id={root_id!r} "
-                    f"after {DB_POLL_TIMEOUT}s — sub-agent did not fire, or parent link broken")
+        if harness == "codex" and "link3-child" in links:
+            # The child rollout exists and the sub-agent replied, so the proxy
+            # is the only remaining hop that could have dropped the link.
+            result.fail("link5-parent-linkage",
+                        f"child rollout {rollout_child_id!r} exists with "
+                        f"parent_thread_id={root_id!r}, but no client_sessions row has "
+                        f"parent_client_session_id={root_id!r} after {DB_POLL_TIMEOUT}s "
+                        f"— the proxy is not ingesting x-codex-parent-thread-id")
+        else:
+            result.fail("link5-parent-linkage",
+                        f"no child client_sessions row with parent_client_session_id={root_id!r} "
+                        f"after {DB_POLL_TIMEOUT}s — sub-agent did not fire, or parent link broken")
         return
-    child_id = child.get("client_session_id", "?")
+    db_child_id = child.get("client_session_id", "?")
     parent_id = child.get("parent_client_session_id", "?")
-    _log(f"  [link5] PASS child={child_id!r} parent={parent_id!r} → resolves to root")
+    if harness == "codex" and db_child_id != rollout_child_id:
+        result.fail("link5-parent-linkage",
+                    f"DB child {db_child_id!r} does not match the child Codex spawned "
+                    f"({rollout_child_id!r}) — a different child session was linked")
+        return
+    _log(f"  [link5] PASS child={db_child_id!r} parent={parent_id!r} → resolves to root")
 
     result.pass_(root_id, {"link1": "done", **links,
-                           "link5": f"child={child_id!r} parent={parent_id!r}"})
+                           "link5": f"child={db_child_id!r} parent={parent_id!r}"})
 
 
 # Cell name → (harness, mode, expected client value in client_sessions)
