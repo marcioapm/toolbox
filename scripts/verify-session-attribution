@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""verify-session-attribution — end-to-end test for the four-link attribution chain.
+"""verify-session-attribution — end-to-end test for the session attribution chain.
 
 Each cell exercises one (harness, mode) pair and asserts:
   [1] run reached status=done (one-shot) or answered two turns (interactive)
@@ -11,15 +11,15 @@ Each cell exercises one (harness, mode) pair and asserts:
   [4] client_sessions row exists in llmproxy postgres with expected client value
   [5] (sub-agent cells only) child row's parent_client_session_id resolves to root
 
-DB path: ssh <VIBES_HOST> → ssh <LLMPROXY_HOST> → sudo docker exec <postgres_container_id> psql
+DB path: ssh <VIBES_HOST> → ssh <LLMPROXY_HOST> → sudo docker exec <postgres> psql
 
 Approximate cost per full run: ~$0.02–0.05 (haiku/mini models, trivial prompts).
 """
 
 from __future__ import annotations
 
-import atexit
 import argparse
+import atexit
 import csv
 import io
 import json
@@ -31,114 +31,83 @@ import signal
 import sqlite3
 import subprocess
 import sys
-import time
 import textwrap
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Config / environment
+# Config
 # ---------------------------------------------------------------------------
 
-VIBES_HOST  = os.environ.get("VIBES_HOST",    "vibes")
-LLMPROXY_HOST = os.environ.get("LLMPROXY_HOST", "llmproxy")
+VIBES_HOST    = os.environ.get("VIBES_HOST",     "vibes")
+LLMPROXY_HOST = os.environ.get("LLMPROXY_HOST",  "llmproxy")
 POSTGRES_USER = os.environ.get("POSTGRES_USER",  "llmproxy")
 POSTGRES_DB   = os.environ.get("POSTGRES_DB",    "llmproxy")
 
-# ---------------------------------------------------------------------------
-# Ensure OPENAI_API_KEY is in the environment for codex.
-# Codex requires it; if absent, it fails before any network request.
-# Read from ~/.codex/auth.json (standard codex credential store) if not set.
-# ---------------------------------------------------------------------------
-
-def _ensure_openai_key() -> None:
-    """Set OPENAI_API_KEY from ~/.codex/auth.json if not already in the env."""
-    if os.environ.get("OPENAI_API_KEY"):
-        return
-    auth_path = Path.home() / ".codex" / "auth.json"
-    try:
-        data = json.loads(auth_path.read_text())
-        key = data.get("OPENAI_API_KEY", "")
-        if key:
-            os.environ["OPENAI_API_KEY"] = key
-    except (OSError, json.JSONDecodeError):
-        pass  # codex cell will fail with a clear error if the key is missing
-
-
-_ensure_openai_key()
-
-# How long to poll for the DB row after the agent finishes (seconds).
-DB_POLL_TIMEOUT = float(os.environ.get("DB_POLL_TIMEOUT", "15"))
+DB_POLL_TIMEOUT  = float(os.environ.get("DB_POLL_TIMEOUT", "15"))
 DB_POLL_INTERVAL = 0.5
-
-# How long to wait for a run to reach done/failed (seconds).
-RUN_TIMEOUT = float(os.environ.get("RUN_TIMEOUT", "120"))
-# How long to wait between polls of agent-run status.
+RUN_TIMEOUT      = float(os.environ.get("RUN_TIMEOUT", "120"))
 STATUS_POLL_INTERVAL = 1.0
-
-# After launching interactive and sending first prompt, how long to wait for
-# the first reply before steering the second prompt (seconds).
-INTERACTIVE_FIRST_REPLY_TIMEOUT = float(os.environ.get("INTERACTIVE_FIRST_REPLY_TIMEOUT", "90"))
+INTERACTIVE_FIRST_REPLY_TIMEOUT  = float(os.environ.get("INTERACTIVE_FIRST_REPLY_TIMEOUT", "90"))
 INTERACTIVE_SECOND_REPLY_TIMEOUT = float(os.environ.get("INTERACTIVE_SECOND_REPLY_TIMEOUT", "90"))
 
-# agent-run state and log roots.
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
 LOG_ROOT   = Path(os.environ.get("AGENT_RUN_LOG_DIR",   "/var/tmp/agent-runs"))
 
-# Cheap models to keep cost down.
-# Claude: just the model name (agent-run constructs --model <model>).
-CLAUDE_MODEL  = os.environ.get("CLAUDE_MODEL",  "claude-haiku-4-5")
-# Opencode: full provider/model string (e.g. llmproxy-anthropic/claude-haiku-4.5).
-# The ~/.config/opencode/opencode.json provider config is used at runtime.
-OPENCODE_MODEL= os.environ.get("OPENCODE_MODEL","llmproxy-anthropic/claude-haiku-4.5")
-# Codex: model name and provider for the --harness-arg config override.
-# gpt-4o-mini is not available; use the same model as the local codex config.
-CODEX_MODEL   = os.environ.get("CODEX_MODEL",   "gpt-5.4")
-CODEX_PROVIDER= os.environ.get("CODEX_PROVIDER","llmproxy")
+# Cheap models, to keep the suite's cost near zero.
+CLAUDE_MODEL   = os.environ.get("CLAUDE_MODEL",   "claude-haiku-4-5")
+OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "llmproxy-anthropic/claude-haiku-4.5")
+CODEX_MODEL    = os.environ.get("CODEX_MODEL",    "gpt-5.4")
+CODEX_PROVIDER = os.environ.get("CODEX_PROVIDER", "llmproxy")
 
-# ---------------------------------------------------------------------------
-# Interactive turn tokens — must be synthesised by the model (absent from
-# prompts) and disjoint from each other so a turn-1 reply cannot satisfy
-# turn-2's check.  "42" = 7*6 and "27" = 3*9 are the expected answers;
-# neither is a substring of the other.
-# Prompts are kept under 25 chars so the steer payload stays below the
-# claude TUI's single-line buffer limit (empirically ~50 bytes).
-# ---------------------------------------------------------------------------
+TERMINAL_STATUSES = {"done", "failed", "launch_failed", "died", "killed"}
+
+# Interactive turn tokens must be *synthesised* by the model: the answer never
+# appears in the prompt, and the two tokens are disjoint so a turn-1 reply
+# cannot satisfy turn-2's check.  Prompts stay short because the claude TUI
+# steer buffer is a single line (empirically ~50 bytes).
 TURN1_PROMPT = "What is 7 times 6?"
 TURN1_TOKEN  = "42"
 TURN2_PROMPT = "What is 3 times 9?"
 TURN2_TOKEN  = "27"
 
-# Sub-agent prompts.
-CLAUDE_SUBAGENT_PROMPT = (
-    "Use the Task tool to spawn a sub-agent with the instruction: "
-    "'Reply with exactly: SUBPONG'. Wait for it to finish."
-)
-OPENCODE_SUBAGENT_PROMPT = (
-    "Spawn an explore sub-agent with the instruction: "
-    "'Reply with exactly: SUBPONG'. Wait for it to finish."
-)
+SUBAGENT_PROMPTS = {
+    "claude": ("Use the Task tool to spawn a sub-agent with the instruction: "
+               "'Reply with exactly: SUBPONG'. Wait for it to finish."),
+    "opencode": ("Spawn an explore sub-agent with the instruction: "
+                 "'Reply with exactly: SUBPONG'. Wait for it to finish."),
+}
 
-# Session-id validation: agent-run mints UUIDs or ses_… strings; a stray
-# quote here would produce a psql syntax error that M1 would report as "no
-# row".  Validate before interpolating.
-_SESSION_ID_RE = re.compile(r'^[A-Za-z0-9_-]+$')
-
-# ---------------------------------------------------------------------------
-# Result tracking
-# ---------------------------------------------------------------------------
+# agent-run mints UUIDs or ses_… strings; validating before interpolation keeps
+# a stray quote from becoming a psql syntax error reported as "no row".
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 PASS = "PASS"
 FAIL = "FAIL"
 SKIP = "SKIP"
 
-# Module-level set of run names launched this invocation so the signal
-# handler can reap them all on interrupt.
+# Every run launched this invocation, so the signal/atexit handlers can reap
+# runs whose cell never got to its own teardown.
 _active_runs: set[str] = set()
-# Stash the --json flag so _log can redirect to stderr when set.
 _json_mode: bool = False
+
+
+def _ensure_openai_key() -> None:
+    """Set OPENAI_API_KEY from ~/.codex/auth.json if not already in the env."""
+    if os.environ.get("OPENAI_API_KEY"):
+        return
+    try:
+        data = json.loads((Path.home() / ".codex" / "auth.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return  # codex cell fails loudly at link1 if the key is really missing
+    if data.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = data["OPENAI_API_KEY"]
+
+
+_ensure_openai_key()
 
 
 @dataclass
@@ -168,185 +137,140 @@ class CellResult:
 
 
 # ---------------------------------------------------------------------------
-# Utilities
+# Process / run-state utilities
 # ---------------------------------------------------------------------------
 
 def _log(msg: str) -> None:
-    # When --json is active, human log goes to stderr so stdout stays pure JSON.
-    if _json_mode:
-        print(msg, flush=True, file=sys.stderr)
-    else:
-        print(msg, flush=True)
+    print(msg, flush=True, file=sys.stderr if _json_mode else sys.stdout)
 
 
-def _run(*cmd: str, check: bool = True, capture: bool = True,
-         timeout: int = 30, input_text: Optional[str] = None,
-         env: Optional[dict] = None) -> subprocess.CompletedProcess:
-    """Run a command, returning CompletedProcess. Raises on non-zero if check=True."""
-    return subprocess.run(
-        list(cmd),
-        capture_output=capture,
-        text=True,
-        timeout=timeout,
-        check=check,
-        input=input_text,
-        env=env,
-    )
+def _run(*cmd: str, check: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
+    """Run a command.
+
+    check=True is load-bearing for the DB path: a non-zero ssh/psql/docker exit
+    must raise so a transport failure can never be mistaken for an empty result.
+    """
+    return subprocess.run(list(cmd), capture_output=True, text=True,
+                          timeout=timeout, check=check)
+
+
+def _agent_run_quiet(*args: str) -> None:
+    """Best-effort `agent-run` subcommand used on teardown paths; never raises."""
+    try:
+        _run("agent-run", *args, timeout=30, check=False)
+    except Exception:
+        pass
 
 
 def _agent_run_status(name: str) -> str:
-    """Return current effective status of an agent-run, or 'unknown'."""
-    state_dir = STATE_ROOT / name
-    status_file = state_dir / "status"
     try:
-        return status_file.read_text().strip()
+        return (STATE_ROOT / name / "status").read_text().strip()
     except OSError:
         return "unknown"
 
 
 def _wait_for_terminal(name: str, timeout: float) -> str:
-    """Poll until status is terminal or timeout. Returns final status."""
-    terminal = {"done", "failed", "launch_failed", "died", "killed"}
+    """Poll until status is terminal or timeout. Returns the final status."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         st = _agent_run_status(name)
-        if st in terminal:
+        if st in TERMINAL_STATUSES:
             return st
         time.sleep(STATUS_POLL_INTERVAL)
     return _agent_run_status(name)
 
 
 def _session_json(run_name: str) -> Optional[dict]:
-    """Read session.json from the persistent log dir, or None."""
-    path = LOG_ROOT / run_name / "session.json"
     try:
-        data = json.loads(path.read_text(errors="replace"))
-        return data if isinstance(data, dict) else None
+        data = json.loads((LOG_ROOT / run_name / "session.json").read_text(errors="replace"))
     except (OSError, json.JSONDecodeError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def _read_log(run_name: str) -> str:
-    """Read the entire run log (L4: scan whole log so tokens can't scroll out)."""
-    path = LOG_ROOT / run_name / "log"
+    """Whole run log — never a tail, so a token cannot scroll out of view."""
     try:
-        return path.read_bytes().decode("utf-8", errors="replace")
+        return (LOG_ROOT / run_name / "log").read_bytes().decode("utf-8", errors="replace")
     except OSError:
         return ""
 
 
-def _read_log_tail(run_name: str, max_bytes: int = 4096) -> str:
-    """Read the last max_bytes from the run log (for diagnostic snippets only)."""
-    path = LOG_ROOT / run_name / "log"
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - max_bytes))
-            return f.read().decode("utf-8", errors="replace")
-    except OSError:
-        return ""
+def _log_tail(run_name: str, max_chars: int = 1000) -> str:
+    return _read_log(run_name)[-max_chars:]
 
 
 def _count_in_log(run_name: str, token: str) -> int:
-    """Count case-insensitive occurrences of token in the full run log."""
-    content = _read_log(run_name).lower()
-    return content.count(token.lower())
+    return _read_log(run_name).lower().count(token.lower())
 
 
-def _clean_transcript(run_name: str) -> str:
-    """Return pyte-rendered transcript via `agent-run clean`, or '' on error."""
-    try:
-        result = _run("agent-run", "clean", run_name, timeout=15, check=False)
-        return result.stdout if result.returncode == 0 else ""
-    except Exception:
-        return ""
+def _token_in_assistant_region(run_name: str, token: str) -> bool:
+    """True if token appears outside the echoed input lines of `agent-run clean`.
 
-
-def _token_in_assistant_region(run_name: str, token: str, harness: str) -> bool:
-    """Check if token appears in an assistant-authored line of the clean transcript.
-
-    Claude TUI prefixes user input with '❯ '; opencode with '┃ '.  Lines
-    that start with these prefixes are echoed prompts, not model output.
-    Codex is unaffected by C1 (it writes only agentMessage/delta to the log)
-    so this function is only called for claude and opencode.
+    The interactive log is a raw PTY capture, so the prompt is echoed into it;
+    only the pyte-rendered transcript lets us tell input from model output.
+    Claude prefixes user input with '❯', opencode with '┃'.
     """
-    transcript = _clean_transcript(run_name)
-    if not transcript:
-        # Fall back to raw log (still better than old code — token must appear
-        # at least once more than the raw prompt contains it, checked by caller).
-        return False
-    tok_lower = token.lower()
-    # Input-line prefixes for each harness.
-    input_prefixes = ("❯", "┃")
+    try:
+        rendered = _run("agent-run", "clean", run_name, timeout=15, check=False)
+        transcript = rendered.stdout if rendered.returncode == 0 else ""
+    except Exception:
+        transcript = ""
     for line in transcript.splitlines():
-        stripped = line.strip()
-        if any(stripped.startswith(p) for p in input_prefixes):
-            continue  # skip echoed prompt lines
-        if tok_lower in stripped.lower():
+        line = line.strip()
+        if line.startswith(("❯", "┃")):
+            continue
+        if token.lower() in line.lower():
             return True
     return False
 
 
-def _reap_run(name: str, keep: bool) -> None:
-    """Kill and remove a run's state and log dirs (unless --keep).
+# ---------------------------------------------------------------------------
+# Cleanup — must survive failure, launch timeout and SIGINT/SIGTERM
+# ---------------------------------------------------------------------------
 
-    Prefers `agent-run reap` over shutil.rmtree so a live runner causes a
-    loud error rather than becoming an invisible orphan (H1).
-    """
+def _reap_run(name: str, keep: bool) -> None:
     _active_runs.discard(name)
     if keep:
         return
-    # Try the supported deletion path first; it refuses to delete live runners.
-    # --min-age-hours must be > 0; use a tiny value so terminal-state runs are
-    # collected immediately regardless of age.
-    try:
-        _run("agent-run", "reap", "--name", name, "--include-logs",
-             "--min-age-hours", "0.0001", "--log-min-age-hours", "0.0001",
-             "--idle-hours", "0.0001", timeout=30, check=False)
-    except Exception:
-        pass
-    # Fallback: rmtree if reap left dirs behind (e.g. reap not aware of log dir).
+    # `agent-run reap` is the supported deletion path and refuses to delete a
+    # live runner, turning a silent orphan into a loud error.  It also declines
+    # runs younger than --min-age-hours, hence the rmtree fallback.
+    _agent_run_quiet("reap", "--name", name, "--include-logs",
+                     "--min-age-hours", "0.0001", "--log-min-age-hours", "0.0001",
+                     "--idle-hours", "0.0001")
     for root in (STATE_ROOT, LOG_ROOT):
-        d = root / name
-        if d.is_dir():
-            shutil.rmtree(d, ignore_errors=True)
+        if (root / name).is_dir():
+            shutil.rmtree(root / name, ignore_errors=True)
 
 
-def _kill_and_reap(name: str, keep: bool) -> None:
-    """SIGTERM → wait → SIGKILL if needed → reap.  Guarantees no orphan (H1)."""
-    try:
-        _run("agent-run", "kill", name, timeout=15, check=False)
-    except Exception:
-        pass
-    st = _wait_for_terminal(name, 10)
-    if st not in {"done", "failed", "launch_failed", "died", "killed", "unknown"}:
-        # Still alive after SIGTERM budget; escalate to SIGKILL.
-        try:
-            _run("agent-run", "kill", name, "KILL", timeout=15, check=False)
-        except Exception:
-            pass
+def _kill_and_reap(name: str, keep: bool = False) -> None:
+    """SIGTERM → wait → SIGKILL if still alive → reap. Never orphans a runner."""
+    if not (STATE_ROOT / name).is_dir():
+        _reap_run(name, keep)  # never launched, or already collected
+        return
+    _agent_run_quiet("kill", name)
+    if _wait_for_terminal(name, 10) not in TERMINAL_STATUSES | {"unknown"}:
+        _agent_run_quiet("kill", name, "KILL")
         _wait_for_terminal(name, 5)
     _reap_run(name, keep)
 
 
-def _cleanup_all(keep: bool = False) -> None:
-    """Kill and reap every run launched this invocation (H2/H3 — signal handler)."""
+def _cleanup_all() -> None:
     for name in list(_active_runs):
         try:
-            _kill_and_reap(name, keep)
+            _kill_and_reap(name)
         except Exception:
             pass
 
 
 def _install_signal_handlers() -> None:
-    """Install SIGINT/SIGTERM handlers and atexit to reap on any exit (H3)."""
     def _handler(signum, frame):
         _log(f"\n[verify] caught signal {signum}, cleaning up…")
         _cleanup_all()
         sys.exit(1)
 
-    signal.signal(signal.SIGINT,  _handler)
+    signal.signal(signal.SIGINT, _handler)
     signal.signal(signal.SIGTERM, _handler)
     atexit.register(_cleanup_all)
 
@@ -355,48 +279,32 @@ def _install_signal_handlers() -> None:
 # DB access (two-hop SSH → psql)
 # ---------------------------------------------------------------------------
 
-# Sentinel returned by helpers to distinguish transport error from empty result.
+@dataclass
 class _DbError:
-    """Represents a DB transport/auth/connection failure, not an empty result."""
-    def __init__(self, detail: str):
-        self.detail = detail
-
-    def __repr__(self):
-        return f"DbError({self.detail!r})"
-
-
-def _parse_psql_csv(raw: str) -> list[dict]:
-    """Parse psql --csv output (with header) into a list of row dicts."""
-    rows = []
-    reader = csv.DictReader(io.StringIO(raw.strip()))
-    for row in reader:
-        rows.append(dict(row))
-    return rows
+    """A transport/auth/query failure — never the same thing as "no rows"."""
+    detail: str
 
 
 def _psql_query_csv(sql: str) -> "list[dict] | _DbError":
-    """Run a psql query over ssh vibes → ssh llmproxy → docker exec psql.
+    """Run a query via ssh vibes → ssh llmproxy → docker exec psql.
 
-    Returns list of row dicts on success, or _DbError on transport/auth failure.
-    The container ID is discovered dynamically so restarts don't break us.
+    The container id is discovered dynamically so restarts don't break us.
     """
     safe_sql = sql.replace("'", "'\"'\"'")
     inner_cmd = (
-        f"sudo docker exec "
-        f"$(sudo docker ps -q -f name=llmproxy_postgres) "
+        f"sudo docker exec $(sudo docker ps -q -f name=llmproxy_postgres) "
         f"psql -U {POSTGRES_USER} -d {POSTGRES_DB} --csv -c '{safe_sql}'"
     )
-    outer_cmd = f"ssh {LLMPROXY_HOST} {shlex.quote(inner_cmd)}"
     try:
-        result = _run("ssh", VIBES_HOST, outer_cmd, timeout=20)
-        return _parse_psql_csv(result.stdout)
+        result = _run("ssh", VIBES_HOST, f"ssh {LLMPROXY_HOST} {shlex.quote(inner_cmd)}", timeout=20)
     except subprocess.SubprocessError as exc:
         _log(f"    [DB] query failed: {exc}")
         return _DbError(str(exc))
+    return list(csv.DictReader(io.StringIO(result.stdout.strip())))
 
 
 def _db_preflight() -> Optional[str]:
-    """Run SELECT 1 to confirm the DB path is live. Returns error string or None."""
+    """Return an error string if the DB path is not usable, else None."""
     rows = _psql_query_csv("SELECT 1 AS ok")
     if isinstance(rows, _DbError):
         return f"DB unreachable: {rows.detail}"
@@ -405,22 +313,17 @@ def _db_preflight() -> Optional[str]:
     return None
 
 
-def _validate_session_id(session_id: str) -> bool:
-    """Validate session_id matches expected character set before SQL interpolation."""
-    return bool(_SESSION_ID_RE.match(session_id))
+def _poll_db(column: str, session_id: str,
+             timeout: float = DB_POLL_TIMEOUT) -> "dict | None | _DbError":
+    """Poll client_sessions for a row where <column> = session_id.
 
-
-def _poll_db_row(session_id: str, expected_client: str,
-                 timeout: float = DB_POLL_TIMEOUT) -> "dict | None | _DbError":
-    """Poll until a client_sessions row for session_id appears, or timeout.
-
-    Returns: dict (row found), None (timeout — no row), or _DbError (transport).
+    Returns dict (row found), None (timeout, no row) or _DbError (transport).
     """
-    if not _validate_session_id(session_id):
+    if not _SESSION_ID_RE.match(session_id):
         return _DbError(f"session_id {session_id!r} contains invalid characters")
     sql = (
         "SELECT client_session_id, client, parent_client_session_id, created_at "
-        f"FROM client_sessions WHERE client_session_id = '{session_id}' LIMIT 1"
+        f"FROM client_sessions WHERE {column} = '{session_id}' LIMIT 1"
     )
     deadline = time.monotonic() + timeout
     last_error: Optional[_DbError] = None
@@ -431,78 +334,37 @@ def _poll_db_row(session_id: str, expected_client: str,
         elif rows:
             return rows[0]
         time.sleep(DB_POLL_INTERVAL)
-    return last_error if last_error else None
-
-
-def _poll_db_child_row(root_session_id: str, timeout: float = DB_POLL_TIMEOUT) -> "dict | None | _DbError":
-    """Poll for any child row whose parent_client_session_id = root_session_id."""
-    if not _validate_session_id(root_session_id):
-        return _DbError(f"session_id {root_session_id!r} contains invalid characters")
-    sql = (
-        "SELECT client_session_id, client, parent_client_session_id, created_at "
-        f"FROM client_sessions WHERE parent_client_session_id = '{root_session_id}' LIMIT 1"
-    )
-    deadline = time.monotonic() + timeout
-    last_error: Optional[_DbError] = None
-    while time.monotonic() < deadline:
-        rows = _psql_query_csv(sql)
-        if isinstance(rows, _DbError):
-            last_error = rows
-        elif rows:
-            return rows[0]
-        time.sleep(DB_POLL_INTERVAL)
-    return last_error if last_error else None
+    return last_error
 
 
 # ---------------------------------------------------------------------------
-# Harness-specific link-3 verification (disk record)
+# Link 3 — the harness's own on-disk record (read-only)
 # ---------------------------------------------------------------------------
 
 def _verify_claude_disk(session_id: str, cwd: str) -> tuple[bool, str]:
-    """Verify session_id appears as a .jsonl in ~/.claude/projects/<mangled-cwd>/."""
-    # Claude mangles the cwd by replacing / with - (all path separators).
-    mangled = cwd.replace("/", "-")
-    claude_dir = Path.home() / ".claude" / "projects" / mangled
-    transcript = claude_dir / f"{session_id}.jsonl"
-    if transcript.exists():
-        return True, str(transcript)
-    # Also search without a specific cwd — scan all project dirs.
-    projects_root = Path.home() / ".claude" / "projects"
-    if projects_root.is_dir():
-        for proj_dir in projects_root.iterdir():
-            t = proj_dir / f"{session_id}.jsonl"
-            if t.exists():
-                return True, str(t)
-    return False, f"no transcript at {transcript} (scanned all project dirs)"
+    projects = Path.home() / ".claude" / "projects"
+    expected = projects / cwd.replace("/", "-") / f"{session_id}.jsonl"
+    if expected.exists():
+        return True, str(expected)
+    for found in projects.glob(f"*/{session_id}.jsonl"):
+        return True, str(found)
+    return False, f"no transcript at {expected} (scanned all project dirs)"
 
 
 def _verify_opencode_disk(session_id: str) -> tuple[bool, str]:
-    """Verify session_id appears in the opencode.db sessions table with messages."""
     db_path = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
     if not db_path.exists():
         return False, f"opencode.db not found at {db_path}"
     try:
-        # Open read-only via URI so we don't perturb the live WAL.
-        uri = f"file:{db_path}?mode=ro"
-        con = sqlite3.connect(uri, uri=True, timeout=5)
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)  # never perturb the live WAL
         try:
-            # Check session row exists.
-            cur = con.execute(
-                "SELECT id FROM session WHERE id = ? LIMIT 1", (session_id,)
-            )
-            row = cur.fetchone()
-            if not row:
+            if not con.execute("SELECT id FROM session WHERE id = ? LIMIT 1", (session_id,)).fetchone():
                 return False, f"no session row for id={session_id!r} in opencode.db"
-            # Check it has messages (a decoy empty session must fail).
-            cur2 = con.execute(
-                "SELECT COUNT(*) FROM message WHERE session_id = ?", (session_id,)
-            )
-            count = cur2.fetchone()[0]
+            count = con.execute("SELECT COUNT(*) FROM message WHERE session_id = ?",
+                                (session_id,)).fetchone()[0]
             if count == 0:
-                return False, (
-                    f"session {session_id!r} exists in opencode.db but has 0 messages "
-                    "(decoy empty session — FAIL)"
-                )
+                return False, (f"session {session_id!r} exists in opencode.db but has 0 messages "
+                               "(decoy empty session — FAIL)")
             return True, f"opencode.db: session has {count} message(s)"
         finally:
             con.close()
@@ -511,551 +373,274 @@ def _verify_opencode_disk(session_id: str) -> tuple[bool, str]:
 
 
 def _verify_codex_disk(session_id: str) -> tuple[bool, str]:
-    """Verify session_id appears in ~/.codex/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl."""
     sessions_root = Path.home() / ".codex" / "sessions"
     if not sessions_root.is_dir():
-        return False, f"~/.codex/sessions not found"
-    # Search recursively for rollout file containing the id.
-    pattern = f"rollout-*-{session_id}.jsonl"
-    for year_dir in sorted(sessions_root.iterdir(), reverse=True):
-        if not year_dir.is_dir():
-            continue
-        for month_dir in sorted(year_dir.iterdir(), reverse=True):
-            if not month_dir.is_dir():
-                continue
-            for day_dir in sorted(month_dir.iterdir(), reverse=True):
-                if not day_dir.is_dir():
-                    continue
-                matches = list(day_dir.glob(f"rollout-*-{session_id}.jsonl"))
-                if matches:
-                    return True, str(matches[0])
+        return False, "~/.codex/sessions not found"
+    for match in sessions_root.rglob(f"rollout-*-{session_id}.jsonl"):
+        return True, str(match)
     return False, f"no rollout file matching rollout-*-{session_id}.jsonl under {sessions_root}"
 
 
-# ---------------------------------------------------------------------------
-# Wait helpers for interactive mode
-# ---------------------------------------------------------------------------
-
-def _wait_for_interactive_reply(run_name: str, harness: str,
-                                 token: str, min_count: int,
-                                 timeout: float) -> bool:
-    """Wait until token appears in an assistant region min_count times, or terminal.
-
-    For claude and opencode: asserts the token is in a non-input line of the
-    pyte-rendered clean transcript (C1 fix — rules out echo-only matches).
-    Also requires the raw log count to be at least min_count (so a turn-2
-    check cannot be satisfied by the turn-1 reply appearing again).
-
-    For codex: the log contains only agentMessage/delta payloads (no echo),
-    so a raw log count check is sufficient.
-    """
-    terminal = {"done", "failed", "launch_failed", "died", "killed"}
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        st = _agent_run_status(run_name)
-        if _interactive_reply_present(run_name, harness, token, min_count):
-            return True
-        if st in terminal:
-            # Run ended — do a final check in case the reply just appeared.
-            return _interactive_reply_present(run_name, harness, token, min_count)
-        time.sleep(1.0)
-    return _interactive_reply_present(run_name, harness, token, min_count)
-
-
-def _interactive_reply_present(run_name: str, harness: str,
-                                token: str, min_count: int) -> bool:
-    """Single-shot check: token appears in assistant region at least min_count times."""
-    if harness in ("claude", "opencode"):
-        # Require the token to be in a non-input line of the rendered transcript
-        # AND appear in the raw log at least min_count times (count increase check).
-        if not _token_in_assistant_region(run_name, token, harness):
-            return False
-        return _count_in_log(run_name, token) >= min_count
-    else:
-        # Codex: raw log contains only model output — count check is sufficient.
-        return _count_in_log(run_name, token) >= min_count
-
-
-# ---------------------------------------------------------------------------
-# Individual cells
-# ---------------------------------------------------------------------------
-
-def cell_oneshot(
-    harness: str,
-    run_name: str,
-    expected_client: str,
-    cwd: str,
-    keep: bool,
-    result: CellResult,
-) -> None:
-    """Run a one-shot harness cell and assert all four links."""
-    _log(f"  Launching {harness} one-shot → run={run_name!r}")
-
-    cmd = ["agent-run", "--harness", harness, "--prompt", TURN1_PROMPT]
+def _verify_disk(harness: str, session_id: str, cwd: str) -> tuple[bool, str]:
     if harness == "claude":
-        cmd += ["--model", CLAUDE_MODEL]
-    elif harness == "opencode":
-        cmd += ["--model", OPENCODE_MODEL]
-    elif harness == "codex":
-        # Override model and provider via -c flags. The global ~/.codex/config.toml
-        # already sets model_provider=llmproxy; we just pin the model for cost control.
-        cmd += [
-            "--harness-arg", f"-c model={CODEX_MODEL}",
-            "--harness-arg", f"-c model_provider={CODEX_PROVIDER}",
-        ]
-    cmd.append(run_name)
+        return _verify_claude_disk(session_id, cwd)
+    if harness == "opencode":
+        return _verify_opencode_disk(session_id)
+    return _verify_codex_disk(session_id)
 
+
+# ---------------------------------------------------------------------------
+# Link assertions shared by every cell
+# ---------------------------------------------------------------------------
+
+def _harness_args(harness: str) -> list[str]:
+    """Model/provider pinning for cost control."""
+    if harness == "claude":
+        return ["--model", CLAUDE_MODEL]
+    if harness == "opencode":
+        return ["--model", OPENCODE_MODEL]
+    # codex takes its model as config overrides; the provider comes from
+    # ~/.codex/config.toml but is pinned here so the cell is self-contained.
+    return ["--harness-arg", f"-c model={CODEX_MODEL}",
+            "--harness-arg", f"-c model_provider={CODEX_PROVIDER}"]
+
+
+def _launch(cmd: list[str], run_name: str, timeout: int, result: CellResult) -> bool:
+    """Launch a run, registering it for teardown *before* the process starts.
+
+    On timeout we do not assume the launch failed — the run may well be alive;
+    run_cell's finally kills and reaps whatever this registered.
+    """
     _active_runs.add(run_name)
     try:
-        _run(*cmd, timeout=30)
+        _run(*cmd, timeout=timeout)
+        return True
     except subprocess.CalledProcessError as exc:
-        result.fail("link1-launch", f"agent-run exited {exc.returncode}: {exc.stderr[:200]}")
-        return
+        result.fail("link1-launch", f"agent-run exited {exc.returncode}: {(exc.stderr or '')[:200]}")
     except subprocess.TimeoutExpired:
-        # The launch timed out but the run may be alive — poll before giving up.
-        if _agent_run_status(run_name) not in {"unknown"}:
-            _log(f"  Launch timed out but run exists; waiting for terminal…")
-            _wait_for_terminal(run_name, 30)
-        result.fail("link1-launch", "agent-run launch timed out (30s)")
-        return
+        result.fail("link1-launch", f"agent-run launch timed out ({timeout}s)")
+    return False
 
-    # Link 1: wait for done.
-    _log(f"  Waiting for {run_name} to reach done (timeout={RUN_TIMEOUT}s)…")
+
+def _await_done(run_name: str, result: CellResult) -> bool:
     status = _wait_for_terminal(run_name, RUN_TIMEOUT)
     if status != "done":
-        tail = _read_log_tail(run_name, 1000)
-        result.fail("link1-run", f"status={status!r} (expected 'done')\nLog tail:\n{tail}")
-        return
-    _log(f"  [link1] PASS status=done")
+        result.fail("link1-run", f"status={status!r} (expected 'done')\nLog tail:\n{_log_tail(run_name)}")
+        return False
+    _log("  [link1] PASS status=done")
+    return True
 
-    # Link 2: session.json.
+
+def _links_2_3_4(harness: str, run_name: str, expected_client: str, cwd: str,
+                 result: CellResult) -> "tuple[str, dict] | None":
+    """Assert session.json, the harness disk record and the DB row.
+
+    Returns (session_id, links dict) or None once `result` holds the failure.
+    """
     sj = _session_json(run_name)
     if sj is None:
         result.fail("link2-session-json", "session.json missing or malformed")
-        return
+        return None
     session_id = sj.get("session_id") or sj.get("id")
     confidence = sj.get("confidence", "")
     acquisition = sj.get("acquisition", "")
     if not session_id:
         result.fail("link2-session-json", f"session.json has no session_id: {sj}")
-        return
+        return None
     if confidence != "certain":
         result.fail("link2-session-json",
                     f"confidence={confidence!r} (expected 'certain'); acquisition={acquisition!r}")
-        return
+        return None
     if acquisition not in ("pushed", "minted"):
         result.fail("link2-session-json",
                     f"implausible acquisition={acquisition!r} (expected pushed|minted)")
-        return
+        return None
     _log(f"  [link2] PASS session_id={session_id!r} confidence={confidence} acquisition={acquisition}")
 
-    # Link 3: harness disk record.
-    if harness == "claude":
-        ok, detail = _verify_claude_disk(session_id, cwd)
-    elif harness == "opencode":
-        ok, detail = _verify_opencode_disk(session_id)
-    elif harness == "codex":
-        ok, detail = _verify_codex_disk(session_id)
-    else:
-        ok, detail = False, f"unknown harness {harness!r}"
+    ok, detail = _verify_disk(harness, session_id, cwd)
     if not ok:
         result.fail("link3-disk-record", detail)
-        return
+        return None
     _log(f"  [link3] PASS disk: {detail}")
 
-    # Link 4: DB row.
     _log(f"  Polling DB for client_sessions row (timeout={DB_POLL_TIMEOUT}s)…")
-    row = _poll_db_row(session_id, expected_client)
+    row = _poll_db("client_session_id", session_id)
     if isinstance(row, _DbError):
         result.fail("link4-db-unreachable", f"DB transport error: {row.detail}")
-        return
+        return None
     if row is None:
         result.fail("link4-db-row",
                     f"no client_sessions row for {session_id!r} after {DB_POLL_TIMEOUT}s")
-        return
+        return None
     db_client = row.get("client", "")
     if db_client != expected_client:
         result.fail("link4-db-row",
                     f"client={db_client!r} (expected {expected_client!r}) for {session_id!r}")
-        return
+        return None
     _log(f"  [link4] PASS DB: client={db_client!r} created_at={row.get('created_at','?')!r}")
 
-    result.pass_(session_id, {
-        "link1": "done",
+    return session_id, {
         "link2": f"confidence={confidence} acquisition={acquisition}",
         "link3": detail,
         "link4": f"client={db_client}",
-    })
+    }
 
 
-def cell_interactive(
-    harness: str,
-    run_name: str,
-    expected_client: str,
-    cwd: str,
-    keep: bool,
-    result: CellResult,
-) -> None:
-    """Run an interactive harness cell: launch, verify first reply, steer second, verify.
+def _reply_present(run_name: str, harness: str, token: str, min_count: int) -> bool:
+    """True once the model has genuinely emitted `token` min_count times.
 
-    Link-1 liveness check (C1 fix): asserts a token the model must synthesise
-    (absent from the prompt), requires it to appear in an assistant region of the
-    pyte-rendered transcript (not the echoed input line), and requires the raw log
-    count to increase after the steer so turn-2 is genuinely proven.
+    For claude/opencode the raw log echoes the prompt, so the token must also
+    appear in an assistant region of the rendered transcript.  Managed codex
+    writes only agentMessage/delta payloads to the log, so the count suffices.
+    """
+    if _count_in_log(run_name, token) < min_count:
+        return False
+    return harness == "codex" or _token_in_assistant_region(run_name, token)
+
+
+def _wait_for_reply(run_name: str, harness: str, token: str, min_count: int,
+                    timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if _reply_present(run_name, harness, token, min_count):
+            return True
+        # One final look after the run ends or time runs out, in case the last
+        # chunk of output landed between the check and the status read.
+        if _agent_run_status(run_name) in TERMINAL_STATUSES or time.monotonic() >= deadline:
+            return _reply_present(run_name, harness, token, min_count)
+        time.sleep(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Cells
+# ---------------------------------------------------------------------------
+
+def cell_oneshot(harness: str, run_name: str, expected_client: str, cwd: str,
+                 result: CellResult) -> None:
+    _log(f"  Launching {harness} one-shot → run={run_name!r}")
+    cmd = ["agent-run", "--harness", harness, *_harness_args(harness),
+           "--prompt", TURN1_PROMPT, run_name]
+    if not _launch(cmd, run_name, 30, result):
+        return
+    _log(f"  Waiting for {run_name} to reach done (timeout={RUN_TIMEOUT}s)…")
+    if not _await_done(run_name, result):
+        return
+    chain = _links_2_3_4(harness, run_name, expected_client, cwd, result)
+    if chain is None:
+        return
+    session_id, links = chain
+    result.pass_(session_id, {"link1": "done", **links})
+
+
+def cell_interactive(harness: str, run_name: str, expected_client: str, cwd: str,
+                     result: CellResult) -> None:
+    """Launch a TUI, verify turn 1, steer, verify turn 2, then links 2–4.
+
+    Liveness is asserted on tokens the model must synthesise (the answers are
+    absent from the prompts) and, after the steer, on the turn-2 token's log
+    count *increasing* — so neither prompt echo nor the turn-1 reply can stand
+    in for an answer that never came.
     """
     _log(f"  Launching {harness} interactive → run={run_name!r}")
-
-    cmd = [
-        "agent-run", "-i",
-        "--harness", harness,
-        "--prompt", TURN1_PROMPT,
-    ]
-    if harness == "claude":
-        cmd += ["--model", CLAUDE_MODEL]
-    elif harness == "opencode":
-        cmd += ["--model", OPENCODE_MODEL]
-    elif harness == "codex":
-        cmd += [
-            "--harness-arg", f"-c model={CODEX_MODEL}",
-            "--harness-arg", f"-c model_provider={CODEX_PROVIDER}",
-        ]
-    cmd.append(run_name)
-
-    _active_runs.add(run_name)
-    try:
-        _run(*cmd, timeout=60)
-    except subprocess.CalledProcessError as exc:
-        result.fail("link1-launch", f"agent-run -i exited {exc.returncode}: {exc.stderr[:200]}")
-        return
-    except subprocess.TimeoutExpired:
-        if _agent_run_status(run_name) not in {"unknown"}:
-            _log(f"  Launch timed out but run exists; waiting for terminal…")
-            _wait_for_terminal(run_name, 30)
-        result.fail("link1-launch", "agent-run -i launch timed out (60s)")
+    cmd = ["agent-run", "-i", "--harness", harness, *_harness_args(harness),
+           "--prompt", TURN1_PROMPT, run_name]
+    if not _launch(cmd, run_name, 60, result):
         return
 
-    # Link 1a: wait for first synthesised reply "42" in the assistant region.
-    # min_count=1: at least one occurrence in the full log must be in assistant output.
     _log(f"  Waiting for turn-1 reply {TURN1_TOKEN!r} in assistant region "
          f"(timeout={INTERACTIVE_FIRST_REPLY_TIMEOUT}s)…")
-    if not _wait_for_interactive_reply(run_name, harness, TURN1_TOKEN, 1,
-                                       INTERACTIVE_FIRST_REPLY_TIMEOUT):
-        tail = _read_log_tail(run_name, 1000)
-        st = _agent_run_status(run_name)
+    if not _wait_for_reply(run_name, harness, TURN1_TOKEN, 1, INTERACTIVE_FIRST_REPLY_TIMEOUT):
         result.fail("link1-interactive-first-reply",
                     f"{TURN1_TOKEN!r} not in assistant region after "
-                    f"{INTERACTIVE_FIRST_REPLY_TIMEOUT}s (status={st!r})\nLog tail:\n{tail}")
-        _kill_and_reap(run_name, keep)
+                    f"{INTERACTIVE_FIRST_REPLY_TIMEOUT}s "
+                    f"(status={_agent_run_status(run_name)!r})\nLog tail:\n{_log_tail(run_name)}")
         return
-    count_after_t1 = _count_in_log(run_name, TURN1_TOKEN)
     _log(f"  [link1a] PASS: turn-1 reply {TURN1_TOKEN!r} seen in assistant region "
-         f"(log count={count_after_t1})")
+         f"(log count={_count_in_log(run_name, TURN1_TOKEN)})")
 
-    # Steer second prompt.
-    _log(f"  Steering second prompt…")
+    # Baseline before steering, so turn 2 must strictly add an occurrence.
+    before_steer = _count_in_log(run_name, TURN2_TOKEN)
+    _log("  Steering second prompt…")
     try:
         _run("agent-run", "steer", run_name, TURN2_PROMPT, timeout=15)
     except subprocess.CalledProcessError as exc:
-        result.fail("link1-steer", f"agent-run steer failed: {exc.stderr[:200]}")
-        _kill_and_reap(run_name, keep)
+        result.fail("link1-steer", f"agent-run steer failed: {(exc.stderr or '')[:200]}")
         return
 
-    # Link 1b: wait for second synthesised reply "85" in the assistant region.
-    # min_count=1 for TURN2_TOKEN (disjoint from TURN1_TOKEN — "85" ≠ "42").
-    # We do NOT require TURN1_TOKEN to increase further; TURN2_TOKEN is the proof.
     _log(f"  Waiting for turn-2 reply {TURN2_TOKEN!r} in assistant region "
          f"(timeout={INTERACTIVE_SECOND_REPLY_TIMEOUT}s)…")
-    if not _wait_for_interactive_reply(run_name, harness, TURN2_TOKEN, 1,
-                                       INTERACTIVE_SECOND_REPLY_TIMEOUT):
-        tail = _read_log_tail(run_name, 1000)
-        st = _agent_run_status(run_name)
+    if not _wait_for_reply(run_name, harness, TURN2_TOKEN, before_steer + 1,
+                           INTERACTIVE_SECOND_REPLY_TIMEOUT):
         result.fail("link1-interactive-second-reply",
-                    f"{TURN2_TOKEN!r} not in assistant region after "
-                    f"{INTERACTIVE_SECOND_REPLY_TIMEOUT}s (status={st!r})\nLog tail:\n{tail}")
-        _kill_and_reap(run_name, keep)
+                    f"{TURN2_TOKEN!r} count did not rise above {before_steer} in an assistant "
+                    f"region after {INTERACTIVE_SECOND_REPLY_TIMEOUT}s "
+                    f"(status={_agent_run_status(run_name)!r})\nLog tail:\n{_log_tail(run_name)}")
         return
     _log(f"  [link1b] PASS: turn-2 reply {TURN2_TOKEN!r} seen in assistant region")
 
-    # Link 2: session.json (written at launch).
-    sj = _session_json(run_name)
-    if sj is None:
-        result.fail("link2-session-json", "session.json missing or malformed")
-        _kill_and_reap(run_name, keep)
+    chain = _links_2_3_4(harness, run_name, expected_client, cwd, result)
+    if chain is None:
         return
-    session_id = sj.get("session_id") or sj.get("id")
-    confidence = sj.get("confidence", "")
-    acquisition = sj.get("acquisition", "")
-    if not session_id or confidence != "certain":
-        result.fail("link2-session-json",
-                    f"session_id={session_id!r} confidence={confidence!r}")
-        _kill_and_reap(run_name, keep)
-        return
-    _log(f"  [link2] PASS session_id={session_id!r} confidence={confidence} acquisition={acquisition}")
-
-    # Link 3: disk record. Check post-second-reply so writes have flushed.
-    if harness == "claude":
-        ok, detail = _verify_claude_disk(session_id, cwd)
-    elif harness == "opencode":
-        ok, detail = _verify_opencode_disk(session_id)
-    elif harness == "codex":
-        ok, detail = _verify_codex_disk(session_id)
-    else:
-        ok, detail = False, f"unknown harness {harness!r}"
-    if not ok:
-        result.fail("link3-disk-record", detail)
-        _kill_and_reap(run_name, keep)
-        return
-    _log(f"  [link3] PASS disk: {detail}")
-
-    # Link 4: DB row.
-    _log(f"  Polling DB for client_sessions row…")
-    row = _poll_db_row(session_id, expected_client)
-    if isinstance(row, _DbError):
-        result.fail("link4-db-unreachable", f"DB transport error: {row.detail}")
-        _kill_and_reap(run_name, keep)
-        return
-    if row is None:
-        result.fail("link4-db-row",
-                    f"no client_sessions row for {session_id!r} after {DB_POLL_TIMEOUT}s")
-        _kill_and_reap(run_name, keep)
-        return
-    db_client = row.get("client", "")
-    if db_client != expected_client:
-        result.fail("link4-db-row",
-                    f"client={db_client!r} (expected {expected_client!r})")
-        _kill_and_reap(run_name, keep)
-        return
-    _log(f"  [link4] PASS DB: client={db_client!r}")
-
-    # Kill the interactive run now that all checks pass.
-    _kill_and_reap(run_name, keep)
-
-    result.pass_(session_id, {
-        "link1": "two turns answered",
-        "link2": f"confidence={confidence} acquisition={acquisition}",
-        "link3": detail,
-        "link4": f"client={db_client}",
-    })
+    session_id, links = chain
+    result.pass_(session_id, {"link1": "two turns answered", **links})
 
 
-def cell_subagent_opencode(
-    run_name: str,
-    keep: bool,
-    result: CellResult,
-) -> None:
-    """opencode sub-agent cell: root→child parent linkage in DB."""
-    _log(f"  Launching opencode sub-agent → run={run_name!r}")
+def cell_subagent(harness: str, run_name: str, expected_client: str, cwd: str,
+                  result: CellResult) -> None:
+    """One-shot run that spawns a sub-agent, plus link 5 (root→child linkage).
 
-    cmd = [
-        "agent-run", "--harness", "opencode",
-        "--model", OPENCODE_MODEL,
-        "--agent-mode", "build",
-        "--prompt", OPENCODE_SUBAGENT_PROMPT,
-        run_name,
-    ]
-    _active_runs.add(run_name)
-    try:
-        _run(*cmd, timeout=30)
-    except subprocess.CalledProcessError as exc:
-        result.fail("link1-launch", f"agent-run exited {exc.returncode}: {exc.stderr[:200]}")
+    For depth-1 claude sub-agents the proxy has no parent-agent-id header and
+    resolves the parent from the root session id instead ("??-fallback"); the
+    assertion is the same either way.
+    """
+    _log(f"  Launching {harness} sub-agent → run={run_name!r}")
+    cmd = ["agent-run", "--harness", harness, *_harness_args(harness)]
+    if harness == "opencode":
+        cmd += ["--agent-mode", "build"]
+    cmd += ["--prompt", SUBAGENT_PROMPTS[harness], run_name]
+    if not _launch(cmd, run_name, 30, result):
         return
-    except subprocess.TimeoutExpired:
-        if _agent_run_status(run_name) not in {"unknown"}:
-            _wait_for_terminal(run_name, 30)
-        result.fail("link1-launch", "launch timed out")
+    if not _await_done(run_name, result):
         return
+    chain = _links_2_3_4(harness, run_name, expected_client, cwd, result)
+    if chain is None:
+        return
+    root_id, links = chain
 
-    # Wait for done.
-    status = _wait_for_terminal(run_name, RUN_TIMEOUT)
-    if status != "done":
-        tail = _read_log_tail(run_name, 1000)
-        result.fail("link1-run", f"status={status!r}\nLog:\n{tail}")
+    _log(f"  Polling DB for child row (parent={root_id!r}, timeout={DB_POLL_TIMEOUT}s)…")
+    child = _poll_db("parent_client_session_id", root_id)
+    if isinstance(child, _DbError):
+        result.fail("link5-db-unreachable", f"DB transport error: {child.detail}")
         return
-    _log(f"  [link1] PASS status=done")
-
-    # Link 2: session.json.
-    sj = _session_json(run_name)
-    if not sj:
-        result.fail("link2-session-json", "session.json missing")
-        return
-    root_id = sj.get("session_id") or sj.get("id")
-    confidence = sj.get("confidence", "")
-    if not root_id or confidence != "certain":
-        result.fail("link2-session-json", f"root_id={root_id!r} confidence={confidence!r}")
-        return
-    _log(f"  [link2] PASS root_id={root_id!r}")
-
-    # Link 3: disk record.
-    ok, detail = _verify_opencode_disk(root_id)
-    if not ok:
-        result.fail("link3-disk-record", detail)
-        return
-    _log(f"  [link3] PASS disk: {detail}")
-
-    # Link 4: root DB row — assert client matches expected.
-    row = _poll_db_row(root_id, "opencode")
-    if isinstance(row, _DbError):
-        result.fail("link4-db-unreachable", f"DB transport error: {row.detail}")
-        return
-    if row is None:
-        result.fail("link4-db-row", f"no root row for {root_id!r}")
-        return
-    db_client = row.get("client", "")
-    if db_client != "opencode":
-        result.fail("link4-db-row", f"client={db_client!r} (expected 'opencode') for {root_id!r}")
-        return
-    _log(f"  [link4] PASS root row: client={db_client!r}")
-
-    # Link 5: child row with parent_client_session_id = root_id.
-    _log(f"  Polling DB for child row (parent={root_id!r})…")
-    child_row = _poll_db_child_row(root_id, timeout=DB_POLL_TIMEOUT)
-    if isinstance(child_row, _DbError):
-        result.fail("link5-db-unreachable", f"DB transport error: {child_row.detail}")
-        return
-    if child_row is None:
+    if child is None:
         result.fail("link5-parent-linkage",
                     f"no child client_sessions row with parent_client_session_id={root_id!r} "
-                    f"after {DB_POLL_TIMEOUT}s")
+                    f"after {DB_POLL_TIMEOUT}s — sub-agent did not fire, or parent link broken")
         return
-    child_id = child_row.get("client_session_id", "?")
-    parent_id = child_row.get("parent_client_session_id", "?")
+    child_id = child.get("client_session_id", "?")
+    parent_id = child.get("parent_client_session_id", "?")
     _log(f"  [link5] PASS child={child_id!r} parent={parent_id!r} → resolves to root")
 
-    # Also assert the sub-agent's own reply came back (M4 fix).
-    log_content = _read_log(run_name).lower()
-    if "subpong" not in log_content:
-        result.fail("link5-subagent-reply",
-                    "sub-agent never produced 'SUBPONG' in the run log")
+    # A child row alone doesn't prove the sub-agent ran to completion.
+    if "subpong" not in _read_log(run_name).lower():
+        result.fail("link5-subagent-reply", "sub-agent never produced 'SUBPONG' in the run log")
         return
-    _log(f"  [link5+] PASS sub-agent reply 'SUBPONG' confirmed in log")
+    _log("  [link5+] PASS sub-agent reply 'SUBPONG' confirmed in log")
 
-    result.pass_(root_id, {
-        "link1": "done",
-        "link2": f"confidence={confidence}",
-        "link3": detail,
-        "link4": f"client={db_client}",
-        "link5": f"child={child_id!r} parent={parent_id!r}",
-    })
-
-
-def cell_subagent_claude(
-    run_name: str,
-    keep: bool,
-    result: CellResult,
-) -> None:
-    """claude sub-agent cell: root→child parent linkage via ??-fallback."""
-    _log(f"  Launching claude sub-agent → run={run_name!r}")
-
-    cmd = [
-        "agent-run", "--harness", "claude",
-        "--model", CLAUDE_MODEL,
-        "--prompt", CLAUDE_SUBAGENT_PROMPT,
-        run_name,
-    ]
-    _active_runs.add(run_name)
-    try:
-        _run(*cmd, timeout=30)
-    except subprocess.CalledProcessError as exc:
-        result.fail("link1-launch", f"agent-run exited {exc.returncode}: {exc.stderr[:200]}")
-        return
-    except subprocess.TimeoutExpired:
-        if _agent_run_status(run_name) not in {"unknown"}:
-            _wait_for_terminal(run_name, 30)
-        result.fail("link1-launch", "launch timed out")
-        return
-
-    status = _wait_for_terminal(run_name, RUN_TIMEOUT)
-    if status != "done":
-        tail = _read_log_tail(run_name, 1000)
-        result.fail("link1-run", f"status={status!r}\nLog:\n{tail}")
-        return
-    _log(f"  [link1] PASS status=done")
-
-    sj = _session_json(run_name)
-    if not sj:
-        result.fail("link2-session-json", "session.json missing")
-        return
-    root_id = sj.get("session_id") or sj.get("id")
-    confidence = sj.get("confidence", "")
-    if not root_id or confidence != "certain":
-        result.fail("link2-session-json", f"root_id={root_id!r} confidence={confidence!r}")
-        return
-    _log(f"  [link2] PASS root_id={root_id!r}")
-
-    ok, detail = _verify_claude_disk(root_id, str(Path.cwd()))
-    if not ok:
-        result.fail("link3-disk-record", detail)
-        return
-    _log(f"  [link3] PASS disk: {detail}")
-
-    # Link 4: root DB row — assert client matches expected.
-    row = _poll_db_row(root_id, "claude-code")
-    if isinstance(row, _DbError):
-        result.fail("link4-db-unreachable", f"DB transport error: {row.detail}")
-        return
-    if row is None:
-        result.fail("link4-db-row", f"no root row for {root_id!r}")
-        return
-    db_client = row.get("client", "")
-    if db_client != "claude-code":
-        result.fail("link4-db-row",
-                    f"client={db_client!r} (expected 'claude-code') for {root_id!r}")
-        return
-    _log(f"  [link4] PASS root row: client={db_client!r}")
-
-    # Link 5: child row. For depth-1 claude sub-agents the proxy uses the
-    # session-id fallback (not parent-agent-id header), so
-    # parent_client_session_id = the root session-id.
-    _log(f"  Polling DB for child row (parent={root_id!r}, timeout={DB_POLL_TIMEOUT}s)…")
-    child_row = _poll_db_child_row(root_id, timeout=DB_POLL_TIMEOUT)
-    if isinstance(child_row, _DbError):
-        result.fail("link5-db-unreachable", f"DB transport error: {child_row.detail}")
-        return
-    if child_row is None:
-        result.fail("link5-parent-linkage",
-                    f"no child client_sessions row with parent_client_session_id={root_id!r} "
-                    f"after {DB_POLL_TIMEOUT}s — depth-1 sub-agent did not fire or fallback broken")
-        return
-    child_id = child_row.get("client_session_id", "?")
-    parent_id = child_row.get("parent_client_session_id", "?")
-    _log(f"  [link5] PASS child={child_id!r} parent={parent_id!r} (via ??-fallback)")
-
-    # Also assert the sub-agent's own reply came back (M4 fix).
-    log_content = _read_log(run_name).lower()
-    if "subpong" not in log_content:
-        result.fail("link5-subagent-reply",
-                    "sub-agent never produced 'SUBPONG' in the run log")
-        return
-    _log(f"  [link5+] PASS sub-agent reply 'SUBPONG' confirmed in log")
-
-    result.pass_(root_id, {
-        "link1": "done",
-        "link2": f"confidence={confidence}",
-        "link3": detail,
-        "link4": f"client={db_client}",
-        "link5": f"child={child_id!r} parent={parent_id!r} (depth-1 ??-fallback)",
-    })
+    result.pass_(root_id, {"link1": "done", **links,
+                           "link5": f"child={child_id!r} parent={parent_id!r}"})
 
 
 def cell_subagent_codex(result: CellResult) -> None:
-    """codex sub-agent cell — SKIP.
+    """codex sub-agent — the only SKIP in the suite.
 
-    codex sends a single id under three header names (x-client-request-id,
-    session-id, thread-id) and NO parent header. The app-server JSON-RPC
-    surface (thread/start, turn/start) has MultiAgentMode and Thread.parentThreadId
-    in its schema, but there is no CLI-level mechanism to instruct codex to
-    spawn a sub-agent via a prompt alone. The AgentControl mechanism that would
-    set agentNickname/agentRole/parentThreadId is an internal codex orchestrator
-    feature, not exposed through any publicly documented app-server method that
-    can be triggered by a user prompt in the current release.
-
-    Attempting to prompt codex to "spawn a sub-agent" returns a text response
-    but never creates a second thread with a parentThreadId. The schema confirms
-    the plumbing exists; the triggering surface does not.
-
-    Evidence: ACCEPTANCE-EVIDENCE.md §4 "codex — no triggerable sub-agent surface";
-    schema inspection of ThreadStartParams (no parentThreadId input field) and
-    TurnStartParams (no multiAgentMode field) in codex app-server protocol v2.
+    codex sends one id under three header names and no parent header. The
+    app-server schema has Thread.parentThreadId and MultiAgentMode, but
+    ThreadStartParams has no parentThreadId input and TurnStartParams has no
+    multiAgentMode: the AgentControl orchestration that would set them is
+    internal, not reachable from a user prompt. Prompting codex to delegate
+    yields text but never a child thread with a parent link.
+    Evidence: ACCEPTANCE-EVIDENCE.md §4 and the app-server v2 JSON schema.
     """
     result.skip(
         "codex sub-agent SKIP: no reliably triggerable sub-agent mechanism. "
@@ -1066,38 +651,24 @@ def cell_subagent_codex(result: CellResult) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Unique run-name generator
-# ---------------------------------------------------------------------------
-
-def _run_name(prefix: str) -> str:
-    """Generate a unique agent-run name for this invocation."""
-    short = uuid.uuid4().hex[:8]
-    return f"vsa-{prefix}-{short}"
-
-
-# ---------------------------------------------------------------------------
-# Cell registry and dispatch
-# ---------------------------------------------------------------------------
-
-# Maps cell name → (harness, mode, expected_client)
+# Cell name → (harness, mode, expected client value in client_sessions)
 CELLS = {
-    "claude-oneshot":    ("claude",   "oneshot",      "claude-code"),
-    "claude-interactive":("claude",   "interactive",  "claude-code"),
-    "opencode-oneshot":  ("opencode", "oneshot",      "opencode"),
+    "claude-oneshot":       ("claude",   "oneshot",     "claude-code"),
+    "claude-interactive":   ("claude",   "interactive", "claude-code"),
+    "opencode-oneshot":     ("opencode", "oneshot",     "opencode"),
     "opencode-interactive": ("opencode", "interactive", "opencode"),
-    "codex-oneshot":     ("codex",    "oneshot",      "codex"),
-    "codex-interactive": ("codex",    "interactive",  "codex"),
-    "opencode-subagent": ("opencode", "subagent",     "opencode"),
-    "claude-subagent":   ("claude",   "subagent",     "claude-code"),
-    "codex-subagent":    ("codex",    "subagent",     "codex"),
+    "codex-oneshot":        ("codex",    "oneshot",     "codex"),
+    "codex-interactive":    ("codex",    "interactive", "codex"),
+    "opencode-subagent":    ("opencode", "subagent",    "opencode"),
+    "claude-subagent":      ("claude",   "subagent",    "claude-code"),
+    "codex-subagent":       ("codex",    "subagent",    "codex"),
 }
 
 
 def run_cell(cell_name: str, keep: bool) -> CellResult:
     harness, mode, expected_client = CELLS[cell_name]
     result = CellResult(name=cell_name)
-    rname = _run_name(cell_name.replace("-", "_"))
+    rname = f"vsa-{cell_name.replace('-', '_')}-{uuid.uuid4().hex[:8]}"
     cwd = str(Path.cwd())
 
     _log(f"\n{'='*60}")
@@ -1106,32 +677,29 @@ def run_cell(cell_name: str, keep: bool) -> CellResult:
 
     try:
         if mode == "oneshot":
-            cell_oneshot(harness, rname, expected_client, cwd, keep, result)
+            cell_oneshot(harness, rname, expected_client, cwd, result)
         elif mode == "interactive":
-            cell_interactive(harness, rname, expected_client, cwd, keep, result)
-        elif mode == "subagent":
-            if harness == "opencode":
-                cell_subagent_opencode(rname, keep, result)
-            elif harness == "claude":
-                cell_subagent_claude(rname, keep, result)
-            elif harness == "codex":
-                cell_subagent_codex(result)
+            cell_interactive(harness, rname, expected_client, cwd, result)
+        elif harness == "codex":
+            cell_subagent_codex(result)
+        else:
+            cell_subagent(harness, rname, expected_client, cwd, result)
     except Exception as exc:
         import traceback
         result.fail("unexpected-exception", f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
     finally:
-        # Reap any run that the cell function did not already reap (H2 fix).
-        # Codex-subagent never launches a run, so _active_runs won't have rname.
-        # _reap_run is idempotent: if the cell already reaped it, the dirs are gone.
+        # Single teardown for every exit path — pass, fail, launch timeout or
+        # exception. Cells never reap themselves. (codex-subagent launches
+        # nothing, so its name is never in _active_runs.)
         if rname in _active_runs:
-            _reap_run(rname, keep)
+            _kill_and_reap(rname, keep)
 
     _log(f"\n  → {result.verdict}: {cell_name}")
     if result.verdict == FAIL:
-        _log(f"     FAILED at [{result.failure_link}]: {result.failure_detail[:200] if result.failure_detail else ''}")
+        _log(f"     FAILED at [{result.failure_link}]: {(result.failure_detail or '')[:200]}")
     elif result.verdict == SKIP:
         _log(f"     SKIP: {result.notes[0][:120] if result.notes else ''}")
-    elif result.verdict == PASS:
+    else:
         _log(f"     session_id={result.session_id!r}")
         for lk, lv in result.links.items():
             _log(f"     {lk}: {lv}")
@@ -1159,8 +727,8 @@ DB access: ssh VIBES_HOST → ssh LLMPROXY_HOST → docker exec psql
 
 Approximate cost: ~$0.02–0.05 per full run (haiku/mini models, trivial prompts).
 
---keep preserves agent-run state and log dirs for debugging.  For interactive
-cells this also leaves the TUI process running; kill it with agent-run kill <name>.
+--keep preserves agent-run state and log dirs for debugging. The run itself is
+still terminated, so no TUI or app-server is left behind.
 
 Typical debug workflow:
   1. Run with --only claude-oneshot --keep to preserve run dirs.
@@ -1182,45 +750,28 @@ def main(argv: Optional[list[str]] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=HELP_EPILOG,
     )
-    parser.add_argument(
-        "--only", metavar="CELL[,CELL...]",
-        help="Run only the named cell(s), comma-separated",
-    )
-    parser.add_argument(
-        "--harness", metavar="NAME",
-        help="Run only cells for this harness (claude|opencode|codex)",
-    )
-    parser.add_argument(
-        "--skip-subagents", action="store_true",
-        help="Skip all sub-agent cells",
-    )
-    parser.add_argument(
-        "--keep", action="store_true",
-        help=(
-            "Preserve agent-run state and log dirs for debugging (default: clean up). "
-            "For interactive cells this leaves the TUI process running."
-        ),
-    )
-    parser.add_argument(
-        "--json", action="store_true",
-        help=(
-            "Emit machine-readable JSON summary to stdout; human log goes to stderr. "
-            "stdout is valid JSON on both pass and fail paths."
-        ),
-    )
+    parser.add_argument("--only", metavar="CELL[,CELL...]",
+                        help="Run only the named cell(s), comma-separated")
+    parser.add_argument("--harness", metavar="NAME",
+                        help="Run only cells for this harness (claude|opencode|codex)")
+    parser.add_argument("--skip-subagents", action="store_true", help="Skip all sub-agent cells")
+    parser.add_argument("--keep", action="store_true",
+                        help=("Preserve agent-run state and log dirs for debugging "
+                              "(default: clean up). The run is still terminated."))
+    parser.add_argument("--json", action="store_true",
+                        help=("Emit machine-readable JSON summary to stdout; human log goes to "
+                              "stderr. stdout is valid JSON on both pass and fail paths."))
     args = parser.parse_args(argv)
     _json_mode = args.json
 
     _install_signal_handlers()
 
-    # Determine which cells to run.
-    all_cells = list(CELLS.keys())
+    all_cells = list(CELLS)
     if args.only:
-        selected = [c.strip() for c in args.only.split(",")]
-        unknown = [c for c in selected if c not in CELLS]
+        cells_to_run = [c.strip() for c in args.only.split(",")]
+        unknown = [c for c in cells_to_run if c not in CELLS]
         if unknown:
             parser.error(f"Unknown cells: {', '.join(unknown)}. Valid: {', '.join(all_cells)}")
-        cells_to_run = selected
     elif args.harness:
         if args.harness not in ("claude", "opencode", "codex"):
             parser.error(f"--harness must be claude|opencode|codex, got {args.harness!r}")
@@ -1231,17 +782,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.skip_subagents:
         cells_to_run = [c for c in cells_to_run if "subagent" not in c]
 
-    _log(f"verify-session-attribution")
+    _log("verify-session-attribution")
     _log(f"cells: {', '.join(cells_to_run)}")
     _log(f"DB: ssh {VIBES_HOST} → ssh {LLMPROXY_HOST} → psql -U {POSTGRES_USER} -d {POSTGRES_DB}")
     _log(f"keep={args.keep} skip-subagents={args.skip_subagents}")
     _log("")
 
-    # DB preflight: fail loud and fast if the path is broken (M1 fix).
-    # Skip for codex-only runs that never touch the DB differently, but the
-    # preflight is cheap so always run it unless all selected cells are codex-subagent.
-    non_skip_cells = [c for c in cells_to_run if c != "codex-subagent"]
-    if non_skip_cells:
+    # Fail loud and fast if the DB path is down, so no cell has to report
+    # "no row" for what is really a broken tunnel.
+    if [c for c in cells_to_run if c != "codex-subagent"]:
         _log("Checking DB path (preflight SELECT 1)…")
         db_err = _db_preflight()
         if db_err:
@@ -1251,12 +800,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
         _log("DB preflight OK\n")
 
-    results: list[CellResult] = []
-    for cell_name in cells_to_run:
-        r = run_cell(cell_name, keep=args.keep)
-        results.append(r)
+    results = [run_cell(cell_name, keep=args.keep) for cell_name in cells_to_run]
 
-    # Summary table.
     _log(f"\n{'='*60}")
     _log("SUMMARY")
     _log(f"{'='*60}")
@@ -1264,18 +809,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     fail_count = sum(1 for r in results if r.verdict == FAIL)
     skip_count = sum(1 for r in results if r.verdict == SKIP)
     for r in results:
-        marker = {"PASS": "✓", "FAIL": "✗", "SKIP": "~"}.get(r.verdict, "?")
+        marker = {PASS: "✓", FAIL: "✗", SKIP: "~"}.get(r.verdict, "?")
         sid = f"  sid={r.session_id!r}" if r.session_id else ""
         link = f"  [{r.failure_link}]" if r.verdict == FAIL else ""
         _log(f"  {marker} {r.verdict:4s}  {r.name}{sid}{link}")
         if r.verdict == FAIL and r.failure_detail:
-            # Print first line of detail.
-            first_line = r.failure_detail.split("\n")[0][:100]
-            _log(f"         {first_line}")
+            _log(f"         {r.failure_detail.splitlines()[0][:100]}")
     _log(f"\n  PASS={pass_count}  FAIL={fail_count}  SKIP={skip_count}")
 
     if args.json:
-        out = {
+        print(json.dumps({
             "pass": pass_count, "fail": fail_count, "skip": skip_count,
             "cells": [
                 {
@@ -1289,8 +832,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 }
                 for r in results
             ],
-        }
-        print(json.dumps(out, indent=2))
+        }, indent=2))
 
     return 1 if fail_count > 0 else 0
 
