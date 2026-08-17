@@ -4357,6 +4357,19 @@ def cmd_steer(args: argparse.Namespace) -> int:
             f"agent-run: '{name}' was launched one-shot (not interactive) and cannot be steered. "
             f"Relaunch with -i or --harness ... -i to make it steerable."
         )
+    # For managed codex runs, --raw sends no terminator so the adapter never
+    # dispatches the bytes — the steer is provably undelivered. Reject loudly.
+    if args.raw:
+        try:
+            run_json_data = json.loads((_log_dir(name) / "run.json").read_text())
+        except (OSError, json.JSONDecodeError, ValueError):
+            run_json_data = {}
+        if isinstance(run_json_data, dict) and run_json_data.get("harness") == "codex":
+            sys.exit(
+                "agent-run: '--raw' is not supported for managed codex runs; "
+                "the codex app-server adapter requires a newline terminator to dispatch input. "
+                "Use plain 'steer' (without --raw) instead."
+            )
     pid = _require_positive_state_int(d, "pid", name)
     if not _pid_alive(pid):
         sys.exit(f"agent-run: '{args.name}' is not running")
@@ -4814,6 +4827,13 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     prompt_file: Optional[str] = getattr(args, "prompt_file", None)
     if prompt_file and not Path(prompt_file).is_file():
         sys.exit(f"agent-run: prompt file not found: {prompt_file}")
+    # Guard against callers that construct a Namespace directly (e.g. tests):
+    # --model is not forwarded for codex regardless of how cmd_launch is reached.
+    if is_managed and harness == "codex" and getattr(args, "model", None):
+        sys.exit(
+            "agent-run: --model is not supported for --harness codex; "
+            "use --harness-arg -c model=<model> to set the model via codex config"
+        )
     echo: bool = bool(getattr(args, "echo", False))
     echo_interval: float = float(getattr(args, "echo_interval", 2.0))
     _opportunistic_heal()
@@ -4983,7 +5003,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                 if opencode_port is not None:
                     cwd_str = str(Path.cwd())
                     opencode_session_id = _opencode_prefork_mint(
-                        opencode_port, name, cwd_str, acquire_log
+                        opencode_port, name, cwd_str, acquire_log, state_dir=d
                     )
                     if opencode_session_id:
                         _acquire_session_opencode_minted(log_d, opencode_session_id, acquire_log)
@@ -5019,7 +5039,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                 if oneshot_port is not None:
                     cwd_str = str(Path.cwd())
                     oneshot_session_id = _opencode_prefork_mint(
-                        oneshot_port, name, cwd_str, acquire_log
+                        oneshot_port, name, cwd_str, acquire_log, state_dir=d
                     )
                     if oneshot_session_id:
                         _acquire_session_opencode_minted(log_d, oneshot_session_id, acquire_log)
@@ -6202,8 +6222,16 @@ def _opencode_health_poll(port: int, timeout: float, acquire_log: Path) -> bool:
     return False
 
 
-def _opencode_mint_session(port: int, title: str, acquire_log: Path) -> Optional[str]:
-    """POST /session to mint a new opencode session. Returns the session id or None."""
+def _opencode_mint_session(
+    port: int, title: str, expected_cwd: str, acquire_log: Path
+) -> Optional[str]:
+    """POST /session to mint a new opencode session, then verify server identity.
+
+    Returns the session id if and only if the server's response confirms the
+    session directory matches expected_cwd — proving the responder is the process
+    we started in that directory, not a foreign server that raced to bind the port.
+    Returns None on any mismatch or failure; caller must degrade to missing.
+    """
     url = f"http://127.0.0.1:{port}/session"
     payload = json.dumps({"title": title}).encode("utf-8")
     req = urllib.request.Request(
@@ -6217,11 +6245,23 @@ def _opencode_mint_session(port: int, title: str, acquire_log: Path) -> Optional
             body = resp.read().decode("utf-8", errors="replace")
             data = json.loads(body)
             session_id = data.get("id")
-            if session_id and isinstance(session_id, str):
-                _acquire_log_write(acquire_log, f"minted session id={session_id!r}")
-                return session_id
-            _acquire_log_write(acquire_log, f"POST /session returned no id: {body[:200]}")
-            return None
+            if not (session_id and isinstance(session_id, str)):
+                _acquire_log_write(acquire_log, f"POST /session returned no id: {body[:200]}")
+                return None
+            # Verify that the returned session belongs to our process: opencode
+            # sets the session's directory to its own cwd, so a match proves the
+            # responder was started in the same directory as this launch.
+            session_dir = data.get("directory", "")
+            if os.path.realpath(session_dir) != os.path.realpath(expected_cwd):
+                _acquire_log_write(
+                    acquire_log,
+                    f"POST /session identity check failed: session directory "
+                    f"{session_dir!r} != expected cwd {expected_cwd!r}; "
+                    "a foreign opencode server may own the port — degrading to missing",
+                )
+                return None
+            _acquire_log_write(acquire_log, f"minted session id={session_id!r} directory={session_dir!r}")
+            return session_id
     except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
         _acquire_log_write(acquire_log, f"POST /session failed: {exc}")
         return None
@@ -6232,6 +6272,7 @@ def _opencode_prefork_mint(
     run_name: str,
     cwd: str,
     acquire_log: Path,
+    state_dir: Optional[Path] = None,
 ) -> Optional[str]:
     """Start a temporary opencode process, mint a session, return the session id.
 
@@ -6242,6 +6283,9 @@ def _opencode_prefork_mint(
     The minted session is pre-registered in the opencode database and will be
     continued when the real TUI is started with --session <id>. Returns None
     if any step fails; the caller must degrade to confidence=missing.
+
+    state_dir, when provided, lets the signal handler resolve the phantom
+    status=starting run left if the launcher is killed during the health poll.
     """
     import subprocess as _subprocess
 
@@ -6256,12 +6300,13 @@ def _opencode_prefork_mint(
         _acquire_log_write(acquire_log, f"could not start opencode for mint: {exc}")
         return None
 
-    # Install a signal handler that kills the mint process on SIGTERM/SIGINT
-    # during the up-to-30 s health poll, so the launcher is never killed while
-    # leaving an orphaned opencode process behind.
+    # Install signal handlers for SIGTERM, SIGINT, and SIGHUP that kill the
+    # mint process and resolve the phantom status=starting run before re-raising.
+    # Matches _runner's own _on_signal which handles all three.
     _mint_proc_ref = [proc]
     _orig_term = signal.getsignal(signal.SIGTERM)
     _orig_int = signal.getsignal(signal.SIGINT)
+    _orig_hup = signal.getsignal(signal.SIGHUP)
 
     def _mint_cleanup_handler(signum, frame):
         p = _mint_proc_ref[0]
@@ -6277,24 +6322,36 @@ def _opencode_prefork_mint(
                     p.kill()
                 except OSError:
                     pass
+        # Resolve the phantom status=starting run so list/watch do not show a
+        # non-terminal run that will never progress. Mirror the fork-failure path.
+        if state_dir is not None:
+            try:
+                _write(state_dir / "exit_code", "1\n")
+                _write(state_dir / "ended_at", _now_iso() + "\n")
+                _write(state_dir / "status", "failed\n")
+            except OSError:
+                pass
         # Restore and re-raise so the caller's normal signal handling takes over.
         signal.signal(signal.SIGTERM, _orig_term)
         signal.signal(signal.SIGINT, _orig_int)
+        signal.signal(signal.SIGHUP, _orig_hup)
         os.kill(os.getpid(), signum)
 
     try:
         signal.signal(signal.SIGTERM, _mint_cleanup_handler)
         signal.signal(signal.SIGINT, _mint_cleanup_handler)
+        signal.signal(signal.SIGHUP, _mint_cleanup_handler)
 
         health_ok = _opencode_health_poll(port, _OPENCODE_HEALTH_TIMEOUT, acquire_log)
         if not health_ok:
             _acquire_log_write(acquire_log, "opencode server did not become healthy for mint")
             return None
-        session_id = _opencode_mint_session(port, run_name, acquire_log)
+        session_id = _opencode_mint_session(port, run_name, cwd, acquire_log)
         return session_id
     finally:
         signal.signal(signal.SIGTERM, _orig_term)
         signal.signal(signal.SIGINT, _orig_int)
+        signal.signal(signal.SIGHUP, _orig_hup)
         _mint_proc_ref[0] = None
         try:
             proc.terminate()
@@ -6375,12 +6432,15 @@ def _write_run_json(log_dir: Path, data: dict) -> None:
             pass
 
 
-def _appserver_read_lines(out_fd: int, buf: bytes, timeout: float) -> tuple[list[bytes], bytes]:
-    """Drain all available bytes from raw fd out_fd, return (complete_lines, remainder).
+def _appserver_read_lines(out_fd: int, buf: bytes, timeout: float) -> tuple[list[bytes], bytes, bool]:
+    """Drain all available bytes from raw fd out_fd, return (complete_lines, remainder, eof).
 
     If timeout > 0, waits up to that many seconds for data to arrive. Then
     drains all bytes currently available in the kernel buffer so frames are
     never stranded due to a BufferedReader/select mismatch.
+    eof is True when the write end of the pipe has been closed; the caller
+    must break its read loop when eof is True (spinning would busy-loop because
+    a closed pipe fd stays permanently readable).
     """
     if timeout > 0:
         try:
@@ -6394,17 +6454,21 @@ def _appserver_read_lines(out_fd: int, buf: bytes, timeout: float) -> tuple[list
                 nl = buf.index(b"\n")
                 lines.append(buf[:nl])
                 buf = buf[nl + 1:]
-            return lines, buf
+            return lines, buf, False
 
     # Drain all available bytes without blocking further.
+    eof = False
     while True:
         try:
             chunk = os.read(out_fd, 65536)
         except BlockingIOError:
             break
         except OSError:
+            eof = True
             break
         if not chunk:
+            # os.read returns b"" when the write end of the pipe is closed (EOF).
+            eof = True
             break
         buf += chunk
         # Check if more data is immediately available.
@@ -6420,7 +6484,7 @@ def _appserver_read_lines(out_fd: int, buf: bytes, timeout: float) -> tuple[list
         nl = buf.index(b"\n")
         lines.append(buf[:nl])
         buf = buf[nl + 1:]
-    return lines, buf
+    return lines, buf, eof
 
 
 def _run_managed_oneshot_codex_appserver(
@@ -6530,7 +6594,7 @@ def _run_managed_oneshot_codex_appserver(
         while time.monotonic() < deadline and thread_id is None:
             if proc.poll() is not None:
                 break
-            lines, buf = _appserver_read_lines(out_fd, buf, 0.2)
+            lines, buf, eof = _appserver_read_lines(out_fd, buf, 0.2)
             for line_bytes in lines:
                 try:
                     msg = json.loads(line_bytes.decode("utf-8", errors="replace"))
@@ -6553,6 +6617,8 @@ def _run_managed_oneshot_codex_appserver(
                 elif msg.get("id") == thread_rpc_id and "error" in msg:
                     _acquire_log_write(acquire_log, f"codex app-server: thread/start error: {msg['error']}")
                     break
+            if eof:
+                break
 
         if thread_id is None:
             _acquire_log_write(acquire_log, "codex app-server: thread/start failed or timed out")
@@ -6584,9 +6650,7 @@ def _run_managed_oneshot_codex_appserver(
         turn_done = False
         deadline = time.monotonic() + 600  # 10-minute hard cap for a one-shot turn
         while time.monotonic() < deadline and not turn_done:
-            if proc.poll() is not None:
-                break
-            lines, buf = _appserver_read_lines(out_fd, buf, 0.2)
+            lines, buf, eof = _appserver_read_lines(out_fd, buf, 0.2)
             for line_bytes in lines:
                 try:
                     msg = json.loads(line_bytes.decode("utf-8", errors="replace"))
@@ -6616,6 +6680,10 @@ def _run_managed_oneshot_codex_appserver(
                     _acquire_log_write(acquire_log, f"codex app-server: turn/start error: {msg['error']}")
                     turn_done = True
                     exit_code = 1
+            # Drain before checking process exit so frames buffered in the pipe
+            # after the app-server exits are not discarded.
+            if eof or (not lines and proc.poll() is not None):
+                break
 
         if not turn_done:
             _acquire_log_write(acquire_log, "codex app-server: turn did not complete (timeout or process died)")
@@ -6806,7 +6874,7 @@ def _run_managed_interactive_codex_appserver(
         while time.monotonic() < deadline and thread_id is None:
             if proc.poll() is not None:
                 break
-            lines, buf = _appserver_read_lines(out_fd, buf, 0.2)
+            lines, buf, eof = _appserver_read_lines(out_fd, buf, 0.2)
             for line_bytes in lines:
                 try:
                     msg = json.loads(line_bytes.decode("utf-8", errors="replace"))
@@ -6829,6 +6897,8 @@ def _run_managed_interactive_codex_appserver(
                 elif msg.get("id") == thread_rpc_id and "error" in msg:
                     _acquire_log_write(acquire_log, f"codex app-server interactive: thread/start error: {msg['error']}")
                     break
+            if eof:
+                break
 
         if thread_id is None:
             _acquire_log_write(acquire_log, "codex app-server interactive: thread/start failed or timed out")
@@ -6862,7 +6932,8 @@ def _run_managed_interactive_codex_appserver(
         # turn/start or turn/steer result → set active_turn_id; error → log and retry.
         # FIFO → steer text → turn/steer (if active turn) or turn/start (if idle).
         steer_buf = b""
-        # Track last completed turn's exit status to detect deliberate vs crash exit.
+        # True once any turn/completed with status="completed" has been received,
+        # used to distinguish clean app-server exit from mid-session transport failure.
         had_completed_turn = False
         session_deadline = time.monotonic() + 86400
 
@@ -6878,7 +6949,7 @@ def _run_managed_interactive_codex_appserver(
                 break
 
             if out_fd in readable:
-                lines, buf = _appserver_read_lines(out_fd, buf, 0)
+                lines, buf, eof = _appserver_read_lines(out_fd, buf, 0)
                 for line_bytes in lines:
                     try:
                         msg = json.loads(line_bytes.decode("utf-8", errors="replace"))
@@ -6919,22 +6990,18 @@ def _run_managed_interactive_codex_appserver(
                         err = msg["error"]
                         _acquire_log_write(acquire_log, f"codex app-server interactive: rpc error id={msg_id} error={err!r}")
                         if msg_id in pending_steer_rpc_ids:
-                            # Steer was rejected (e.g. stale expectedTurnId): the turn
-                            # already completed, so the agent is now idle. Clear the
-                            # active_turn_id and re-issue as a new turn/start so the
-                            # message is not silently lost.
+                            # Steer was rejected (e.g. stale expectedTurnId): clear
+                            # active_turn_id so the next steer starts a fresh turn.
+                            # The steer text is already gone from the FIFO; log the loss.
                             pending_steer_rpc_ids.discard(msg_id)
                             active_turn_id = None
-                            # Extract the original steer text from pending_steers if tracked,
-                            # otherwise just clear state. The steer text itself was already
-                            # written to the FIFO and is gone; log the loss.
                             _acquire_log_write(acquire_log, "codex app-server interactive: steer rejected — turn already completed; steer was lost")
 
                     elif msg_id == turn_rpc_id and "result" in msg:
-                        # turn/start response: capture the turn id.
+                        # turn/start response: capture the turn id from result.turn.id.
                         result = msg["result"]
                         if isinstance(result, dict):
-                            turn_info = result.get("turn") or result
+                            turn_info = result.get("turn")
                             if isinstance(turn_info, dict):
                                 new_turn_id = turn_info.get("id")
                                 if new_turn_id:
@@ -6943,17 +7010,23 @@ def _run_managed_interactive_codex_appserver(
                         # Reset so subsequent steer responses are matched by their own ids.
                         turn_rpc_id = -1
 
-                    elif msg_id is not None and "result" in msg:
-                        # Response to a steer or subsequent turn/start.
+                    elif msg_id in pending_steer_rpc_ids and "result" in msg:
+                        # Response to a pending turn/steer or idle-path turn/start.
+                        # Only update active_turn_id when the result is a turn object,
+                        # never from an unrelated result that happens to carry an id.
                         pending_steer_rpc_ids.discard(msg_id)
                         result = msg["result"]
                         if isinstance(result, dict):
-                            turn_info = result.get("turn") or result
+                            turn_info = result.get("turn")
                             if isinstance(turn_info, dict):
                                 new_turn_id = turn_info.get("id")
                                 if new_turn_id:
                                     active_turn_id = new_turn_id
                                     _acquire_log_write(acquire_log, f"codex app-server interactive: turn id updated to {active_turn_id!r}")
+                # Stdout EOF means the app-server closed its write end; stop
+                # selecting on it — continuing would busy-loop at 100% CPU.
+                if eof:
+                    break
 
             if fifo_fd in readable:
                 try:
@@ -7011,9 +7084,14 @@ def _run_managed_interactive_codex_appserver(
                         })
                         _acquire_log_write(acquire_log, f"codex app-server interactive: turn/start (steer idle) text={steer_text[:80]!r}")
 
-        # An unexplained EOF or process death after a completed turn is a normal exit;
-        # without a completed turn it is an unexpected transport failure.
-        if proc.poll() is not None and proc.returncode != 0 and not had_completed_turn:
+        # For interactive runs, any non-zero app-server exit is a transport
+        # failure regardless of whether a turn completed — the session is gone
+        # and further steers cannot reach the agent. Only a clean exit (rc=0)
+        # after a completed turn is a normal outcome.
+        rc = proc.poll()
+        if rc is not None and rc != 0:
+            exit_code = 1
+        elif not had_completed_turn and rc is not None:
             exit_code = 1
         _acquire_log_write(acquire_log, f"codex app-server interactive: session loop ended exit_code={exit_code}")
 
@@ -7113,7 +7191,6 @@ def _build_managed_argv(
             argv.extend(["--agent", agent_mode])
         if not interactive:
             # One-shot: opencode run --session <id> [message].
-            # --auto enables unattended approval of permissions.
             argv.append("run")
             if session_id:
                 argv.extend(["--session", session_id])
@@ -7124,7 +7201,7 @@ def _build_managed_argv(
         else:
             # Interactive TUI: bare opencode attached to the pre-minted session.
             # --port exposes the HTTP API on a known port for health and mint.
-            # --auto enables unattended approval of permissions.
+            # --auto enables unattended approval of permissions (interactive only).
             # NEVER add --prompt here: --session silently swallows it.
             if opencode_port is not None:
                 argv.extend(["--port", str(opencode_port)])
@@ -7191,8 +7268,6 @@ def _acquire_session_missing(
 ) -> None:
     """Write a session.json with confidence=missing when acquisition fails."""
     _record_session(log_dir, acquire_log, harness, None, "missing", "missing", reason)
-
-
 
 
 # ---------------------------------------------------------------------------

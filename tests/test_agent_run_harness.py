@@ -1885,6 +1885,47 @@ class TestCodexRpcEdgeCases:
         fake.chmod(0o755)
         return str(fake_dir)
 
+    def _make_active_turn_steer_rejecting_codex(self, tmp_path: Path, thread_id: str = "active-err-tid") -> str:
+        """Fake app-server that keeps a turn active and rejects turn/steer with a JSON-RPC error.
+
+        Unlike _make_steer_error_codex, this server sends a turn.id in the turn/start
+        result so active_turn_id is populated. A subsequent steer will therefore be sent
+        as turn/steer (not turn/start), and the server rejects it with an rpc error.
+        """
+        fake_dir = tmp_path / "bin-active"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, select as _sel\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv(timeout=None):\n"
+            "    if timeout is not None:\n"
+            "        r, _, _ = _sel.select([sys.stdin], [], [], timeout)\n"
+            "        if not r: return None\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            f"TID = '{thread_id}'\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'codex_exec/test'}})\n"
+            "recv()\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'thread': {'id': TID, 'sessionId': TID, 'path': '~/.codex/r.jsonl'}}})\n"
+            "# Respond with a turn id so active_turn_id is set in the runner.\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'turn': {'id': 'active-turn-1', 'status': 'inProgress'}}})\n"
+            "send({'method': 'item/agentMessage/delta', 'params': {'delta': 'working...'}})\n"
+            "# The turn is still running. Wait for a steer (which arrives as turn/steer).\n"
+            "msg = recv(timeout=5.0)\n"
+            "if msg and msg.get('method') == 'turn/steer':\n"
+            "    send({'id': msg['id'], 'error': {'code': -32001, 'message': 'steer rejected by server'}})\n"
+            "send({'method': 'turn/completed', 'params': {'turn': {'id': 'active-turn-1', 'status': 'completed'}}})\n"
+            "sys.exit(0)\n"
+        )
+        fake.chmod(0o755)
+        return str(fake_dir)
+
     def _wait_running(self, state_dir: Path, timeout: float = 10.0) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -1952,13 +1993,13 @@ class TestCodexRpcEdgeCases:
     def test_steer_error_response_does_not_report_success(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
-        """A steer rejected by the app-server must be logged; runner must not silently drop it.
+        """A turn/steer rejected by the app-server must be logged in the acquire log.
 
         The fix adds error handling for turn/steer rejection so the acquire log
-        records the failure. The steer text is still lost (the app-server has moved on),
-        but the error is visible in diagnostics.
+        records the failure. Uses a server that keeps the turn active (sends a turn id)
+        so the steer dispatches as turn/steer and can be rejected at the protocol level.
         """
-        bin_dir = self._make_steer_error_codex(tmp_path)
+        bin_dir = self._make_active_turn_steer_rejecting_codex(tmp_path)
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
         name = "steer-error-test"
         ns = argparse.Namespace(
@@ -1973,23 +2014,24 @@ class TestCodexRpcEdgeCases:
 
         reached = self._wait_running(state_dir, timeout=10.0)
         assert reached, "Run must reach running"
-        time.sleep(0.8)  # let initial turn complete and active_turn_id clear
+        time.sleep(0.5)  # let the server send the delta and wait for a steer
 
-        # Send a steer after the turn has already completed (expectedTurnId will be stale
-        # because the fake server's completion had no id, so active_turn_id was cleared,
-        # meaning this becomes a turn/start which the fake answers with a SIGKILL-style error).
+        # The turn is still active (server sent active-turn-1 id). The steer
+        # dispatches as turn/steer. The server rejects it with an rpc error.
         steer_ns = argparse.Namespace(name=name, message=["DO SOMETHING"], raw=False, esc=False)
-        rc = agent_run.cmd_steer(steer_ns)
-        assert rc == 0, "cmd_steer must exit 0 (the error is in the protocol layer)"
+        agent_run.cmd_steer(steer_ns)
 
         self._wait_terminal(state_dir, timeout=12.0)
 
-        # The acquire log must record the steer/error.
         acquire_log = log_dir / "session-acquire.log"
         log_text = acquire_log.read_text() if acquire_log.exists() else ""
-        # Either it sent a steer (which errored) or a new turn/start; both should be logged.
-        assert "turn/steer" in log_text or "turn/start" in log_text, (
-            f"Acquire log must record the steer attempt: {log_text!r}"
+        # The steer must have gone as turn/steer (active_turn_id was set).
+        assert "turn/steer" in log_text, (
+            f"Steer must dispatch as turn/steer when active_turn_id is set: {log_text!r}"
+        )
+        # The rpc error from the server must be recorded.
+        assert "rpc error id=" in log_text, (
+            f"Acquire log must record the rpc error from the server: {log_text!r}"
         )
 
     def test_turn_completed_without_id_clears_active_turn_id(
@@ -2025,8 +2067,8 @@ class TestCodexRpcEdgeCases:
         acquire_log = log_dir / "session-acquire.log"
         log_text = acquire_log.read_text() if acquire_log.exists() else ""
         # With no id in turn/completed, active_turn_id should be None, so the adapter
-        # sends turn/start (idle path), not turn/steer with expectedTurnId.
-        assert "turn/start (steer idle)" in log_text or "turn/steer" in log_text, (
-            f"Acquire log must show the steer dispatch: {log_text!r}"
+        # sends turn/start (idle path), not turn/steer with a stale expectedTurnId.
+        assert "turn/start (steer idle)" in log_text, (
+            f"Acquire log must show idle-path turn/start (active_turn_id was cleared): {log_text!r}"
         )
 
