@@ -3,6 +3,8 @@
 Covers:
 - _parse_launch_argv: --harness flag parsing, mutually exclusive constraints,
   prompt/prompt-file requirement, --harness + -- mutual exclusion.
+- _build_parser: managed-mode options (--harness, --permissions, etc.) appear
+  in --help output and do not break subcommand dispatch.
 - _build_managed_argv: correct argv construction per harness × mode.
 - session.json: written atomically by _write_session_json/_record_session.
 - watch --json session field: additive, null when no session.json present.
@@ -229,6 +231,63 @@ class TestParseLaunchArgvHarness:
         r = _parse([sub, "myrun"])
         assert r.subcommand_tokens is not None
         assert r.subcommand_tokens[0] == sub
+
+
+# ---------------------------------------------------------------------------
+# _build_parser help text — managed-mode options must be discoverable
+# ---------------------------------------------------------------------------
+
+class TestParserHelpShowsManagedMode:
+    """_build_parser() must register managed-mode options so they appear in
+    --help output.  Absence silently hides a user-facing feature; this class
+    prevents that regression.
+    """
+
+    def _help_text(self) -> str:
+        return agent_run._build_parser().format_help()
+
+    def test_harness_flag_in_help(self):
+        assert "--harness" in self._help_text()
+
+    def test_permissions_flag_in_help(self):
+        assert "--permissions" in self._help_text()
+
+    def test_prompt_flag_in_help(self):
+        assert "--prompt" in self._help_text()
+
+    def test_prompt_file_flag_in_help(self):
+        assert "--prompt-file" in self._help_text()
+
+    def test_model_flag_in_help(self):
+        assert "--model" in self._help_text()
+
+    def test_agent_mode_flag_in_help(self):
+        assert "--agent-mode" in self._help_text()
+
+    def test_session_id_flag_in_help(self):
+        assert "--session-id" in self._help_text()
+
+    def test_harness_arg_flag_in_help(self):
+        assert "--harness-arg" in self._help_text()
+
+    def test_raw_usage_line_present(self):
+        # The raw-mode usage line must remain visible so the existing contract
+        # is not obscured by the managed-mode additions.
+        assert "NAME -- <cmd" in self._help_text()
+
+    def test_bypass_is_documented_as_default(self):
+        # --permissions bypass must be described as the default so users know
+        # they get bypassPermissions without specifying anything.
+        help_text = self._help_text()
+        assert "bypass" in help_text
+        assert "bypassPermissions" in help_text
+
+    def test_subcommand_dispatch_unaffected_by_new_args(self):
+        # Registering managed-mode flags in the top-level parser must not break
+        # subcommand dispatch: parse_args(['status', 'myrun']) must still work.
+        ns = agent_run._build_parser().parse_args(["status", "myrun"])
+        assert ns.sub == "status"
+        assert ns.name == "myrun"
 
 
 # ---------------------------------------------------------------------------

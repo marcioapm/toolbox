@@ -7091,8 +7091,87 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="agent-run",
         description="Coding agent wrapper with structured run tracking.",
+        # Raw-mode usage shown first so the existing contract is prominent;
+        # managed-mode options follow in the argument group below.
+        usage=(
+            "agent-run [flags] NAME -- <cmd...>\n"
+            "       agent-run [flags] NAME <cmd...>\n"
+            "       agent-run --harness claude|opencode|codex [options] NAME\n"
+            "       agent-run {status,watch,logs,tail,clean,steer,kill,list,reap,du,help} ..."
+        ),
     )
     sub = p.add_subparsers(dest="sub")
+
+    # Managed-mode options are parsed by _parse_launch_argv, not by this parser.
+    # They are registered here with default=SUPPRESS so they appear in --help
+    # without injecting phantom keys into the Namespace on subcommand dispatch.
+    mg = p.add_argument_group(
+        "managed mode (--harness claude|opencode|codex)",
+        "agent-run builds the launch command itself; requires --prompt or --prompt-file",
+    )
+    mg.add_argument(
+        "--harness",
+        metavar="claude|opencode|codex",
+        default=argparse.SUPPRESS,
+        help="select managed mode and harness; mutually exclusive with a trailing '-- <cmd>'",
+    )
+    mg.add_argument(
+        "--prompt",
+        metavar="TEXT",
+        default=argparse.SUPPRESS,
+        help="inline prompt text (mutually exclusive with --prompt-file)",
+    )
+    mg.add_argument(
+        "-f",
+        "--prompt-file",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help="read the prompt from a file (mutually exclusive with --prompt); "
+        "also available in raw mode",
+    )
+    mg.add_argument(
+        "--permissions",
+        metavar="bypass|prompt",
+        default=argparse.SUPPRESS,
+        help="permission mode: 'bypass' (default) appends --permission-mode bypassPermissions "
+        "/ --auto to the harness command; 'prompt' omits those flags so the harness's own "
+        "permission UI is used",
+    )
+    mg.add_argument(
+        "--model",
+        metavar="MODEL",
+        default=argparse.SUPPRESS,
+        help="model string forwarded to the harness (not supported for codex; use "
+        "--harness-arg -c model=<m> instead)",
+    )
+    mg.add_argument(
+        "--agent-mode",
+        metavar="NAME",
+        default=argparse.SUPPRESS,
+        help="harness agent/mode name (e.g. opencode --agent build); forwarded as "
+        "--agent to the harness",
+    )
+    mg.add_argument(
+        "--session-id",
+        metavar="UUID",
+        default=argparse.SUPPRESS,
+        help="supply a specific session UUID instead of having agent-run generate one "
+        "(claude only; opencode and codex always mint a new session)",
+    )
+    mg.add_argument(
+        "--harness-arg",
+        metavar="FLAG",
+        default=argparse.SUPPRESS,
+        help="pass FLAG verbatim to the harness command after agent-run's own constructed "
+        "arguments; repeatable escape hatch for flags agent-run does not model",
+    )
+    mg.add_argument(
+        "--cwd",
+        metavar="DIR",
+        default=argparse.SUPPRESS,
+        help="(accepted by the parser but not yet implemented; run from the target directory "
+        "instead)",
+    )
 
     sp_status = sub.add_parser("status", help="print one-line status")
     sp_status.add_argument("name")
