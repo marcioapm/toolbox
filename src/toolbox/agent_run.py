@@ -261,7 +261,7 @@ import traceback
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
@@ -274,6 +274,15 @@ MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
 FINAL_RENDER_TIMEOUT_SECONDS = 10.0
 FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
 ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
+# Per-line and total byte caps for `logs` output. A single TUI line can be
+# megabytes long (one \n per session, many \r redraw frames). The per-line cap
+# keeps any one line from dominating the excerpt; the total cap bounds what
+# reaches the LLM consumer. 64 KiB per line covers structured JSON lines
+# comfortably while preventing a single blob from swamping the budget.
+# 256 KiB total is 8x the downstream 32 KiB front-cap — enough that a tail
+# window contains meaningful content, small enough to be safe in an LLM prompt.
+LOGS_MAX_LINE_BYTES = 64 * 1024
+LOGS_MAX_TOTAL_BYTES = 256 * 1024
 
 # Statuses that are conclusively terminal: the run will never transition
 # again on its own. "done"/"failed"/"launch_failed" are published by the
@@ -3036,83 +3045,180 @@ def _reset_terminal_modes() -> None:
         pass
 
 
-def _tail_bytes(f: "BinaryIO", n: int) -> List[bytes]:
+def _split_lines_bytes(data: bytes) -> List[bytes]:
+    """Split ``data`` on ``\\n`` only, stripping a trailing ``\\r`` from each segment.
+
+    Terminal logs use ``\\r`` as an in-line cursor-home (progress redraw), not as a
+    line terminator. Splitting only on ``\\n`` and stripping ``\\r`` from the end of
+    each segment is faithful to that convention: CRLF logs shed the ``\\r``, bare-``\\r``
+    redraw frames are kept intact within the line they belong to, and the grammar is
+    identical whether called from the forward or reverse reader.
+    """
+    return [seg.rstrip(b"\r") for seg in data.split(b"\n")]
+
+
+def _tail_bytes(f: BinaryIO, n: int) -> List[bytes]:
     """Return the last ``n`` lines from ``f`` without reading the entire file.
 
-    Uses a reverse block-read: start at EOF and walk backwards in 8 KiB chunks,
-    accumulating data until at least n+1 newlines have been seen so that
-    splitlines() can return a clean slice. Terminates on the first block that
-    takes pos to 0, so a file with fewer than n lines returns all lines.
+    Walks backward from EOF in 8 KiB blocks, accumulating chunks into a list and
+    joining once, until at least n+1 newlines have been seen or the start of file is
+    reached (fewer than n lines case). Uses a list of chunks to avoid the O(n²)
+    copying that repeated ``bytes`` concatenation would cause.
+
+    Lines are split on ``\\n`` only; trailing ``\\r`` is stripped per segment (see
+    ``_split_lines_bytes``). Returns an empty list for n < 1.
     """
+    if n < 1:
+        return []
     f.seek(0, os.SEEK_END)
     pos = f.tell()
     block = 8192
-    data = b""
-    while pos > 0 and data.count(b"\n") <= n:
+    chunks: List[bytes] = []
+    newline_count = 0
+    while pos > 0 and newline_count <= n:
         read_size = min(block, pos)
         pos -= read_size
         f.seek(pos)
-        data = f.read(read_size) + data
-    return data.splitlines()[-n:]
+        chunk = f.read(read_size)
+        chunks.append(chunk)
+        newline_count += chunk.count(b"\n")
+    data = b"".join(reversed(chunks))
+    lines = _split_lines_bytes(data)
+    # Drop a trailing empty segment produced by a file-final \n.
+    if lines and lines[-1] == b"":
+        lines = lines[:-1]
+    return lines[-n:]
 
 
-def _head_bytes(f: "BinaryIO", n: int) -> List[bytes]:
+def _head_bytes(f: BinaryIO, n: int) -> List[bytes]:
     """Return the first ``n`` lines from ``f`` with a bounded forward read.
 
-    Reads in 8 KiB chunks and stops as soon as n newlines have been collected,
-    so even an 8 MB single-line log terminates after reading at most one chunk
-    beyond the n-th newline — it never materialises the whole file.
+    Reads 8 KiB at a time, scanning each incoming chunk for ``\\n`` without
+    re-scanning accumulated data, so the work is O(bytes_read) rather than
+    O(bytes_read²). Stops after the n-th complete line or at EOF. A partial
+    final line at EOF (no trailing ``\\n``) is included as the n-th line if
+    fewer than n complete lines were found.
+
+    Lines are split on ``\\n`` only; trailing ``\\r`` is stripped per segment (see
+    ``_split_lines_bytes``). Returns an empty list for n < 1.
     """
+    if n < 1:
+        return []
     lines: List[bytes] = []
-    buf = b""
+    # pending accumulates bytes of the current incomplete line.
+    pending: List[bytes] = []
     while len(lines) < n:
         chunk = f.read(8192)
         if not chunk:
-            # EOF; emit whatever partial last line remains.
-            if buf:
-                lines.append(buf)
+            # EOF: flush any unterminated final line.
+            if pending:
+                lines.append(b"".join(pending).rstrip(b"\r"))
             break
-        buf += chunk
-        parts = buf.split(b"\n")
-        # The last element is an incomplete line (no trailing newline yet).
-        for part in parts[:-1]:
-            lines.append(part)
-            if len(lines) == n:
-                break
-        buf = parts[-1] if len(lines) < n else b""
-    return lines[:n]
+        # Scan the chunk for newlines without rebuilding a growing bytes object.
+        start = 0
+        while start < len(chunk) and len(lines) < n:
+            nl = chunk.find(b"\n", start)
+            if nl == -1:
+                pending.append(chunk[start:])
+                start = len(chunk)
+            else:
+                pending.append(chunk[start:nl])
+                lines.append(b"".join(pending).rstrip(b"\r"))
+                pending = []
+                start = nl + 1
+        if start < len(chunk) and len(lines) == n:
+            break
+    return lines
 
 
 def _slice_str_tail(text: str, n: int) -> str:
-    """Return the last ``n`` lines of ``text``, preserving the trailing newline."""
-    lines = text.splitlines()
-    return "\n".join(lines[-n:]) + "\n"
+    """Return the last ``n`` lines of ``text`` as a newline-terminated string.
+
+    Splits on ``\\n`` only so that ``\\r``, ``\\f``, ``\\v``, U+2028, and other
+    Unicode line-break characters in the rendered transcript are not treated as
+    additional separators and are not rewritten. Returns ``""`` for empty input
+    or n < 1.
+    """
+    if n < 1 or not text:
+        return ""
+    parts = text.split("\n")
+    # A trailing \n produces a final empty part; drop it before slicing.
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    if not parts:
+        return ""
+    return "".join(line + "\n" for line in parts[-n:])
 
 
 def _slice_str_head(text: str, n: int) -> str:
-    """Return the first ``n`` lines of ``text``, preserving the trailing newline."""
-    lines = text.splitlines()
-    return "\n".join(lines[:n]) + "\n"
+    """Return the first ``n`` lines of ``text`` as a newline-terminated string.
+
+    Splits on ``\\n`` only (same grammar as ``_slice_str_tail``). Returns ``""``
+    for empty input or n < 1.
+    """
+    if n < 1 or not text:
+        return ""
+    parts = text.split("\n")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    if not parts:
+        return ""
+    return "".join(line + "\n" for line in parts[:n])
+
+
+# ANSI/OSC strippers reused on the logs output path to remove terminal-control
+# sequences that are invisible to humans but visible to LLM consumers.
+_LOGS_OSC_RE = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_LOGS_CSI_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]")
+_LOGS_ESC_RE = re.compile(rb"\x1b.", re.DOTALL)
+
+
+def _strip_ansi_bytes(data: bytes) -> bytes:
+    """Remove ANSI CSI, OSC, and bare ESC sequences from a byte string."""
+    data = _LOGS_OSC_RE.sub(b"", data)
+    data = _LOGS_CSI_RE.sub(b"", data)
+    return _LOGS_ESC_RE.sub(b"", data)
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
-    # Exactly one of tail/head is set; default is tail=50 (set by the parser).
     tail_n: Optional[int] = getattr(args, "tail", None)
     head_n: Optional[int] = getattr(args, "head", None)
+    n = head_n if head_n is not None else (tail_n if tail_n is not None else 50)
     try:
-        with log.open("rb") as f:
+        with _watch_open_validated_log(log) as f:
+            if f is None:
+                sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
             if head_n is not None:
-                lines = _head_bytes(f, head_n)
+                lines = _head_bytes(f, n)
             else:
-                # Default: tail 50.
-                n = tail_n if tail_n is not None else 50
                 lines = _tail_bytes(f, n)
+        total = 0
+        truncated = False
         for line in lines:
+            clean = _strip_ansi_bytes(line)
+            # Per-line cap: a single TUI line can be megabytes long.
+            if len(clean) > LOGS_MAX_LINE_BYTES:
+                clean = clean[:LOGS_MAX_LINE_BYTES]
+                truncated = True
+            # Total output cap: bound what reaches the LLM consumer.
+            remaining = LOGS_MAX_TOTAL_BYTES - total
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(clean) > remaining:
+                clean = clean[:remaining]
+                truncated = True
             try:
-                sys.stdout.buffer.write(line + b"\n")
+                sys.stdout.buffer.write(clean + b"\n")
             except BrokenPipeError:
                 break
+            total += len(clean) + 1
+        if truncated:
+            try:
+                sys.stdout.buffer.write(b"[agent-run: output truncated]\n")
+            except BrokenPipeError:
+                pass
     finally:
         _reset_terminal_modes()
     return 0
@@ -3440,7 +3546,10 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
 
 def cmd_clean(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
-    raw = log.read_bytes()
+    with _watch_open_validated_log(log) as f:
+        if f is None:
+            sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
+        raw = f.read()
     try:
         rendered = _render_log(
             raw,
@@ -3461,7 +3570,6 @@ def cmd_clean(args: argparse.Namespace) -> int:
         rendered = _slice_str_tail(rendered, tail_n)
     elif head_n is not None:
         rendered = _slice_str_head(rendered, head_n)
-    # Neither flag: unbounded — preserves existing behaviour for interactive use.
 
     out_path = getattr(args, "out", None)
     if out_path:
@@ -5995,7 +6103,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_watch.set_defaults(func=cmd_watch)
 
-    sp_logs = sub.add_parser("logs", help="print last N lines of the log (default --tail 50)")
+    sp_logs = sub.add_parser(
+        "logs",
+        help="print last N lines of the log (default --tail 50)",
+        allow_abbrev=False,
+    )
     sp_logs.add_argument("name")
     logs_slice = sp_logs.add_mutually_exclusive_group()
     logs_slice.add_argument(
@@ -6010,7 +6122,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=None,
         metavar="N",
-        help="print the first N lines; bounded forward read, never loads whole file",
+        help="print the first N lines; reads forward until N newlines found or EOF",
     )
     sp_logs.set_defaults(func=cmd_logs)
 
@@ -6021,6 +6133,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_clean = sub.add_parser(
         "clean",
         help="render PTY-captured TUI log into a readable transcript via pyte",
+        allow_abbrev=False,
     )
     sp_clean.add_argument("name")
     sp_clean.add_argument(
@@ -6381,22 +6494,24 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             continue
         break
 
-    # A bare "--" before any name has no run to attach the command to.
-    if tokens and tokens[0] == "--":
-        raise _LaunchArgvError(
-            "agent-run: the run name must appear before '--'; shape is "
-            "'agent-run [flags] NAME -- <command> [args...]'"
-        )
-
     # No launch flags set and first token is a known subcommand: delegate to
     # argparse.  A run may not be named after a subcommand, so a "--" after a
-    # subcommand name is still part of that subcommand's own argv.
+    # subcommand name is still part of that subcommand's own argv (main() will
+    # strip a bare "--" immediately after the subcommand name before parsing).
     any_launch_flag = interactive or prompt_file or echo or submit_mode is not None or idle_timeout is not None
-    if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
+    if not any_launch_flag and tokens and tokens[0] in _KNOWN_SUBCOMMANDS:
         return _LaunchArgv(
             interactive=False, prompt_file=None, echo=False, echo_interval=2.0,
             submit_mode=None, idle_timeout=None, name="", command=[],
             subcommand_tokens=tokens,
+        )
+
+    # A bare "--" with no subcommand following is a launch-command separator
+    # without a name — reject it with a diagnostic.
+    if tokens and tokens[0] == "--":
+        raise _LaunchArgvError(
+            "agent-run: the run name must appear before '--'; shape is "
+            "'agent-run [flags] NAME -- <command> [args...]'"
         )
 
     if len(tokens) < 2:
@@ -6467,8 +6582,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Subcommand dispatch: argparse handles help for each subcommand.
     if parsed.subcommand_tokens is not None:
         parser = _build_parser()
+        tokens = parsed.subcommand_tokens
+        # Strip a bare "--" immediately after the subcommand name, e.g.
+        # "logs -- <name> --tail N": argparse would otherwise treat everything
+        # after "--" as positionals and reject the flags.
+        if len(tokens) > 1 and tokens[1] == "--":
+            tokens = [tokens[0]] + tokens[2:]
         try:
-            args = parser.parse_args(parsed.subcommand_tokens)
+            args = parser.parse_args(tokens)
         except SystemExit as exc:
             if parsed.subcommand_tokens[0] == "watch" and exc.code == 2:
                 raise SystemExit(1) from exc

@@ -344,34 +344,117 @@ class TestLogsFlags:
         assert exc_info.value.code == 2
 
     def test_stale_positional_form_exits_nonzero(self, capsys):
-        """agent-run logs <name> 200 (old positional) must be rejected non-zero."""
+        """agent-run logs <name> 200 (old positional) must be rejected non-zero via main()."""
         with pytest.raises(SystemExit) as exc_info:
-            agent_run._build_parser().parse_args(["logs", "myrun", "200"])
+            agent_run.main(["logs", "myrun", "200"])
         assert exc_info.value.code != 0
 
     def test_single_line_8mb_log_tail_1(self, isolated_runs_root, monkeypatch):
-        """An 8 MB single-line log (the wtgc5 shape): --tail 1 returns that one line
-        without materialising the whole file in one go."""
-        big_line = b"x" * (8 * 1024 * 1024)
+        """--tail 1 on an 8 MB single-line log must emit bounded output, not the full file.
+
+        The motivating wtgc5 case: a log with one \\n means one "line", so the line
+        count alone cannot bound output. The byte budget must fire instead, and a
+        truncation marker must be emitted so the consumer knows the output is partial.
+        """
+        file_size = 8 * 1024 * 1024 + 1  # 8 MB + trailing \n
+        big_line = b"x" * (file_size - 1)
         log_content = big_line + b"\n"
         _make_log_run(isolated_runs_root, "bigrun_tail", log_content)
         stdout = _FakeStdout(tty=False)
         monkeypatch.setattr(sys, "stdout", stdout)
         rc = agent_run.cmd_logs(argparse.Namespace(name="bigrun_tail", tail=1, head=None))
         assert rc == 0
-        assert stdout.buffer.getvalue() == big_line + b"\n"
+        out = stdout.buffer.getvalue()
+        # Output must be bounded, not the whole file.
+        assert len(out) <= agent_run.LOGS_MAX_TOTAL_BYTES + 100, (
+            f"output {len(out)} bytes exceeds byte budget"
+        )
+        # Truncation marker must be present.
+        assert b"[agent-run: output truncated]" in out, "truncation marker missing"
+        # The output starts with content from the line, not zero bytes.
+        assert len(out) > 0
 
     def test_single_line_8mb_log_head_1(self, isolated_runs_root, monkeypatch):
-        """An 8 MB single-line log: --head 1 returns that one line, terminating
-        after reading at most one 8 KiB chunk beyond the first (and only) newline."""
-        big_line = b"y" * (8 * 1024 * 1024)
+        """--head 1 on an 8 MB single-line log must emit bounded output, not the full file."""
+        file_size = 8 * 1024 * 1024 + 1
+        big_line = b"y" * (file_size - 1)
         log_content = big_line + b"\n"
         _make_log_run(isolated_runs_root, "bigrun_head", log_content)
         stdout = _FakeStdout(tty=False)
         monkeypatch.setattr(sys, "stdout", stdout)
         rc = agent_run.cmd_logs(argparse.Namespace(name="bigrun_head", tail=None, head=1))
         assert rc == 0
-        assert stdout.buffer.getvalue() == big_line + b"\n"
+        out = stdout.buffer.getvalue()
+        assert len(out) <= agent_run.LOGS_MAX_TOTAL_BYTES + 100, (
+            f"output {len(out)} bytes exceeds byte budget"
+        )
+        assert b"[agent-run: output truncated]" in out, "truncation marker missing"
+
+    def test_8mb_log_reads_less_than_file_size_tail(self, isolated_runs_root, monkeypatch):
+        """_tail_bytes on a file with many short lines must not read the entire file.
+
+        A log with 50+ newlines should terminate the reverse walk before reaching
+        byte 0. On old code (O(n²) with bytes concatenation), 8 MB single-line
+        logs would be fully read; on new code the byte budget stops the read early.
+        This test uses many-line input so the newline-count exit fires.
+        """
+        # Many short lines: reverse walk should find 50 newlines well before EOF.
+        log_content = (b"line\n" * 10000)  # 50 KB, many newlines
+        file_size = len(log_content)
+        _make_log_run(isolated_runs_root, "bigrun_tail_reads", log_content)
+        read_total = [0]
+
+        original_open = agent_run._watch_open_validated_log
+
+        from contextlib import contextmanager
+
+        class CountingFile:
+            def __init__(self, f):
+                self._f = f
+            def read(self, n=-1):
+                data = self._f.read(n)
+                read_total[0] += len(data)
+                return data
+            def seek(self, *a): return self._f.seek(*a)
+            def tell(self): return self._f.tell()
+
+        @contextmanager
+        def patched_open(path):
+            with original_open(path) as f:
+                if f is not None:
+                    yield CountingFile(f)
+                else:
+                    yield None
+
+        monkeypatch.setattr(agent_run, "_watch_open_validated_log", patched_open)
+        stdout = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout)
+        agent_run.cmd_logs(argparse.Namespace(name="bigrun_tail_reads", tail=50, head=None))
+        assert read_total[0] < file_size, (
+            f"read {read_total[0]} bytes, expected < {file_size} (whole file)"
+        )
+
+    def test_tail_and_head_return_different_content(self, isolated_runs_root, monkeypatch):
+        """--tail N and --head N must return different content on a multi-section log."""
+        # Distinct markers at head and tail so swapping the helpers would flip content.
+        lines = [b"HEAD-MARKER"] + [b"middle"] * 20 + [b"TAIL-MARKER"]
+        log_content = b"\n".join(lines) + b"\n"
+        _make_log_run(isolated_runs_root, "content_run", log_content)
+
+        stdout_tail = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout_tail)
+        agent_run.cmd_logs(argparse.Namespace(name="content_run", tail=3, head=None))
+        tail_out = stdout_tail.buffer.getvalue()
+
+        stdout_head = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout_head)
+        agent_run.cmd_logs(argparse.Namespace(name="content_run", tail=None, head=3))
+        head_out = stdout_head.buffer.getvalue()
+
+        assert b"TAIL-MARKER" in tail_out, "--tail must include tail of file"
+        assert b"HEAD-MARKER" not in tail_out, "--tail must not include head of file"
+        assert b"HEAD-MARKER" in head_out, "--head must include head of file"
+        assert b"TAIL-MARKER" not in head_out, "--head must not include tail of file"
 
     def test_tail_zero_rejected(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
@@ -382,6 +465,32 @@ class TestLogsFlags:
         with pytest.raises(SystemExit) as exc_info:
             agent_run._build_parser().parse_args(["logs", "run", "--head", "0"])
         assert exc_info.value.code == 2
+
+    def test_logs_double_dash_before_name_and_flag(self, isolated_runs_root, monkeypatch):
+        """logs -- <name> --tail N must work (the -- is stripped before argparse)."""
+        log_content = b"\n".join(f"line{i}".encode() for i in range(1, 11)) + b"\n"
+        _make_log_run(isolated_runs_root, "dashrun", log_content)
+        stdout = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout)
+        rc = agent_run.main(["logs", "--", "dashrun", "--tail", "3"])
+        assert rc == 0
+        lines = stdout.buffer.getvalue().splitlines()
+        # --tail 3 from a 10-line log should return the last 3 lines.
+        assert len(lines) == 3
+        assert lines[-1] == b"line10"
+
+    def test_ansi_stripped_on_logs_output(self, isolated_runs_root, monkeypatch):
+        """ANSI and OSC sequences in the log must be stripped from logs output."""
+        ansi_line = b"\x1b[2J\x1b[H\x1b]0;TITLE\x07visible"
+        log_content = ansi_line + b"\n"
+        _make_log_run(isolated_runs_root, "ansirun", log_content)
+        stdout = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout)
+        rc = agent_run.cmd_logs(argparse.Namespace(name="ansirun", tail=1, head=None))
+        assert rc == 0
+        out = stdout.buffer.getvalue()
+        assert b"\x1b" not in out, "ANSI escape sequences must be stripped"
+        assert b"visible" in out, "visible content must be preserved"
 
 
 class TestCleanSlicing:
