@@ -5097,49 +5097,51 @@ def _worktree_nested_reason(info: _WorktreeInfo, path: Path) -> Optional[str]:
 def _worktree_foreign_nested_reason(path: Path) -> Optional[str]:
     """Detect git worktree roots structurally nested inside the candidate directory.
 
-    Scans subdirectories of ``path`` for ``.git`` entries that indicate a
-    worktree root belonging to any repository, not just the candidate's own.
-    ``_worktree_nested_reason`` only queries the candidate's repository, so a
-    linked worktree of a different repository is invisible to it.  This check
-    operates on filesystem structure rather than repository metadata.
+    ``_worktree_nested_reason`` only queries the candidate's own repository, so
+    a linked worktree of a different repository is invisible to it.  This check
+    uses ``git ls-files --others`` (without ``--directory``) to enumerate
+    untracked and ignored paths: git reports any nested repository as a single
+    directory entry with a trailing ``/`` and does not descend into it, so the
+    nested root is visible at any depth without a bounded filesystem walk.
 
-    Called unconditionally, including under ``--force-dirty`` where content
-    checks are skipped: an untracked intermediate directory can hide a foreign
-    worktree from the untracked-content check, but the structural signature
-    (``.git`` file or directory) is independent of git's index.
+    Two passes cover both cases:
+    - ``--others --exclude-standard``: untracked content, including a nested
+      repo whose intermediate directories are not gitignored.
+    - ``--others --ignored --exclude-standard``: content inside ignored
+      directories; a nested repo buried inside ``node_modules/`` or ``.venv/``
+      appears here as a directory entry, not as individual files.
 
-    Scans subdirectories up to ``_FOREIGN_WORKTREE_SCAN_DEPTH`` levels deep to
-    bound cost while covering the common nesting patterns.  Symlinks are not
-    followed.  Any ``scandir`` or ``lstat`` error fails closed.
+    For every directory entry reported (path ending with ``/``), ``lstat`` on
+    the ``.git`` entry inside it confirms the git-repo boundary.  A missing
+    ``.git`` means the directory is an ordinary untracked folder; any other
+    ``lstat`` error fails closed.  Any git invocation failure also fails closed.
+
+    Called unconditionally, including under ``--force-dirty``: content checks
+    are skipped there, but the structural signature (``.git`` file or directory)
+    is independent of git's index.
     """
-    _FOREIGN_WORKTREE_SCAN_DEPTH = 4
-    stack: List[Tuple[Path, int]] = [(path, 0)]
-    while stack:
-        current, depth = stack.pop()
-        if current != path:
+    checks = (
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    )
+    seen: set[str] = set()
+    for git_args in checks:
+        outcome = _watch_run_git_checked(path, git_args)
+        if outcome.stdout is None:
+            return f"cannot enumerate untracked paths ({outcome.error_detail})"
+        for entry in outcome.stdout.split("\0"):
+            if not entry or not entry.endswith("/") or entry in seen:
+                continue
+            seen.add(entry)
+            # Trailing / marks a git repository boundary; verify via lstat.
+            candidate_git = path / entry.rstrip("/") / ".git"
             try:
-                (current / ".git").lstat()
-                return f"nested git repository at {current}"
+                candidate_git.lstat()
+                return f"nested git repository at {path / entry.rstrip('/')}"
             except FileNotFoundError:
                 pass
             except OSError as exc:
-                return f"cannot check .git in {current}: {exc}"
-        try:
-            with os.scandir(current) as it:
-                subdirs = [
-                    Path(e.path)
-                    for e in it
-                    if e.is_dir(follow_symlinks=False) and e.name != ".git"
-                ]
-        except OSError as exc:
-            return f"cannot scan {current} for nested repositories: {exc}"
-        if depth >= _FOREIGN_WORKTREE_SCAN_DEPTH:
-            # Depth limit reached with subdirectories unexamined: an unexplored
-            # subtree is an uncertainty, so fail closed rather than proceed.
-            if subdirs:
-                return f"scan depth limit reached with unexplored subdirectories at {current}"
-            continue
-        stack.extend((d, depth + 1) for d in subdirs)
+                return f"cannot check .git in {path / entry.rstrip('/')}: {exc}"
     return None
 
 

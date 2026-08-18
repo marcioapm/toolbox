@@ -1622,7 +1622,66 @@ class TestReapWorktreeNested:
         assert inner_wt.is_dir(), "inner (foreign) worktree at depth 5 was DELETED"
         assert outer_wt.is_dir(), "outer worktree was DELETED"
         assert "worktrees_removed=0 worktrees_skipped=1" in out
-        assert "nested git repository" in out or "unexplored subdirectories" in out
+        assert "nested git repository" in out
+
+    def test_foreign_nested_worktree_at_depth_8_ignored_intermediate_refused_under_force_dirty(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A foreign linked worktree 8 directories deep inside a gitignored
+        intermediate directory is refused under --force-dirty.
+
+        git ls-files --others --ignored reports the nested repo as a single
+        directory entry at its full path even when all intermediate directories
+        are gitignored, so depth is not a limiting factor."""
+        outer_repo = _make_repo(git_root, "outer-repo")
+        outer_wt = _add_worktree(outer_repo, git_root / "outer-wt", "f-outer")
+        # Ignore the top-level vendor directory so the intermediate dirs are
+        # gitignored; the nested repo still appears via --others --ignored.
+        (outer_repo / ".git" / "info" / "exclude").write_text("vendor/\n")
+        deep = outer_wt / "vendor" / "a" / "b" / "c" / "d" / "e" / "f" / "g"
+        deep.mkdir(parents=True)
+
+        inner_repo = _make_repo(git_root, "inner-repo")
+        inner_wt = _add_worktree(inner_repo, deep / "inner-wt", "f-inner")
+        (inner_wt / "precious.txt").write_text("must survive\n")
+
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", cwd=outer_wt, age_hours=1000
+        )
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert inner_wt.is_dir(), "inner (foreign) worktree at depth 8 (ignored) was DELETED"
+        assert outer_wt.is_dir(), "outer worktree was DELETED"
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+        assert "nested git repository" in out
+
+    def test_deep_vendor_directory_without_nested_repo_is_removable(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A linked worktree whose only deep content is a plain vendor directory
+        (no nested git repository) must be removable regardless of depth.
+
+        The git ls-files approach reports individual files for untracked dirs,
+        not directory entries, so no depth limit applies and no false refusal
+        is produced for vendor trees that are merely deep."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        # A deep untracked directory tree with no nested git repo.
+        deep = wt / "vendor" / "a" / "b" / "c" / "d" / "e" / "f" / "g" / "h"
+        deep.mkdir(parents=True)
+        (deep / "lib.py").write_text("# vendored library\n")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert not wt.exists(), (
+            "worktree with only a deep vendor dir (no nested repo) was not removed"
+        )
+        assert "worktrees_removed=1" in out
+        assert "scan depth limit" not in out
 
 
 class TestReapWorktreeFinalRevalidation:
@@ -2551,32 +2610,31 @@ class TestReapWorktreeUndefendedGuards:
     def test_foreign_nested_scandir_error_refuses(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
-        """An os.scandir failure inside _worktree_foreign_nested_reason at
-        depth <= 4 causes a refusal; the docstring promises fail-closed on
-        any scandir or lstat error.
+        """A git ls-files failure inside _worktree_foreign_nested_reason causes
+        a refusal; any enumeration failure fails closed.
 
-        Mutation: replacing the OSError handler with 'subdirs = []' treats
-        an unreadable subtree as empty, letting the candidate through."""
+        Mutation: replacing the stdout-is-None branch with 'continue' treats
+        an unreadable enumeration as empty, letting the candidate through."""
         repo = _make_repo(git_root)
         wt = _add_worktree(repo, git_root / "wt", "feature")
         subdir = wt / "sub"
         subdir.mkdir()
         _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
 
-        real_scandir = os.scandir
+        real_git = agent_run._watch_run_git_checked
 
-        def scandir_fails_in_subdir(path):
-            if str(path) == str(subdir):
-                raise OSError("simulated permission denied")
-            return real_scandir(path)
+        def git_fails_ls_files_others(path, args, **kw):
+            if list(args[:2]) == ["ls-files", "--others"]:
+                return agent_run._WatchGitOutcome(None, "git_failed")
+            return real_git(path, args, **kw)
 
-        monkeypatch.setattr(os, "scandir", scandir_fails_in_subdir)
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", git_fails_ls_files_others)
 
         agent_run.cmd_reap(_reap_args())
 
         out = capsys.readouterr().out
         assert wt.is_dir()
-        assert "cannot scan" in out and "nested repositories" in out
+        assert "cannot enumerate untracked paths" in out
         assert "worktrees_removed=0 worktrees_skipped=1" in out
 
     # G13 — empty rev-parse path yields UNKNOWN classification
