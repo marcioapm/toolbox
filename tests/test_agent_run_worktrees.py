@@ -440,3 +440,363 @@ class TestDuWorktrees:
         assert wt.is_dir()
         assert (wt / "untracked").read_text() == "keep me\n"
         assert sorted(p.name for p in (repo / ".git" / "worktrees").iterdir()) == admin_before
+
+
+# ---------------------------------------------------------------------------
+# reap --include-worktrees
+# ---------------------------------------------------------------------------
+
+class TestReapWorktrees:
+    def test_off_by_default(self, isolated_runs_root, isolated_log_root, git_root, capsys):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(include_worktrees=False))
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "worktrees_removed=0" in out
+
+    def test_clean_linked_worktree_removed_with_admin_metadata(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert not wt.exists()
+        assert "worktrees_removed=1" in out
+        # A bare rmtree would leave .git/worktrees/wt registered.
+        listed = [
+            ln.split(" ", 1)[1]
+            for ln in _git(repo, "worktree", "list", "--porcelain").splitlines()
+            if ln.startswith("worktree ")
+        ]
+        assert listed == [str(repo.resolve())]
+        admin = repo / ".git" / "worktrees"
+        assert not admin.exists() or "wt" not in [p.name for p in admin.iterdir()]
+
+    @pytest.mark.parametrize("kind", ["main", "plain", "bare", "missing"])
+    def test_never_removes_non_linked_cwd(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys, kind
+    ):
+        repo = _make_repo(git_root)
+        if kind == "main":
+            cwd = repo
+        elif kind == "plain":
+            cwd = git_root / "home"
+            cwd.mkdir()
+            (cwd / "precious.txt").write_text("do not delete\n")
+        elif kind == "bare":
+            cwd = git_root / "bare.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(cwd)], check=True)
+        else:
+            cwd = git_root / "gone"
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=cwd, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert "worktrees_removed=0" in out
+        if kind == "missing":
+            # Nothing to classify: not even reported as a candidate.
+            assert "worktrees_skipped=0" in out
+        else:
+            assert cwd.is_dir()
+            assert "not a linked worktree" in out
+        if kind == "plain":
+            assert (cwd / "precious.txt").exists()
+
+    def test_git_failure_never_removes(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+        monkeypatch.setattr(
+            agent_run, "_watch_run_git_checked",
+            lambda *a, **k: agent_run._WatchGitOutcome(None, "git_missing"),
+        )
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "worktrees_removed=0" in out
+        assert "worktrees_skipped=1" in out
+
+    def test_untracked_files_refused(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        (wt / "scratch.txt").write_text("agent output\n")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "untracked file(s)" in out
+        assert "--force-dirty" in out
+        assert "worktrees_skipped=1" in out
+
+    def test_modified_tracked_file_refused(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        (wt / "tracked.txt").write_text("edited\n")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        assert wt.is_dir()
+        assert "worktrees_skipped=1" in capsys.readouterr().out
+
+    def test_unpushed_commit_refused(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        (wt / "tracked.txt").write_text("committed but unpushed\n")
+        _git(wt, "add", "tracked.txt")
+        _git(wt, "commit", "-qm", "local only")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "not on any remote" in out
+        assert "worktrees_skipped=1" in out
+
+    def test_force_dirty_removes_dirty_worktree(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        (wt / "scratch.txt").write_text("agent output\n")
+        (wt / "tracked.txt").write_text("edited\n")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        assert not wt.exists()
+        assert "worktrees_removed=1" in capsys.readouterr().out
+
+    def test_live_run_sharing_cwd_blocks_removal(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "a-done", cwd=wt, age_hours=1000)
+        live = _make_state_run(
+            isolated_runs_root, isolated_log_root, "b-live", status="running", cwd=wt
+        )
+        (live / "pid").write_text(f"{os.getpid()}\n")
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "a live run is using this directory" in out
+        assert "worktrees_skipped=1" in out
+
+    def test_shared_worktree_removed_once(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        for name in ("a-run", "b-run", "c-run"):
+            _make_state_run(isolated_runs_root, isolated_log_root, name, cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert not wt.exists()
+        assert "worktrees_removed=1" in out
+        assert "worktrees_skipped=0" in out
+        assert out.count("[removing]") == 1
+        assert "runs: a-run, b-run, c-run" in out
+
+    def test_symlinked_cwd_component_refused(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        link = git_root / "wt-link"
+        link.symlink_to(wt, target_is_directory=True)
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=link, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "not a real directory" in out
+        assert "worktrees_skipped=1" in out
+
+    def test_age_threshold_boundaries(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        young = _add_worktree(repo, git_root / "young", "f-young")
+        old = _add_worktree(repo, git_root / "old", "f-old")
+        _make_state_run(isolated_runs_root, isolated_log_root, "young", cwd=young, age_hours=9)
+        _make_state_run(isolated_runs_root, isolated_log_root, "old", cwd=old, age_hours=11)
+
+        agent_run.cmd_reap(_reap_args(worktree_min_age_hours=10))
+
+        out = capsys.readouterr().out
+        assert young.is_dir()
+        assert not old.exists()
+        assert "worktrees_removed=1" in out
+
+    def test_youngest_sharing_run_governs_the_age_gate(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A recently finished run keeps a shared worktree even when an older
+        sibling would pass the threshold on its own."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "a-old", cwd=wt, age_hours=1000)
+        _make_state_run(isolated_runs_root, isolated_log_root, "b-new", cwd=wt, age_hours=1)
+
+        agent_run.cmd_reap(_reap_args())
+
+        assert wt.is_dir()
+        assert "worktrees_removed=0" in capsys.readouterr().out
+
+    def test_env_threshold_used_when_flag_absent(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=5)
+        monkeypatch.setenv("AGENT_RUN_WORKTREE_MIN_AGE_HOURS", "2")
+
+        agent_run.cmd_reap(_reap_args())
+
+        assert not wt.exists()
+        assert "worktrees_removed=1" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-1", "0", "abc"])
+    def test_invalid_env_threshold_falls_back_to_default(self, monkeypatch, capsys, raw):
+        monkeypatch.setenv("AGENT_RUN_WORKTREE_MIN_AGE_HOURS", raw)
+
+        assert agent_run._parse_worktree_min_age_seconds() == 168 * 3600
+        assert "AGENT_RUN_WORKTREE_MIN_AGE_HOURS" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("raw", ["nan", "inf", "-1", "0"])
+    def test_invalid_flag_threshold_rejected_by_argparse(self, raw):
+        with pytest.raises(SystemExit):
+            agent_run._build_parser().parse_args(["reap", "--worktree-min-age-hours", raw])
+
+    def test_non_terminal_run_cwd_is_not_a_candidate(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        sd = _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", status="running", cwd=wt, age_hours=1000
+        )
+        (sd / "pid").write_text(f"{os.getpid()}\n")
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "worktrees_removed=0 worktrees_skipped=0" in out
+
+    def test_unknown_status_not_collected_even_with_force_unknown(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", status="weird", cwd=wt, age_hours=1000
+        )
+
+        agent_run.cmd_reap(_reap_args(force_unknown=True))
+
+        assert wt.is_dir()
+        assert "worktrees_removed=0" in capsys.readouterr().out
+
+
+class TestReapWorktreesDryRun:
+    def _run_both(self, args_kw, capsys):
+        dry = capsys
+        agent_run.cmd_reap(_reap_args(dry_run=True, **args_kw))
+        dry_out = dry.readouterr().out
+        agent_run.cmd_reap(_reap_args(**args_kw))
+        real_out = capsys.readouterr().out
+        return dry_out, real_out
+
+    def _counts(self, out: str) -> tuple[str, str]:
+        removed = next(f for f in out.split() if f.startswith("worktrees_removed="))
+        skipped = next(f for f in out.split() if f.startswith("worktrees_skipped="))
+        return removed, skipped
+
+    def test_dry_run_mutates_nothing(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(dry_run=True))
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "dry-run" in out
+        assert "worktrees_removed=1" in out
+        assert (isolated_runs_root / "r1").is_dir()
+
+    def test_dry_run_predicts_removal(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", cwd=git_root / "wt", age_hours=1000
+        )
+
+        dry_out, real_out = self._run_both({}, capsys)
+
+        assert self._counts(dry_out) == self._counts(real_out) == (
+            "worktrees_removed=1", "worktrees_skipped=0"
+        )
+
+    @pytest.mark.parametrize("hazard", ["dirty", "unpushed", "main", "young", "live"])
+    def test_dry_run_predicts_refusals(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys, hazard
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        cwd = wt
+        if hazard == "dirty":
+            (wt / "junk").write_text("x\n")
+        elif hazard == "unpushed":
+            (wt / "tracked.txt").write_text("local\n")
+            _git(wt, "commit", "-qam", "local only")
+        elif hazard == "main":
+            cwd = repo
+        elif hazard == "live":
+            live = _make_state_run(
+                isolated_runs_root, isolated_log_root, "z-live", status="running", cwd=wt
+            )
+            (live / "pid").write_text(f"{os.getpid()}\n")
+        age = 1 if hazard == "young" else 1000
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "a-run", cwd=cwd, age_hours=age
+        )
+
+        dry_out, real_out = self._run_both({}, capsys)
+
+        assert self._counts(dry_out) == self._counts(real_out)
+        assert "worktrees_removed=0" in dry_out
+        assert cwd.is_dir()

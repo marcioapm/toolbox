@@ -781,6 +781,7 @@ agent-run attach <name>                   # attach interactively (Ctrl-C detache
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
                 [--include-logs] [--log-min-age-hours N]
+                [--include-worktrees] [--worktree-min-age-hours N] [--force-dirty]
                 [--orphan-processes] [--orphan-min-age-hours N]
                 [--max-seconds N]
 agent-run du [--by-run] [--top N] [--bytes|--json] [--worktrees]  # disk usage; read-only
@@ -842,7 +843,29 @@ single-directory layout for runs launched before the state/log split.
     `--idle-hours` (or `AGENT_RUN_IDLE_KILL_HOURS`, default 24h) is
     idle-killed through the same identity-verified escalation
     `agent-run kill <name> KILL` uses, and marked `killed`.
-2. **Terminal-state and orphan-scratch garbage collection**: runs whose
+2. **Linked-worktree garbage collection** (opt-in, `--include-worktrees`):
+    a terminal run's recorded launch `cwd` is removed **only when that
+    directory is a linked git worktree** and the *youngest* terminal run
+    sharing it is older than `--worktree-min-age-hours` (or
+    `AGENT_RUN_WORKTREE_MIN_AGE_HOURS`, default 168h/7 days — its own
+    independent threshold, because this destroys a working tree rather than
+    bookkeeping). **A non-git directory is never removed**: a run's `cwd` is
+    frequently a real project checkout or `$HOME`, so main/root worktrees,
+    bare repositories, non-git directories, and anything git cannot classify
+    are all refused, as is any path with a symlinked component. A git failure
+    of any kind (git missing, timeout, unreadable repo) is a refusal, never a
+    green light. Removal goes through `git worktree remove` against the
+    owning repository, so the parent's `.git/worktrees/<name>` administrative
+    entry is unregistered as well — an `rmtree` would strand it. Also
+    refused, with the reason printed: a worktree with uncommitted changes,
+    untracked files, or commits present on no remote (override with
+    `--force-dirty`, off by default, which destroys unpushed work
+    irreversibly), and one whose directory any live (non-terminal) run is
+    still using. A worktree shared by several terminal runs is handled once,
+    not once per run. Runs before step 3, because the `cwd` it reads lives in
+    the state dir step 3 deletes. The summary line always reports
+    `worktrees_removed=N worktrees_skipped=N`.
+3. **Terminal-state and orphan-scratch garbage collection**: runs whose
     status is conclusively terminal (`done`, `failed`, `died`, `killed`) and
     whose `ended_at` is older than `--min-age-hours` (or preferred
     `AGENT_RUN_MIN_AGE_HOURS`; compatible alias `AGENT_RUN_REAP_MIN_AGE_HOURS`,
@@ -853,7 +876,7 @@ single-directory layout for runs launched before the state/log split.
     this invocation is never collected in the same invocation. Unknown/
     legacy/corrupt statuses are left intact by default and require
     `--force-unknown` to collect after review.
-3. **Preserved-log garbage collection** (opt-in, `--include-logs`): whole
+4. **Preserved-log garbage collection** (opt-in, `--include-logs`): whole
     preserved-log-only run directories (state dir already gone) whose
     newest recursive mtime is older than `--log-min-age-hours` (or
     `AGENT_RUN_LOG_MIN_AGE_HOURS`, default 21 days — matching the existing
@@ -864,14 +887,14 @@ single-directory layout for runs launched before the state/log split.
     longer retention window and is never influenced by the state-dir
     threshold. Off by default — without `--include-logs`, reap never
     touches a preserved log, matching the persistent `log`/`log.clean`/
-    `prompt` behaviour of step 2. A run with a live state dir is never
-    touched by this step regardless of age. Runs after step 2 (so a state
-    dir step 2 just removed can become log-only and eligible in the same
+    `prompt` behaviour of step 3. A run with a live state dir is never
+    touched by this step regardless of age. Runs after step 3 (so a state
+    dir step 3 just removed can become log-only and eligible in the same
     invocation) and before the orphan-scratch sweep (so a log dir removed
     whole here is never also probed for a leftover `tmp/`).
-4. **Orphan-process termination** (opt-in, `--orphan-processes`): find and
+5. **Orphan-process termination** (opt-in, `--orphan-processes`): find and
     terminate live agent-run runner processes that have **no state directory**
-    — invisible to passes 1-3 because they hold no entry in
+    — invisible to passes 1-4 because they hold no entry in
     `$AGENT_RUN_STATE_DIR`. This kills processes agent-run has **no state
     record for**, selected by argv parsing, and is opt-in for that reason.
     Candidates are identified by strict argv matching (basename check, not a
@@ -947,6 +970,18 @@ affecting the others:
 - **`--orphan-min-age-hours N`** — live processes with no state directory
   must have been running for at least this long before they are eligible for
   orphan termination. Independent of all GC thresholds. Default 24 h.
+- **`--worktree-min-age-hours N`** — a linked git worktree used as a
+  terminal run's launch `cwd` is removed (only under `--include-worktrees`)
+  once the youngest run sharing it is older than this. Independent of every
+  threshold above because it destroys a working tree, not bookkeeping.
+  Default 168 h (7 days).
+
+Linked worktrees are typically where the bytes actually are: on one measured
+host, 94 runs resolved to 23 launch directories, 20 of them linked worktrees
+totalling 18 GB, against a few hundred MB in `STATE_ROOT` plus `LOG_ROOT`.
+Run `agent-run du --worktrees --by-run --top 20` to see that, and
+`agent-run reap --include-worktrees --dry-run` before ever enabling the
+removal on a timer.
 
 On disk, `--log-min-age-hours` mainly affects the long tail of old logs: on a
 busy host, most bytes are in *recent* logs, and PTY-captured `--echo` runs are

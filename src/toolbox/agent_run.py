@@ -238,6 +238,18 @@ already gone) once their newest recursive mtime is older than
 --min-age-hours; see ``--log-min-age-hours`` help. Off by default; a run
 with a live state dir is never touched regardless of age.
 
+`agent-run reap --include-worktrees` additionally removes a terminal run's
+recorded launch `cwd` when — and only when — that directory is a *linked*
+git worktree older than --worktree-min-age-hours (default 7 days, its own
+independent threshold). A non-git directory is never removed: a run's cwd
+is frequently a real project checkout or $HOME. Removal goes through `git
+worktree remove` against the owning repository so the parent's
+.git/worktrees/<name> admin entry is unregistered too. Uncommitted changes,
+untracked files, commits absent from every remote, a live run sharing the
+directory, and any symlinked path component are all refusals; only
+--force-dirty overrides the unsaved-work refusals. A worktree shared by
+several terminal runs is removed once. Off by default.
+
 `agent-run list` defaults to showing only runs whose effective status is
 *not* conclusively terminal (`starting`, `running`, `stalled`; a `died` or
 `killed` run is terminal and hidden by default, matching reap's own
@@ -533,6 +545,15 @@ def _parse_log_min_age_seconds() -> float:
 def _parse_orphan_min_age_seconds() -> float:
     raw = os.environ.get("AGENT_RUN_ORPHAN_MIN_AGE_HOURS", "24")
     return _positive_finite_hours(raw, "AGENT_RUN_ORPHAN_MIN_AGE_HOURS", 24.0)
+
+
+# Linked-worktree GC threshold, independent of every threshold above:
+# removing a worktree destroys a working tree rather than bookkeeping, so it
+# defaults to the same conservative week the state-dir threshold uses and is
+# tuned separately from it.
+def _parse_worktree_min_age_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_WORKTREE_MIN_AGE_HOURS", "168")
+    return _positive_finite_hours(raw, "AGENT_RUN_WORKTREE_MIN_AGE_HOURS", 168.0)
 
 
 def _parse_reap_max_seconds() -> float:
@@ -4817,6 +4838,229 @@ def _worktree_run_cwd(name: str) -> Optional[Path]:
     return _worktree_resolve_cwd(_watch_read_cwd_file(_state_dir(name) / "cwd"))
 
 
+# `git worktree remove` unlinks the whole checkout, so it needs far more than
+# the plumbing-read budget a rev-parse gets; a multi-gigabyte tree on a slow
+# disk would otherwise time out mid-deletion.
+WORKTREE_REMOVE_TIMEOUT_SECONDS: float = 300.0
+
+
+def _worktree_symlink_free_reason(raw: str) -> Optional[str]:
+    """``None`` when ``raw`` is an absolute path whose every component is an
+    lstat-confirmed real directory, else the reason it is not.
+
+    Deletion never follows a mutable pathname: if any component is a symlink,
+    the directory eventually removed is not the one that was inspected. This
+    mirrors the lstat-only guards the LOG_ROOT passes apply before deleting.
+    """
+    if not raw:
+        return "no cwd recorded"
+    path = Path(raw)
+    if not path.is_absolute():
+        return f"recorded cwd {raw!r} is not absolute"
+    for component in [path, *path.parents]:
+        if _dir_identity(component) is None:
+            return f"path component {component} is not a real directory"
+    return None
+
+
+def _worktree_live_run_cwds() -> set:
+    """Resolved launch directories of every run whose effective status is not
+    conclusively terminal. A worktree in this set is still in use by a live
+    run and must never be removed, however old the terminal run that shares
+    it. Unreadable and unrecognized statuses count as live: only
+    ``TERMINAL_STATUSES`` releases a directory."""
+    live: set = set()
+    if not STATE_ROOT.is_dir():
+        return live
+    try:
+        entries = sorted(STATE_ROOT.iterdir())
+    except OSError:
+        return live
+    for d in entries:
+        if d.name.startswith("."):
+            continue
+        try:
+            _validate_run_name(d.name)
+        except SystemExit:
+            continue
+        if _dir_identity(d) is None:
+            continue
+        if _effective_status(d) in TERMINAL_STATUSES:
+            continue
+        resolved = _worktree_resolve_cwd(_watch_read_cwd_file(d / "cwd"))
+        if resolved is not None:
+            live.add(str(resolved))
+    return live
+
+
+def _worktree_unsaved_work_reason(path: Path) -> Optional[str]:
+    """``None`` when removing the worktree at ``path`` would destroy no work,
+    else the reason it would.
+
+    Two independent hazards are checked: a dirty working tree (modified
+    tracked files or untracked files, per ``status --porcelain``; ignored
+    files are excluded, matching git's own default) and commits reachable
+    from HEAD but from no remote-tracking ref. Every git failure is itself a
+    refusal — an unanswerable question about unsaved work is not a "no".
+    """
+    status = _watch_run_git_checked(path, ["status", "--porcelain"])
+    if status.stdout is None:
+        return f"cannot read git status ({status.error})"
+    dirty_entries = [ln for ln in status.stdout.splitlines() if ln.strip()]
+    if dirty_entries:
+        return f"{len(dirty_entries)} uncommitted or untracked file(s)"
+
+    unpushed = _watch_run_git_checked(path, ["rev-list", "--count", "HEAD", "--not", "--remotes"])
+    if unpushed.stdout is None:
+        return f"cannot count unpushed commits ({unpushed.error})"
+    count = _safe_int(unpushed.stdout.strip())
+    if count is None:
+        return "unparseable unpushed commit count"
+    if count > 0:
+        return f"{count} commit(s) not on any remote"
+    return None
+
+
+def _worktree_remove(info: _WorktreeInfo, path: Path, *, force: bool) -> Optional[str]:
+    """Remove the linked worktree at ``path`` via ``git worktree remove``,
+    returning ``None`` on success or the failure reason.
+
+    The command runs against the owning repository's ``--git-common-dir`` so
+    the ``.git/worktrees/<name>`` administrative entry is unregistered along
+    with the checkout; an ``rmtree`` would leave that registration stranded.
+    ``force`` is passed only under ``reap --force-dirty``: without it git
+    itself refuses a worktree with modified or untracked files, which is a
+    second line of defence behind ``_worktree_unsaved_work_reason``.
+    """
+    if not info.common_dir:
+        return "owning repository is unknown"
+    args = ["worktree", "remove", *(["--force"] if force else []), str(path)]
+    outcome = _watch_run_git_checked(
+        Path(info.common_dir), args, timeout=WORKTREE_REMOVE_TIMEOUT_SECONDS
+    )
+    if outcome.stdout is None:
+        return f"git worktree remove failed ({outcome.error})"
+    return None
+
+
+class _WorktreeCandidate(NamedTuple):
+    """One deduplicated launch directory shared by ``names`` terminal runs.
+    ``raw`` is the path exactly as recorded (used for the symlink guard),
+    ``resolved`` its realpath (used for identity and every git call).
+    ``age_seconds`` is the *youngest* sharing run's terminal-state age, so a
+    directory a recently finished run used is never removed on the strength
+    of an older sibling."""
+
+    resolved: Path
+    raw: str
+    names: List[str]
+    age_seconds: Optional[float]
+
+
+def _worktree_collect_candidates(state_candidates: List[Path]) -> List[_WorktreeCandidate]:
+    """Group terminal runs' recorded launch directories by realpath.
+
+    Only runs in ``TERMINAL_STATUSES`` contribute; a shared directory is
+    returned once, listing every run that recorded it. ``--force-unknown``
+    deliberately does not widen this: an unrecognized status is not evidence
+    that a working tree is finished with.
+    """
+    by_path: dict = {}
+    for d in state_candidates:
+        if _read(d / "status") not in TERMINAL_STATUSES:
+            continue
+        raw = _watch_read_cwd_file(d / "cwd")
+        resolved = _worktree_resolve_cwd(raw)
+        if resolved is None:
+            continue
+        age = _terminal_state_age_seconds(d)
+        key = str(resolved)
+        if key not in by_path:
+            by_path[key] = _WorktreeCandidate(resolved, raw, [d.name], age)
+            continue
+        existing = by_path[key]
+        # An unknown age is treated as the youngest possible: it must not be
+        # discarded in favour of a sibling's known, older age.
+        if age is None or existing.age_seconds is None:
+            merged_age = None
+        else:
+            merged_age = min(existing.age_seconds, age)
+        by_path[key] = existing._replace(
+            names=[*existing.names, d.name], age_seconds=merged_age
+        )
+    return [by_path[k] for k in sorted(by_path)]
+
+
+def _worktree_gc_pass(
+    state_candidates: List[Path],
+    *,
+    dry_run: bool,
+    force_dirty: bool,
+    min_age_threshold: float,
+    budget_expired,
+) -> Tuple[int, int, int]:
+    """Remove linked git worktrees left behind by terminal runs.
+
+    Returns ``(removed, skipped, deferred)``. Each directory is handled once
+    however many runs share it. Every refusal prints its reason, and the same
+    read-only checks run under ``--dry-run``, so a preview never predicts an
+    action a real invocation would refuse.
+
+    Only ``_WORKTREE_LINKED`` directories are ever removed. A run's ``cwd`` is
+    routinely a real project checkout or ``$HOME``; a non-git directory, a
+    main worktree, a bare repo, and every git failure are all refusals.
+    """
+    removed = skipped = deferred = 0
+    live_cwds = _worktree_live_run_cwds()
+
+    for cand in _worktree_collect_candidates(state_candidates):
+        if budget_expired():
+            deferred += 1
+            continue
+        label = f"  [worktree] {cand.resolved}"
+        shared = f" (runs: {', '.join(cand.names)})" if len(cand.names) > 1 else ""
+
+        if cand.age_seconds is None or cand.age_seconds < min_age_threshold:
+            continue
+        age_h = cand.age_seconds / 3600
+
+        info = _worktree_classify(cand.resolved)
+        if info.kind != _WORKTREE_LINKED:
+            print(f"{label}: skipped: not a linked worktree ({info.detail or info.kind}){shared}")
+            skipped += 1
+            continue
+        if str(cand.resolved) in live_cwds:
+            print(f"{label}: skipped: a live run is using this directory{shared}")
+            skipped += 1
+            continue
+        symlink_reason = _worktree_symlink_free_reason(cand.raw)
+        if symlink_reason is not None:
+            print(f"{label}: skipped: {symlink_reason}{shared}")
+            skipped += 1
+            continue
+        if not force_dirty:
+            unsaved = _worktree_unsaved_work_reason(cand.resolved)
+            if unsaved is not None:
+                print(f"{label}: skipped: {unsaved} — use --force-dirty to override{shared}")
+                skipped += 1
+                continue
+
+        print(
+            f"{label}: linked worktree (age={age_h:.1f}h) "
+            f"[{'dry-run' if dry_run else 'removing'}]{shared}"
+        )
+        if dry_run:
+            removed += 1
+            continue
+        failure = _worktree_remove(info, cand.resolved, force=force_dirty)
+        if failure is not None:
+            print(f"{label}: skipped: {failure}")
+            skipped += 1
+            continue
+        removed += 1
+    return removed, skipped, deferred
+
+
 def cmd_reap(args: argparse.Namespace) -> int:
     """Reconcile stale ``running`` state, idle-kill lingering processes, and
     garbage-collect old terminal-state runs, state-less scratch dirs, and
@@ -4837,6 +5081,9 @@ def cmd_reap(args: argparse.Namespace) -> int:
     include_logs: bool = bool(getattr(args, "include_logs", False))
     orphan_processes: bool = bool(getattr(args, "orphan_processes", False))
     orphan_min_age_hours: Optional[float] = getattr(args, "orphan_min_age_hours", None)
+    include_worktrees: bool = bool(getattr(args, "include_worktrees", False))
+    worktree_min_age_hours: Optional[float] = getattr(args, "worktree_min_age_hours", None)
+    force_dirty: bool = bool(getattr(args, "force_dirty", False))
     if target_name is not None:
         target_name = _validate_run_name(target_name)
 
@@ -4860,6 +5107,14 @@ def cmd_reap(args: argparse.Namespace) -> int:
         orphan_min_age_hours * 3600
         if orphan_min_age_hours is not None
         else _parse_orphan_min_age_seconds()
+    )
+    # Independent of every threshold above: governs destruction of a working
+    # tree, not of bookkeeping. Parsed even when --include-worktrees is
+    # absent so the flag is always validated; see --worktree-min-age-hours help.
+    worktree_min_age_threshold: float = (
+        worktree_min_age_hours * 3600
+        if worktree_min_age_hours is not None
+        else _parse_worktree_min_age_seconds()
     )
     max_seconds_arg: Optional[float] = getattr(args, "max_seconds", None)
     reap_budget: float = (
@@ -4899,6 +5154,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
     gc_skipped_count = 0
     orphan_procs_killed = 0
     orphan_procs_skipped = 0
+    worktrees_removed = 0
+    worktrees_skipped = 0
     deferred_count = 0
     found_target = False
     reconciled_this_pass = set()
@@ -5017,6 +5274,23 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 "force-kill; leaving status as published by force-kill"
             )
             skipped_count += 1
+
+    # Pass 1.5 (--include-worktrees only): remove linked git worktrees whose
+    # only users are terminal runs. Runs before pass 2 because the launch
+    # directory it reads lives in the state dir pass 2 deletes; a run
+    # reconciled in pass 1 has a fresh ended_at and so fails the age gate here
+    # rather than being collected in the same invocation.
+    if include_worktrees:
+        wt_removed, wt_skipped, wt_deferred = _worktree_gc_pass(
+            state_candidates,
+            dry_run=dry_run,
+            force_dirty=force_dirty,
+            min_age_threshold=worktree_min_age_threshold,
+            budget_expired=lambda: time.monotonic() - reap_start > reap_budget,
+        )
+        worktrees_removed += wt_removed
+        worktrees_skipped += wt_skipped
+        deferred_count += wt_deferred
 
     # Pass 2: collect terminal state dirs older than the threshold. The
     # explicit set is structural protection for H1: an old ended_at left by a
@@ -5496,6 +5770,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         f"orphaned_scratch={orphaned_scratch_count} gc_skipped={gc_skipped_count} "
         f"resumed={resumed_count} logs_collected={logs_collected_count} "
         f"orphan_procs_killed={orphan_procs_killed} orphan_procs_skipped={orphan_procs_skipped} "
+        f"worktrees_removed={worktrees_removed} worktrees_skipped={worktrees_skipped} "
         f"deferred={deferred_count}"
     )
     return 0
@@ -9110,6 +9385,46 @@ def _build_parser() -> argparse.ArgumentParser:
         "float, must be finite and > 0); independent of --min-age-hours and "
         "--log-min-age-hours; default from AGENT_RUN_ORPHAN_MIN_AGE_HOURS "
         "or 24h.  Parsed and validated even when --orphan-processes is absent.",
+    )
+    sp_reap.add_argument(
+        "--include-worktrees",
+        action="store_true",
+        default=False,
+        help="also remove the launch directory of a terminal run when that "
+        "directory is a LINKED GIT WORKTREE, once older than "
+        "--worktree-min-age-hours. A non-git directory is NEVER removed: a "
+        "run's cwd is frequently a real project checkout or $HOME, so main "
+        "worktrees, bare repos, non-git directories, and anything git cannot "
+        "classify are all refused, as is any path with a symlinked "
+        "component. Removal goes through 'git worktree remove' against the "
+        "owning repository, so the parent's .git/worktrees/<name> admin entry "
+        "is unregistered too. A worktree with uncommitted changes, untracked "
+        "files, or commits on no remote is refused unless --force-dirty is "
+        "given, and one still used by a live run is always refused. A "
+        "worktree shared by several terminal runs is removed once. Off by "
+        "default",
+    )
+    sp_reap.add_argument(
+        "--worktree-min-age-hours",
+        type=_positive_finite_float,
+        default=None,
+        metavar="N",
+        help="override the linked-worktree GC age threshold used by "
+        "--include-worktrees (hours, float, must be finite and > 0), measured "
+        "from the youngest terminal run sharing the directory; independent of "
+        "--min-age-hours, --log-min-age-hours and --orphan-min-age-hours, "
+        "since it governs destruction of a working tree rather than of "
+        "bookkeeping; default from AGENT_RUN_WORKTREE_MIN_AGE_HOURS or 168h "
+        "(7 days).  Parsed and validated even when --include-worktrees is absent",
+    )
+    sp_reap.add_argument(
+        "--force-dirty",
+        action="store_true",
+        default=False,
+        help="with --include-worktrees, remove a linked worktree even when it "
+        "has uncommitted changes, untracked files, or commits not present on "
+        "any remote.  This destroys unpushed work irreversibly; off by "
+        "default and never implied by any other flag",
     )
     sp_reap.add_argument(
         "--max-seconds",
