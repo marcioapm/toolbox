@@ -289,9 +289,6 @@ LOGS_MAX_TOTAL_BYTES = 32 * 1024
 _RENDER_LOG_DEFAULT_WIDTH = 120
 _RENDER_LOG_DEFAULT_HEIGHT = 60
 _RENDER_LOG_DEFAULT_HISTORY = 2048
-# Cache metadata is the completeness contract; this remains only for callers
-# that retain compatibility with old caches, which are otherwise rejected.
-CLEAN_CACHE_MAX_STALENESS_SECONDS = 30.0
 
 # Statuses that are conclusively terminal: the run will never transition
 # again on its own. "done"/"failed"/"launch_failed" are published by the
@@ -3618,9 +3615,10 @@ def _bounded_final_render(
 def _echo_loop(log_dir: "Path", interval: float) -> None:
     """Incrementally render a verified raw-log prefix into ``log.clean``.
 
-    A successful metadata publication identifies the exact inode and byte prefix
-    represented by the cache. Parse or publication failures leave that contract
-    unpublished and are retried without retaining potentially mutated pyte state.
+    Each tick feeds only the bytes appended since the last verified offset, so a
+    published cache always identifies the exact (dev, ino, offset) prefix it
+    covers via ``log.clean.meta.json``. Any parse or publication failure leaves
+    that contract unpublished and is retried after discarding mutated pyte state.
     """
     log = log_dir / "log"
     clean = log_dir / "log.clean"
@@ -3640,10 +3638,14 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
     offset = 0
     log_ino = -1
     log_dev = -1
+    # (rendered-or-None, source stat, offset) awaiting publication; retried on a
+    # publish failure. rendered None means the text is unchanged (metadata only).
     pending: Optional[tuple[Optional[str], Any, int]] = None
     last_rendered: Optional[str] = None
     failures = 0
-    blocked: Optional[tuple[int, int, int]] = None
+    # (dev, ino) whose byte-zero prefix deterministically fails to parse; its
+    # cache stays marked incomplete so readers re-render instead of trusting it.
+    blocked: Optional[tuple[int, int]] = None
 
     while True:
         try:
@@ -3651,10 +3653,9 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
                 if f is None:
                     raise OSError("cannot open regular log")
                 current = os.fstat(f.fileno())
-                if (
-                    current.st_size < offset
-                    or (offset and (current.st_ino, current.st_dev) != (log_ino, log_dev))
-                ):
+                identity = (current.st_dev, current.st_ino)
+                if current.st_size < offset or (offset and identity != (log_dev, log_ino)):
+                    # Truncation or replacement: re-parse the new file from zero.
                     screen, stream = new_state()
                     offset = 0
                     log_ino = current.st_ino
@@ -3674,29 +3675,23 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
             continue
 
         if chunk:
-            if blocked == (current.st_dev, current.st_ino, offset):
-                # A deterministic parser failure cannot make progress through
-                # this prefix. Metadata remains incomplete, so readers rerender.
+            if blocked == identity:
                 time.sleep(interval)
                 continue
             try:
                 _feed_pyte(stream, chunk)
                 rendered = _serialize_screen(screen)
             except Exception:
-                # Feed and serialization can mutate pyte before raising. Restart
-                # from byte zero so no later publication uses partial state.
+                # Feed/serialize can mutate pyte before raising; rebuild from
+                # zero so no later publication uses partial state.
                 screen, stream = new_state()
                 offset = 0
-                log_ino = -1
-                log_dev = -1
                 pending = None
                 failures += 1
                 if failures >= 2:
-                    blocked = (current.st_dev, current.st_ino, offset)
+                    blocked = identity
                     try:
-                        _publish_clean_metadata(
-                            clean, stat_result=current, offset=offset, complete=False,
-                        )
+                        _publish_clean_metadata(clean, stat_result=current, offset=0, complete=False)
                     except OSError:
                         pass
                 time.sleep(interval)
@@ -3711,17 +3706,14 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
 
         if pending is not None:
             rendered, source_stat, published_offset = pending
+            complete = published_offset == source_stat.st_size
             try:
                 if rendered is not None:
-                    _publish_clean(
-                        clean, rendered, stat_result=source_stat,
-                        offset=published_offset, complete=(published_offset == source_stat.st_size),
-                    )
+                    _publish_clean(clean, rendered, stat_result=source_stat,
+                                   offset=published_offset, complete=complete)
                 else:
-                    _publish_clean_metadata(
-                        clean, stat_result=source_stat,
-                        offset=published_offset, complete=(published_offset == source_stat.st_size),
-                    )
+                    _publish_clean_metadata(clean, stat_result=source_stat,
+                                            offset=published_offset, complete=complete)
             except OSError:
                 time.sleep(interval)
                 continue

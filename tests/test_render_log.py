@@ -474,13 +474,11 @@ class TestEchoLoop:
 
 # ---------------------------------------------------------------------------
 # RecursionError hardening — pyte's coroutine-based FSM can recurse past the
-# interpreter's limit on certain pathological ANSI/Ink redraw patterns (this
-# crashed 101/212 recent agent-run sessions in production). _render_log must
-# degrade to a plain-text ANSI-stripped rendering instead of propagating the
-# crash — the clean transcript is a convenience artifact, never a run-ending
-# hazard. We can't reliably reproduce the exact pyte-recursing byte pattern
-# in a portable unit test, so we simulate the failure at the seam
-# (ByteStream.feed) and assert the fallback kicks in and returns a string.
+# interpreter's limit on certain pathological ANSI/Ink redraw patterns.
+# _render_log must degrade to a plain-text ANSI-stripped rendering instead of
+# propagating the crash — the clean transcript is a convenience artifact, never
+# a run-ending hazard. The exact recursing byte pattern is not portably
+# reproducible, so the failure is simulated at the ByteStream.feed seam.
 # ---------------------------------------------------------------------------
 
 class TestRenderLogRecursionHardening:

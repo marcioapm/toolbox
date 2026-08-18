@@ -644,11 +644,11 @@ class TestCleanByteBudget:
 
 
 class TestCleanCache:
-    """cmd_clean reads log.clean when the cache is fresh and geometry matches.
+    """cmd_clean reads log.clean when metadata proves it covers the raw log.
 
-    Reuse requires both a geometry match (width/height/history equal the
-    daemon's defaults) and freshness (log.clean mtime lags log mtime by at most
-    CLEAN_CACHE_MAX_STALENESS_SECONDS). The fallback to raw rendering is
+    Reuse requires a geometry match (width/height/history equal the daemon's
+    defaults) and metadata whose dev/ino/offset/size match the current raw log;
+    log.clean mtime does not enter the decision. The fallback to raw rendering is
     load-bearing: log.clean is written only under --echo, and 32 of 301 run
     directories on macmini have none.
     """
@@ -684,7 +684,7 @@ class TestCleanCache:
         [
             pytest.param("hit", "cached content\n", 0.0, 0, False, id="complete-cache-reused"),
             pytest.param("absent", None, 0.0, 0, True, id="no-cache-renders"),
-            pytest.param("stale", "cached content\n", None, 0, False, id="mtime-does-not-control-cache"),
+            pytest.param("stale", "cached content\n", 3600.0, 0, False, id="mtime-does-not-control-cache"),
             pytest.param("geometry", "cached content\n", 0.0, 1, True, id="non-default-geometry-renders"),
         ],
     )
@@ -692,16 +692,14 @@ class TestCleanCache:
         self, isolated_runs_root, monkeypatch, capsys,
         case, clean_text, gap, width_delta, expect_render,
     ):
-        """log.clean is reused only when it is both fresh and geometry-compatible.
+        """log.clean is reused only when metadata covers the raw log and geometry
+        matches.
 
-        A stale cache means the --echo daemon stopped rendering (e.g. the raw log
-        crossed ECHO_LOOP_MAX_RENDER_BYTES) while log kept growing; a non-default
-        geometry means the cached render does not match what was asked for.
+        The ``stale`` case gives log.clean an mtime an hour behind log to prove
+        mtime is not part of the decision; a non-default geometry means the
+        cached render does not match what was asked for, forcing a raw render.
         """
         now = 1_000_000.0
-        threshold = agent_run.CLEAN_CACHE_MAX_STALENESS_SECONDS
-        if gap is None:
-            gap = threshold if case == "threshold" else threshold + 1.0
 
         render_called = []
 
