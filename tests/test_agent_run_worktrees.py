@@ -1006,6 +1006,41 @@ class TestReapWorktreeLivenessEvidence:
         assert result.paths == []
         assert result.unresolved == ("tc-example",)
 
+    @pytest.mark.parametrize("pid_obstruction", ["mode_000", "is_a_directory"])
+    def test_unreadable_pid_file_aborts_liveness_scan(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys, pid_obstruction
+    ):
+        """An unreadable pid file (mode 000 or a directory in its place) is
+        ambiguity, not absence: _worktree_state_has_live_runner must return
+        (None, reason) so the liveness scan aborts and the pass refuses."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        sd = _make_state_run(
+            isolated_runs_root, isolated_log_root, "a-run",
+            status="done", cwd=wt, age_hours=1000,
+        )
+        pid_path = sd / "pid"
+        if pid_obstruction == "mode_000":
+            pid_path.write_text("99999\n")
+            pid_path.chmod(0o000)
+        else:
+            pid_path.mkdir()
+
+        try:
+            live, err = agent_run._worktree_state_has_live_runner(sd)
+            assert live is None, "unreadable pid must not return False (no-runner)"
+            assert err is not None and "unreadable pid" in err
+
+            agent_run.cmd_reap(_reap_args())
+        finally:
+            if pid_obstruction == "mode_000":
+                pid_path.chmod(0o644)
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree deleted despite unreadable pid file"
+        assert "liveness scan failed" in out
+        assert "worktrees_removed=0" in out
+
 
 class TestReapWorktreesDryRun:
     def _run_both(self, args_kw, capsys):

@@ -4933,8 +4933,19 @@ def _worktree_state_scan() -> _WorktreeStateScan:
 
 
 def _worktree_state_has_live_runner(d: Path) -> Tuple[Optional[bool], Optional[str]]:
-    """Determine whether a state directory's recorded runner is still alive."""
-    pid_raw = _read(d / "pid")
+    """Determine whether a state directory's recorded runner is still alive.
+
+    A missing pid file with no other evidence is not scan-fatal: a legacy
+    state dir without a pid should not abort the whole pass.  An unreadable
+    pid file (mode 000, a directory in its place) is ambiguity, not absence:
+    it blocks GC the same way a live pid does, mirroring _gc_live_runner_pid.
+    """
+    try:
+        pid_raw = (d / "pid").read_text().strip()
+    except FileNotFoundError:
+        return False, None
+    except (OSError, UnicodeError) as exc:
+        return None, f"run {d.name} has unreadable pid file: {exc}"
     if not pid_raw:
         return False, None
     try:
