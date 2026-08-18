@@ -274,15 +274,14 @@ MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
 FINAL_RENDER_TIMEOUT_SECONDS = 10.0
 FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
 ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
-# Per-line and total byte caps for `logs` output. A single TUI line can be
-# megabytes long (one \n per session, many \r redraw frames). The per-line cap
-# keeps any one line from dominating the excerpt; the total cap bounds what
-# reaches the LLM consumer. 64 KiB per line covers structured JSON lines
-# comfortably while preventing a single blob from swamping the budget.
-# 256 KiB total is 8x the downstream 32 KiB front-cap — enough that a tail
-# window contains meaningful content, small enough to be safe in an LLM prompt.
-LOGS_MAX_LINE_BYTES = 64 * 1024
-LOGS_MAX_TOTAL_BYTES = 256 * 1024
+# Per-line and total byte caps for `logs` and `clean` output. A single TUI
+# line can be megabytes long (one \n per session, many \r redraw frames). The
+# per-line cap keeps any one line from dominating; the total cap bounds what
+# reaches the LLM consumer. The primary downstream consumer (threadctl drift
+# check) reads at most 32 000 bytes and passes the last 4 000 characters to
+# an LLM — a budget above 32 KiB total is discarded before use.
+LOGS_MAX_LINE_BYTES = 8 * 1024
+LOGS_MAX_TOTAL_BYTES = 32 * 1024
 
 # Statuses that are conclusively terminal: the run will never transition
 # again on its own. "done"/"failed"/"launch_failed" are published by the
