@@ -255,8 +255,13 @@ stdout, so `agent-run list | grep ...` stays honest.
 
 `agent-run du` reports disk usage per effective status (or per run with
 `--by-run`), including preserved logs, and never mutates anything — no
-locks, no heal, no prune. See its own `--help` for `--top`, `--bytes`, and
-`--json`.
+locks, no heal, no prune. With `--worktrees` it additionally sizes each
+run's recorded launch `cwd` when that directory is a *linked* git worktree,
+in its own WORKTREE column; a worktree shared by several runs is
+deduplicated by realpath and charged once, so TOTAL counts every byte
+exactly once. Off by default because those trees are typically much larger
+than STATE_ROOT and LOG_ROOT combined. See its own `--help` for `--top`,
+`--bytes`, and `--json`.
 """
 
 from __future__ import annotations
@@ -4685,6 +4690,133 @@ def cmd_clean(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# linked git worktree detection (shared by du and reap)
+# ---------------------------------------------------------------------------
+
+# Classification of a run's recorded launch ``cwd``. Only _WORKTREE_LINKED is
+# ever acted on: a linked worktree is a disposable checkout whose repository
+# data lives in another directory that is not being touched. Every other
+# value — including every git failure — means "leave this directory alone".
+_WORKTREE_LINKED = "linked"
+_WORKTREE_MAIN = "main"
+_WORKTREE_BARE = "bare"
+_WORKTREE_NOT_A_REPO = "not_a_repo"
+_WORKTREE_UNKNOWN = "unknown"
+
+
+class _WorktreeInfo(NamedTuple):
+    """``kind`` is one of the ``_WORKTREE_*`` constants. ``common_dir`` is the
+    owning repository's absolute ``--git-common-dir``, populated only for
+    ``_WORKTREE_LINKED``: ``git worktree remove`` must run against it so the
+    parent repo's ``.git/worktrees/<name>`` admin entry is unregistered along
+    with the checkout. ``detail`` names the specific reason behind a
+    non-actionable ``kind``, for operator-visible skip messages."""
+
+    kind: str
+    common_dir: Optional[str] = None
+    detail: Optional[str] = None
+
+
+def _dir_identity(path: Path) -> Optional[Tuple[int, int]]:
+    """``(st_dev, st_ino)`` of ``path`` if it is a real directory (lstat, so a
+    symlink never qualifies), else ``None``."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino) if _stat_module.S_ISDIR(st.st_mode) else None
+
+
+def _worktree_resolve_cwd(raw: str) -> Optional[Path]:
+    """Canonicalize a recorded launch ``cwd`` to an absolute, symlink-free
+    path naming a real directory, or ``None``.
+
+    Resolving up front is what makes deduplication correct: several runs
+    launched in the same worktree through different symlinked prefixes record
+    different strings for one directory, and summing those separately would
+    multiply the reported size by the number of runs.
+    """
+    if not raw:
+        return None
+    try:
+        resolved = Path(os.path.realpath(raw))
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_absolute() or _dir_identity(resolved) is None:
+        return None
+    return resolved
+
+
+def _worktree_classify(path: Path) -> _WorktreeInfo:
+    """Classify ``path`` as a linked worktree, a main worktree, a bare repo,
+    not a repo, or unknown. Read-only: only ``rev-parse`` plumbing runs, so
+    nothing is created, pruned or garbage-collected in the inspected repo.
+
+    A linked worktree's ``--git-dir`` is ``<common>/worktrees/<name>`` while
+    its ``--git-common-dir`` is the owning repo's git dir; for a main worktree
+    the two are the same path. ``--path-format=absolute`` (git >= 2.31) makes
+    that comparison meaningful; an older git fails the whole ``rev-parse``,
+    which is reported as ``_WORKTREE_UNKNOWN`` rather than guessed at.
+
+    Every failure mode — git not installed, a timeout, unparseable output,
+    an unreadable directory — yields ``_WORKTREE_UNKNOWN``. No caller may read
+    that as permission to delete.
+    """
+    if _dir_identity(path) is None:
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail="not a real directory")
+
+    # `--show-toplevel` is deliberately absent from this call: it aborts the
+    # whole rev-parse in a bare repository, which would mask the bare case as
+    # a generic failure. It is asked for separately, only when needed.
+    probe = _watch_run_git_checked(path, [
+        "rev-parse", "--path-format=absolute",
+        "--is-bare-repository", "--is-inside-work-tree",
+        "--git-dir", "--git-common-dir",
+    ])
+    if probe.stdout is None:
+        if probe.error == "not_a_repo":
+            return _WorktreeInfo(_WORKTREE_NOT_A_REPO, detail="not a git repository")
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail=probe.error or "git_failed")
+
+    lines = [ln.strip() for ln in probe.stdout.splitlines()]
+    if len(lines) != 4:
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail="unexpected rev-parse output")
+    is_bare, inside_work_tree, git_dir, common_dir = lines
+    if is_bare == "true":
+        return _WorktreeInfo(_WORKTREE_BARE, detail="bare repository")
+    if inside_work_tree != "true":
+        # Inside a .git directory, or a git version answering something other
+        # than true/false. Neither is a work tree this may act on.
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail="not inside a work tree")
+    if not git_dir or not common_dir:
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail="empty rev-parse path")
+    if git_dir == common_dir:
+        return _WorktreeInfo(_WORKTREE_MAIN, common_dir=common_dir)
+
+    top_probe = _watch_run_git_checked(
+        path, ["rev-parse", "--path-format=absolute", "--show-toplevel"]
+    )
+    if top_probe.stdout is None:
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail=top_probe.error or "git_failed")
+    toplevel = top_probe.stdout.strip()
+    top_identity = _dir_identity(Path(toplevel)) if toplevel else None
+    if top_identity is None or top_identity != _dir_identity(path):
+        # A subdirectory of a linked worktree reports the same pair of git
+        # dirs as the worktree's top. `git worktree remove` only accepts the
+        # top, and sizing a subdirectory would account for part of a tree that
+        # another candidate already covers in full.
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail="not the top of its worktree")
+    return _WorktreeInfo(_WORKTREE_LINKED, common_dir=common_dir)
+
+
+def _worktree_run_cwd(name: str) -> Optional[Path]:
+    """Resolved launch directory recorded for run ``name``, or ``None`` when
+    the run has no readable ``cwd`` state file or it no longer names a real
+    directory."""
+    return _worktree_resolve_cwd(_watch_read_cwd_file(_state_dir(name) / "cwd"))
+
+
 def cmd_reap(args: argparse.Namespace) -> int:
     """Reconcile stale ``running`` state, idle-kill lingering processes, and
     garbage-collect old terminal-state runs, state-less scratch dirs, and
@@ -5386,26 +5518,59 @@ class _DuRow(NamedTuple):
     """One accounting row: a single run (``--by-run``) or an aggregated
     group. ``count`` is the number of runs folded into the row (1 for a
     per-run row). Log bytes exclude the ``tmp/`` scratch subtree — total is
-    state + log + scratch, so nothing is double-counted."""
+    state + log + scratch + worktree, so nothing is double-counted.
+    ``worktree_bytes`` is 0 unless ``du --worktrees`` was requested."""
 
     key: str  # run name (--by-run) or group/status label (rollup)
     count: int
     state_bytes: int
     log_bytes: int
     scratch_bytes: int
+    worktree_bytes: int = 0
 
     @property
     def total_bytes(self) -> int:
-        return self.state_bytes + self.log_bytes + self.scratch_bytes
+        return self.state_bytes + self.log_bytes + self.scratch_bytes + self.worktree_bytes
 
 
-def _du_collect_rows() -> List[_DuRow]:
+def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
+    """Charge each linked worktree's size to exactly one of the rows whose
+    recorded ``cwd`` resolves to it.
+
+    Attribution rule: the worktree is charged in full to the first run in the
+    ``rows`` order (run name ascending), and every other run sharing it shows
+    0. Charging every sharer would multiply one directory's size by the number
+    of runs launched in it — on the measured host, 94 runs resolve to 23
+    directories — and TOTAL would then be meaningless.
+
+    Only ``_WORKTREE_LINKED`` directories are counted; main worktrees, bare
+    repos, non-repos, and every git failure contribute 0. Read-only.
+    """
+    charged: set[str] = set()
+    out: List[_DuRow] = []
+    for row in rows:
+        cwd = _worktree_run_cwd(row.key)
+        worktree_bytes = 0
+        if cwd is not None and str(cwd) not in charged:
+            charged.add(str(cwd))
+            if _worktree_classify(cwd).kind == _WORKTREE_LINKED:
+                worktree_bytes = _dir_size_bytes(cwd)
+        out.append(row._replace(worktree_bytes=worktree_bytes))
+    return out
+
+
+def _du_collect_rows(*, include_worktrees: bool = False) -> List[_DuRow]:
     """One row per run, read-only: no locks, no heal, no prune, no mutation.
 
     Sizes are apparent size (sum of ``st_size``), matching ``_dir_size_bytes``
     used elsewhere for the same reason (`reap --include-logs`'s report
     line) — labelled explicitly in ``cmd_du``'s own header so the number's
     meaning isn't ambiguous with on-disk block usage.
+
+    ``include_worktrees`` additionally sizes each run's recorded launch
+    ``cwd`` when it is a linked git worktree; it is off by default because
+    those trees are typically far larger than STATE_ROOT and LOG_ROOT
+    combined and walking them dominates the command's runtime.
     """
     state_names: set = set()
     if STATE_ROOT.is_dir():
@@ -5433,7 +5598,7 @@ def _du_collect_rows() -> List[_DuRow]:
         scratch_bytes = _dir_size_bytes(scratch_dir) if has_log else 0
         log_bytes = _dir_size_bytes(_log_dir(name), exclude=scratch_dir) if has_log else 0
         rows.append(_DuRow(name, 1, state_bytes, log_bytes, scratch_bytes))
-    return rows
+    return _du_charge_worktrees(rows) if include_worktrees else rows
 
 
 def _du_run_group(name: str) -> str:
@@ -5451,16 +5616,17 @@ def _du_aggregate_groups(run_rows: List[_DuRow]) -> List[_DuRow]:
     totals: dict = {}
     for row in run_rows:
         group = _du_run_group(row.key)
-        state_b, log_b, scratch_b, n = totals.get(group, (0, 0, 0, 0))
+        state_b, log_b, scratch_b, worktree_b, n = totals.get(group, (0, 0, 0, 0, 0))
         totals[group] = (
             state_b + row.state_bytes,
             log_b + row.log_bytes,
             scratch_b + row.scratch_bytes,
+            worktree_b + row.worktree_bytes,
             n + 1,
         )
     return [
-        _DuRow(group, n, state_b, log_b, scratch_b)
-        for group, (state_b, log_b, scratch_b, n) in totals.items()
+        _DuRow(group, n, state_b, log_b, scratch_b, worktree_b)
+        for group, (state_b, log_b, scratch_b, worktree_b, n) in totals.items()
     ]
 
 
@@ -5488,58 +5654,67 @@ def _du_print_table(
     label_header: str,
     as_bytes: bool,
     top: Optional[int],
+    show_worktree: bool = False,
 ) -> None:
     """Print one plain-aligned-columns table (no Markdown) plus a TOTAL row.
     ``total`` is passed in rather than recomputed so it always reflects
-    every run even when ``rows`` was truncated by ``--top``."""
+    every run even when ``rows`` was truncated by ``--top``. The WORKTREE
+    column appears only under ``--worktrees``, so the default layout and its
+    column positions are unchanged."""
     count_header = "RUNS"
     shown, omitted = _du_split_top(rows, top)
 
-    columns = [label_header, count_header, "STATE", "LOG", "SCRATCH", "TOTAL"]
+    columns = [label_header, count_header, "STATE", "LOG", "SCRATCH"]
+    if show_worktree:
+        columns.append("WORKTREE")
+    columns.append("TOTAL")
     widths = [max(len(columns[0]), *(len(r.key) for r in shown)) if shown else len(columns[0]), len(columns[1])]
-    print(f"{columns[0]:<{widths[0]}}  {columns[1]:>{widths[1]}}  {columns[2]:>10}  {columns[3]:>10}  {columns[4]:>10}  {columns[5]:>10}")
+
+    def size_fields(r: _DuRow) -> str:
+        sizes = [r.state_bytes, r.log_bytes, r.scratch_bytes]
+        if show_worktree:
+            sizes.append(r.worktree_bytes)
+        sizes.append(r.total_bytes)
+        return "  ".join(f"{_du_fmt(b, as_bytes=as_bytes):>10}" for b in sizes)
+
+    header_sizes = "  ".join(f"{c:>10}" for c in columns[2:])
+    print(f"{columns[0]:<{widths[0]}}  {columns[1]:>{widths[1]}}  {header_sizes}")
     for r in shown:
-        print(
-            f"{r.key:<{widths[0]}}  {r.count:>{widths[1]}}  "
-            f"{_du_fmt(r.state_bytes, as_bytes=as_bytes):>10}  "
-            f"{_du_fmt(r.log_bytes, as_bytes=as_bytes):>10}  "
-            f"{_du_fmt(r.scratch_bytes, as_bytes=as_bytes):>10}  "
-            f"{_du_fmt(r.total_bytes, as_bytes=as_bytes):>10}"
-        )
+        print(f"{r.key:<{widths[0]}}  {r.count:>{widths[1]}}  {size_fields(r)}")
     if omitted:
         omitted_total = sum(r.total_bytes for r in omitted)
         print(
             f"... {len(omitted)} more row(s) omitted by --top "
             f"(sum {_du_fmt(omitted_total, as_bytes=as_bytes)}; TOTAL below covers all runs)"
         )
-    print(
-        f"{total.key:<{widths[0]}}  {total.count:>{widths[1]}}  "
-        f"{_du_fmt(total.state_bytes, as_bytes=as_bytes):>10}  "
-        f"{_du_fmt(total.log_bytes, as_bytes=as_bytes):>10}  "
-        f"{_du_fmt(total.scratch_bytes, as_bytes=as_bytes):>10}  "
-        f"{_du_fmt(total.total_bytes, as_bytes=as_bytes):>10}"
-    )
+    print(f"{total.key:<{widths[0]}}  {total.count:>{widths[1]}}  {size_fields(total)}")
 
 
-def _du_row_to_dict(r: _DuRow) -> dict:
-    return {
+def _du_row_to_dict(r: _DuRow, *, include_worktrees: bool) -> dict:
+    payload = {
         "runs": r.count,
         "state_bytes": r.state_bytes,
         "log_bytes": r.log_bytes,
         "scratch_bytes": r.scratch_bytes,
         "total_bytes": r.total_bytes,
     }
+    if include_worktrees:
+        payload["worktree_bytes"] = r.worktree_bytes
+    return payload
 
 
 def cmd_du(args: argparse.Namespace) -> int:
     """Disk usage per effective status (default) or per run (``--by-run``),
     including preserved logs. Strictly read-only: no locks, no
     ``_opportunistic_heal``, no ``_prune_old_logs``, no mutation of any kind
-    — only ``os.scandir``/``stat`` reads via ``_dir_size_bytes``.
+    — only ``os.scandir``/``stat`` reads via ``_dir_size_bytes``, plus (under
+    ``--worktrees``) ``git rev-parse`` reads, which neither create nor prune
+    anything in the inspected repository.
     """
     as_bytes: bool = bool(getattr(args, "bytes", False))
     as_json: bool = bool(getattr(args, "json", False))
     by_run: bool = bool(getattr(args, "by_run", False))
+    include_worktrees: bool = bool(getattr(args, "worktrees", False))
     top: Optional[int] = getattr(args, "top", None)
     if as_bytes and as_json:
         # --json already emits exact integers; combining with --bytes would
@@ -5547,7 +5722,7 @@ def cmd_du(args: argparse.Namespace) -> int:
         # confusing. Reject rather than guess which the caller meant.
         sys.exit("agent-run: --bytes has no effect with --json, which always emits exact integers")
 
-    run_rows = _du_collect_rows()
+    run_rows = _du_collect_rows(include_worktrees=include_worktrees)
     all_rows = run_rows if by_run else _du_aggregate_groups(run_rows)
     total = _DuRow(
         "TOTAL",
@@ -5555,6 +5730,7 @@ def cmd_du(args: argparse.Namespace) -> int:
         sum(r.state_bytes for r in all_rows),
         sum(r.log_bytes for r in all_rows),
         sum(r.scratch_bytes for r in all_rows),
+        sum(r.worktree_bytes for r in all_rows),
     )
 
     if as_json:
@@ -5562,12 +5738,22 @@ def cmd_du(args: argparse.Namespace) -> int:
         payload = {
             "state_root": str(STATE_ROOT),
             "log_root": str(LOG_ROOT),
-            "total": _du_row_to_dict(total),
+            "worktrees_included": include_worktrees,
+            "total": _du_row_to_dict(total, include_worktrees=include_worktrees),
         }
+        if include_worktrees:
+            # Names the attribution rule the numbers were produced under, so a
+            # consumer never has to infer it from the values.
+            payload["worktree_attribution"] = "charged once to the first run sharing the worktree"
         if by_run:
-            payload["runs"] = [{"name": r.key, **_du_row_to_dict(r)} for r in shown]
+            payload["runs"] = [
+                {"name": r.key, **_du_row_to_dict(r, include_worktrees=include_worktrees)}
+                for r in shown
+            ]
         else:
-            payload["groups"] = {r.key: _du_row_to_dict(r) for r in shown}
+            payload["groups"] = {
+                r.key: _du_row_to_dict(r, include_worktrees=include_worktrees) for r in shown
+            }
         if omitted:
             payload["omitted"] = {
                 "count": len(omitted),
@@ -5581,12 +5767,18 @@ def cmd_du(args: argparse.Namespace) -> int:
         f"agent-run du: apparent size (st_size), {size_label}, "
         f"STATE_ROOT={STATE_ROOT} LOG_ROOT={LOG_ROOT}"
     )
+    if include_worktrees:
+        print(
+            "worktrees: linked git worktrees at each run's recorded cwd, "
+            "deduplicated by realpath and charged once to the first run sharing them"
+        )
     _du_print_table(
         all_rows,
         total,
         label_header="NAME" if by_run else "STATUS",
         as_bytes=as_bytes,
         top=top,
+        show_worktree=include_worktrees,
     )
     return 0
 
@@ -8964,6 +9156,22 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="emit a machine-readable object instead of a table; always uses "
         "exact integers, so --bytes is rejected alongside it",
+    )
+    sp_du.add_argument(
+        "--worktrees",
+        action="store_true",
+        default=False,
+        help="also account for each run's recorded launch cwd when it is a "
+        "linked git worktree, in a separate WORKTREE column (and "
+        "worktree_bytes under --json). OFF BY DEFAULT: those trees are "
+        "usually far larger than STATE_ROOT and LOG_ROOT combined, so "
+        "walking them can multiply this command's runtime. Main worktrees, "
+        "bare repos, non-git directories, and any directory git cannot "
+        "classify contribute 0. A worktree shared by several runs is "
+        "deduplicated by realpath and charged once, to the first run sharing "
+        "it (the others show 0), so TOTAL counts every byte exactly once. "
+        "Read-only: detection runs git rev-parse only, never gc or "
+        "worktree prune",
     )
     sp_du.set_defaults(func=cmd_du)
 

@@ -86,9 +86,16 @@ def _actual_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
 
 
 def _du_args(
-    *, by_run: bool = False, top: Optional[int] = None, bytes_: bool = False, json_: bool = False
+    *,
+    by_run: bool = False,
+    top: Optional[int] = None,
+    bytes_: bool = False,
+    json_: bool = False,
+    worktrees: bool = False,
 ) -> argparse.Namespace:
-    return argparse.Namespace(by_run=by_run, top=top, bytes=bytes_, json=json_)
+    return argparse.Namespace(
+        by_run=by_run, top=top, bytes=bytes_, json=json_, worktrees=worktrees
+    )
 
 
 # ---------------------------------------------------------------------------

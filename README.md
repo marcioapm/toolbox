@@ -783,7 +783,7 @@ agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown
                 [--include-logs] [--log-min-age-hours N]
                 [--orphan-processes] [--orphan-min-age-hours N]
                 [--max-seconds N]
-agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage; read-only
+agent-run du [--by-run] [--top N] [--bytes|--json] [--worktrees]  # disk usage; read-only
 ```
 
 Unlike `tail`, which only streams output, `attach` gives live keyboard and
@@ -1091,10 +1091,35 @@ readable object and always uses exact integers, so combining it with
 `_opportunistic_heal`, no `_prune_old_logs` — and tolerates races
 (`FileNotFoundError`/`PermissionError`) by skipping the affected entry.
 
+#### Linked worktrees (`--worktrees`)
+
+Agents are frequently launched inside a linked git worktree created for the
+task, and those trees usually hold far more bytes than `STATE_ROOT` and
+`LOG_ROOT` combined — invisible to plain `du`, which only walks those two
+roots. `agent-run du --worktrees` adds a `WORKTREE` column (and
+`worktree_bytes` under `--json`) sizing each run's recorded launch `cwd`
+**when that directory is a linked worktree**. Main/root worktrees, bare
+repositories, non-git directories, missing directories, and anything git
+cannot classify all contribute 0 — a git failure is never read as a
+countable worktree.
+
+Attribution: launch directories are deduplicated by realpath, and each
+worktree is charged in full to the **first run** (by run name) that recorded
+it; every other run sharing it shows 0. Without that, one 900 MB worktree
+shared by four runs would be reported as 3.6 GB. `TOTAL` therefore counts
+every byte exactly once, and `TOTAL` == `STATE` + `LOG` + `SCRATCH` +
+`WORKTREE` in both `--by-run` and rollup mode.
+
+**Off by default**, and deliberately so: worktrees are large and walking
+them can multiply the command's runtime several times over. Detection is
+read-only `git rev-parse` plumbing — it never runs `git gc` or
+`git worktree prune` and never writes to the inspected repository.
+
 ```bash
 agent-run du                    # per-status rollup, human-readable
 agent-run du --by-run --top 10  # 10 largest runs by total size
 agent-run du --json             # machine-readable, exact byte integers
+agent-run du --worktrees --by-run  # include linked-worktree bytes per run
 ```
 
 ### Files
