@@ -21,7 +21,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -488,6 +490,52 @@ class TestOpenCodePolicyConfig:
             "plan_exit": "allow",
         }
 
+    def test_per_agent_allow_block_is_overridden_by_policy(self):
+        # A project opencode.json with a per-agent allow block must come out
+        # with the deny applied at both global scope and the agent scope.
+        existing = json.dumps({
+            "permission": {"bash": "allow"},
+            "agent": {
+                "build": {
+                    "permission": {
+                        "question": "allow",
+                        "plan_enter": "allow",
+                        "plan_exit": "allow",
+                    },
+                    "model": "kept",
+                },
+            },
+        })
+        config = json.loads(agent_run._opencode_policy_config(
+            existing, enable_planning=False, enable_questions=False,
+        ))
+        # Global scope: deny applied, unrelated key preserved.
+        assert config["permission"]["bash"] == "allow"
+        assert config["permission"]["question"] == "deny"
+        assert config["permission"]["plan_enter"] == "deny"
+        assert config["permission"]["plan_exit"] == "deny"
+        # Per-agent scope: deny applied, unrelated field preserved.
+        build = config["agent"]["build"]
+        assert build["model"] == "kept"
+        assert build["permission"]["question"] == "deny"
+        assert build["permission"]["plan_enter"] == "deny"
+        assert build["permission"]["plan_exit"] == "deny"
+
+    def test_per_agent_blocks_without_policy_keys_are_left_alone(self):
+        # Agent blocks that contain no policy keys must pass through unchanged.
+        existing = json.dumps({
+            "agent": {
+                "build": {"model": "claude-3"},
+                "test": {"permission": {"bash": "allow"}},
+            },
+        })
+        config = json.loads(agent_run._opencode_policy_config(
+            existing, enable_planning=False, enable_questions=False,
+        ))
+        assert config["agent"]["build"] == {"model": "claude-3"}
+        assert config["agent"]["test"]["permission"]["bash"] == "allow"
+        assert config["agent"]["test"]["permission"]["question"] == "deny"
+
 
 # ---------------------------------------------------------------------------
 # session.json — write, read, and watch integration
@@ -903,7 +951,7 @@ class TestManagedClaudeLaunch:
             time.sleep(0.05)
         assert "--session-id" in log_content, f"Expected --session-id in log: {log_content!r}"
 
-    def test_claude_oneshot_default_policy_delivers_positional_prompt(
+    def test_claude_oneshot_delivers_prompt_via_stdin_with_denies_in_argv(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
         fake = tmp_path / "claude"
@@ -920,8 +968,19 @@ class TestManagedClaudeLaunch:
             harness="claude", interactive=False, prompt="unique managed prompt",
         )
         delivered = (isolated_log_root / name / "log").read_text()
+        # Prompt arrives on stdin; the managed path materialises it to a file
+        # and _build_managed_argv suppresses the positional arg.
         assert "<stdin:unique managed prompt>" in delivered
-        assert "<AskUserQuestion>" in delivered
+        # Each deny must appear as a flag/value pair, not as a bare positional.
+        lines = delivered.splitlines()
+        for tool in ("EnterPlanMode", "ExitPlanMode", "AskUserQuestion"):
+            try:
+                idx = lines.index(f"<{tool}>")
+            except ValueError:
+                raise AssertionError(f"<{tool}> not found in delivered argv: {delivered!r}")
+            assert lines[idx - 1] == "<--disallowedTools>", (
+                f"<{tool}> must be immediately preceded by <--disallowedTools>: {delivered!r}"
+            )
 
     def test_claude_oneshot_never_emits_session_prompt_together_in_argv(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
@@ -1894,6 +1953,82 @@ class TestEndToEndThroughMain:
         args = json.loads((fake.with_name("codex.args")).read_text())
         assert "tools.experimental_request_user_input={enabled=false}" in args
 
+    def test_main_codex_questions_enabled_arm_reaches_appserver(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """--enable-questions flips the codex policy arg to {enabled=true}."""
+        fake_dir = tmp_path / "codex-bin-enabled"
+        fake_dir.mkdir()
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "with open(sys.argv[0] + '.args', 'w') as f: json.dump(sys.argv[1:], f)\n"
+            "def recv(): return json.loads(sys.stdin.readline())\n"
+            "def send(obj): print(json.dumps(obj), flush=True)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {}}); recv()\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'thread': {'id': 'enabled-thread'}}})\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}})\n"
+            "send({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        name = "main-codex-question-enabled"
+        assert agent_run.main([
+            "--harness", "codex", "--enable-questions", "--prompt", "hi", name,
+        ]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+        args = json.loads((fake.with_name("codex.args")).read_text())
+        assert "tools.experimental_request_user_input={enabled=true}" in args
+        assert "tools.experimental_request_user_input={enabled=false}" not in args
+
+    def test_main_opencode_managed_launch_delivers_policy_env(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """OPENCODE_CONFIG_CONTENT with the three policy keys reaches the child process."""
+        fake = tmp_path / "opencode"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "printf 'ENVPROBE:%s\\n' \"$OPENCODE_CONFIG_CONTENT\"\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        name = "oc-policy-env"
+        assert agent_run.main(["--harness", "opencode", "--prompt", "hi", name]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+        log = (isolated_log_root / name / "log").read_text()
+        probe_lines = [l for l in log.splitlines() if l.startswith("ENVPROBE:")]
+        assert probe_lines, f"ENVPROBE line not found in log: {log!r}"
+        cfg = json.loads(probe_lines[0].split("ENVPROBE:", 1)[1].strip())
+        assert cfg["permission"]["question"] == "deny"
+        assert cfg["permission"]["plan_enter"] == "deny"
+        assert cfg["permission"]["plan_exit"] == "deny"
+
+    def test_main_claude_escape_hatches_reach_argv_via_cli(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """--enable-planning and --enable-questions remove the deny flags through main()."""
+        fake = tmp_path / "claude"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n"
+            "printf '<stdin:%s>\\n' \"$(cat)\"\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        name = "main-claude-escape-hatches"
+        assert agent_run.main([
+            "--harness", "claude",
+            "--enable-questions", "--enable-planning",
+            "--prompt", "hi",
+            name,
+        ]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+        log = (isolated_log_root / name / "log").read_text()
+        assert "<--disallowedTools>" not in log, (
+            f"--disallowedTools must be absent when both escape hatches are set: {log!r}"
+        )
+
     def test_main_model_rejected_for_codex(self, isolated_runs_root, isolated_log_root, monkeypatch):
         """main() with --model and --harness codex exits non-zero before creating state."""
         name = "main-codex-model-reject"
@@ -2375,5 +2510,42 @@ class TestCodexRpcEdgeCases:
         # sends turn/start (idle path), not turn/steer with a stale expectedTurnId.
         assert "turn/start (steer idle)" in log_text, (
             f"Acquire log must show idle-path turn/start (active_turn_id was cleared): {log_text!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Codex config key tripwire — fails loudly if codex renames the policy key
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="requires real codex binary on PATH")
+class TestCodexPolicyKeyTripwire:
+    """Verifies that codex still recognises tools.experimental_request_user_input.
+
+    codex app-server silently ignores unknown -c keys by default, so a rename
+    would silently disable the policy on every managed run. --strict-config
+    converts that silent no-op into a launch failure, which this test catches.
+    """
+
+    def test_codex_strict_config_accepts_policy_key(self):
+        """codex app-server --strict-config exits 0 for the policy key; exits 1 if renamed."""
+        result = subprocess.run(
+            [
+                "codex", "app-server",
+                "--strict-config",
+                "-c", "tools.experimental_request_user_input={enabled=false}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=10.0,
+        )
+        # codex app-server reads from stdin and will exit once it gets EOF;
+        # the important thing is it must NOT exit non-zero with a config error.
+        # An exit code of 1 with a strict-config error on stderr is a rename.
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        assert "unknown configuration field" not in stderr, (
+            f"tools.experimental_request_user_input is no longer recognised by codex. "
+            f"The managed policy key has been renamed — update _codex_policy_args. "
+            f"stderr={stderr!r}"
         )
 
