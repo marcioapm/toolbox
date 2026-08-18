@@ -567,3 +567,85 @@ class TestCleanSlicing:
         with pytest.raises(SystemExit) as exc_info:
             agent_run._build_parser().parse_args(["clean", "run", "--tail", "0"])
         assert exc_info.value.code == 2
+
+
+class TestCleanByteBudget:
+    """cmd_clean applies LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to output.
+
+    The rendered transcript can reach hundreds of KB on real runs. Both the
+    stdout and -o paths must be bounded identically to cmd_logs, with a
+    visible truncation marker when the budget fires.
+    """
+
+    def _make_big_render_run(self, runs_root, name: str) -> None:
+        """Seed a minimal run whose raw log is non-empty."""
+        _make_log_run(runs_root, name, b"x\n")
+
+    def test_stdout_budget_fires_on_oversized_render(
+        self, isolated_runs_root, monkeypatch, capsys
+    ):
+        """A rendered transcript larger than LOGS_MAX_TOTAL_BYTES is truncated
+        on the stdout path and the truncation marker is emitted."""
+        oversized = "A" * (agent_run.LOGS_MAX_TOTAL_BYTES + 1) + "\n"
+        monkeypatch.setattr(agent_run, "_render_log", lambda *_a, **_kw: oversized)
+        self._make_big_render_run(isolated_runs_root, "budget_stdout")
+        args = argparse.Namespace(
+            name="budget_stdout", out=None, width=120, height=60, history=100000,
+            tail=None, head=None,
+        )
+        rc = agent_run.cmd_clean(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Output must be bounded.
+        assert len(out.encode("utf-8")) <= agent_run.LOGS_MAX_TOTAL_BYTES + len(
+            agent_run._TRUNCATION_MARKER_STR.encode("utf-8")
+        ) + 10
+        # Truncation marker must be present.
+        assert agent_run._TRUNCATION_MARKER_STR in out
+
+    def test_file_out_budget_fires_on_oversized_render(
+        self, isolated_runs_root, monkeypatch, tmp_path, capsys
+    ):
+        """A rendered transcript larger than LOGS_MAX_TOTAL_BYTES is truncated
+        on the -o path; the written file includes the truncation marker."""
+        oversized = "B" * (agent_run.LOGS_MAX_TOTAL_BYTES + 1) + "\n"
+        monkeypatch.setattr(agent_run, "_render_log", lambda *_a, **_kw: oversized)
+        self._make_big_render_run(isolated_runs_root, "budget_fileout")
+        out_file = tmp_path / "budget.txt"
+        args = argparse.Namespace(
+            name="budget_fileout",
+            out=str(out_file),
+            width=120,
+            height=60,
+            history=100000,
+            tail=None,
+            head=None,
+        )
+        rc = agent_run.cmd_clean(args)
+        assert rc == 0
+        text = out_file.read_text(encoding="utf-8")
+        data = text.encode("utf-8")
+        assert len(data) <= agent_run.LOGS_MAX_TOTAL_BYTES + len(
+            agent_run._TRUNCATION_MARKER_STR.encode("utf-8")
+        ) + 10
+        assert agent_run._TRUNCATION_MARKER_STR in text
+        # Byte count in stderr message must match the file size.
+        stderr = capsys.readouterr().err
+        assert str(len(data)) in stderr
+
+    def test_small_render_passes_through_untruncated(
+        self, isolated_runs_root, monkeypatch, capsys
+    ):
+        """A rendered transcript well within budget emits no truncation marker."""
+        small = "line one\nline two\nline three\n"
+        monkeypatch.setattr(agent_run, "_render_log", lambda *_a, **_kw: small)
+        self._make_big_render_run(isolated_runs_root, "budget_small")
+        args = argparse.Namespace(
+            name="budget_small", out=None, width=120, height=60, history=100000,
+            tail=None, head=None,
+        )
+        rc = agent_run.cmd_clean(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert out == small
+        assert agent_run._TRUNCATION_MARKER_STR not in out

@@ -3179,6 +3179,91 @@ def _strip_ansi_bytes(data: bytes) -> bytes:
     return _LOGS_ESC_RE.sub(b"", data)
 
 
+_TRUNCATION_MARKER_BYTES = b"[agent-run: output truncated]\n"
+_TRUNCATION_MARKER_STR = "[agent-run: output truncated]\n"
+
+
+def _budget_bytes_lines(lines: "Iterable[bytes]") -> "tuple[bytes, bool]":
+    """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to ANSI-stripped byte lines.
+
+    Strips ANSI sequences from each line, hard-caps any single line at
+    LOGS_MAX_LINE_BYTES, and stops accumulating once the total reaches
+    LOGS_MAX_TOTAL_BYTES. Returns (output, truncated). The newline between
+    lines is included in the total accounting.
+
+    Input type is ``list[bytes]`` (raw log lines from _head_bytes/_tail_bytes).
+    A str-based counterpart ``_budget_str`` handles the clean render path;
+    both share the same constants but differ in ANSI-stripping and delimiter
+    handling, which makes a single generic implementation contorted.
+    """
+    out_parts: "list[bytes]" = []
+    total = 0
+    truncated = False
+    for line in lines:
+        clean = _strip_ansi_bytes(line)
+        if len(clean) > LOGS_MAX_LINE_BYTES:
+            clean = clean[:LOGS_MAX_LINE_BYTES]
+            truncated = True
+        remaining = LOGS_MAX_TOTAL_BYTES - total
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(clean) > remaining:
+            clean = clean[:remaining]
+            truncated = True
+        out_parts.append(clean + b"\n")
+        total += len(clean) + 1
+    return b"".join(out_parts), truncated
+
+
+def _budget_str(text: str) -> "tuple[str, bool]":
+    """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to a rendered str transcript.
+
+    Splits on newlines, caps each line at LOGS_MAX_LINE_BYTES UTF-8 bytes, and
+    stops once the accumulated UTF-8 byte count reaches LOGS_MAX_TOTAL_BYTES.
+    Returns (output, truncated). The trailing newline of each accepted line is
+    included in the total accounting.
+
+    ``text`` is expected to be newline-terminated (as produced by _render_log
+    and _slice_str_*). Splitting a newline-terminated string yields a spurious
+    empty final element; the strip()/split() pattern below discards it so the
+    loop only sees real lines, and the output remains newline-terminated via the
+    per-line "\n" suffix.
+
+    Input type is ``str`` (already-rendered pyte transcript). The bytes-based
+    counterpart ``_budget_bytes_lines`` handles the raw log path with ANSI
+    stripping; the two are kept separate because collapsing them into one
+    function would require parameterising stripping, encoding, and delimiter
+    handling — more complexity than two parallel ~15-line functions.
+    """
+    # rstrip one trailing newline so split() doesn't emit a spurious empty
+    # element for the document's terminal newline.
+    stripped = text.rstrip("\n")
+    lines = stripped.split("\n") if stripped else []
+    out_parts: "list[str]" = []
+    total = 0
+    truncated = False
+    for line in lines:
+        line_bytes = line.encode("utf-8")
+        if len(line_bytes) > LOGS_MAX_LINE_BYTES:
+            # Truncate at a UTF-8 code-point boundary.
+            line_bytes = line_bytes[:LOGS_MAX_LINE_BYTES]
+            line = line_bytes.decode("utf-8", errors="ignore")
+            truncated = True
+        remaining = LOGS_MAX_TOTAL_BYTES - total
+        if remaining <= 0:
+            truncated = True
+            break
+        line_len = len(line_bytes)
+        if line_len > remaining:
+            line_bytes = line_bytes[:remaining]
+            line = line_bytes.decode("utf-8", errors="ignore")
+            truncated = True
+        out_parts.append(line + "\n")
+        total += len(line.encode("utf-8")) + 1
+    return "".join(out_parts), truncated
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
     tail_n: Optional[int] = getattr(args, "tail", None)
@@ -3192,32 +3277,13 @@ def cmd_logs(args: argparse.Namespace) -> int:
                 lines = _head_bytes(f, n)
             else:
                 lines = _tail_bytes(f, n)
-        total = 0
-        truncated = False
-        for line in lines:
-            clean = _strip_ansi_bytes(line)
-            # Per-line cap: a single TUI line can be megabytes long.
-            if len(clean) > LOGS_MAX_LINE_BYTES:
-                clean = clean[:LOGS_MAX_LINE_BYTES]
-                truncated = True
-            # Total output cap: bound what reaches the LLM consumer.
-            remaining = LOGS_MAX_TOTAL_BYTES - total
-            if remaining <= 0:
-                truncated = True
-                break
-            if len(clean) > remaining:
-                clean = clean[:remaining]
-                truncated = True
-            try:
-                sys.stdout.buffer.write(clean + b"\n")
-            except BrokenPipeError:
-                break
-            total += len(clean) + 1
-        if truncated:
-            try:
-                sys.stdout.buffer.write(b"[agent-run: output truncated]\n")
-            except BrokenPipeError:
-                pass
+        out, truncated = _budget_bytes_lines(lines)
+        try:
+            sys.stdout.buffer.write(out)
+            if truncated:
+                sys.stdout.buffer.write(_TRUNCATION_MARKER_BYTES)
+        except BrokenPipeError:
+            pass
     finally:
         _reset_terminal_modes()
     return 0
@@ -3570,14 +3636,22 @@ def cmd_clean(args: argparse.Namespace) -> int:
     elif head_n is not None:
         rendered = _slice_str_head(rendered, head_n)
 
+    # Apply the same per-line and total byte budgets as cmd_logs so both
+    # commands are bounded on both axes. Real clean renders reach 309 KB
+    # (observed on msgfix2); without this cap the -o path writes unbounded
+    # data and the stdout path floods the LLM consumer.
+    budgeted, truncated = _budget_str(rendered)
+    if truncated:
+        budgeted = budgeted + _TRUNCATION_MARKER_STR
+
     out_path = getattr(args, "out", None)
     if out_path:
-        data = rendered.encode("utf-8")
+        data = budgeted.encode("utf-8")
         Path(out_path).write_bytes(data)
         size = len(data)
         sys.stderr.write(f"agent-run: wrote {size} bytes of cleaned transcript to {out_path}\n")
         return 0
-    sys.stdout.write(rendered)
+    sys.stdout.write(budgeted)
     return 0
 
 
