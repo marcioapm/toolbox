@@ -274,29 +274,24 @@ MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
 FINAL_RENDER_TIMEOUT_SECONDS = 10.0
 FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
 ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
-# Per-line and total byte caps for `logs` and `clean` output. A single TUI
-# line can be megabytes long (one \n per session, many \r redraw frames). The
-# per-line cap keeps any one line from dominating; the total cap bounds what
-# reaches the LLM consumer. The primary downstream consumer (threadctl drift
-# check) reads at most 32 000 bytes and passes the last 4 000 characters to
-# an LLM — a budget above 32 KiB total is discarded before use.
+# Per-line and total byte caps for `logs` and `clean` output. A single TUI line
+# can be megabytes long (one \n per session, many \r redraw frames), so a line
+# count alone does not bound output. The primary consumer, the threadctl drift
+# check, reads at most 32 000 bytes and forwards the last 4 000 characters to an
+# LLM; anything above 32 KiB total is discarded before use.
 LOGS_MAX_LINE_BYTES = 8 * 1024
 LOGS_MAX_TOTAL_BYTES = 32 * 1024
-# Geometry the --echo daemon uses when writing log.clean (via _render_log_to_clean,
-# which calls _render_log with no arguments). cmd_clean compares the caller's
-# requested geometry against these to decide whether the cache is usable.
-# All three must match _render_log's default-parameter values exactly.
+# Geometry the --echo daemon renders log.clean at, via _render_log_to_clean
+# calling _render_log with no arguments. cmd_clean reuses the cache only when
+# the caller's geometry matches, so these must equal _render_log's defaults.
 _RENDER_LOG_DEFAULT_WIDTH = 120
 _RENDER_LOG_DEFAULT_HEIGHT = 60
 _RENDER_LOG_DEFAULT_HISTORY = 100000
-# Maximum seconds log.clean may trail log (by mtime) and still be considered
-# fresh. The --echo daemon re-renders every echo_interval seconds (default
-# 2.0 s), so a freshly written log.clean is at most ~2 s behind the raw log
-# under normal operation. The daemon silently stops rendering once the raw
-# log exceeds ECHO_LOOP_MAX_RENDER_BYTES (16 MiB), from which point the gap
-# grows without bound. 30 s gives 15× the default interval as headroom for
-# slow renders and scheduler jitter, while reliably catching a frozen cache
-# (where the gap grows at the rate of continued raw-log writes).
+# Maximum seconds log.clean may trail log by mtime and still be reused. The
+# daemon re-renders every echo_interval seconds (default 2.0), so a live cache
+# trails by ~2 s; 30 s allows 15x headroom for slow renders and scheduler jitter
+# while still catching a daemon that stopped rendering after the raw log crossed
+# ECHO_LOOP_MAX_RENDER_BYTES, where the gap grows without bound.
 CLEAN_CACHE_MAX_STALENESS_SECONDS = 30.0
 
 # Statuses that are conclusively terminal: the run will never transition
@@ -3060,76 +3055,60 @@ def _reset_terminal_modes() -> None:
         pass
 
 
-def _split_lines_bytes(data: bytes) -> List[bytes]:
-    """Split ``data`` on ``\\n`` only, stripping a trailing ``\\r`` from each segment.
-
-    Terminal logs use ``\\r`` as an in-line cursor-home (progress redraw), not as a
-    line terminator. Splitting only on ``\\n`` and stripping ``\\r`` from the end of
-    each segment is faithful to that convention: CRLF logs shed the ``\\r``, bare-``\\r``
-    redraw frames are kept intact within the line they belong to, and the grammar is
-    identical whether called from the forward or reverse reader.
-    """
-    return [seg.rstrip(b"\r") for seg in data.split(b"\n")]
-
-
 def _tail_bytes(f: BinaryIO, n: int) -> List[bytes]:
-    """Return the last ``n`` lines from ``f`` without reading the entire file.
+    """Return the last ``n`` lines of ``f``, walking backward from EOF.
 
-    Walks backward from EOF in 8 KiB blocks, accumulating chunks into a list and
-    joining once, until at least n+1 newlines have been seen or the start of file is
-    reached (fewer than n lines case). Uses a list of chunks to avoid the O(n²)
-    copying that repeated ``bytes`` concatenation would cause.
+    Reads 8 KiB blocks in reverse until n+1 newlines are seen or byte 0 is
+    reached, collecting chunks in a list and joining once; repeated ``bytes``
+    concatenation would be O(size**2). A log containing fewer than n+1
+    newlines is therefore read in full — a single-line multi-megabyte log
+    costs one whole-file read, and the caller's byte budget, not this
+    function, is what bounds the emitted output.
 
-    Lines are split on ``\\n`` only; trailing ``\\r`` is stripped per segment (see
-    ``_split_lines_bytes``). Returns an empty list for n < 1.
+    Lines are split on ``\\n`` only, with a trailing ``\\r`` stripped from each
+    segment: terminal logs use ``\\r`` as an in-line cursor-home for progress
+    redraws, not as a line terminator. Returns [] for n < 1.
     """
     if n < 1:
         return []
     f.seek(0, os.SEEK_END)
     pos = f.tell()
-    block = 8192
     chunks: List[bytes] = []
     newline_count = 0
     while pos > 0 and newline_count <= n:
-        read_size = min(block, pos)
+        read_size = min(8192, pos)
         pos -= read_size
         f.seek(pos)
         chunk = f.read(read_size)
         chunks.append(chunk)
         newline_count += chunk.count(b"\n")
-    data = b"".join(reversed(chunks))
-    lines = _split_lines_bytes(data)
-    # Drop a trailing empty segment produced by a file-final \n.
-    if lines and lines[-1] == b"":
-        lines = lines[:-1]
+    lines = [seg.rstrip(b"\r") for seg in b"".join(reversed(chunks)).split(b"\n")]
+    if lines[-1] == b"":
+        lines = lines[:-1]  # trailing empty segment from a file-final \n
     return lines[-n:]
 
 
 def _head_bytes(f: BinaryIO, n: int) -> List[bytes]:
-    """Return the first ``n`` lines from ``f`` with a bounded forward read.
+    """Return the first ``n`` lines of ``f``, scanning forward in 8 KiB reads.
 
-    Reads 8 KiB at a time, scanning each incoming chunk for ``\\n`` without
-    re-scanning accumulated data, so the work is O(bytes_read) rather than
-    O(bytes_read²). Stops after the n-th complete line or at EOF. A partial
-    final line at EOF (no trailing ``\\n``) is included as the n-th line if
-    fewer than n complete lines were found.
+    Each chunk is scanned once for ``\\n`` rather than re-scanning accumulated
+    bytes, so cost is O(bytes read). Reading stops after the n-th complete line
+    or at EOF; an unterminated final line at EOF counts as a line. A log whose
+    first n lines span the whole file — again, the single-line multi-megabyte
+    case — is read in full, and the caller's byte budget bounds the output.
 
-    Lines are split on ``\\n`` only; trailing ``\\r`` is stripped per segment (see
-    ``_split_lines_bytes``). Returns an empty list for n < 1.
+    Same line grammar as ``_tail_bytes``. Returns [] for n < 1.
     """
     if n < 1:
         return []
     lines: List[bytes] = []
-    # pending accumulates bytes of the current incomplete line.
-    pending: List[bytes] = []
+    pending: List[bytes] = []  # bytes of the current incomplete line
     while len(lines) < n:
         chunk = f.read(8192)
         if not chunk:
-            # EOF: flush any unterminated final line.
             if pending:
-                lines.append(b"".join(pending).rstrip(b"\r"))
+                lines.append(b"".join(pending).rstrip(b"\r"))  # unterminated final line
             break
-        # Scan the chunk for newlines without rebuilding a growing bytes object.
         start = 0
         while start < len(chunk) and len(lines) < n:
             nl = chunk.find(b"\n", start)
@@ -3141,48 +3120,28 @@ def _head_bytes(f: BinaryIO, n: int) -> List[bytes]:
                 lines.append(b"".join(pending).rstrip(b"\r"))
                 pending = []
                 start = nl + 1
-        if start < len(chunk) and len(lines) == n:
-            break
     return lines
 
 
-def _slice_str_tail(text: str, n: int) -> str:
-    """Return the last ``n`` lines of ``text`` as a newline-terminated string.
+def _slice_str_lines(text: str, n: int, *, from_end: bool) -> str:
+    """Return the last (``from_end``) or first ``n`` lines of ``text``, newline-terminated.
 
     Splits on ``\\n`` only so that ``\\r``, ``\\f``, ``\\v``, U+2028, and other
-    Unicode line-break characters in the rendered transcript are not treated as
-    additional separators and are not rewritten. Returns ``""`` for empty input
-    or n < 1.
+    Unicode line-break characters occurring inside a rendered transcript are
+    neither treated as separators nor rewritten. Returns ``""`` for empty
+    ``text`` or n < 1.
     """
     if n < 1 or not text:
         return ""
     parts = text.split("\n")
-    # A trailing \n produces a final empty part; drop it before slicing.
-    if parts and parts[-1] == "":
-        parts = parts[:-1]
-    if not parts:
-        return ""
-    return "".join(line + "\n" for line in parts[-n:])
+    if parts[-1] == "":
+        parts = parts[:-1]  # trailing empty part from a final \n
+    selected = parts[-n:] if from_end else parts[:n]
+    return "".join(line + "\n" for line in selected)
 
 
-def _slice_str_head(text: str, n: int) -> str:
-    """Return the first ``n`` lines of ``text`` as a newline-terminated string.
-
-    Splits on ``\\n`` only (same grammar as ``_slice_str_tail``). Returns ``""``
-    for empty input or n < 1.
-    """
-    if n < 1 or not text:
-        return ""
-    parts = text.split("\n")
-    if parts and parts[-1] == "":
-        parts = parts[:-1]
-    if not parts:
-        return ""
-    return "".join(line + "\n" for line in parts[:n])
-
-
-# ANSI/OSC strippers reused on the logs output path to remove terminal-control
-# sequences that are invisible to humans but visible to LLM consumers.
+# Terminal-control sequences are invisible in a terminal but consume tokens and
+# corrupt matching for the LLM consumers that read `logs` output.
 _LOGS_OSC_RE = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _LOGS_CSI_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]")
 _LOGS_ESC_RE = re.compile(rb"\x1b.", re.DOTALL)
@@ -3195,22 +3154,16 @@ def _strip_ansi_bytes(data: bytes) -> bytes:
     return _LOGS_ESC_RE.sub(b"", data)
 
 
-_TRUNCATION_MARKER_BYTES = b"[agent-run: output truncated]\n"
 _TRUNCATION_MARKER_STR = "[agent-run: output truncated]\n"
+_TRUNCATION_MARKER_BYTES = _TRUNCATION_MARKER_STR.encode("utf-8")
 
 
 def _budget_bytes_lines(lines: "Iterable[bytes]") -> "tuple[bytes, bool]":
-    """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to ANSI-stripped byte lines.
+    """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to raw log lines.
 
-    Strips ANSI sequences from each line, hard-caps any single line at
-    LOGS_MAX_LINE_BYTES, and stops accumulating once the total reaches
-    LOGS_MAX_TOTAL_BYTES. Returns (output, truncated). The newline between
-    lines is included in the total accounting.
-
-    Input type is ``list[bytes]`` (raw log lines from _head_bytes/_tail_bytes).
-    A str-based counterpart ``_budget_str`` handles the clean render path;
-    both share the same constants but differ in ANSI-stripping and delimiter
-    handling, which makes a single generic implementation contorted.
+    ANSI-strips each line, caps it at LOGS_MAX_LINE_BYTES, and stops once the
+    running total (including one newline per emitted line) reaches
+    LOGS_MAX_TOTAL_BYTES. Returns (output, truncated).
     """
     out_parts: "list[bytes]" = []
     total = 0
@@ -3233,27 +3186,17 @@ def _budget_bytes_lines(lines: "Iterable[bytes]") -> "tuple[bytes, bool]":
 
 
 def _budget_str(text: str) -> "tuple[str, bool]":
-    """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to a rendered str transcript.
+    """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to a rendered transcript.
 
-    Splits on newlines, caps each line at LOGS_MAX_LINE_BYTES UTF-8 bytes, and
-    stops once the accumulated UTF-8 byte count reaches LOGS_MAX_TOTAL_BYTES.
-    Returns (output, truncated). The trailing newline of each accepted line is
-    included in the total accounting.
+    Counterpart of ``_budget_bytes_lines`` for the ``str`` produced by
+    ``_render_log``. Kept separate rather than merged: caps here are measured on
+    the UTF-8 encoding and a cut that lands mid-code-point is dropped by
+    ``errors="ignore"``, so an accepted line can bill fewer bytes than the cap it
+    was cut at. Routing this through the bytes version would change that
+    accounting and therefore the truncation point.
 
-    ``text`` is expected to be newline-terminated (as produced by _render_log
-    and _slice_str_*). Splitting a newline-terminated string yields a spurious
-    empty final element; the strip()/split() pattern below discards it so the
-    loop only sees real lines, and the output remains newline-terminated via the
-    per-line "\n" suffix.
-
-    Input type is ``str`` (already-rendered pyte transcript). The bytes-based
-    counterpart ``_budget_bytes_lines`` handles the raw log path with ANSI
-    stripping; the two are kept separate because collapsing them into one
-    function would require parameterising stripping, encoding, and delimiter
-    handling — more complexity than two parallel ~15-line functions.
+    Returns (output, truncated); output stays newline-terminated.
     """
-    # rstrip one trailing newline so split() doesn't emit a spurious empty
-    # element for the document's terminal newline.
     stripped = text.rstrip("\n")
     lines = stripped.split("\n") if stripped else []
     out_parts: "list[str]" = []
@@ -3262,7 +3205,6 @@ def _budget_str(text: str) -> "tuple[str, bool]":
     for line in lines:
         line_bytes = line.encode("utf-8")
         if len(line_bytes) > LOGS_MAX_LINE_BYTES:
-            # Truncate at a UTF-8 code-point boundary.
             line_bytes = line_bytes[:LOGS_MAX_LINE_BYTES]
             line = line_bytes.decode("utf-8", errors="ignore")
             truncated = True
@@ -3270,8 +3212,7 @@ def _budget_str(text: str) -> "tuple[str, bool]":
         if remaining <= 0:
             truncated = True
             break
-        line_len = len(line_bytes)
-        if line_len > remaining:
+        if len(line_bytes) > remaining:
             line_bytes = line_bytes[:remaining]
             line = line_bytes.decode("utf-8", errors="ignore")
             truncated = True
@@ -3282,17 +3223,14 @@ def _budget_str(text: str) -> "tuple[str, bool]":
 
 def cmd_logs(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
-    tail_n: Optional[int] = getattr(args, "tail", None)
-    head_n: Optional[int] = getattr(args, "head", None)
-    n = head_n if head_n is not None else (tail_n if tail_n is not None else 50)
     try:
         with _watch_open_validated_log(log) as f:
             if f is None:
                 sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
-            if head_n is not None:
-                lines = _head_bytes(f, n)
+            if args.head is not None:
+                lines = _head_bytes(f, args.head)
             else:
-                lines = _tail_bytes(f, n)
+                lines = _tail_bytes(f, args.tail if args.tail is not None else 50)
         out, truncated = _budget_bytes_lines(lines)
         try:
             sys.stdout.buffer.write(out)
@@ -3638,24 +3576,25 @@ def _read_clean_cache(
 ) -> "Optional[str]":
     """Return the text of ``log.clean`` if it is fresh and geometry-compatible.
 
-    Returns ``None`` (fall back to rendering) when any of the following hold:
-    - The requested geometry differs from the daemon's defaults.
-    - ``log.clean`` does not exist or is not a regular file.
-    - ``log.clean`` mtime lags ``log`` mtime by more than
-      CLEAN_CACHE_MAX_STALENESS_SECONDS (indicates the daemon has stopped
-      rendering — e.g. the raw log crossed ECHO_LOOP_MAX_RENDER_BYTES).
-    - Any OSError while stat-ing or reading.
+    Returns ``None``, meaning the caller must render from the raw log, when the
+    requested geometry is not the daemon's default, when ``log.clean`` is absent
+    or not a regular file, when its mtime lags ``log``'s by more than
+    CLEAN_CACHE_MAX_STALENESS_SECONDS, or on any OSError.
 
-    The staleness bound exists because the daemon silently freezes once the raw
-    log exceeds 16 MiB: ``log.clean`` stops updating while ``log`` keeps
-    growing, and the gap becomes unbounded. Existence of ``log.clean`` alone
-    cannot distinguish a fresh render from a frozen one.
+    The staleness bound is what distinguishes a live cache from a frozen one:
+    the daemon stops rendering once the raw log exceeds
+    ECHO_LOOP_MAX_RENDER_BYTES, after which ``log.clean`` is unchanged while
+    ``log`` keeps growing. Existence alone cannot detect that.
 
-    ``log.clean`` is opened through ``_watch_open_validated_log`` (same
-    FIFO/symlink defence as the raw log), and mtime is read from the open fd
-    via fstat to avoid a race between stat and read.
+    Opened via ``_watch_open_validated_log`` for the same FIFO/symlink defence
+    as the raw log; mtime comes from fstat on the open fd, closing the
+    stat-then-read race.
     """
-    if width != _RENDER_LOG_DEFAULT_WIDTH or height != _RENDER_LOG_DEFAULT_HEIGHT or history != _RENDER_LOG_DEFAULT_HISTORY:
+    if (
+        width != _RENDER_LOG_DEFAULT_WIDTH
+        or height != _RENDER_LOG_DEFAULT_HEIGHT
+        or history != _RENDER_LOG_DEFAULT_HISTORY
+    ):
         return None
     log_clean = log_path.parent / "log.clean"
     try:
@@ -3677,10 +3616,10 @@ def _read_clean_cache(
 def cmd_clean(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
 
-    # Use the incremental cache written by the --echo daemon when it exists,
-    # is fresh (mtime gap within CLEAN_CACHE_MAX_STALENESS_SECONDS), and was
-    # rendered at the default geometry. Avoids re-running pyte over the entire
-    # raw log — on an 8.8 MB single-line log that replay is seconds of CPU.
+    # Prefer log.clean, written by the --echo daemon, over re-rendering. Each
+    # daemon tick re-renders the entire raw log, so log.clean is a whole-file
+    # snapshot, not an incremental one; reusing it only saves cmd_clean the
+    # repeat pyte replay, which costs seconds of CPU on an 8.8 MB single-line log.
     rendered = _read_clean_cache(log, width=args.width, height=args.height, history=args.history)
     if rendered is None:
         with _watch_open_validated_log(log) as f:
@@ -3697,21 +3636,18 @@ def cmd_clean(args: argparse.Namespace) -> int:
         except RenderDependencyError as exc:
             sys.exit(str(exc))
 
-    # Slice the rendered transcript *after* rendering: pyte replays the whole
-    # byte stream as a VT100 emulator, so feeding it a byte-sliced fragment
-    # starts mid-escape-sequence and produces garbage. Slice lines from the
-    # already-decoded string instead.
+    # Slice after rendering, never before: pyte replays the byte stream as a
+    # VT100 emulator, so a byte-sliced fragment starts mid-escape-sequence.
+    # getattr: internal callers construct Namespaces without tail/head.
     tail_n: Optional[int] = getattr(args, "tail", None)
     head_n: Optional[int] = getattr(args, "head", None)
     if tail_n is not None:
-        rendered = _slice_str_tail(rendered, tail_n)
+        rendered = _slice_str_lines(rendered, tail_n, from_end=True)
     elif head_n is not None:
-        rendered = _slice_str_head(rendered, head_n)
+        rendered = _slice_str_lines(rendered, head_n, from_end=False)
 
-    # Apply the same per-line and total byte budgets as cmd_logs so both
-    # commands are bounded on both axes. Real clean renders reach 309 KB
-    # (observed on msgfix2); without this cap the -o path writes unbounded
-    # data and the stdout path floods the LLM consumer.
+    # Same byte budget as cmd_logs: real renders reach hundreds of KB, which
+    # would otherwise flood both the -o file and the stdout consumer.
     budgeted, truncated = _budget_str(rendered)
     if truncated:
         budgeted = budgeted + _TRUNCATION_MARKER_STR

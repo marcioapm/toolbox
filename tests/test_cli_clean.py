@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import builtins
 import io
+import os
 import signal
 import sys
 
@@ -338,68 +339,57 @@ class TestLogsFlags:
         assert len(lines) == 50
         assert lines[0] == "L011"  # lines 11-60 are the last 50
 
-    def test_tail_and_head_together_is_usage_error(self, capsys):
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run._build_parser().parse_args(["logs", "run", "--tail", "5", "--head", "3"])
-        assert exc_info.value.code == 2
-
     def test_stale_positional_form_exits_nonzero(self, capsys):
         """agent-run logs <name> 200 (old positional) must be rejected non-zero via main()."""
         with pytest.raises(SystemExit) as exc_info:
             agent_run.main(["logs", "myrun", "200"])
         assert exc_info.value.code != 0
 
-    def test_single_line_8mb_log_tail_1(self, isolated_runs_root, monkeypatch):
-        """--tail 1 on an 8 MB single-line log must emit bounded output, not the full file.
+    @pytest.mark.parametrize(
+        "flag, fill",
+        [("tail", b"x"), ("head", b"y")],
+    )
+    def test_single_line_8mb_log_is_byte_bounded(
+        self, isolated_runs_root, monkeypatch, flag, fill
+    ):
+        """--tail/--head 1 on an 8 MB single-line log must emit bounded output.
 
-        The motivating wtgc5 case: a log with one \\n means one "line", so the line
-        count alone cannot bound output. The byte budget must fire instead, and a
-        truncation marker must be emitted so the consumer knows the output is partial.
+        The motivating wtgc5 case: one \\n means one "line", so the line count
+        cannot bound output and neither can the reader, which must read the whole
+        file to find that line. The byte budget is the only bound, and the
+        truncation marker must tell the consumer the output is partial.
         """
-        file_size = 8 * 1024 * 1024 + 1  # 8 MB + trailing \n
-        big_line = b"x" * (file_size - 1)
-        log_content = big_line + b"\n"
-        _make_log_run(isolated_runs_root, "bigrun_tail", log_content)
+        file_size = 8 * 1024 * 1024 + 1  # 8 MB payload + trailing \n
+        log_content = fill * (file_size - 1) + b"\n"
+        name = f"bigrun_{flag}"
+        _make_log_run(isolated_runs_root, name, log_content)
         stdout = _FakeStdout(tty=False)
         monkeypatch.setattr(sys, "stdout", stdout)
-        rc = agent_run.cmd_logs(argparse.Namespace(name="bigrun_tail", tail=1, head=None))
-        assert rc == 0
-        out = stdout.buffer.getvalue()
-        # Output must be bounded, not the whole file.
-        assert len(out) <= agent_run.LOGS_MAX_TOTAL_BYTES + 100, (
-            f"output {len(out)} bytes exceeds byte budget"
+        rc = agent_run.cmd_logs(
+            argparse.Namespace(
+                name=name,
+                tail=1 if flag == "tail" else None,
+                head=1 if flag == "head" else None,
+            )
         )
-        # Truncation marker must be present.
-        assert b"[agent-run: output truncated]" in out, "truncation marker missing"
-        # The output starts with content from the line, not zero bytes.
-        assert len(out) > 0
-
-    def test_single_line_8mb_log_head_1(self, isolated_runs_root, monkeypatch):
-        """--head 1 on an 8 MB single-line log must emit bounded output, not the full file."""
-        file_size = 8 * 1024 * 1024 + 1
-        big_line = b"y" * (file_size - 1)
-        log_content = big_line + b"\n"
-        _make_log_run(isolated_runs_root, "bigrun_head", log_content)
-        stdout = _FakeStdout(tty=False)
-        monkeypatch.setattr(sys, "stdout", stdout)
-        rc = agent_run.cmd_logs(argparse.Namespace(name="bigrun_head", tail=None, head=1))
         assert rc == 0
         out = stdout.buffer.getvalue()
         assert len(out) <= agent_run.LOGS_MAX_TOTAL_BYTES + 100, (
-            f"output {len(out)} bytes exceeds byte budget"
+            f"--{flag} output {len(out)} bytes exceeds byte budget"
         )
         assert b"[agent-run: output truncated]" in out, "truncation marker missing"
+        assert fill in out, "budgeted output must retain log content"
 
-    def test_8mb_log_reads_less_than_file_size_tail(self, isolated_runs_root, monkeypatch):
-        """_tail_bytes on a file with many short lines must not read the entire file.
+    def test_tail_stops_reverse_walk_before_start_of_file(self, isolated_runs_root, monkeypatch):
+        """_tail_bytes stops the reverse walk once n+1 newlines are seen.
 
-        A log with 50+ newlines should terminate the reverse walk before reaching
-        byte 0. On old code (O(n²) with bytes concatenation), 8 MB single-line
-        logs would be fully read; on new code the byte budget stops the read early.
-        This test uses many-line input so the newline-count exit fires.
+        With 10 000 short lines, --tail 50 must satisfy its newline count within
+        the first few 8 KiB blocks read backward from EOF and never reach byte 0.
+        This bounds only the many-newline shape; a log with fewer than n+1
+        newlines is still read in full, and the byte budget is what bounds
+        output there (see test_single_line_8mb_log_tail_1).
         """
-        # Many short lines: reverse walk should find 50 newlines well before EOF.
-        log_content = (b"line\n" * 10000)  # 50 KB, many newlines
+        log_content = (b"line\n" * 10000)  # 50 KB, 10 000 newlines
         file_size = len(log_content)
         _make_log_run(isolated_runs_root, "bigrun_tail_reads", log_content)
         read_total = [0]
@@ -456,14 +446,20 @@ class TestLogsFlags:
         assert b"HEAD-MARKER" in head_out, "--head must include head of file"
         assert b"TAIL-MARKER" not in head_out, "--head must not include tail of file"
 
-    def test_tail_zero_rejected(self, capsys):
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            pytest.param(["logs", "run", "--tail", "5", "--head", "3"], id="logs-tail-and-head"),
+            pytest.param(["logs", "run", "--tail", "0"], id="logs-tail-zero"),
+            pytest.param(["logs", "run", "--head", "0"], id="logs-head-zero"),
+            pytest.param(["clean", "run", "--tail", "5", "--head", "3"], id="clean-tail-and-head"),
+            pytest.param(["clean", "run", "--tail", "0"], id="clean-tail-zero"),
+        ],
+    )
+    def test_rejected_slice_argv_exits_2(self, argv):
+        """Mutually exclusive --tail/--head and non-positive N are argparse usage errors."""
         with pytest.raises(SystemExit) as exc_info:
-            agent_run._build_parser().parse_args(["logs", "run", "--tail", "0"])
-        assert exc_info.value.code == 2
-
-    def test_head_zero_rejected(self, capsys):
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run._build_parser().parse_args(["logs", "run", "--head", "0"])
+            agent_run._build_parser().parse_args(argv)
         assert exc_info.value.code == 2
 
     def test_logs_double_dash_before_name_and_flag(self, isolated_runs_root, monkeypatch):
@@ -556,18 +552,6 @@ class TestCleanSlicing:
 
         assert unsliced_out == old_out
 
-    def test_clean_tail_and_head_together_is_usage_error(self, capsys):
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run._build_parser().parse_args(
-                ["clean", "run", "--tail", "5", "--head", "3"]
-            )
-        assert exc_info.value.code == 2
-
-    def test_clean_tail_zero_rejected(self, capsys):
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run._build_parser().parse_args(["clean", "run", "--tail", "0"])
-        assert exc_info.value.code == 2
-
 
 class TestCleanByteBudget:
     """cmd_clean applies LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to output.
@@ -577,10 +561,6 @@ class TestCleanByteBudget:
     visible truncation marker when the budget fires.
     """
 
-    def _make_big_render_run(self, runs_root, name: str) -> None:
-        """Seed a minimal run whose raw log is non-empty."""
-        _make_log_run(runs_root, name, b"x\n")
-
     def test_stdout_budget_fires_on_oversized_render(
         self, isolated_runs_root, monkeypatch, capsys
     ):
@@ -588,7 +568,7 @@ class TestCleanByteBudget:
         on the stdout path and the truncation marker is emitted."""
         oversized = "A" * (agent_run.LOGS_MAX_TOTAL_BYTES + 1) + "\n"
         monkeypatch.setattr(agent_run, "_render_log", lambda *_a, **_kw: oversized)
-        self._make_big_render_run(isolated_runs_root, "budget_stdout")
+        _make_log_run(isolated_runs_root, "budget_stdout", b"x\n")
         args = argparse.Namespace(
             name="budget_stdout", out=None, width=120, height=60, history=100000,
             tail=None, head=None,
@@ -610,7 +590,7 @@ class TestCleanByteBudget:
         on the -o path; the written file includes the truncation marker."""
         oversized = "B" * (agent_run.LOGS_MAX_TOTAL_BYTES + 1) + "\n"
         monkeypatch.setattr(agent_run, "_render_log", lambda *_a, **_kw: oversized)
-        self._make_big_render_run(isolated_runs_root, "budget_fileout")
+        _make_log_run(isolated_runs_root, "budget_fileout", b"x\n")
         out_file = tmp_path / "budget.txt"
         args = argparse.Namespace(
             name="budget_fileout",
@@ -639,7 +619,7 @@ class TestCleanByteBudget:
         """A rendered transcript well within budget emits no truncation marker."""
         small = "line one\nline two\nline three\n"
         monkeypatch.setattr(agent_run, "_render_log", lambda *_a, **_kw: small)
-        self._make_big_render_run(isolated_runs_root, "budget_small")
+        _make_log_run(isolated_runs_root, "budget_small", b"x\n")
         args = argparse.Namespace(
             name="budget_small", out=None, width=120, height=60, history=100000,
             tail=None, head=None,
@@ -654,189 +634,82 @@ class TestCleanByteBudget:
 class TestCleanCache:
     """cmd_clean reads log.clean when the cache is fresh and geometry matches.
 
-    Cache validity requires both a geometry match (width/height/history equal
-    the daemon's defaults) and a staleness check (log.clean mtime must not lag
-    log mtime by more than CLEAN_CACHE_MAX_STALENESS_SECONDS). The fallback
-    to raw rendering must be load-bearing: 32 of 301 run directories on macmini
-    have no log.clean (written only under --echo).
+    Reuse requires both a geometry match (width/height/history equal the
+    daemon's defaults) and freshness (log.clean mtime lags log mtime by at most
+    CLEAN_CACHE_MAX_STALENESS_SECONDS). The fallback to raw rendering is
+    load-bearing: log.clean is written only under --echo, and 32 of 301 run
+    directories on macmini have none.
     """
 
     def _make_cached_run(
         self,
         runs_root,
         name: str,
-        raw_bytes: bytes,
-        clean_text: str,
+        clean_text,
         log_mtime: float,
         clean_mtime: float,
     ):
-        """Seed a run with both log and log.clean, with explicit mtimes."""
-        import os
-        log_d = _make_log_run(runs_root, name, raw_bytes)
-        log_path = log_d / "log"
-        clean_path = log_d / "log.clean"
-        clean_path.write_text(clean_text, encoding="utf-8")
-        os.utime(log_path, (log_mtime, log_mtime))
-        os.utime(clean_path, (clean_mtime, clean_mtime))
+        """Seed a run with log, and log.clean unless clean_text is None, at set mtimes."""
+        log_d = _make_log_run(runs_root, name, b"raw content\n")
+        os.utime(log_d / "log", (log_mtime, log_mtime))
+        if clean_text is not None:
+            clean_path = log_d / "log.clean"
+            clean_path.write_text(clean_text, encoding="utf-8")
+            os.utime(clean_path, (clean_mtime, clean_mtime))
         return log_d
 
-    def test_cache_hit_skips_render(self, isolated_runs_root, monkeypatch, capsys):
-        """When log.clean is present and fresh, _render_log is not called."""
-        now = 1_000_000.0
-        render_called = []
-        monkeypatch.setattr(
-            agent_run, "_render_log", lambda *_a, **_kw: render_called.append(1) or "wrong\n"
-        )
-        self._make_cached_run(
-            isolated_runs_root, "cache_hit",
-            raw_bytes=b"raw content\n",
-            clean_text="cached content\n",
-            log_mtime=now,
-            clean_mtime=now,  # zero gap: definitely fresh
-        )
-        args = argparse.Namespace(
-            name="cache_hit", out=None,
-            width=agent_run._RENDER_LOG_DEFAULT_WIDTH,
-            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
-            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
-            tail=None, head=None,
-        )
-        rc = agent_run.cmd_clean(args)
-        assert rc == 0
-        assert not render_called, "_render_log must not be called on a cache hit"
-        out = capsys.readouterr().out
-        assert "cached content" in out
+    @pytest.mark.parametrize(
+        "case, clean_text, gap, width_delta, expect_render",
+        [
+            pytest.param("hit", "cached content\n", 0.0, 0, False, id="fresh-cache-reused"),
+            pytest.param("threshold", "cached content\n", None, 0, False, id="gap-at-threshold-reused"),
+            pytest.param("absent", None, 0.0, 0, True, id="no-cache-renders"),
+            pytest.param("stale", "cached content\n", None, 0, True, id="gap-past-threshold-renders"),
+            pytest.param("geometry", "cached content\n", 0.0, 1, True, id="non-default-geometry-renders"),
+        ],
+    )
+    def test_cache_reuse_decision(
+        self, isolated_runs_root, monkeypatch, capsys,
+        case, clean_text, gap, width_delta, expect_render,
+    ):
+        """log.clean is reused only when it is both fresh and geometry-compatible.
 
-    def test_cache_absent_falls_back_to_render(self, isolated_runs_root, monkeypatch, capsys):
-        """When log.clean does not exist, cmd_clean renders from the raw log."""
-        rendered_text = "rendered from raw\n"
-        monkeypatch.setattr(agent_run, "_render_log", lambda *_a, **_kw: rendered_text)
-        _make_log_run(isolated_runs_root, "cache_absent", b"raw content\n")
-        # No log.clean written.
-        args = argparse.Namespace(
-            name="cache_absent", out=None,
-            width=agent_run._RENDER_LOG_DEFAULT_WIDTH,
-            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
-            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
-            tail=None, head=None,
-        )
-        rc = agent_run.cmd_clean(args)
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "rendered from raw" in out
-
-    def test_cache_stale_falls_back_to_render(self, isolated_runs_root, monkeypatch, capsys):
-        """When log.clean mtime lags log mtime by more than the staleness
-        threshold, the cache is rejected and cmd_clean renders from raw.
-
-        This simulates the daemon freezing after the raw log crossed
-        ECHO_LOOP_MAX_RENDER_BYTES: log keeps growing (advancing its mtime)
-        while log.clean stops updating.
+        A stale cache means the --echo daemon stopped rendering (e.g. the raw log
+        crossed ECHO_LOOP_MAX_RENDER_BYTES) while log kept growing; a non-default
+        geometry means the cached render does not match what was asked for.
         """
         now = 1_000_000.0
-        stale_gap = agent_run.CLEAN_CACHE_MAX_STALENESS_SECONDS + 1.0
-        rendered_text = "freshly rendered\n"
-        monkeypatch.setattr(agent_run, "_render_log", lambda *_a, **_kw: rendered_text)
-        self._make_cached_run(
-            isolated_runs_root, "cache_stale",
-            raw_bytes=b"raw content\n",
-            clean_text="stale cached content\n",
-            log_mtime=now,
-            clean_mtime=now - stale_gap,  # log.clean is too far behind log
-        )
-        args = argparse.Namespace(
-            name="cache_stale", out=None,
-            width=agent_run._RENDER_LOG_DEFAULT_WIDTH,
-            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
-            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
-            tail=None, head=None,
-        )
-        rc = agent_run.cmd_clean(args)
-        assert rc == 0
-        out = capsys.readouterr().out
-        assert "freshly rendered" in out
-        assert "stale cached content" not in out
+        threshold = agent_run.CLEAN_CACHE_MAX_STALENESS_SECONDS
+        if gap is None:
+            gap = threshold if case == "threshold" else threshold + 1.0
 
-    def test_non_default_geometry_bypasses_cache(self, isolated_runs_root, monkeypatch, capsys):
-        """A non-default --width/--height/--history forces a re-render even when
-        a fresh log.clean exists, because the daemon always renders at the default
-        geometry and a different geometry produces different output."""
-        now = 1_000_000.0
-        rendered_text = "custom geometry render\n"
         render_called = []
 
         def fake_render(*_a, **_kw):
             render_called.append(1)
-            return rendered_text
+            return "freshly rendered\n"
 
         monkeypatch.setattr(agent_run, "_render_log", fake_render)
         self._make_cached_run(
-            isolated_runs_root, "cache_geom",
-            raw_bytes=b"raw content\n",
-            clean_text="default geometry cached\n",
+            isolated_runs_root, f"cache_{case}",
+            clean_text=clean_text,
             log_mtime=now,
-            clean_mtime=now,
+            clean_mtime=now - gap,
         )
         args = argparse.Namespace(
-            name="cache_geom", out=None,
-            width=agent_run._RENDER_LOG_DEFAULT_WIDTH + 1,  # non-default
+            name=f"cache_{case}", out=None,
+            width=agent_run._RENDER_LOG_DEFAULT_WIDTH + width_delta,
             height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
             history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
             tail=None, head=None,
         )
-        rc = agent_run.cmd_clean(args)
-        assert rc == 0
-        assert render_called, "_render_log must be called when geometry is non-default"
+
+        assert agent_run.cmd_clean(args) == 0
         out = capsys.readouterr().out
-        assert "custom geometry render" in out
-        assert "default geometry cached" not in out
-
-    def test_fresh_cache_boundary(self, isolated_runs_root, monkeypatch, capsys):
-        """A gap exactly at CLEAN_CACHE_MAX_STALENESS_SECONDS is accepted;
-        one second beyond is rejected."""
-        now = 1_000_000.0
-        threshold = agent_run.CLEAN_CACHE_MAX_STALENESS_SECONDS
-
-        # At-threshold: cache is used.
-        render_called = []
-        monkeypatch.setattr(
-            agent_run, "_render_log", lambda *_a, **_kw: render_called.append(1) or "raw\n"
-        )
-        self._make_cached_run(
-            isolated_runs_root, "cache_at_threshold",
-            raw_bytes=b"raw\n",
-            clean_text="at threshold\n",
-            log_mtime=now,
-            clean_mtime=now - threshold,  # exactly at threshold: not stale
-        )
-        args = argparse.Namespace(
-            name="cache_at_threshold", out=None,
-            width=agent_run._RENDER_LOG_DEFAULT_WIDTH,
-            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
-            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
-            tail=None, head=None,
-        )
-        agent_run.cmd_clean(args)
-        assert not render_called, "cache exactly at threshold must be accepted"
-
-        # One second beyond threshold: cache is rejected.
-        render_called.clear()
-        monkeypatch.setattr(
-            agent_run, "_render_log", lambda *_a, **_kw: render_called.append(1) or "raw\n"
-        )
-        self._make_cached_run(
-            isolated_runs_root, "cache_beyond_threshold",
-            raw_bytes=b"raw\n",
-            clean_text="beyond threshold\n",
-            log_mtime=now,
-            clean_mtime=now - threshold - 1.0,  # one second over: stale
-        )
-        args2 = argparse.Namespace(
-            name="cache_beyond_threshold", out=None,
-            width=agent_run._RENDER_LOG_DEFAULT_WIDTH,
-            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
-            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
-            tail=None, head=None,
-        )
-        agent_run.cmd_clean(args2)
-        assert render_called, "cache one second beyond threshold must be rejected"
+        if expect_render:
+            assert render_called, "expected a raw render, but log.clean was reused"
+            assert "freshly rendered" in out
+            assert "cached content" not in out
+        else:
+            assert not render_called, "expected log.clean reuse, but _render_log ran"
+            assert "cached content" in out
