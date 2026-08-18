@@ -302,6 +302,23 @@ class TestA2OpenCodeDenyBeatsProjectAllow:
 # A3: Claude deny beats a genuinely honoured allow
 # ---------------------------------------------------------------------------
 
+def _claude_run(prompt_stdin: str, extra_argv: list[str] = (), timeout: int = 60) -> str:
+    """Run claude --print and return stdout text."""
+    model_args = ["--model", _CLAUDE_MODEL] if _CLAUDE_MODEL else []
+    result = subprocess.run(
+        [
+            "claude",
+            *model_args,
+            "--print",
+            "--permission-mode", "bypassPermissions",
+            *extra_argv,
+        ],
+        input=prompt_stdin,
+        capture_output=True, text=True, timeout=timeout,
+    )
+    return result.stdout
+
+
 def _claude_json(prompt_stdin: str, extra_argv: list[str] = (), timeout: int = 60) -> dict:
     """Run claude --print --output-format json and return the parsed result object."""
     model_args = ["--model", _CLAUDE_MODEL] if _CLAUDE_MODEL else []
@@ -324,9 +341,10 @@ def _claude_json(prompt_stdin: str, extra_argv: list[str] = (), timeout: int = 6
 class TestA3ClaudeDenyBeatsHonouredAllow:
     """A3: --disallowedTools deny beats a genuinely honoured allow.
 
-    Bash is the concrete tool: it is genuinely honoured (control arm has
-    num_turns=2 proving a tool call occurred) and suppressed by
-    --disallowedTools Bash (deny arm has num_turns=1).
+    Bash is the concrete tool: it is genuinely honoured (control arm writes a
+    file that can only exist if Bash ran) and suppressed by --disallowedTools
+    Bash (deny arm: file does not exist).  Model wording is irrelevant to both
+    assertions.
 
     EnterPlanMode and AskUserQuestion are not available in this Claude Code
     installation (2.1.207) for this workspace: neither appears in the model's
@@ -336,34 +354,43 @@ class TestA3ClaudeDenyBeatsHonouredAllow:
     fails loudly, prompting implementation of the full A3 proof for them.
     """
 
-    _PROMPT = "Use Bash to run exactly: echo A3_BASH_EXEC_SENTINEL"
-
-    def test_a3_control_bash_invoked(self):
-        """Control: no --disallowedTools → Bash tool called, result is the command output."""
-        data = _claude_json(self._PROMPT)
-        # The model echoes only the bash output when bash executes successfully.
-        result = data.get("result", "").strip()
-        assert "A3_BASH_EXEC_SENTINEL" in result, (
-            f"Control arm: bash output sentinel not in result. result={result!r}"
+    def test_a3_control_bash_invoked(self, tmp_path):
+        """Control: no --disallowedTools → Bash writes a file that proves it ran."""
+        marker = tmp_path / "a3_control_marker.txt"
+        prompt = (
+            f"Use Bash to run exactly this command and nothing else: "
+            f"echo A3CTRL > {marker}"
+        )
+        out = _claude_run(prompt)
+        assert marker.exists(), (
+            f"Control arm: marker file not created — Bash was not invoked. "
+            f"output={out!r}"
+        )
+        assert "A3CTRL" in marker.read_text(), (
+            f"Control arm: marker file exists but contains unexpected content. "
+            f"content={marker.read_text()!r}"
         )
 
-    def test_a3_deny_blocks_bash(self):
-        """Deny arm: --disallowedTools Bash → bash not executed; result is a refusal.
+    def test_a3_deny_blocks_bash(self, tmp_path):
+        """Deny arm: --disallowedTools Bash → Bash cannot run; marker file must not exist.
 
-        The discriminator is result.strip() != sentinel: when bash executes, the
-        model echoes only the command output; when denied, it produces a refusal
-        that is much longer.  Non-empty result proves Claude ran.
+        Non-empty output proves Claude ran; absent file proves Bash did not.
         """
-        data = _claude_json(self._PROMPT, extra_argv=["--disallowedTools", "Bash"])
-        result = data.get("result", "")
-        # Positive control: Claude ran and produced text.
-        assert result.strip(), (
-            f"Deny arm positive control failed: Claude produced no output. data={data}"
+        marker = tmp_path / "a3_deny_marker.txt"
+        prompt = (
+            f"Use Bash to run exactly this command and nothing else: "
+            f"echo A3DENY > {marker}"
         )
-        # Actual assertion: bash was not executed (result is not just the sentinel).
-        assert result.strip() != "A3_BASH_EXEC_SENTINEL", (
-            "Deny arm: result is exactly the bash output — bash was executed despite deny. "
-            f"result={result!r}"
+        out = _claude_run(prompt, extra_argv=["--disallowedTools", "Bash"])
+        # Positive control: Claude ran and produced text output.
+        assert out.strip(), (
+            f"Deny arm positive control failed: Claude produced no output. "
+            f"This means the run itself failed, not that deny worked."
+        )
+        # Ground-truth assertion: Bash did not execute.
+        assert not marker.exists(), (
+            f"Deny arm: marker file was created — Bash executed despite --disallowedTools Bash. "
+            f"deny mechanism is broken. output={out!r}"
         )
 
     def test_a3_enterplanmode_askuserquestion_skip_reason(self):
@@ -461,13 +488,13 @@ class TestA5EnabledArmsObservablyEnable:
             f"A5 opencode: bash not invoked when question=allow. tools={tools_used!r}"
         )
 
-    def test_a5_claude_enabled_arm_bash_callable(self):
-        """Claude enabled arm (no --disallowedTools): Bash tool is callable."""
+    def test_a5_claude_enabled_arm_bash_callable(self, tmp_path):
+        """Claude enabled arm (no --disallowedTools): Bash writes a file, proving it ran."""
         # Verify _build_managed_argv produces no --disallowedTools when both enabled.
         argv = agent_run._build_managed_argv(
             "claude",
             interactive=False,
-            prompt="Use Bash to run exactly: printf A5_CLAUDE_ENABLED",
+            prompt="placeholder",
             model=None,
             agent_mode=None,
             session_id="00000000-0000-4000-8000-000000000001",
@@ -479,9 +506,12 @@ class TestA5EnabledArmsObservablyEnable:
             f"A5 claude: --disallowedTools present in enabled-arm argv: {argv}"
         )
 
-        # Live: confirm Bash is actually invoked (result contains the output).
-        data = _claude_json("Use Bash to run exactly: echo A5_CLAUDE_ENABLED")
-        result = data.get("result", "").strip()
-        assert "A5_CLAUDE_ENABLED" in result, (
-            f"A5 claude enabled: bash output not found. result={result!r}"
+        # Live: Bash writes a marker; file existence is the ground-truth assertion.
+        marker = tmp_path / "a5_claude_enabled_marker.txt"
+        out = _claude_run(
+            f"Use Bash to run exactly this command and nothing else: echo A5ENABLED > {marker}"
+        )
+        assert marker.exists(), (
+            f"A5 claude enabled: marker file not created — Bash was not invoked. "
+            f"output={out!r}"
         )
