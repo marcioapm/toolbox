@@ -649,8 +649,7 @@ class TestCleanCache:
     Reuse requires a geometry match (width/height/history equal the daemon's
     defaults) and metadata whose dev/ino/offset/size match the current raw log;
     log.clean mtime does not enter the decision. The fallback to raw rendering is
-    load-bearing: log.clean is written only under --echo, and 32 of 301 run
-    directories on macmini have none.
+    still load-bearing for older run directories that predate the always-on renderer.
     """
 
     def _make_cached_run(

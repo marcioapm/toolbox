@@ -47,7 +47,7 @@ Usage::
     agent-run [flags] <name> -- <cmd...>  # recommended: explicit separator
     agent-run <name> <cmd...>            # non-interactive (one-shot)
     agent-run -i <name> -- <cmd...>      # interactive (PTY-wrapped, steerable)
-    agent-run --echo <name> -- <cmd...>  # also render a cleaned live transcript
+    agent-run --echo <name> -- <cmd...>  # accepted for backward compat; log.clean is now always produced
     agent-run --idle-timeout N <name> -- <cmd...>  # self-terminate after N idle seconds
     agent-run tail <name>                # follow log in real time
     agent-run logs <name> [--tail N | --head N]  # last/first N lines (default --tail 50)
@@ -109,11 +109,10 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     pty_pid      PTY child pid (interactive only)
     keeper_pid   FIFO-keeper pid (interactive only)
     prompt_pid   initial-prompt helper pid (when -f and interactive)
-    echo_pid     transcript renderer pid (when --echo)
-    render_pid   final-transcript-render child pid (when --echo; present only
-                 while the bounded final render is in flight, so
-                 ``_force_kill`` can discover and reap it if the runner
-                 itself is wedged)
+    echo_pid     transcript renderer pid (live incremental renderer, always present)
+    render_pid   final-transcript-render child pid (present only while the
+                 bounded final render is in flight, so ``_force_kill`` can
+                 discover and reap it if the runner itself is wedged)
     command      pretty-printed launch command
     argv         JSON-encoded argv (authoritative form for replay)
     submit_mode  cr | crlf (selected from argv for interactive submission)
@@ -133,7 +132,7 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs)::
 
     log          captured stdout+stderr (PTY-captured when interactive)
-    log.clean    rendered transcript (only when launched with --echo)
+    log.clean    rendered transcript (produced for every run that generates output)
     prompt       copy of the -f/--prompt-file input, if one was given
     tmp/         per-run scratch dir exported as TMPDIR and BUN_TMPDIR (see
                  above); removed only by `agent-run reap`, never on normal
@@ -3379,7 +3378,7 @@ class RenderDependencyError(RuntimeError):
 
 
 _RENDER_DEPENDENCY_MESSAGE = (
-    "agent-run: `pyte` is required for `clean` / --echo. "
+    "agent-run: `pyte` is required for `clean` and the live transcript renderer. "
     "Install with: pipx inject mmartins-toolbox pyte  (or uv tool install --with pyte ...)"
 )
 
@@ -3560,6 +3559,10 @@ def _bounded_final_render(
         size = (log_dir / "log").stat().st_size
     except OSError as exc:
         return f"cannot stat log: {exc}"
+    if size == 0:
+        # An empty log carries no transcript to render; producing log.clean
+        # with an empty rendering and complete=True would be a misleading artifact.
+        return None
     if size > MAX_FINAL_RENDER_BYTES:
         return f"log is {size} bytes; final render limit is {MAX_FINAL_RENDER_BYTES} bytes"
 
@@ -5810,26 +5813,26 @@ def _runner(
         signal.signal(signal.SIGINT, _on_signal)
         signal.signal(signal.SIGHUP, _on_signal)
 
-        # If --echo was requested, fork a background renderer that periodically
-        # writes a cleaned transcript next to the raw log. Stays alive for the
-        # whole run; the signal handler tears it down on shutdown.
-        if echo:
-            with _block_handled_runner_signals():
-                echo_pid = os.fork()
-                if echo_pid != 0:
-                    _publish_or_reap_child(state_dir, "echo_pid", echo_pid)
-                else:
-                    _reset_runner_signal_handlers()
-            if echo_pid == 0:
+        # Fork a background renderer that periodically writes a cleaned
+        # transcript next to the raw log.  Runs unconditionally for every
+        # launch mode so log.clean is always present; stays alive for the
+        # whole run and is torn down by the signal handler on shutdown.
+        with _block_handled_runner_signals():
+            echo_pid = os.fork()
+            if echo_pid != 0:
+                _publish_or_reap_child(state_dir, "echo_pid", echo_pid)
+            else:
                 _reset_runner_signal_handlers()
-                try:
-                    os.close(ready_fd)
-                except OSError:
-                    pass
-                try:
-                    _echo_loop(log_dir, echo_interval)
-                finally:
-                    os._exit(0)
+        if echo_pid == 0:
+            _reset_runner_signal_handlers()
+            try:
+                os.close(ready_fd)
+            except OSError:
+                pass
+            try:
+                _echo_loop(log_dir, echo_interval)
+            finally:
+                os._exit(0)
 
         # Opt-in stall guard: a sibling child watching log mtime, so a wedged
         # agent reaches a terminal status instead of running forever.
@@ -5937,47 +5940,46 @@ def _runner(
             ready_sent = True
         exit_code = 1
 
-    # Persistent helpers (notably --echo) outlive the agent by design, so reap
-    # them on successful completion as well as on crashes and external signals.
+    # Persistent helpers outlive the agent by design, so reap them on
+    # successful completion as well as on crashes and external signals.
     _teardown_children(state_dir)
     # Publish the agent's terminal state *before* producing a convenience
     # transcript artifact.  A pathological renderer can never leave a dead
     # agent reported as starting/running.
     _finalize(exit_code)
-    if echo:
-        # The periodic renderer may never tick on a short run, or may have run
-        # just before the agent's final output.  Render once in a bounded child
-        # after stopping it.  The status is already terminal if this times out.
-        def _track_render_pid(pid: Optional[int]) -> None:
-            nonlocal render_pid
-            if pid is None:
-                render_pid = None
-                try:
-                    (state_dir / "render_pid").unlink()
-                except FileNotFoundError:
-                    pass
-                return
-            render_pid = pid
+    # The periodic renderer may never tick on a short run, or may have run
+    # just before the agent's final output.  Render once in a bounded child
+    # after stopping it.  The status is already terminal if this times out.
+    def _track_render_pid(pid: Optional[int]) -> None:
+        nonlocal render_pid
+        if pid is None:
+            render_pid = None
             try:
-                # Same publish-or-reap path used at every other fork site, so
-                # a state-file write failure for render_pid cannot orphan the
-                # render child either -- _publish_or_reap_child kills and
-                # reaps it itself before raising.
-                _publish_or_reap_child(state_dir, "render_pid", pid)
-            except OSError:
-                render_pid = None
-
-        render_error = _bounded_final_render(log_dir, register=_track_render_pid)
-        if render_error:
-            try:
-                os.write(
-                    log_fd,
-                    f"\nagent-run: final echo render failed: {render_error}\n".encode(
-                        errors="replace"
-                    ),
-                )
-            except OSError:
+                (state_dir / "render_pid").unlink()
+            except FileNotFoundError:
                 pass
+            return
+        render_pid = pid
+        try:
+            # Same publish-or-reap path used at every other fork site, so
+            # a state-file write failure for render_pid cannot orphan the
+            # render child either -- _publish_or_reap_child kills and
+            # reaps it itself before raising.
+            _publish_or_reap_child(state_dir, "render_pid", pid)
+        except OSError:
+            render_pid = None
+
+    render_error = _bounded_final_render(log_dir, register=_track_render_pid)
+    if render_error:
+        try:
+            os.write(
+                log_fd,
+                f"\nagent-run: final render failed: {render_error}\n".encode(
+                    errors="replace"
+                ),
+            )
+        except OSError:
+            pass
     os._exit(exit_code)
 
 
