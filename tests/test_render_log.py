@@ -32,6 +32,36 @@ class TestRenderLogSynthetic:
         out = _render_log(b"hello world\r\n")
         assert "hello world" in out
 
+    def test_bare_lf_does_not_staircase(self):
+        """A one-shot run writes bare LF (no PTY, no ONLCR translation).
+        Without LNM enabled on the screen, each bare LF advances the cursor
+        row but leaves the column unchanged, so every subsequent line is
+        indented by the character count of the previous line.  LNM must be
+        set so bare LF resets the cursor to column 0."""
+        # Three lines of different lengths to make the staircase visible.
+        raw = (
+            b"\x1b[90mprefix\x1b[0m short\n"
+            b"\x1b[90mprefix\x1b[0m much-longer-line-here\n"
+            b"\x1b[90mprefix\x1b[0m end\n"
+        )
+        out = _render_log(raw)
+        lines = [l for l in out.splitlines() if l.strip()]
+        assert lines, "rendered output must not be empty"
+        staircase = [l for l in lines if l != l.lstrip()]
+        assert not staircase, (
+            f"bare-LF staircase: {staircase}; full output: {out!r}"
+        )
+        # Visible content must be preserved.
+        assert "short" in out
+        assert "much-longer-line-here" in out
+        assert "end" in out
+
+    def test_bare_lf_and_crlf_render_identically(self):
+        """LNM on means bare LF and CRLF produce the same rendered output."""
+        content = b"line-one content\nline-two content\nline-three content\n"
+        crlf_content = content.replace(b"\n", b"\r\n")
+        assert _render_log(content) == _render_log(crlf_content)
+
     def test_strips_csi_ansi_codes(self):
         # Bold red text, then reset
         raw = b"\x1b[1;31mHELLO\x1b[0m world\r\n"

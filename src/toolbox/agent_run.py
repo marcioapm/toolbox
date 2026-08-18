@@ -3388,6 +3388,12 @@ def _new_pyte_screen(pyte, width: int, height: int, history: int):
 
     Pyte 0.8 stops an entire plain-text draw batch at those characters.  Skipping
     each unsupported character keeps replay independent of feed boundaries.
+
+    LNM (Line New Mode) is enabled so bare LF moves the cursor to column 0 as
+    well as down one row.  Without it, a one-shot (non-PTY) run's bare-LF line
+    endings leave the cursor column unchanged and every subsequent line is
+    indented by the length of the previous one — a staircase artifact.  PTY
+    output carries CRLF and renders identically with LNM on.
     """
     from pyte import modes as mo
 
@@ -3429,7 +3435,9 @@ def _new_pyte_screen(pyte, width: int, height: int, history: int):
                     self.cursor.x = min(self.cursor.x + char_width, self.columns)
             self.dirty.add(self.cursor.y)
 
-    return SafeHistoryScreen(width, height, history=history, ratio=0.5)
+    screen = SafeHistoryScreen(width, height, history=history, ratio=0.5)
+    screen.set_mode(mo.LNM)
+    return screen
 
 
 def _serialize_screen(screen) -> str:

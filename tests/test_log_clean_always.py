@@ -95,13 +95,20 @@ class TestPrintModeSGRRendering:
 
     Real print-mode runs emit SGR sequences such as \\x1b[0m (reset) and \\x1b[90m
     (dim/dark grey) even when non-interactive.  log.clean must contain the visible
-    text without those sequences.
+    text without those sequences, and every rendered line must start at column 0
+    (no staircase from bare-LF cursor drift).
     """
 
     @pytest.fixture
     def print_sgr_log_bytes(self, fixtures_dir) -> bytes:
-        """Synthetic print-mode log shaped after real runs: SGR dim prefix + reset."""
-        return (fixtures_dir / "print_mode_sgr.log").read_bytes()
+        """Synthetic print-mode log shaped after real runs: bare-LF line endings,
+        SGR dim prefix, SGR reset.  One-shot runs write to the log fd without a
+        PTY, so there is no ONLCR translation and line endings are bare LF."""
+        raw = (fixtures_dir / "print_mode_sgr.log").read_bytes()
+        # Fixture must be bare LF; CRLF would mask the staircase bug.
+        assert b"\r\n" not in raw, "fixture must use bare LF, not CRLF"
+        assert b"\n" in raw, "fixture must have at least one bare LF"
+        return raw
 
     def test_sgr_codes_absent_from_log_clean(
         self, isolated_runs_root, isolated_log_root, print_sgr_log_bytes, tmp_path
@@ -136,6 +143,11 @@ class TestPrintModeSGRRendering:
         content = clean.read_text()
         assert "\x1b[" not in content, "SGR introducer leaked into log.clean"
         assert "\x1b" not in content, "ESC byte leaked into log.clean"
+        # No staircase: every non-empty line must start at column 0.
+        staircase = [l for l in content.splitlines() if l != l.lstrip() and l.lstrip()]
+        assert not staircase, (
+            f"bare-LF staircase in log.clean: {staircase[:2]}"
+        )
 
     def test_sgr_visible_text_preserved(
         self, isolated_runs_root, isolated_log_root, print_sgr_log_bytes, tmp_path
@@ -166,6 +178,11 @@ class TestPrintModeSGRRendering:
         # Visible text from the fixture must survive the render.
         assert "FIXTURE-FINAL-LINE" in content
         assert "FIXTURE-WORD-0" in content
+        # No staircase: bare-LF cursor drift must not indent any line.
+        staircase = [l for l in content.splitlines() if l != l.lstrip() and l.lstrip()]
+        assert not staircase, (
+            f"bare-LF staircase in log.clean: {staircase[:2]}"
+        )
 
 
 class TestInteractiveModeAlwaysProducesLogClean:
