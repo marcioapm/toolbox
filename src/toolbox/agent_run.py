@@ -153,10 +153,47 @@ Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs):
     run.json     immutable launch facts + exit facts (all modes): name, argv,
                  command, cwd, started_at, harness, interactive, model,
                  agent_mode; augmented with ended_at, exit_code, status on exit
+    hooks.jsonl  append-only event log written by `agent-run hook`; one JSON
+                 object per line, each recording a harness hook invocation
+                 (event name, timestamp, harness type, payload excerpt).
+                 Absent when no hook has ever fired for this run — hooks are
+                 opt-in, never written by agent-run itself. See "Harness hook
+                 integration" below.
     session-acquire.log  diagnostic log for session acquisition (managed mode)
     tmp/         per-run scratch dir exported as TMPDIR and BUN_TMPDIR (see
                  above); removed only by `agent-run reap`, never on normal
                  run exit
+
+Harness hook integration — user-side configuration (agent-run never writes
+these for you):
+
+    claude (~/.claude/settings.json):
+        {"hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command",
+          "command": "agent-run hook stop"}]}]}}
+
+    codex (~/.codex/config.toml):
+        notify = ["agent-run", "hook", "turn-complete"]
+
+    opencode plugin (JavaScript, shells out because opencode hooks are JS):
+        export default {
+          name: "agent-run-hook",
+          onEvent(event) {
+            if (event.type !== "session.idle") return;
+            const { execSync } = require("child_process");
+            execSync(
+              `agent-run hook session-idle --json '${JSON.stringify(event)}'`,
+              { stdio: "inherit" }
+            );
+          },
+        };
+
+agent-run exports AGENT_RUN_NAME, AGENT_RUN_STATE_DIR, and AGENT_RUN_LOG_DIR
+into the agent's environment so that `agent-run hook` can identify the run
+without requiring the hook to know anything about how the agent was launched.
+The hook resolves the run first from AGENT_RUN_NAME, then by walking its
+caller's process ancestry to match a recorded pid/pgid. Explicit --name
+overrides both. On any resolution failure the hook exits 0 silently (a broken
+hook must never stall the harness turn).
 
 `status` reports "not running (log preserved)" when the state dir is gone
 but the log dir survived. `logs`/`tail`/`clean` always read from the log
@@ -347,6 +384,28 @@ TERMINAL_STATUSES = frozenset({"done", "failed", "launch_failed", "died", "kille
 # `--force-unknown`) so an operator has a supported way to clear it instead
 # of `rm -rf` by hand.
 KNOWN_NONTERMINAL_STATUSES = frozenset({"starting", "running", "stalled"})
+
+# Maximum number of hook events retained in hooks.jsonl per run. Once this
+# limit is reached, new events are silently dropped to bound file growth on
+# chatty per-tool-call hooks. watch reports truncated=true when the cap fires.
+AGENT_RUN_HOOK_MAX_EVENTS: int = int(os.environ.get("AGENT_RUN_HOOK_MAX_EVENTS", "1000"))
+
+# Maximum bytes read from stdin for a hook payload. A larger payload is a sign
+# of transcript content, not a signal — drop what does not fit.
+_HOOK_STDIN_MAX_BYTES: int = 64 * 1024
+
+# Bounded read timeout for hook stdin: prevents hanging the harness turn when
+# the hook is invoked with stdin connected but no data arrives.
+_HOOK_STDIN_TIMEOUT_SECONDS: float = 2.0
+
+# Maximum size of one hooks.jsonl line. POSIX guarantees O_APPEND writes of
+# <= PIPE_BUF (512 bytes minimum; 4096 on Linux and macOS) are atomic, and
+# a realistic JSONL line fits well within this bound.
+_HOOK_MAX_LINE_BYTES: int = 4096
+
+# Payload fields truncated to this length so a single hook event does not
+# become a transcript store.
+_HOOK_PAYLOAD_TRUNCATE_CHARS: int = 200
 
 
 def _status_bucket(status: str) -> str:
@@ -2854,6 +2913,418 @@ def _watch_validate_repo_arg(repo_arg: Optional[str]) -> Optional[str]:
     return str(Path(repo_arg).resolve())
 
 
+# ---------------------------------------------------------------------------
+# agent-run hook — harness hook receiver
+# ---------------------------------------------------------------------------
+
+def _hook_resolve_run(
+    name_override: Optional[str],
+) -> Optional[str]:
+    """Return the validated run name for this hook invocation, or None.
+
+    Resolution order:
+      1. Explicit --name <run> argument (name_override).
+      2. AGENT_RUN_NAME env var, validated against the log dir.
+      3. Ancestry walk: compare caller ppid chain against recorded
+         pid/pgid/pty_pid in each run's state dir.
+      4. None — no-op, exit 0.
+
+    Returns a validated name string whose log dir exists, or None.
+    Never raises.
+    """
+    # 1. Explicit override.
+    if name_override:
+        try:
+            _validate_run_name(name_override)
+        except SystemExit:
+            return None
+        if _log_dir(name_override).is_dir():
+            return name_override
+        return None
+
+    # 2. Env var.
+    env_name = os.environ.get("AGENT_RUN_NAME", "").strip()
+    if env_name:
+        try:
+            _validate_run_name(env_name)
+        except SystemExit:
+            pass
+        else:
+            if _log_dir(env_name).is_dir():
+                return env_name
+        # Env var set but unresolvable — do not fall through to ancestry.
+        return None
+
+    # 3. Ancestry fallback: walk ppid chain up to 10 hops.
+    ancestor_pids: list[int] = []
+    try:
+        pid = os.getppid()
+        for _ in range(10):
+            if pid <= 1:
+                break
+            ancestor_pids.append(pid)
+            # Read ppid of pid from /proc on Linux; skip on other platforms
+            # (the set is still useful for pgid comparison below).
+            try:
+                fields = _proc_stat_fields(pid)
+                if fields:
+                    pid = int(fields[1])
+                else:
+                    break
+            except (TypeError, ValueError, OSError):
+                break
+    except OSError:
+        pass
+
+    if not ancestor_pids:
+        return None
+
+    ancestor_set = set(ancestor_pids)
+    # Also check whether our session id matches a runner's pgid (cheap: setsid
+    # makes the runner its own session leader, so sid == pgid == pid).
+    try:
+        my_sid = os.getsid(0)
+    except OSError:
+        my_sid = -1
+
+    try:
+        if not STATE_ROOT.is_dir():
+            return None
+        entries = list(STATE_ROOT.iterdir())
+    except OSError:
+        return None
+
+    for entry in entries:
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        try:
+            _validate_run_name(entry.name)
+        except SystemExit:
+            continue
+        try:
+            run_pid = _safe_int(_read(entry / "pid"))
+            run_pgid = _safe_int(_read(entry / "pgid"))
+            run_pty_pid = _safe_int(_read(entry / "pty_pid"))
+        except OSError:
+            continue
+        # Match: runner pid or pgid or pty_pid is an ancestor, or session id
+        # matches the runner's pgid (runner called setsid → sid == pgid).
+        candidates = {v for v in (run_pid, run_pgid, run_pty_pid) if v}
+        if candidates & ancestor_set:
+            name = entry.name
+            if _log_dir(name).is_dir():
+                return name
+        if my_sid > 0 and run_pgid == my_sid:
+            name = entry.name
+            if _log_dir(name).is_dir():
+                return name
+
+    return None
+
+
+def _hook_read_payload(
+    json_flag: Optional[str],
+    extra_argv: list[str],
+) -> tuple[Any, str]:
+    """Read and return the harness payload and source label.
+
+    Priority:
+      1. --json <string> (opencode plugin path).
+      2. extra_argv[0] if it parses as JSON (codex argv[1] path).
+      3. stdin if not a tty and data is available within timeout (claude stdin).
+      4. Empty dict fallback.
+
+    Never blocks longer than _HOOK_STDIN_TIMEOUT_SECONDS. Caps stdin at
+    _HOOK_STDIN_MAX_BYTES. Returns (parsed_payload, source) where source is
+    one of "flag", "argv", "stdin", or "none". Payload is always a dict (or
+    whatever the JSON decoded to); on parse failure returns {"raw": first_512}.
+    """
+    def _try_parse(text: str) -> tuple[Any, bool]:
+        try:
+            return json.loads(text), True
+        except (json.JSONDecodeError, ValueError):
+            return {"raw": text[:512]}, False
+
+    # 1. --json flag.
+    if json_flag is not None:
+        payload, _ = _try_parse(json_flag)
+        return payload, "flag"
+
+    # 2. Extra positional argv (codex shape: JSON as process argv[1]).
+    if extra_argv:
+        candidate = extra_argv[0]
+        if candidate.startswith("{") or candidate.startswith("["):
+            payload, ok = _try_parse(candidate)
+            if ok:
+                return payload, "argv"
+            # Looks like JSON but failed to parse — return raw form.
+            return payload, "argv"
+
+    # 3. Stdin — only if not a tty and data is available.
+    try:
+        if sys.stdin.isatty():
+            return {}, "none"
+    except OSError:
+        return {}, "none"
+
+    # Obtain a binary file-like for the actual read. sys.stdin may be a
+    # TextIOWrapper (normal interactive shell) or a raw binary file (test
+    # replacement). Prefer .buffer when available (TextIOWrapper path) so we
+    # bypass any text-layer buffering; fall back to sys.stdin itself if not.
+    try:
+        stdin_binary = sys.stdin.buffer
+    except AttributeError:
+        stdin_binary = sys.stdin  # type: ignore[assignment]
+
+    try:
+        ready, _, _ = select.select([stdin_binary], [], [], _HOOK_STDIN_TIMEOUT_SECONDS)
+    except (OSError, ValueError):
+        return {}, "none"
+
+    if not ready:
+        return {}, "none"
+
+    try:
+        raw = stdin_binary.read(_HOOK_STDIN_MAX_BYTES)
+    except OSError:
+        return {}, "none"
+
+    if not raw:
+        return {}, "none"
+
+    try:
+        text = raw.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return {"raw": repr(raw[:512])}, "stdin"
+
+    payload, _ = _try_parse(text.strip())
+    return payload, "stdin"
+
+
+def _hook_truncate_payload(payload: Any) -> Any:
+    """Return a copy of payload with long string fields capped.
+
+    Operates only on dict payloads. Caps any string value to
+    _HOOK_PAYLOAD_TRUNCATE_CHARS characters. The keys most likely to carry
+    transcript content — last_assistant_message, last-assistant-message,
+    input-messages, transcript_path — are explicitly targeted; all other
+    string values are also capped so an unknown field cannot smuggle bulk data.
+    Never raises; on any non-dict input returns the input unchanged.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    result = {}
+    for k, v in payload.items():
+        if isinstance(v, str) and len(v) > _HOOK_PAYLOAD_TRUNCATE_CHARS:
+            result[k] = v[:_HOOK_PAYLOAD_TRUNCATE_CHARS]
+        elif isinstance(v, list):
+            # Truncate list to a single truncated-string summary.
+            summary = json.dumps(v, ensure_ascii=True)
+            if len(summary) > _HOOK_PAYLOAD_TRUNCATE_CHARS:
+                summary = summary[:_HOOK_PAYLOAD_TRUNCATE_CHARS]
+            result[k] = summary
+        else:
+            result[k] = v
+    return result
+
+
+def _hook_append_record(log_dir: Path, record: dict) -> None:
+    """Append one JSONL record to hooks.jsonl, atomically.
+
+    Uses a single os.write() to an O_WRONLY|O_APPEND|O_CREAT fd so the
+    write is atomic on Linux and macOS for lines <= PIPE_BUF (4096 bytes).
+    If the encoded line exceeds _HOOK_MAX_LINE_BYTES, truncates the payload
+    fields (not the envelope) until it fits and sets "truncated": true.
+    Drops the write silently when hooks.jsonl already has >=
+    AGENT_RUN_HOOK_MAX_EVENTS lines. Never raises; all errors go to stderr.
+    """
+    hooks_path = log_dir / "hooks.jsonl"
+
+    # Line-cap check: count existing lines before appending.
+    try:
+        if hooks_path.exists():
+            with hooks_path.open("rb") as f:
+                line_count = f.read().count(b"\n")
+            if line_count >= AGENT_RUN_HOOK_MAX_EVENTS:
+                return  # cap hit; drop silently
+    except OSError:
+        pass  # if we cannot count, proceed and let the write fail if needed
+
+    # Encode the record, truncating payload if needed.
+    def _encode(rec: dict) -> bytes:
+        return (json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+
+    line = _encode(record)
+    if len(line) > _HOOK_MAX_LINE_BYTES:
+        # Shrink the payload until the line fits.
+        rec2 = dict(record)
+        payload = rec2.get("payload", {})
+        if isinstance(payload, dict):
+            # Drop string values to empty to save space.
+            small: dict = {}
+            for k, v in payload.items():
+                if isinstance(v, str):
+                    small[k] = v[: max(0, _HOOK_PAYLOAD_TRUNCATE_CHARS // 4)]
+                else:
+                    small[k] = v
+            rec2["payload"] = small
+        rec2["truncated"] = True
+        line = _encode(rec2)
+        # If still too large, drop payload entirely.
+        if len(line) > _HOOK_MAX_LINE_BYTES:
+            rec2["payload"] = {}
+            line = _encode(rec2)
+
+    try:
+        fd = os.open(
+            str(hooks_path),
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            0o644,
+        )
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        print(f"agent-run hook: cannot write hooks.jsonl: {exc}", file=sys.stderr)
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    """Receive a harness hook notification and record it in hooks.jsonl.
+
+    Always exits 0. A non-zero exit from a claude Stop hook is interpreted by
+    the harness as a blocking decision — a broken hook must never stall a
+    coding session. All errors go to stderr; stdout is kept empty (codex warns
+    on notify-program stdout). See the module docstring for per-harness setup.
+    """
+    try:
+        return _cmd_hook_inner(args)
+    except Exception as exc:  # noqa: BLE001
+        print(f"agent-run hook: unexpected error: {exc}", file=sys.stderr)
+        return 0
+
+
+def _cmd_hook_inner(args: argparse.Namespace) -> int:
+    event: str = args.event.lower()
+    name_override: Optional[str] = getattr(args, "name", None)
+    json_flag: Optional[str] = getattr(args, "json_payload", None)
+    extra_argv: list[str] = list(getattr(args, "extra", []) or [])
+
+    name = _hook_resolve_run(name_override)
+    if name is None:
+        # No resolvable run — no-op per spec.
+        return 0
+
+    log_dir = _log_dir(name)
+    if not log_dir.is_dir():
+        return 0
+
+    payload, source = _hook_read_payload(json_flag, extra_argv)
+
+    # Detect harness from payload shape.
+    harness: Optional[str] = None
+    if isinstance(payload, dict):
+        if "session_id" in payload and "hook_event_name" in payload:
+            harness = "claude"
+        elif "type" in payload and "thread-id" in payload:
+            harness = "codex"
+        elif "type" in payload and "session" in payload:
+            harness = "opencode"
+
+    truncated_payload = _hook_truncate_payload(payload)
+
+    record: dict = {
+        "event": event,
+        "at": _now_iso(),
+        "harness": harness,
+        "source": source,
+        "pid": os.getpid(),
+        "resolved_by": "name" if getattr(args, "name", None) else (
+            "env" if os.environ.get("AGENT_RUN_NAME", "").strip() else "ancestry"
+        ),
+        "payload": truncated_payload,
+    }
+
+    _hook_append_record(log_dir, record)
+    return 0
+
+
+def _read_hooks_jsonl(log_dir: Path) -> Optional[dict]:
+    """Read hooks.jsonl and return a summary dict, or None if absent.
+
+    Defensive: skips unparseable lines, never raises. A corrupt or partially
+    written hooks.jsonl must not break watch (which threadctl polls every 30s).
+    Returns None when the file is absent (the common case — hooks are opt-in).
+
+    Summary shape::
+
+        {"count": N, "last": {event, at, harness},
+         "last_event_age_s": float|null, "events": {event_name: count, ...},
+         "truncated": bool}
+
+    ``truncated`` is True when the line count equals or exceeds
+    AGENT_RUN_HOOK_MAX_EVENTS.
+    """
+    hooks_path = log_dir / "hooks.jsonl"
+    try:
+        if not hooks_path.exists():
+            return None
+        raw = hooks_path.read_bytes()
+    except OSError:
+        return None
+
+    lines = raw.split(b"\n")
+    records: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                records.append(obj)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    if not records:
+        return {"count": 0, "last": None, "last_event_age_s": None,
+                "events": {}, "truncated": False}
+
+    last = records[-1]
+    last_summary = {
+        "event": last.get("event"),
+        "at": last.get("at"),
+        "harness": last.get("harness"),
+    }
+
+    last_event_age_s: Optional[float] = None
+    at_str = last.get("at")
+    if at_str:
+        try:
+            at_dt = datetime.strptime(at_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+            last_event_age_s = max(
+                0.0, (datetime.now(timezone.utc) - at_dt).total_seconds()
+            )
+        except (ValueError, TypeError):
+            pass
+
+    event_counts: dict[str, int] = {}
+    for r in records:
+        ev = r.get("event")
+        if isinstance(ev, str):
+            event_counts[ev] = event_counts.get(ev, 0) + 1
+
+    return {
+        "count": len(records),
+        "last": last_summary,
+        "last_event_age_s": last_event_age_s,
+        "events": event_counts,
+        "truncated": len(records) >= AGENT_RUN_HOOK_MAX_EVENTS,
+    }
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Emit a stateless, read-only JSON fact snapshot for one run.
 
@@ -3293,6 +3764,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
         "observation_error": None,
         "session": None,
         "scratch": _scratch_unknown("not_observed"),
+        "hooks": None,
     }
     unknown = set(fields) - set(payload)
     if unknown:
@@ -3366,6 +3838,7 @@ def _cmd_watch_observe(
             name, observed_at, WATCH_STATUS_LOG_PRESERVED,
             **observed(repo_arg, None, repo_arg),
             session=session_data,
+            hooks=_read_hooks_jsonl(log_dir),
         )
         _watch_emit(
             payload,
@@ -3404,6 +3877,7 @@ def _cmd_watch_observe(
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
         session=session_data,
+        hooks=_read_hooks_jsonl(log_dir),
         # repo_str is for git-fact attribution; recorded_cwd is for scratch so
         # that --repo (correcting which repo to inspect) does not silently move
         # the scratch scan off the run's launch directory.
@@ -6819,6 +7293,14 @@ def _runner(
             os.environ["TMPDIR"] = str(tmp_dir)
             os.environ["BUN_TMPDIR"] = str(tmp_dir)
 
+        # Export run identity so harness hooks can call `agent-run hook`
+        # without needing to know the run name out of band. Export the roots
+        # used at launch time so a run started with a custom STATE/LOG dir is
+        # resolvable by hooks that inherit these vars rather than the defaults.
+        os.environ["AGENT_RUN_NAME"] = state_dir.name
+        os.environ.setdefault("AGENT_RUN_STATE_DIR", str(STATE_ROOT))
+        os.environ.setdefault("AGENT_RUN_LOG_DIR", str(LOG_ROOT))
+
         runner_pgid = os.getpgid(my_pid)
         identity = _process_identity(my_pid)
         if identity is None:
@@ -8919,6 +9401,36 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_du.set_defaults(func=cmd_du)
 
+    sp_hook = sub.add_parser(
+        "hook",
+        help="receive a harness hook notification and record it in hooks.jsonl (always exits 0)",
+    )
+    sp_hook.add_argument(
+        "event",
+        help="hook event name (e.g. stop, turn-complete, session-idle); normalised to lowercase",
+    )
+    sp_hook.add_argument(
+        "extra",
+        nargs="*",
+        help="optional extra positional: if the first looks like JSON, treated as the "
+        "harness payload (codex notify shape passes JSON as argv[1])",
+    )
+    sp_hook.add_argument(
+        "--name",
+        default=None,
+        metavar="RUN",
+        help="resolve against this run name; overrides AGENT_RUN_NAME and ancestry walk",
+    )
+    sp_hook.add_argument(
+        "--json",
+        dest="json_payload",
+        default=None,
+        metavar="JSON",
+        help="harness payload as a JSON string (opencode plugin path); "
+        "takes priority over positional argv and stdin",
+    )
+    sp_hook.set_defaults(func=cmd_hook)
+
     sp_help = sub.add_parser("help", help="show this help")
     sp_help.set_defaults(func=lambda _a: (p.print_help() or 0))
 
@@ -8971,7 +9483,7 @@ class _LaunchArgv(NamedTuple):
 
 _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
     "status", "watch", "logs", "tail", "attach", "clean", "steer", "kill",
-    "list", "reap", "du", "help",
+    "list", "reap", "du", "hook", "help",
 })
 
 # Managed-mode flags that take a value. Each accepts "--flag value" and
