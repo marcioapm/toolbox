@@ -1819,6 +1819,7 @@ def _newest_mtime_recursive(
     cutoff: Optional[float] = None,
     *,
     skip_top_dir_mtime: bool = False,
+    strict: bool = False,
 ) -> Optional[float]:
     """Newest mtime anywhere below ``d`` (including ``d`` itself unless
     ``skip_top_dir_mtime`` is set), without following symlinks.
@@ -1844,6 +1845,11 @@ def _newest_mtime_recursive(
     walk to O(1).  When the directory is genuinely old the full walk runs,
     which is correct — that directory is about to be deleted anyway.
 
+    When ``strict`` is ``True``, any ``scandir`` or ``stat`` failure returns
+    ``_WALK_INCOMPLETE`` immediately.  Use this when a partially-observed tree
+    must not be treated as old: a recent file in an unreadable subtree would
+    otherwise be invisible, making a live worktree appear idle.
+
     Symlinks are never followed (``entry.stat(follow_symlinks=False)``), so a
     malicious scratch tree cannot redirect the walk outside its log directory.
     """
@@ -1866,12 +1872,16 @@ def _newest_mtime_recursive(
             with os.scandir(current) as it:
                 entries = list(it)
         except OSError:
+            if strict:
+                return _WALK_INCOMPLETE  # type: ignore[return-value]
             walk_error = True
             continue
         for entry in entries:
             try:
                 st = entry.stat(follow_symlinks=False)
             except OSError:
+                if strict:
+                    return _WALK_INCOMPLETE  # type: ignore[return-value]
                 continue
             mtime = st.st_mtime
             if newest is None or mtime > newest:
@@ -5084,8 +5094,13 @@ def _worktree_nested_reason(info: _WorktreeInfo, path: Path) -> Optional[str]:
 
 
 def _worktree_activity_age_seconds(path: Path) -> Tuple[Optional[float], Optional[str]]:
-    """Age of the newest recursively observed filesystem mtime in a worktree."""
-    newest = _newest_mtime_recursive(path)
+    """Age of the newest recursively observed filesystem mtime in a worktree.
+
+    Uses strict mode so any unreadable subtree returns an error rather than a
+    stale timestamp: a recent file hidden by a permission error must not make
+    the worktree appear idle.
+    """
+    newest = _newest_mtime_recursive(path, strict=True)
     if newest is None or newest is _WALK_INCOMPLETE:
         return None, "cannot determine worktree filesystem activity"
     return max(0.0, time.time() - newest), None

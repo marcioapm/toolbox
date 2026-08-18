@@ -1587,6 +1587,46 @@ class TestReapWorktreeFinalRevalidation:
         assert "worktrees_removed=0 worktrees_skipped=1" in out
 
 
+class TestReapWorktreeActivityWalk:
+    """The recursive mtime walk must fail closed when a subtree is unreadable:
+    a recent file hidden behind a permission error must not allow the worktree
+    to appear idle."""
+
+    def test_walk_error_fails_closed_in_strict_mode(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A scandir failure during the activity walk causes _WALK_INCOMPLETE to
+        be returned, so the activity gate reports the worktree as unreadable
+        rather than falling back to a stale timestamp."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        # Add a subdirectory so that the walk recurses: the failure will occur
+        # when scanning the subdirectory, after the top-level scan succeeds and
+        # records its (old) mtime.
+        sub = wt / "subdir"
+        sub.mkdir()
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_scandir = os.scandir
+        call_count: dict = {"n": 0}
+
+        def scandir_that_fails_on_subdir(path):
+            # Fail when scanning the subdirectory: the top-level scan succeeds
+            # (recording the old mtime), but the subdir is unreadable.
+            if str(path).startswith(str(sub)):
+                raise OSError("simulated permission denied")
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", scandir_that_fails_on_subdir)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "cannot determine worktree filesystem activity" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+
 class TestReapWorktreeNoRepositoryControlledExecution:
     """Inspecting a candidate must never run a command the inspected
     repository chose: its contents are attacker-controlled by assumption."""
