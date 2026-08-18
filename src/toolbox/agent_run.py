@@ -273,6 +273,11 @@ MAX_PTY_INPUT_BUFFER = 1024 * 1024
 MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
 FINAL_RENDER_TIMEOUT_SECONDS = 10.0
 FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
+# Per-tick new-bytes cap for the echo daemon's incremental pyte feed.  Each
+# tick costs O(new bytes), so this bounds the parse cost per interval regardless
+# of total log size.  Exceeding this limit produces a visible warning in
+# log.clean rather than silently skipping — a silent skip was the failure mode
+# of the old whole-file design once the log crossed the (same-valued) size gate.
 ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
 # Per-line and total byte caps for `logs` and `clean` output. A single TUI line
 # can be megabytes long (one \n per session, many \r redraw frames), so a line
@@ -289,9 +294,7 @@ _RENDER_LOG_DEFAULT_HEIGHT = 60
 _RENDER_LOG_DEFAULT_HISTORY = 100000
 # Maximum seconds log.clean may trail log by mtime and still be reused. The
 # daemon re-renders every echo_interval seconds (default 2.0), so a live cache
-# trails by ~2 s; 30 s allows 15x headroom for slow renders and scheduler jitter
-# while still catching a daemon that stopped rendering after the raw log crossed
-# ECHO_LOOP_MAX_RENDER_BYTES, where the gap grows without bound.
+# trails by ~2 s; 30 s allows 15x headroom for slow renders and scheduler jitter.
 CLEAN_CACHE_MAX_STALENESS_SECONDS = 30.0
 
 # Statuses that are conclusively terminal: the run will never transition
@@ -3434,6 +3437,28 @@ def _render_log(
     return "\n".join(deduped) + "\n"
 
 
+def _serialize_screen(screen) -> str:
+    """Walk a pyte HistoryScreen and return the same text _render_log would.
+
+    Serialization is O(lines rendered so far): it walks history.top + display
+    regardless of how many new bytes were parsed in the latest tick.  Callers
+    must not describe this step as incremental.
+    """
+    rows: List[str] = []
+    for entry in screen.history.top:
+        text = "".join(entry[col].data for col in sorted(entry)) if entry else ""
+        rows.append(text.rstrip())
+    for row in screen.display:
+        rows.append(row.rstrip())
+    deduped: List[str] = []
+    for line in rows:
+        if not deduped or deduped[-1] != line:
+            deduped.append(line)
+    while deduped and not deduped[-1]:
+        deduped.pop()
+    return "\n".join(deduped) + "\n"
+
+
 def _render_log_to_clean(log_dir: Path) -> None:
     """Atomically render ``log`` to ``log.clean`` in ``log_dir``."""
     log = log_dir / "log"
@@ -3521,50 +3546,142 @@ def _bounded_final_render(
 
 
 def _echo_loop(log_dir: "Path", interval: float) -> None:
-    """Periodically render log_dir/log into log_dir/log.clean.
+    """Periodically parse new log bytes and write log_dir/log.clean.
 
-    Runs in a detached child for the lifetime of the agent. The parent's
-    signal handler kills us on shutdown so we don't outlive the run. We
-    only re-render when the raw log's mtime has changed, so a quiet run
-    doesn't burn CPU. Renders are skipped (not crashed) once the raw log
-    exceeds ECHO_LOOP_MAX_RENDER_BYTES, so an unbounded long-running log
-    cannot make each periodic tick progressively more expensive; the final
-    render at exit applies its own independent, stricter size cap.
+    Runs in a detached child for the lifetime of the agent.  The parent's
+    signal handler kills us on shutdown so we don't outlive the run.
+
+    Parse strategy: one pyte HistoryScreen/ByteStream pair is kept alive for
+    the daemon's lifetime.  Each tick feeds only the bytes appended since the
+    previous tick (offset arithmetic on st_size), so parse cost is O(new bytes)
+    rather than O(total log size).
+
+    Serialize strategy: _serialize_screen walks history.top + display to
+    produce the full rendered text, regardless of how many new bytes were
+    parsed.  Serialization is O(lines rendered so far), not O(new bytes).  The
+    write is skipped entirely when the rendered text matches the last write,
+    saving an atomic write+rename on quiet ticks.
+
+    Reset triggers: if st_size < offset (truncation) or st_ino/st_dev changed
+    (file replacement), the screen/stream and offset are discarded and the
+    entire new file is re-parsed from byte zero.
+
+    The per-tick delta is capped at ECHO_LOOP_MAX_RENDER_BYTES.  Exceeding
+    the cap produces a visible warning in log.clean rather than a silent skip
+    (silent freezing was the failure mode of the previous design).
     """
     log = log_dir / "log"
     clean = log_dir / "log.clean"
-    last_mtime = -1.0
-    # Soft cap: if pyte isn't installed, write a friendly stub and exit.
+
     try:
-        import pyte  # noqa: F401  (just probe; real import is in _render_log)
+        import pyte  # noqa: F401  (just probe; real import is below)
     except ImportError:
         clean.write_text(
             "agent-run: --echo requested but `pyte` is not installed.\n"
             "Install with: pipx inject mmartins-toolbox pyte\n"
         )
         return
+
+    import pyte as _pyte  # type: ignore
+
+    def _new_screen():
+        scr = _pyte.HistoryScreen(
+            _RENDER_LOG_DEFAULT_WIDTH,
+            _RENDER_LOG_DEFAULT_HEIGHT,
+            history=_RENDER_LOG_DEFAULT_HISTORY,
+            ratio=0.5,
+        )
+        return scr, _pyte.ByteStream(scr)
+
+    screen, stream = _new_screen()
+    offset: int = 0          # bytes already fed into screen/stream
+    log_ino: int = -1        # inode of the file at offset
+    log_dev: int = -1        # device of the file at offset
+    last_rendered: str = ""  # text written on the last successful tick
+
     while True:
         try:
             log_stat = log.stat()
         except FileNotFoundError:
             time.sleep(interval)
             continue
-        mtime = log_stat.st_mtime
-        if mtime != last_mtime:
-            if log_stat.st_size > ECHO_LOOP_MAX_RENDER_BYTES:
-                last_mtime = mtime
-                time.sleep(interval)
-                continue
+
+        cur_size = log_stat.st_size
+        cur_ino = log_stat.st_ino
+        cur_dev = log_stat.st_dev
+
+        # Reset on truncation or file replacement.
+        if cur_size < offset or (offset > 0 and (cur_ino != log_ino or cur_dev != log_dev)):
+            screen, stream = _new_screen()
+            offset = 0
+            last_rendered = ""
+
+        if cur_size == offset:
+            # Nothing new; no parse, no serialize, no write.
+            time.sleep(interval)
+            continue
+
+        # New bytes available — cap the per-tick delta.
+        delta = cur_size - offset
+        if delta > ECHO_LOOP_MAX_RENDER_BYTES:
+            warning = (
+                f"agent-run: --echo skipped {delta} new bytes this tick "
+                f"(ECHO_LOOP_MAX_RENDER_BYTES={ECHO_LOOP_MAX_RENDER_BYTES}); "
+                "log.clean may be stale\n"
+            )
             try:
-                _render_log_to_clean(log_dir)
-            except Exception:
-                # Don't crash the helper on transient render errors;
-                # next tick may succeed.
+                clean.write_text(warning)
+            except OSError:
                 pass
-            else:
-                # Failed renders must be retried even when the raw log's mtime
-                # remains unchanged.
-                last_mtime = mtime
+            # The skipped bytes are not fed into screen/stream, so its state
+            # reflects only a prefix of the log at cur_size.  Discard it so the
+            # next tick does not produce output from an inconsistent screen.
+            screen, stream = _new_screen()
+            offset = cur_size
+            log_ino = cur_ino
+            log_dev = cur_dev
+            last_rendered = ""
+            time.sleep(interval)
+            continue
+
+        try:
+            with log.open("rb") as f:
+                f.seek(offset)
+                chunk = f.read(delta)
+        except OSError:
+            time.sleep(interval)
+            continue
+
+        if len(chunk) != delta:
+            # The file shrank between stat and read — treat as truncation.
+            screen, stream = _new_screen()
+            offset = 0
+            last_rendered = ""
+            time.sleep(interval)
+            continue
+
+        render_ok = False
+        try:
+            _feed_pyte(stream, chunk)
+            rendered = _serialize_screen(screen)
+            render_ok = True
+        except Exception:
+            # Transient or pathological pyte failure; retry next tick.
+            pass
+
+        if render_ok:
+            offset = cur_size
+            log_ino = cur_ino
+            log_dev = cur_dev
+            if rendered != last_rendered:
+                tmp = clean.with_suffix(".clean.tmp")
+                try:
+                    tmp.write_text(rendered, encoding="utf-8")
+                    tmp.replace(clean)
+                    last_rendered = rendered
+                except OSError:
+                    pass
+
         time.sleep(interval)
 
 
@@ -3581,10 +3698,10 @@ def _read_clean_cache(
     or not a regular file, when its mtime lags ``log``'s by more than
     CLEAN_CACHE_MAX_STALENESS_SECONDS, or on any OSError.
 
-    The staleness bound is what distinguishes a live cache from a frozen one:
-    the daemon stops rendering once the raw log exceeds
-    ECHO_LOOP_MAX_RENDER_BYTES, after which ``log.clean`` is unchanged while
-    ``log`` keeps growing. Existence alone cannot detect that.
+    The staleness bound is what distinguishes a live cache from a stale one;
+    CLEAN_CACHE_MAX_STALENESS_SECONDS is wide enough to tolerate normal
+    scheduler jitter but narrow enough to detect a daemon that has stopped
+    updating log.clean.
 
     Opened via ``_watch_open_validated_log`` for the same FIFO/symlink defence
     as the raw log; mtime comes from fstat on the open fd, closing the
@@ -3616,10 +3733,8 @@ def _read_clean_cache(
 def cmd_clean(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
 
-    # Prefer log.clean, written by the --echo daemon, over re-rendering. Each
-    # daemon tick re-renders the entire raw log, so log.clean is a whole-file
-    # snapshot, not an incremental one; reusing it only saves cmd_clean the
-    # repeat pyte replay, which costs seconds of CPU on an 8.8 MB single-line log.
+    # Prefer log.clean, written by the --echo daemon, over re-rendering.
+    # Reusing the cache saves cmd_clean the pyte replay on large logs.
     rendered = _read_clean_cache(log, width=args.width, height=args.height, history=args.history)
     if rendered is None:
         with _watch_open_validated_log(log) as f:

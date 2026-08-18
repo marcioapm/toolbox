@@ -1075,22 +1075,16 @@ def test_force_kill_reaps_wedged_echo_render_child(tmp_path, monkeypatch):
 
 
 def test_echo_loop_skips_render_but_updates_mtime_over_size_cap(tmp_path, monkeypatch):
-    """Guards the periodic echo-loop resource bound: once the raw log
-    exceeds ECHO_LOOP_MAX_RENDER_BYTES, ticks must skip the expensive
-    render call (not crash, not render) while still tracking mtime so a
-    later shrink is picked back up correctly."""
+    """Guards the per-tick delta cap: when a single tick's new bytes exceed
+    ECHO_LOOP_MAX_RENDER_BYTES, the loop writes a visible warning to log.clean
+    (not a silent skip) and advances the offset so the next tick sees only
+    genuinely new bytes."""
     log_dir = tmp_path / "log"
     log_dir.mkdir()
     log = log_dir / "log"
     log.write_bytes(b"x" * 10)
 
     monkeypatch.setattr(agent_run, "ECHO_LOOP_MAX_RENDER_BYTES", 5)
-    render_calls = []
-    monkeypatch.setattr(
-        agent_run,
-        "_render_log_to_clean",
-        lambda _log_dir: render_calls.append(1),
-    )
 
     pid = os.fork()
     if pid == 0:
@@ -1100,10 +1094,12 @@ def test_echo_loop_skips_render_but_updates_mtime_over_size_cap(tmp_path, monkey
     os.kill(pid, signal.SIGKILL)
     os.waitpid(pid, 0)
 
-    # We can't observe render_calls across the fork boundary directly, so
-    # instead assert on the externally visible effect: log.clean must never
-    # have been created by the oversize periodic loop.
-    assert not (log_dir / "log.clean").exists()
+    # The cap was exceeded, so log.clean must exist and contain a warning.
+    assert (log_dir / "log.clean").exists(), "log.clean was not created after cap exceeded"
+    content = (log_dir / "log.clean").read_text()
+    assert "ECHO_LOOP_MAX_RENDER_BYTES" in content or "skipped" in content.lower(), (
+        f"expected a warning in log.clean when cap exceeded; got: {content!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

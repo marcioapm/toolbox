@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import builtins
 import re
+import time
+from pathlib import Path
 
 import pytest
 
 from toolbox import agent_run
-from toolbox.agent_run import _render_log
+from toolbox.agent_run import (
+    ECHO_LOOP_MAX_RENDER_BYTES,
+    _render_log,
+    _serialize_screen,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +61,7 @@ class TestRenderLogSynthetic:
         # that doesn't smush them together.
         assert "foobar" not in out, "cursor-right should not be eaten"
         assert re.search(r"foo\s+bar", out), f"expected 'foo<spaces>bar' in: {out!r}"
+
     def test_dedupes_adjacent_identical_lines(self):
         # Real PTY output uses CR+LF (\r\n) so the cursor returns to column
         # 0 each line. Without CR, pyte leaves the cursor where it was,
@@ -162,42 +169,252 @@ class TestRenderLogSizing:
 
 
 # ---------------------------------------------------------------------------
-# RecursionError hardening — pyte's coroutine-based FSM can recurse past the
-# interpreter's limit on certain pathological ANSI/Ink redraw patterns (this
-# crashed 101/212 recent agent-run sessions in production). _render_log must
-# degrade to a plain-text ANSI-stripped rendering instead of propagating the
-# crash — the clean transcript is a convenience artifact, never a run-ending
-# hazard. We can't reliably reproduce the exact pyte-recursing byte pattern
-# in a portable unit test, so we simulate the failure at the seam
-# (ByteStream.feed) and assert the fallback kicks in and returns a string.
+# Incremental pyte feed — _serialize_screen produces the same output as a
+# single whole-file _render_log call when fed the same bytes in chunks.
+# Uses the real moon fixture, which contains Ink TUI redraws, cursor motions,
+# OSC title sequences, and escape sequences that span natural chunk boundaries.
 # ---------------------------------------------------------------------------
 
+class TestIncrementalFeed:
+    def test_chunked_feed_byte_identical_to_whole_file(self, moon_log_bytes):
+        """Feeding the real TUI fixture in 64 KiB chunks into a persistent
+        pyte screen produces output byte-identical to a single whole-file
+        _render_log call.  Confirms that ByteStream correctly buffers partial
+        escape sequences across chunk boundaries."""
+        import pyte
+
+        whole = _render_log(moon_log_bytes)
+
+        chunk_size = 64 * 1024
+        screen = pyte.HistoryScreen(
+            agent_run._RENDER_LOG_DEFAULT_WIDTH,
+            agent_run._RENDER_LOG_DEFAULT_HEIGHT,
+            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
+            ratio=0.5,
+        )
+        stream = pyte.ByteStream(screen)
+        for i in range(0, len(moon_log_bytes), chunk_size):
+            agent_run._feed_pyte(stream, moon_log_bytes[i : i + chunk_size])
+
+        chunked = _serialize_screen(screen)
+        assert chunked == whole, (
+            f"chunked output ({len(chunked)} bytes) differs from whole-file "
+            f"output ({len(whole)} bytes)"
+        )
+
+    def test_serialize_screen_matches_render_log(self, moon_log_bytes):
+        """_serialize_screen on a freshly-fed screen equals _render_log output."""
+        import pyte
+
+        screen = pyte.HistoryScreen(
+            agent_run._RENDER_LOG_DEFAULT_WIDTH,
+            agent_run._RENDER_LOG_DEFAULT_HEIGHT,
+            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
+            ratio=0.5,
+        )
+        stream = pyte.ByteStream(screen)
+        agent_run._feed_pyte(stream, moon_log_bytes)
+
+        assert _serialize_screen(screen) == _render_log(moon_log_bytes)
+
+
+# ---------------------------------------------------------------------------
+# _echo_loop — incremental parse, reset, quiet-tick, and cap behaviour.
+#
+# All tests drive the loop by monkeypatching time.sleep: the patched version
+# counts ticks and raises KeyboardInterrupt once the scenario is complete.
+# Log files are written directly to tmp_path so no real filesystem races occur.
+# ---------------------------------------------------------------------------
+
+def _run_echo_loop_ticks(log_dir, *, ticks, monkeypatch, extra_actions=None):
+    """Drive _echo_loop for exactly *ticks* sleep calls, then stop.
+
+    *extra_actions* is an optional callable(tick_number) invoked just before
+    each sleep, letting a test mutate the log file between ticks.
+    """
+    tick_count = 0
+
+    def controlled_sleep(_interval):
+        nonlocal tick_count
+        if extra_actions is not None:
+            extra_actions(tick_count)
+        tick_count += 1
+        if tick_count >= ticks:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent_run.time, "sleep", controlled_sleep)
+    with pytest.raises(KeyboardInterrupt):
+        agent_run._echo_loop(log_dir, 1.0)
+
+
 class TestEchoLoop:
-    def test_failed_render_is_retried_without_mtime_change(self, tmp_path, monkeypatch):
+    def test_basic_render_writes_log_clean(self, tmp_path, monkeypatch):
         log_dir = tmp_path / "run"
         log_dir.mkdir()
-        (log_dir / "log").write_bytes(b"complete\r\n")
-        attempts = 0
+        (log_dir / "log").write_bytes(b"hello\r\n")
 
-        def flaky_render(_log_dir):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                raise OSError("transient replace failure")
-            (log_dir / "log.clean").write_text("complete\n")
+        _run_echo_loop_ticks(log_dir, ticks=1, monkeypatch=monkeypatch)
 
-        def stop_after_retry(_interval):
-            if attempts >= 2:
-                raise KeyboardInterrupt
+        assert (log_dir / "log.clean").exists()
+        assert "hello" in (log_dir / "log.clean").read_text()
 
-        monkeypatch.setattr(agent_run, "_render_log_to_clean", flaky_render)
-        monkeypatch.setattr(agent_run.time, "sleep", stop_after_retry)
+    def test_quiet_tick_no_write(self, tmp_path, monkeypatch):
+        """When st_size == offset (no new bytes), log.clean is not touched."""
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(b"hello\r\n")
 
-        with pytest.raises(KeyboardInterrupt):
-            agent_run._echo_loop(log_dir, 1.0)
+        # Tick 0: parse and write.  Ticks 1 and 2: nothing new — sleep again.
+        write_count = [0]
+        original_replace = Path.replace
 
-        assert attempts == 2
-        assert (log_dir / "log.clean").read_text() == "complete\n"
+        def track_replace(self, target):
+            if self.name == "log.clean.tmp":
+                write_count[0] += 1
+            return original_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", track_replace)
+        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch)
+
+        # Only one write: tick 0.  Ticks 1 and 2 see size == offset and
+        # skip the serialize+write path entirely.
+        assert write_count[0] == 1, f"expected 1 write; got {write_count[0]}"
+
+    def test_unchanged_render_skips_write(self, tmp_path, monkeypatch):
+        """When new bytes arrive but the serialized text is unchanged, the
+        atomic write+rename is skipped."""
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log_file = log_dir / "log"
+        log_file.write_bytes(b"hello\r\n")
+
+        write_count = [0]
+        original_replace = Path.replace
+
+        def track_replace(self, target):
+            if self.name == "log.clean.tmp":
+                write_count[0] += 1
+            return original_replace(self, target)
+
+        def append_on_tick(tick):
+            if tick == 1:
+                # ESC[0m (SGR reset) changes no screen cell content, so the
+                # serialized output is identical to the previous tick.
+                with log_file.open("ab") as f:
+                    f.write(b"\x1b[0m")
+
+        monkeypatch.setattr(Path, "replace", track_replace)
+        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch,
+                             extra_actions=append_on_tick)
+
+        # Tick 0 writes (new content).  Tick 1 parses new bytes but the
+        # serialized text is identical — no second write.
+        assert write_count[0] == 1, (
+            f"expected 1 write (second tick produces identical output); "
+            f"got {write_count[0]}"
+        )
+
+    def test_truncation_triggers_reset(self, tmp_path, monkeypatch):
+        """When st_size < offset (file truncated), screen/stream reset and the
+        new file content is re-parsed from byte zero."""
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log_file = log_dir / "log"
+        # First write: 20 bytes so offset after tick 0 is 20.
+        log_file.write_bytes(b"first-content-here\r\n")
+
+        def mutate_on_tick(tick):
+            if tick == 1:
+                # Overwrite with 10 bytes — shorter than offset (20), so
+                # cur_size < offset fires on the next stat().
+                log_file.write_bytes(b"replaced\r\n")
+
+        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch,
+                             extra_actions=mutate_on_tick)
+
+        content = (log_dir / "log.clean").read_text()
+        assert "replaced" in content, f"expected 'replaced' in log.clean; got: {content!r}"
+        assert "first-content-here" not in content, (
+            f"'first-content-here' survived truncation reset in log.clean: {content!r}"
+        )
+
+    def test_inode_replacement_triggers_reset(self, tmp_path, monkeypatch):
+        """When st_ino/st_dev changes (file replaced), the loop resets even if
+        st_size coincidentally equals the previous offset."""
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log_file = log_dir / "log"
+        # 10 bytes of non-printing content so tick 0 parses but produces no
+        # visible text (pyte ignores NUL bytes).
+        log_file.write_bytes(b"\x00" * 10)
+
+        def replace_on_tick(tick):
+            if tick == 1:
+                # Replace with a different inode of the same byte count.
+                # The size matches the recorded offset, so only the inode
+                # change can trigger a reset.
+                tmp_new = log_file.parent / ".log.new"
+                tmp_new.write_bytes(b"replaced!\r\n")
+                tmp_new.rename(log_file)
+
+        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch,
+                             extra_actions=replace_on_tick)
+
+        content = (log_dir / "log.clean").read_text()
+        assert "replaced" in content, (
+            f"expected 'replaced' after inode-replacement reset; got: {content!r}"
+        )
+
+    def test_failed_feed_does_not_advance_offset(self, tmp_path, monkeypatch):
+        """A transient _feed_pyte failure leaves the offset unchanged so the
+        next tick re-parses the same bytes."""
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(b"data\r\n")
+
+        feed_calls: list[int] = []
+        original_feed = agent_run._feed_pyte
+
+        def flaky_feed(stream, chunk):
+            feed_calls.append(len(chunk))
+            if len(feed_calls) == 1:
+                raise OSError("simulated transient failure")
+            return original_feed(stream, chunk)
+
+        monkeypatch.setattr(agent_run, "_feed_pyte", flaky_feed)
+        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch)
+
+        # Both ticks that saw new bytes must have attempted a feed.
+        assert len(feed_calls) >= 2, f"expected ≥2 feed attempts; got {feed_calls}"
+        # Second attempt succeeded — log.clean must contain the content.
+        assert "data" in (log_dir / "log.clean").read_text()
+
+    def test_per_tick_delta_cap_writes_warning(self, tmp_path, monkeypatch):
+        """When the new-bytes delta in one tick exceeds ECHO_LOOP_MAX_RENDER_BYTES,
+        log.clean receives a warning string rather than a silent skip."""
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log_file = log_dir / "log"
+        log_file.write_bytes(b"")
+
+        # Override the cap to a tiny value so the test does not need a 16 MiB file.
+        monkeypatch.setattr(agent_run, "ECHO_LOOP_MAX_RENDER_BYTES", 5)
+
+        def grow_on_tick(tick):
+            if tick == 0:
+                log_file.write_bytes(b"A" * 100)  # 100 > 5-byte cap
+
+        _run_echo_loop_ticks(log_dir, ticks=2, monkeypatch=monkeypatch,
+                             extra_actions=grow_on_tick)
+
+        content = (log_dir / "log.clean").read_text()
+        assert "ECHO_LOOP_MAX_RENDER_BYTES" in content or "skipped" in content.lower(), (
+            f"expected a cap-exceeded warning in log.clean; got: {content!r}"
+        )
+
+    def test_echo_loop_max_render_bytes_constant_value(self):
+        """Pin the cap value; any change must be a deliberate, test-breaking decision."""
+        assert ECHO_LOOP_MAX_RENDER_BYTES == 16 * 1024 * 1024
 
     def test_missing_pyte_writes_diagnostic_stub(self, tmp_path, monkeypatch):
         log_dir = tmp_path / "run"
@@ -218,6 +435,17 @@ class TestEchoLoop:
         assert "--echo requested" in stub
         assert "pyte" in stub
 
+
+# ---------------------------------------------------------------------------
+# RecursionError hardening — pyte's coroutine-based FSM can recurse past the
+# interpreter's limit on certain pathological ANSI/Ink redraw patterns (this
+# crashed 101/212 recent agent-run sessions in production). _render_log must
+# degrade to a plain-text ANSI-stripped rendering instead of propagating the
+# crash — the clean transcript is a convenience artifact, never a run-ending
+# hazard. We can't reliably reproduce the exact pyte-recursing byte pattern
+# in a portable unit test, so we simulate the failure at the seam
+# (ByteStream.feed) and assert the fallback kicks in and returns a string.
+# ---------------------------------------------------------------------------
 
 class TestRenderLogRecursionHardening:
     @pytest.mark.parametrize("exception", [KeyboardInterrupt(), SystemExit(7)])
