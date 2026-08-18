@@ -724,6 +724,27 @@ def _kill_run_pid(state_dir: Path) -> None:
             time.sleep(0.3)
 
 
+def _wait_terminal(state_dir: Path, timeout: float = 15.0) -> str:
+    """Poll <state_dir>/status until it is terminal; return the last status seen.
+
+    On timeout the runner is killed so a slow fake harness cannot outlive the
+    test, and the non-terminal status is returned for the caller to assert on.
+    """
+    deadline = time.monotonic() + timeout
+    status = "starting"
+    while time.monotonic() < deadline:
+        try:
+            status = (state_dir / "status").read_text().strip()
+        except FileNotFoundError:
+            status = "starting"
+        if status in agent_run.TERMINAL_STATUSES:
+            break
+        time.sleep(0.05)
+    if status not in agent_run.TERMINAL_STATUSES:
+        _kill_run_pid(state_dir)
+    return status
+
+
 def _launch_and_wait(
     state_root: Path,
     log_root: Path,
@@ -762,21 +783,7 @@ def _launch_and_wait(
 
     state_dir = state_root / name
     log_dir = log_root / name
-    deadline = time.monotonic() + timeout
-    status = "starting"
-    while time.monotonic() < deadline:
-        try:
-            status = (state_dir / "status").read_text().strip()
-        except FileNotFoundError:
-            status = "starting"
-        if status in agent_run.TERMINAL_STATUSES:
-            break
-        time.sleep(0.05)
-
-    if status not in agent_run.TERMINAL_STATUSES:
-        # Timed out: kill whatever we started so the process does not outlive
-        # the test, then let the caller's assertion fail with the last status.
-        _kill_run_pid(state_dir)
+    status = _wait_terminal(state_dir, timeout=timeout)
 
     session_data = agent_run._read_session_json(log_dir)
     return status, session_data
@@ -1744,22 +1751,6 @@ class TestEndToEndThroughMain:
         fake.chmod(0o755)
         return str(fake_dir)
 
-    def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
-        """Wait for terminal status. Kills the runner on timeout."""
-        deadline = time.monotonic() + timeout
-        status = "starting"
-        while time.monotonic() < deadline:
-            try:
-                status = (state_dir / "status").read_text().strip()
-            except FileNotFoundError:
-                pass
-            if status in agent_run.TERMINAL_STATUSES:
-                break
-            time.sleep(0.05)
-        if status not in agent_run.TERMINAL_STATUSES:
-            _kill_run_pid(state_dir)
-        return status
-
     def test_main_claude_oneshot_produces_session_json(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
@@ -1770,7 +1761,7 @@ class TestEndToEndThroughMain:
         rc = agent_run.main(["--harness", "claude", "--prompt", "say hi", name])
         assert rc == 0, f"main() returned non-zero: {rc}"
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         session = agent_run._read_session_json(isolated_log_root / name)
         assert session is not None
         assert session["harness"] == "claude"
@@ -1787,7 +1778,7 @@ class TestEndToEndThroughMain:
         rc = agent_run.main(["--harness", "codex", "--prompt", "say hello", name])
         assert rc == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         session = agent_run._read_session_json(isolated_log_root / name)
         assert session is not None
         assert session["session_id"] == "main-e2e-tid"
@@ -1845,7 +1836,7 @@ class TestEndToEndThroughMain:
         rc = agent_run.main(["--harness", "claude", "--prompt", "say hi", name])
         assert rc == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         argv = json.loads((state_dir / "argv").read_text())
         assert argv[argv.index("--session-id") + 1] == fixed_id
         session = agent_run._read_session_json(isolated_log_root / name)
@@ -2144,22 +2135,6 @@ class TestCodexRpcEdgeCases:
         _kill_run_pid(state_dir)
         return False
 
-    def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
-        """Wait for terminal status. Kills the runner on timeout."""
-        deadline = time.monotonic() + timeout
-        status = "starting"
-        while time.monotonic() < deadline:
-            try:
-                status = (state_dir / "status").read_text().strip()
-            except FileNotFoundError:
-                pass
-            if status in agent_run.TERMINAL_STATUSES:
-                break
-            time.sleep(0.05)
-        if status not in agent_run.TERMINAL_STATUSES:
-            _kill_run_pid(state_dir)
-        return status
-
     def test_result_null_frame_does_not_crash_interactive_runner(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
@@ -2181,7 +2156,7 @@ class TestCodexRpcEdgeCases:
         state_dir = isolated_runs_root / name
         log_dir = isolated_log_root / name
 
-        self._wait_terminal(state_dir, timeout=15.0)
+        _wait_terminal(state_dir, timeout=15.0)
 
         # Run must not crash (status must be a normal terminal, not a traceback-induced failure)
         status = agent_run._read(state_dir / "status", "").strip()
@@ -2228,7 +2203,7 @@ class TestCodexRpcEdgeCases:
         steer_ns = argparse.Namespace(name=name, message=["DO SOMETHING"], raw=False, esc=False)
         agent_run.cmd_steer(steer_ns)
 
-        self._wait_terminal(state_dir, timeout=12.0)
+        _wait_terminal(state_dir, timeout=12.0)
 
         acquire_log = log_dir / "session-acquire.log"
         log_text = acquire_log.read_text() if acquire_log.exists() else ""
@@ -2269,7 +2244,7 @@ class TestCodexRpcEdgeCases:
         # Send steer: if active_turn_id was cleared correctly, this becomes turn/start.
         steer_ns = argparse.Namespace(name=name, message=["after-turn"], raw=False, esc=False)
         agent_run.cmd_steer(steer_ns)
-        self._wait_terminal(state_dir, timeout=12.0)
+        _wait_terminal(state_dir, timeout=12.0)
 
         acquire_log = log_dir / "session-acquire.log"
         log_text = acquire_log.read_text() if acquire_log.exists() else ""
@@ -2338,21 +2313,6 @@ class TestCwdLaunch:
         yield
         os.chdir(origin)
 
-    def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
-        deadline = time.monotonic() + timeout
-        status = "starting"
-        while time.monotonic() < deadline:
-            try:
-                status = (state_dir / "status").read_text().strip()
-            except FileNotFoundError:
-                pass
-            if status in agent_run.TERMINAL_STATUSES:
-                break
-            time.sleep(0.05)
-        if status not in agent_run.TERMINAL_STATUSES:
-            _kill_run_pid(state_dir)
-        return status
-
     def _launch(self, argv: list[str]) -> int:
         return agent_run.main(argv)
 
@@ -2362,7 +2322,7 @@ class TestCwdLaunch:
         name = "cwd-basic"
         assert self._launch(["--cwd", str(target), name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         log = (isolated_log_root / name / "log").read_text()
         assert str(target.resolve()) in log
 
@@ -2374,7 +2334,7 @@ class TestCwdLaunch:
         name = "cwd-state-file"
         assert self._launch(["--cwd", str(target), name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
         run_json = json.loads((isolated_log_root / name / "run.json").read_text())
         assert run_json["cwd"] == str(target.resolve())
@@ -2397,7 +2357,7 @@ class TestCwdLaunch:
         name = "cwd-launch-head"
         assert self._launch(["--cwd", str(repo), name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         assert (state_dir / "launch_head").read_text().strip() == head
         assert (state_dir / "cwd").read_text().strip() == str(repo.resolve())
 
@@ -2410,7 +2370,7 @@ class TestCwdLaunch:
         name = "cwd-relative"
         assert self._launch(["--cwd", "workdir", name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
 
     def test_symlinked_component_is_resolved(
@@ -2423,7 +2383,7 @@ class TestCwdLaunch:
         name = "cwd-symlink"
         assert self._launch(["--cwd", str(link / "."), name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         assert (state_dir / "cwd").read_text().strip() == str(real.resolve())
 
     def test_equals_form_launches(self, isolated_runs_root, isolated_log_root, tmp_path):
@@ -2432,7 +2392,7 @@ class TestCwdLaunch:
         name = "cwd-equals"
         assert self._launch([f"--cwd={target}", name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
 
     def test_interactive_run_uses_cwd(self, isolated_runs_root, isolated_log_root, tmp_path):
@@ -2441,7 +2401,7 @@ class TestCwdLaunch:
         name = "cwd-interactive"
         assert self._launch(["-i", "--cwd", str(target), name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         assert (state_dir / "interactive").read_text().strip() == "1"
         assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
         assert str(target.resolve()) in (isolated_log_root / name / "log").read_text()
@@ -2460,7 +2420,7 @@ class TestCwdLaunch:
             "--harness", "claude", "--prompt", "hi", "--cwd", str(target), name,
         ]) == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
         assert str(target.resolve()) in (isolated_log_root / name / "log").read_text()
 
@@ -2484,7 +2444,7 @@ class TestCwdLaunch:
             "--harness", "claude", "--prompt-file", "brief.md", "--cwd", str(target), name,
         ]) == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         assert (isolated_log_root / name / "prompt").read_text() == "do the thing\n"
 
     def test_nonexistent_cwd_exits_and_creates_no_run_dir(
@@ -2532,5 +2492,5 @@ class TestCwdLaunch:
         name = "cwd-tilde"
         assert self._launch(["--cwd", "~/sub", name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         assert (state_dir / "cwd").read_text().strip() == str((home / "sub").resolve())
