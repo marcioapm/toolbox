@@ -293,8 +293,12 @@ from pathlib import Path
 from typing import Any, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 
-STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
-LOG_ROOT = Path(os.environ.get("AGENT_RUN_LOG_DIR", "/var/tmp/agent-runs"))
+# Absolutised against the invocation directory at import: --cwd chdirs the
+# launcher, and a relative root would otherwise re-base into the target
+# directory, creating run state (and running _prune_old_logs deletions) inside
+# it rather than under the configured root.
+STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs")).absolute()
+LOG_ROOT = Path(os.environ.get("AGENT_RUN_LOG_DIR", "/var/tmp/agent-runs")).absolute()
 PRUNE_AFTER_DAYS = 21
 SUBMIT_MODE_CR = "cr"
 SUBMIT_MODE_CRLF = "crlf"
@@ -6068,7 +6072,13 @@ def cmd_kill(args: argparse.Namespace) -> int:
 
 def cmd_launch(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
-    # chdir first: every path below (state, logs, git facts, the launched
+    # A relative --prompt-file names a file the caller typed, so it is anchored
+    # to the invocation directory before --cwd moves the process; the recorded
+    # <state_dir>/prompt_file is then absolute with or without --cwd.
+    prompt_file: Optional[str] = getattr(args, "prompt_file", None)
+    if prompt_file:
+        args.prompt_file = os.path.abspath(prompt_file)
+    # chdir next: every path below (state, logs, git facts, the launched
     # command) must observe one single effective working directory.
     _apply_launch_cwd(args)
     # Pruning takes per-name locks itself.  Do it before acquiring this name's
@@ -6081,33 +6091,32 @@ def cmd_launch(args: argparse.Namespace) -> int:
 def _apply_launch_cwd(args: argparse.Namespace) -> None:
     """Enter the ``--cwd`` directory, before any run state exists.
 
-    Rewrites ``args.cwd`` to the effective absolute directory reported by
-    ``os.getcwd()`` after the chdir, so ``<state_dir>/cwd`` and ``launch_head``
-    record the directory the command actually runs in.  A relative
-    ``--prompt-file`` is made absolute against the invocation directory first,
-    since it names a file the caller typed, not one inside DIR.
+    ``~`` is expanded (argparse does not).  The chdir is the sole validation:
+    checking exists/is_dir first would judge a path that could be replaced
+    before the chdir landed, and reports nothing the chdir does not report
+    itself.  An unusable DIR exits non-zero here, before the state dir is
+    created, so no run is left at status=starting.
 
-    ``~`` is expanded (argparse does not).  An unusable DIR exits non-zero here,
-    before the state dir is created, so no run is left at status=starting.
+    ``PWD``/``OLDPWD`` are re-pointed afterwards because ``os.chdir`` changes
+    only the kernel cwd, leaving the launched command an environment that
+    disagrees with its real working directory.
     """
     requested: Optional[str] = getattr(args, "cwd", None)
     if not requested:
         return
-    # resolve() collapses symlinked components, so is_dir() below judges the
-    # real target rather than the link.
-    target = Path(os.path.expanduser(requested)).resolve()
-    if not target.exists():
-        sys.exit(f"agent-run: --cwd directory does not exist: {requested}")
-    if not target.is_dir():
-        sys.exit(f"agent-run: --cwd is not a directory: {requested}")
-    prompt_file: Optional[str] = getattr(args, "prompt_file", None)
-    if prompt_file:
-        args.prompt_file = os.path.abspath(prompt_file)
     try:
-        os.chdir(target)
-        args.cwd = os.getcwd()
+        os.chdir(os.path.expanduser(requested))
+    except NotADirectoryError:
+        sys.exit(f"agent-run: --cwd is not a directory: {requested}")
+    except FileNotFoundError:
+        sys.exit(f"agent-run: --cwd directory does not exist: {requested}")
     except OSError as exc:
         sys.exit(f"agent-run: cannot enter --cwd {requested}: {exc}")
+    except ValueError as exc:
+        # Embedded NUL: os.chdir rejects the string before issuing a syscall.
+        sys.exit(f"agent-run: invalid --cwd {requested!r}: {exc}")
+    os.environ["PWD"] = os.getcwd()
+    os.environ.pop("OLDPWD", None)
 
 
 def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int:
@@ -6215,17 +6224,13 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
 
     # Written before "starting" is published: Path.cwd() raises if the launch
     # directory is gone, and that must not happen once the run already looks
-    # active with nothing behind it. An explicit --cwd cannot hit that case —
-    # _apply_launch_cwd already entered the directory and resolved its absolute
-    # path, exiting non-zero if either step failed.
-    explicit_cwd: Optional[str] = getattr(args, "cwd", None)
-    if explicit_cwd:
-        cwd: Optional[str] = explicit_cwd
-    else:
-        try:
-            cwd = str(Path.cwd())
-        except OSError:
-            cwd = None
+    # active with nothing behind it. _apply_launch_cwd has already entered any
+    # --cwd, so this reads the one effective directory in both cases.
+    cwd: Optional[str]
+    try:
+        cwd = str(Path.cwd())
+    except OSError:
+        cwd = None
     if cwd is not None:
         _write(d / "cwd", cwd + "\n")
         # Best-effort, only when cwd is itself a git repo: `watch` counts
