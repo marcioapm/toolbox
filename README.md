@@ -780,6 +780,7 @@ agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
 agent-run attach <name>                   # attach interactively (Ctrl-C detaches)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
+                [--all]
                 [--include-logs] [--log-min-age-hours N]
                 [--include-worktrees] [--worktree-min-age-hours N] [--force-dirty]
                 [--orphan-processes] [--orphan-min-age-hours N]
@@ -921,6 +922,18 @@ serialize relaunches). State/log GC first atomically renames a directory to
 a reserved sentinel so an interrupted deletion is resumed by the next reap;
 `--dry-run` runs the same read-only eligibility checks and prints only actions
 a real reap would take, without mutating or deleting anything.
+
+`--all` enables every opt-in pass at once — `--include-logs`,
+`--orphan-processes` and `--include-worktrees` — and nothing else. It changes
+no age threshold: `--min-age-hours`, `--log-min-age-hours`,
+`--orphan-min-age-hours` and `--worktree-min-age-hours` all keep their
+values and defaults. **It does not imply `--force-dirty` or
+`--force-unknown`**: those override *refusals* (unpushed or uncommitted work,
+unclassifiable status) rather than enable a pass, so "do all the passes"
+never silently means "ignore the safety refusals" — request either
+explicitly, after review. Passing `--all` together with an individual pass
+flag is redundant, not an error. `--dry-run --all` previews every pass with
+the same accuracy each pass has on its own.
 
 `--max-seconds N` sets a soft candidate-admission budget. The monotonic budget
 is checked between candidates in every pass, not during an operation already in

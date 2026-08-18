@@ -116,7 +116,7 @@ def _reap_args(**kw) -> argparse.Namespace:
         dry_run=False, idle_hours=None, min_age_hours=None, log_min_age_hours=None,
         name=None, force_unknown=False, include_logs=False, orphan_processes=False,
         orphan_min_age_hours=None, max_seconds=None, include_worktrees=True,
-        worktree_min_age_hours=None, force_dirty=False,
+        worktree_min_age_hours=None, force_dirty=False, all=False,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -704,6 +704,36 @@ class TestReapWorktrees:
         out = capsys.readouterr().out
         assert wt.is_dir()
         assert "worktrees_removed=0 worktrees_skipped=0" in out
+
+    def test_all_enables_the_worktree_pass(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(include_worktrees=False, all=True))
+
+        assert not wt.exists()
+        assert "worktrees_removed=1" in capsys.readouterr().out
+
+    def test_all_does_not_imply_force_dirty(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """Untracked content is a refusal, not a pass: --all leaves the
+        worktree in place until --force-dirty is given explicitly."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        (wt / "untracked").write_text("unpushed work\n")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(include_worktrees=False, all=True))
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert (wt / "untracked").read_text() == "unpushed work\n"
+        assert "worktrees_removed=0" in out
+        assert "worktrees_skipped=1" in out
 
     def test_unknown_status_not_collected_even_with_force_unknown(
         self, isolated_runs_root, isolated_log_root, git_root, capsys

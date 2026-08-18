@@ -5066,6 +5066,10 @@ def cmd_reap(args: argparse.Namespace) -> int:
     garbage-collect old terminal-state runs, state-less scratch dirs, and
     (with ``--include-logs``) preserved log dirs.
 
+    The opt-in passes — ``--include-logs``, ``--orphan-processes``,
+    ``--include-worktrees`` — can be enabled together with ``--all``, which
+    changes no age threshold and overrides no refusal.
+
     The pass is deliberately split into reconciliation, state-backed GC,
     preserved-log GC, and orphan-scratch GC. Every destructive state-backed
     action is guarded by a name lock plus inode/status/pid revalidation;
@@ -5078,10 +5082,14 @@ def cmd_reap(args: argparse.Namespace) -> int:
     log_min_age_hours: Optional[float] = getattr(args, "log_min_age_hours", None)
     target_name: Optional[str] = getattr(args, "name", None)
     force_unknown: bool = bool(getattr(args, "force_unknown", False))
-    include_logs: bool = bool(getattr(args, "include_logs", False))
-    orphan_processes: bool = bool(getattr(args, "orphan_processes", False))
+    # --all turns on every opt-in pass and nothing else: force_unknown and
+    # force_dirty override refusals rather than enable a pass, so they stay
+    # exactly as the caller set them.
+    all_passes: bool = bool(getattr(args, "all", False))
+    include_logs: bool = all_passes or bool(getattr(args, "include_logs", False))
+    orphan_processes: bool = all_passes or bool(getattr(args, "orphan_processes", False))
     orphan_min_age_hours: Optional[float] = getattr(args, "orphan_min_age_hours", None)
-    include_worktrees: bool = bool(getattr(args, "include_worktrees", False))
+    include_worktrees: bool = all_passes or bool(getattr(args, "include_worktrees", False))
     worktree_min_age_hours: Optional[float] = getattr(args, "worktree_min_age_hours", None)
     force_dirty: bool = bool(getattr(args, "force_dirty", False))
     if target_name is not None:
@@ -5275,7 +5283,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             )
             skipped_count += 1
 
-    # Pass 1.5 (--include-worktrees only): remove linked git worktrees whose
+    # Pass 1.5 (--include-worktrees): remove linked git worktrees whose
     # only users are terminal runs. Runs before pass 2 because the launch
     # directory it reads lives in the state dir pass 2 deletes; a run
     # reconciled in pass 1 has a fresh ended_at and so fails the age gate here
@@ -5455,7 +5463,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         if _stat_module.S_ISDIR(_ld_st.st_mode):
             validated_logs.append((_ld, _ld_st))
 
-    # Pass 2.5 (--include-logs only): whole-log-dir GC for preserved-log-only
+    # Pass 2.5 (--include-logs): whole-log-dir GC for preserved-log-only
     # runs (state dir gone). Runs after pass 2 so a run whose state dir pass 2
     # just removed in this same invocation can become log-only and eligible
     # here too. Runs before pass 3 (orphan scratch): a log dir removed whole
@@ -5598,7 +5606,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 continue
             orphaned_scratch_count += 1
 
-    # Pass 4 (--orphan-processes only): find and terminate live agent-run runner
+    # Pass 4 (--orphan-processes): find and terminate live agent-run runner
     # processes that have no state dir — invisible to all prior passes because
     # they hold no entry in STATE_ROOT.  Runs last so a state dir removed in
     # pass 2 of this same invocation is correctly seen as absent by discovery.
@@ -9280,13 +9288,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "reap",
         help="reconcile stale status, idle-kill lingering runs, "
         "garbage-collect old terminal-state run dirs, collect preserved logs "
-        "(--include-logs), and terminate orphan processes (--orphan-processes)",
+        "(--include-logs), terminate orphan processes (--orphan-processes), "
+        "and remove linked worktrees (--include-worktrees); --all enables all "
+        "three opt-in passes without overriding any safety refusal",
     )
     sp_reap.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
         help="report actions without mutating any state",
+    )
+    sp_reap.add_argument(
+        "--all",
+        action="store_true",
+        default=False,
+        help="enable every opt-in pass: --include-logs, --orphan-processes "
+        "and --include-worktrees.  Each pass keeps its own age threshold "
+        "(--min-age-hours, --log-min-age-hours, --orphan-min-age-hours, "
+        "--worktree-min-age-hours) unchanged.  DOES NOT imply --force-dirty "
+        "or --force-unknown: those override safety refusals (unpushed or "
+        "uncommitted work, unclassifiable status) rather than enable a pass, "
+        "and must always be requested explicitly.  Combining --all with an "
+        "individual pass flag is redundant, not an error",
     )
     sp_reap.add_argument(
         "--idle-hours",
@@ -9312,7 +9335,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="also collect old unrecognized/legacy/corrupt statuses; still refuses "
-        "a live or unverifiable recorded runner",
+        "a live or unverifiable recorded runner.  Off by default and never "
+        "implied by --all or any other flag",
     )
     sp_reap.add_argument(
         "--name",
@@ -9326,7 +9350,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="also garbage-collect preserved log directories (state dir "
         "already gone) once older than --log-min-age-hours; without this "
-        "flag preserved logs are never touched by reap",
+        "flag (or --all) preserved logs are never touched by reap",
     )
     sp_reap.add_argument(
         "--log-min-age-hours",
@@ -9351,7 +9375,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "argv parsing; it is opt-in for that reason.  Identity captured at "
         "discovery is re-verified immediately before every signal; any "
         "ambiguity aborts the candidate instead of sending a signal.  Only "
-        "processes older than --orphan-min-age-hours are eligible.",
+        "processes older than --orphan-min-age-hours are eligible.  Also "
+        "enabled by --all.",
     )
     sp_reap.add_argument(
         "--orphan-min-age-hours",
@@ -9379,7 +9404,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "files, or commits on no remote is refused unless --force-dirty is "
         "given, and one still used by a live run is always refused. A "
         "worktree shared by several terminal runs is removed once. Off by "
-        "default",
+        "default; also enabled by --all",
     )
     sp_reap.add_argument(
         "--worktree-min-age-hours",
@@ -9401,7 +9426,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="with --include-worktrees, remove a linked worktree even when it "
         "has uncommitted changes, untracked files, or commits not present on "
         "any remote.  This destroys unpushed work irreversibly; off by "
-        "default and never implied by any other flag",
+        "default and never implied by --all or any other flag",
     )
     sp_reap.add_argument(
         "--max-seconds",
