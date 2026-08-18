@@ -5285,7 +5285,7 @@ def _worktree_candidate_refusal(
     for d in state_entries:
         if d.name in cand.names:
             continue  # already counted in cand.age_seconds
-        if _read(d / "status") not in TERMINAL_STATUSES:
+        if _effective_status(d) not in TERMINAL_STATUSES:
             continue
         raw = _watch_read_cwd_file(d / "cwd")
         run_resolved = _worktree_resolve_cwd(raw)

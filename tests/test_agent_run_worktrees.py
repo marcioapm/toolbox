@@ -1437,6 +1437,46 @@ class TestReapWorktreeSameInvocationReconciliation:
         assert not wt.exists()
         assert "worktrees_removed=1" in capsys.readouterr().out
 
+    def test_sharer_dying_between_pass1_and_worktree_pass_keeps_worktree(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A sharer alive during pass 1 (not recorded in reconciled_cwds) that
+        exits before _worktree_gc_pass runs must still block removal via the
+        late-terminal loop: _effective_status computes 'died' for a running run
+        with a dead pid, so the age gate catches it before the worktree is
+        deleted.  Using raw status (which still says 'running') would skip it."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "a-old", cwd=wt, age_hours=1000)
+
+        proc = subprocess.Popen(["sleep", "60"], cwd=str(wt))
+        sd = _make_state_run(
+            isolated_runs_root, isolated_log_root, "z-live", status="running", cwd=wt
+        )
+        (sd / "pid").write_text(f"{proc.pid}\n")
+        (sd / "process_identity").write_text(f"{agent_run._process_identity(proc.pid)}\n")
+
+        real_pass = agent_run._worktree_gc_pass
+
+        def kill_then_pass(**kw):
+            proc.kill()
+            proc.wait()
+            return real_pass(**kw)
+
+        monkeypatch.setattr(agent_run, "_worktree_gc_pass", kill_then_pass)
+
+        try:
+            agent_run.cmd_reap(_reap_args())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree of a just-died sharer was DELETED"
+        assert "youngest sharing run is below the age threshold" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
 
 class TestReapWorktreeNested:
     """`git worktree remove` on an outer worktree would take a registered
