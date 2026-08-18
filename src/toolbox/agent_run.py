@@ -5093,6 +5093,53 @@ def _worktree_nested_reason(info: _WorktreeInfo, path: Path) -> Optional[str]:
     return None
 
 
+def _worktree_foreign_nested_reason(path: Path) -> Optional[str]:
+    """Detect git worktree roots structurally nested inside the candidate directory.
+
+    Scans subdirectories of ``path`` for ``.git`` entries that indicate a
+    worktree root belonging to any repository, not just the candidate's own.
+    ``_worktree_nested_reason`` only queries the candidate's repository, so a
+    linked worktree of a different repository is invisible to it.  This check
+    operates on filesystem structure rather than repository metadata.
+
+    Called unconditionally, including under ``--force-dirty`` where content
+    checks are skipped: an untracked intermediate directory can hide a foreign
+    worktree from the untracked-content check, but the structural signature
+    (``.git`` file or directory) is independent of git's index.
+
+    Scans subdirectories up to ``_FOREIGN_WORKTREE_SCAN_DEPTH`` levels deep to
+    bound cost while covering the common nesting patterns.  Symlinks are not
+    followed.  Any ``scandir`` or ``lstat`` error fails closed.
+    """
+    _FOREIGN_WORKTREE_SCAN_DEPTH = 4
+    # Stack entries: (directory_path, current_depth)
+    stack: List[Tuple[Path, int]] = [(path, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if current != path:
+            # Check whether this subdirectory is a git worktree root.
+            try:
+                (current / ".git").lstat()
+                return f"nested git repository at {current}"
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                return f"cannot check .git in {current}: {exc}"
+        if depth >= _FOREIGN_WORKTREE_SCAN_DEPTH:
+            continue
+        try:
+            with os.scandir(current) as it:
+                subdirs = [
+                    Path(e.path)
+                    for e in it
+                    if e.is_dir(follow_symlinks=False) and e.name != ".git"
+                ]
+        except OSError as exc:
+            return f"cannot scan {current} for nested repositories: {exc}"
+        stack.extend((d, depth + 1) for d in subdirs)
+    return None
+
+
 def _worktree_activity_age_seconds(path: Path) -> Tuple[Optional[float], Optional[str]]:
     """Age of the newest recursively observed filesystem mtime in a worktree.
 
@@ -5230,6 +5277,13 @@ def _worktree_candidate_refusal(
     nested = _worktree_nested_reason(info, cand.resolved)
     if nested is not None:
         return nested, None, None
+    # Check for worktree roots belonging to other repositories; this check
+    # uses filesystem structure rather than repository metadata, so it catches
+    # foreign worktrees that _worktree_nested_reason cannot see.  Always runs,
+    # including under --force-dirty where content checks are skipped.
+    foreign_nested = _worktree_foreign_nested_reason(cand.resolved)
+    if foreign_nested is not None:
+        return foreign_nested, None, None
 
     live = _worktree_live_run_cwds(state_entries)
     if live.error is not None:

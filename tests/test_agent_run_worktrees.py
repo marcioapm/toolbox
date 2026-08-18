@@ -1471,6 +1471,33 @@ class TestReapWorktreeNested:
         assert f"a live run is using this directory ({nested.resolve()})" in out
         assert "worktrees_removed=0" in out
 
+    def test_foreign_nested_worktree_refused_under_force_dirty(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A linked worktree from a different repository nested inside the
+        candidate is refused even with --force-dirty.  Content checks are
+        skipped under --force-dirty, so the same-repo nested check cannot
+        see the foreign worktree; the structural check must catch it."""
+        outer_repo = _make_repo(git_root, "outer-repo")
+        outer_wt = _add_worktree(outer_repo, git_root / "outer-wt", "f-outer")
+
+        inner_repo = _make_repo(git_root, "inner-repo")
+        inner_wt = _add_worktree(inner_repo, outer_wt / "inner-wt", "f-inner")
+        (inner_wt / "precious.txt").write_text("must survive\n")
+
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", cwd=outer_wt, age_hours=1000
+        )
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert outer_wt.is_dir(), "outer worktree must not be deleted"
+        assert inner_wt.is_dir(), "inner (foreign) worktree must not be deleted"
+        assert (inner_wt / "precious.txt").exists()
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+        assert "nested git repository" in out
+
 
 class TestReapWorktreeFinalRevalidation:
     """State captured at collection is re-read under the publication lock
