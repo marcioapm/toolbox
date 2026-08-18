@@ -8632,7 +8632,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run the launched command with DIR as its working directory; DIR may be "
         "relative and may start with '~', is resolved to an absolute path with symlinks "
         "collapsed, and is entered before any run state is published so <state_dir>/cwd "
-        "records it; available in both managed and raw mode",
+        "records it; available in both managed and raw mode. A relative command path is "
+        "resolved by the command itself and so is relative to DIR, but a relative "
+        "-f/--prompt-file names a file the caller typed and stays relative to the "
+        "invocation directory",
     )
     mg.add_argument(
         "--harness",
@@ -9240,7 +9243,12 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         # cannot strand a phantom run at status=starting.
         for ha in harness_args:
             flag = ha.split("=", 1)[0]
-            if flag in {"--session", "-s", "--session-id", "--port", "--prompt"}:
+            if flag == "--prompt":
+                raise _LaunchArgvError(
+                    "agent-run: --harness-arg '--prompt' would collide with the "
+                    "prompt agent-run sends; use agent-run's own --prompt or --prompt-file"
+                )
+            if flag in {"--session", "-s", "--session-id", "--port"}:
                 raise _LaunchArgvError(
                     f"agent-run: --harness-arg {flag!r} is managed internally by "
                     f"agent-run and cannot be overridden"

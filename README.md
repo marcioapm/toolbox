@@ -603,9 +603,16 @@ and `<state_dir>/launch_head` — which `watch` reads to report git facts —
 record the directory the command actually runs in.
 
 Symlinked components are collapsed: the recorded `cwd` is the real path. A
-relative `--prompt-file` is resolved against the invocation directory, not
-against `DIR`. A `DIR` that does not exist, is not a directory, or cannot be
-entered exits non-zero and creates no run dir.
+`DIR` that does not exist, is not a directory, or cannot be entered exits
+non-zero and creates no run dir.
+
+Relative paths on the command line resolve against two different directories,
+deliberately. A relative *command* path (`agent-run --cwd ~/git/myrepo build --
+./scripts/run.sh`) is resolved by the launched command after the chdir, so it is
+relative to `DIR` — that is what makes `--cwd` useful for repo-local scripts. A
+relative `-f/--prompt-file` names a file the caller typed at their shell, so it
+is resolved against the invocation directory before the chdir; the recorded
+`<state_dir>/prompt_file` is the resulting absolute path.
 
 ### Managed mode
 
