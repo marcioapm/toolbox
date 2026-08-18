@@ -2309,3 +2309,427 @@ class TestDuWorktreeArithmetic:
             "TOTAL must equal the whole worktree size; "
             "unrecognized root content must not be silently excluded"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for undefended guards (Part 2)
+# ---------------------------------------------------------------------------
+
+class TestReapWorktreeUndefendedGuards:
+    """One test per guard that was correct at HEAD but had no test.
+
+    Each test is named after the finding it covers (G4-G18).  The mutation
+    that proves the test is noted in the docstring.
+    """
+
+    # G4 — late-terminal unparseable age
+    def test_late_terminal_run_with_unparseable_age_refuses(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A run that becomes terminal after collection and whose
+        _terminal_state_age_seconds returns None produces a refusal and
+        leaves the worktree.
+
+        Mutation: deleting the 'if late_age is None' guard at the late-terminal
+        loop causes it to compare None < threshold and raise TypeError."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_scan = agent_run._worktree_state_scan
+        calls = {"n": 0}
+
+        def scan_and_inject():
+            calls["n"] += 1
+            if calls["n"] > 1 and not (isolated_runs_root / "r2").exists():
+                sd = _make_state_run(
+                    isolated_runs_root, isolated_log_root, "r2", status="done", cwd=wt
+                )
+                (sd / "ended_at").write_text("garbage\n")
+                monkeypatch.setattr(
+                    agent_run, "_terminal_state_age_seconds",
+                    lambda d: None if d.name == "r2" else 1000 * 3600,
+                )
+            return real_scan()
+
+        monkeypatch.setattr(agent_run, "_worktree_state_scan", scan_and_inject)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "newly terminal run r2 has unparseable age" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    # G5 — pid <= 0 is scan-fatal
+    @pytest.mark.parametrize("pid_val", ["0", "-1"])
+    def test_invalid_pid_value_aborts_liveness_scan(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys, pid_val
+    ):
+        """pid = 0 or -1 is invalid: _worktree_state_has_live_runner must
+        return (None, reason) so the liveness scan aborts.
+
+        Mutation: deleting the 'if pid <= 0' guard causes _pid_alive to
+        return False for invalid pids, treating ambiguity as absence."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        sd = _make_state_run(
+            isolated_runs_root, isolated_log_root, "a-run", cwd=wt, age_hours=1000
+        )
+        (sd / "pid").write_text(f"{pid_val}\n")
+
+        live, err = agent_run._worktree_state_has_live_runner(sd)
+        assert live is None, f"pid={pid_val} must not be treated as absence"
+        assert err is not None and "invalid pid" in err
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "liveness scan failed" in out
+        assert "worktrees_removed=0" in out
+
+    # G6 — malformed (non-integer) pid is scan-fatal
+    def test_malformed_pid_aborts_liveness_scan(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A non-integer pid file is ambiguity, not absence; the liveness
+        scan must abort and the worktree must survive.
+
+        Mutation: replacing the return of (None, reason) with (False, None)
+        treats an unparseable pid as 'no runner' and lets the candidate through."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        sd = _make_state_run(
+            isolated_runs_root, isolated_log_root, "a-run", cwd=wt, age_hours=1000
+        )
+        (sd / "pid").write_text("abc\n")
+
+        live, err = agent_run._worktree_state_has_live_runner(sd)
+        assert live is None, "malformed pid must not be treated as absence"
+        assert err is not None and "malformed pid" in err
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "liveness scan failed" in out
+        assert "malformed pid" in out
+        assert "worktrees_removed=0" in out
+
+    # G8 — git worktree remove failure is a refusal
+    def test_worktree_remove_git_failure_refuses(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """When _watch_run_git_checked fails only for the 'worktree remove'
+        invocation, the pass reports a skip and counts removed=0.
+
+        Mutation: dropping the failure branch from _worktree_remove causes
+        [removing] to appear and worktrees_removed to increment despite git
+        actually refusing the removal."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_git = agent_run._watch_run_git_checked
+
+        def git_fails_worktree_remove(path, args, **kw):
+            if list(args[:2]) == ["worktree", "remove"]:
+                return agent_run._WatchGitOutcome(None, "git_failed")
+            return real_git(path, args, **kw)
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", git_fails_worktree_remove)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree must still exist after git worktree remove failure"
+        assert "git worktree remove failed" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    # G9 (a) — invalid state entry name is scan-fatal
+    def test_invalid_state_directory_name_aborts_scan(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A state entry whose name fails _validate_run_name aborts the scan;
+        the pass deletes nothing.
+
+        Mutation: replacing the return of _WorktreeStateScan(None, ...) with
+        'continue' makes the invalid entry a no-op instead of scan-fatal."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+        (isolated_runs_root / "!!bogus").mkdir()
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "invalid state directory name" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    # G9 (b) — non-directory state entry is scan-fatal
+    def test_non_directory_state_entry_aborts_scan(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A regular file directly under STATE_ROOT with a valid run name
+        aborts the scan; the pass deletes nothing.
+
+        Mutation: replacing the return of _WorktreeStateScan(None, ...) with
+        'continue' makes the non-directory entry a no-op instead of scan-fatal."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+        (isolated_runs_root / "orphan-file").write_text("not a directory\n")
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "state entry is not a real directory" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    # G10 — empty worktree list is a refusal
+    def test_empty_worktree_list_refuses(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """'git worktree list --porcelain -z' returning no 'worktree ' fields
+        is treated as an error: the output is not what was expected.
+
+        Mutation: deleting the 'if not roots' guard treats an empty roots list
+        as 'no nested worktrees, proceed' — the wrong fail direction."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_git = agent_run._watch_run_git_checked
+
+        def git_returns_empty_worktree_list(path, args, **kw):
+            if list(args[:2]) == ["worktree", "list"]:
+                return agent_run._WatchGitOutcome("", None)
+            return real_git(path, args, **kw)
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", git_returns_empty_worktree_list)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "worktree list returned no roots" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    # G11 — unresolvable registered-worktree path is a refusal
+    def test_unresolvable_registered_worktree_refuses(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A 'worktree /gone/path' entry whose path _worktree_resolve_cwd
+        cannot resolve causes a refusal.
+
+        Mutation (no separate mutation needed): nothing in the suite stubs a
+        worktree list line that fails _worktree_resolve_cwd."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_git = agent_run._watch_run_git_checked
+
+        def git_returns_bad_worktree_path(path, args, **kw):
+            if list(args[:2]) == ["worktree", "list"]:
+                return agent_run._WatchGitOutcome("worktree /gone/nonexistent\n", None)
+            return real_git(path, args, **kw)
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", git_returns_bad_worktree_path)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "cannot resolve registered worktree" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    # G12 — scandir/lstat error in foreign-nested scan is a refusal
+    def test_foreign_nested_scandir_error_refuses(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """An os.scandir failure inside _worktree_foreign_nested_reason at
+        depth <= 4 causes a refusal; the docstring promises fail-closed on
+        any scandir or lstat error.
+
+        Mutation: replacing the OSError handler with 'subdirs = []' treats
+        an unreadable subtree as empty, letting the candidate through."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        subdir = wt / "sub"
+        subdir.mkdir()
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_scandir = os.scandir
+
+        def scandir_fails_in_subdir(path):
+            if str(path) == str(subdir):
+                raise OSError("simulated permission denied")
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", scandir_fails_in_subdir)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "cannot scan" in out and "nested repositories" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    # G13 — empty rev-parse path yields UNKNOWN classification
+    def test_empty_rev_parse_path_is_unknown(self, git_root, monkeypatch):
+        """Four lines of rev-parse output where git_dir or common_dir is an
+        empty string must yield _WORKTREE_UNKNOWN with 'empty rev-parse path'.
+
+        Mutation: deleting the 'if not git_dir or not common_dir' guard causes
+        the empty-string paths to compare equal, classifying as _WORKTREE_MAIN."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        monkeypatch.setattr(
+            agent_run, "_watch_run_git_checked",
+            lambda *a, **k: agent_run._WatchGitOutcome("false\ntrue\n\n\n", None),
+        )
+
+        info = agent_run._worktree_classify(wt)
+
+        assert info.kind == agent_run._WORKTREE_UNKNOWN
+        assert info.detail == "empty rev-parse path"
+
+    # G16 — du charged-excludes root guard is load-bearing
+    def test_du_state_root_outside_worktree_with_symlinked_state_dir(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        """STATE_ROOT is outside the worktree; the per-run state dir is a
+        symlink whose resolved target is inside it.  TOTAL must still equal
+        the whole worktree size — the guard at _path_is_within(configured,
+        root) ensures the symlinked target is excluded from the worktree
+        charge (since it is already counted in the state charge).
+
+        Mutation M50: removing the guard causes the symlinked bytes to be
+        double-counted and/or dropped from TOTAL depending on traversal order."""
+        repo = _make_repo(tmp_path / "inside")
+        wt = _add_worktree(repo, tmp_path / "inside" / "wt", "feature")
+        (wt / "payload.bin").write_bytes(b"p" * 5000)
+
+        state = tmp_path / "outside-state"
+        logs = tmp_path / "outside-logs"
+        state.mkdir()
+        logs.mkdir()
+        monkeypatch.setattr(agent_run, "STATE_ROOT", state)
+        monkeypatch.setattr(agent_run, "LOG_ROOT", logs)
+
+        real_state_dir = wt / "real-r1-state"
+        real_state_dir.mkdir()
+        (real_state_dir / "status").write_text("done\n")
+        (real_state_dir / "cwd").write_text(f"{wt}\n")
+        (real_state_dir / "data").write_bytes(b"S" * 900)
+        (state / "r1").symlink_to(real_state_dir, target_is_directory=True)
+        (logs / "r1").mkdir()
+
+        whole = agent_run._dir_size_bytes(wt)
+
+        agent_run.cmd_du(_du_args(by_run=True))
+
+        out = capsys.readouterr().out
+        total = _row(out, "TOTAL")
+        assert int(total[6]) == whole, (
+            f"TOTAL {total[6]} != whole worktree {whole}: bytes dropped or doubled"
+        )
+
+    # G17 — --force-dirty must not override unpushed commits
+    def test_force_dirty_does_not_override_unpushed_commits(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """Documented property (property 2): --force-dirty overrides content
+        checks only, never unpushed commits.  This pins the most tempting
+        future simplification: moving _worktree_unpushed_reason inside the
+        'if not force_dirty:' block would make mutation M (adjacent code)
+        pass all existing tests.
+
+        Mutation: moving _worktree_unpushed_reason inside the force_dirty
+        guard causes the worktree with unpushed commits to be deleted under
+        --force-dirty (mutation passes all 119 tests without this test)."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        (wt / "tracked.txt").write_text("committed but unpushed\n")
+        _git(wt, "commit", "-qam", "local only")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree with unpushed commits deleted under --force-dirty"
+        assert "not on any remote" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    # G18 (a) — reconciled cwd containment (subdirectory blocks removal)
+    def test_reconciled_sharer_in_subdirectory_keeps_worktree(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A run reconciled in this invocation whose cwd is a subdirectory of
+        the candidate is inside the tree 'git worktree remove' would delete;
+        it must still block removal.
+
+        Mutation M24: replacing _path_is_within with equality for the
+        reconciled-cwd check lets a sharer whose cwd is a subdirectory slip
+        through and the worktree is deleted."""
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        nested = wt / "sub" / "deeper"
+        nested.mkdir(parents=True)
+        _make_state_run(isolated_runs_root, isolated_log_root, "a-old", cwd=wt, age_hours=1000)
+        sd = _make_state_run(
+            isolated_runs_root, isolated_log_root, "b-reconciled",
+            status="running", cwd=nested, age_hours=1000,
+        )
+        (sd / "pid").write_text(f"{dead.pid}\n")
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "a sharing run was reconciled in this invocation" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    # G18 (b) — late-terminal cwd containment (subdirectory is weighed by age gate)
+    def test_late_terminal_sharer_in_subdirectory_is_weighed_by_age_gate(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A late-terminal run whose cwd is a subdirectory of the candidate
+        must be weighed by the age gate, not skipped because its cwd is not
+        equal to cand.resolved.
+
+        Mutation M36: replacing _path_is_within with equality in the
+        late-terminal loop skips a sharer in a subdirectory, allowing the
+        worktree to be removed even if the sharing run is fresh."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        nested = wt / "sub" / "deeper"
+        nested.mkdir(parents=True)
+        _make_state_run(isolated_runs_root, isolated_log_root, "a-old", cwd=wt, age_hours=1000)
+
+        real_scan = agent_run._worktree_state_scan
+        calls = {"n": 0}
+
+        def scan_and_inject():
+            calls["n"] += 1
+            if calls["n"] > 1 and not (isolated_runs_root / "b-fresh").exists():
+                _make_state_run(
+                    isolated_runs_root, isolated_log_root, "b-fresh",
+                    status="done", cwd=nested, age_hours=0,
+                )
+            return real_scan()
+
+        monkeypatch.setattr(agent_run, "_worktree_state_scan", scan_and_inject)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "youngest sharing run is below the age threshold" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
