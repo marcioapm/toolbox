@@ -282,6 +282,22 @@ ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
 # an LLM — a budget above 32 KiB total is discarded before use.
 LOGS_MAX_LINE_BYTES = 8 * 1024
 LOGS_MAX_TOTAL_BYTES = 32 * 1024
+# Geometry the --echo daemon uses when writing log.clean (via _render_log_to_clean,
+# which calls _render_log with no arguments). cmd_clean compares the caller's
+# requested geometry against these to decide whether the cache is usable.
+# All three must match _render_log's default-parameter values exactly.
+_RENDER_LOG_DEFAULT_WIDTH = 120
+_RENDER_LOG_DEFAULT_HEIGHT = 60
+_RENDER_LOG_DEFAULT_HISTORY = 100000
+# Maximum seconds log.clean may trail log (by mtime) and still be considered
+# fresh. The --echo daemon re-renders every echo_interval seconds (default
+# 2.0 s), so a freshly written log.clean is at most ~2 s behind the raw log
+# under normal operation. The daemon silently stops rendering once the raw
+# log exceeds ECHO_LOOP_MAX_RENDER_BYTES (16 MiB), from which point the gap
+# grows without bound. 30 s gives 15× the default interval as headroom for
+# slow renders and scheduler jitter, while reliably catching a frozen cache
+# (where the gap grows at the rate of continued raw-log writes).
+CLEAN_CACHE_MAX_STALENESS_SECONDS = 30.0
 
 # Statuses that are conclusively terminal: the run will never transition
 # again on its own. "done"/"failed"/"launch_failed" are published by the
@@ -3429,7 +3445,12 @@ _RENDER_DEPENDENCY_MESSAGE = (
 )
 
 
-def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 100000) -> str:
+def _render_log(
+    raw: bytes,
+    width: int = _RENDER_LOG_DEFAULT_WIDTH,
+    height: int = _RENDER_LOG_DEFAULT_HEIGHT,
+    history: int = _RENDER_LOG_DEFAULT_HISTORY,
+) -> str:
     """Render a raw PTY-captured log (with ANSI/Ink redraw artifacts) into a
     plain-text transcript by replaying the byte stream through a VT100
     emulator (pyte). Returns the deduplicated screen history + final visible
@@ -3609,21 +3630,72 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
         time.sleep(interval)
 
 
+def _read_clean_cache(
+    log_path: Path,
+    width: int,
+    height: int,
+    history: int,
+) -> "Optional[str]":
+    """Return the text of ``log.clean`` if it is fresh and geometry-compatible.
+
+    Returns ``None`` (fall back to rendering) when any of the following hold:
+    - The requested geometry differs from the daemon's defaults.
+    - ``log.clean`` does not exist or is not a regular file.
+    - ``log.clean`` mtime lags ``log`` mtime by more than
+      CLEAN_CACHE_MAX_STALENESS_SECONDS (indicates the daemon has stopped
+      rendering — e.g. the raw log crossed ECHO_LOOP_MAX_RENDER_BYTES).
+    - Any OSError while stat-ing or reading.
+
+    The staleness bound exists because the daemon silently freezes once the raw
+    log exceeds 16 MiB: ``log.clean`` stops updating while ``log`` keeps
+    growing, and the gap becomes unbounded. Existence of ``log.clean`` alone
+    cannot distinguish a fresh render from a frozen one.
+
+    ``log.clean`` is opened through ``_watch_open_validated_log`` (same
+    FIFO/symlink defence as the raw log), and mtime is read from the open fd
+    via fstat to avoid a race between stat and read.
+    """
+    if width != _RENDER_LOG_DEFAULT_WIDTH or height != _RENDER_LOG_DEFAULT_HEIGHT or history != _RENDER_LOG_DEFAULT_HISTORY:
+        return None
+    log_clean = log_path.parent / "log.clean"
+    try:
+        log_mtime = log_path.stat().st_mtime
+    except OSError:
+        return None
+    with _watch_open_validated_log(log_clean) as f:
+        if f is None:
+            return None
+        try:
+            clean_mtime = os.fstat(f.fileno()).st_mtime
+            if log_mtime - clean_mtime > CLEAN_CACHE_MAX_STALENESS_SECONDS:
+                return None
+            return f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
-    with _watch_open_validated_log(log) as f:
-        if f is None:
-            sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
-        raw = f.read()
-    try:
-        rendered = _render_log(
-            raw,
-            width=args.width,
-            height=args.height,
-            history=args.history,
-        )
-    except RenderDependencyError as exc:
-        sys.exit(str(exc))
+
+    # Use the incremental cache written by the --echo daemon when it exists,
+    # is fresh (mtime gap within CLEAN_CACHE_MAX_STALENESS_SECONDS), and was
+    # rendered at the default geometry. Avoids re-running pyte over the entire
+    # raw log — on an 8.8 MB single-line log that replay is seconds of CPU.
+    rendered = _read_clean_cache(log, width=args.width, height=args.height, history=args.history)
+    if rendered is None:
+        with _watch_open_validated_log(log) as f:
+            if f is None:
+                sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
+            raw = f.read()
+        try:
+            rendered = _render_log(
+                raw,
+                width=args.width,
+                height=args.height,
+                history=args.history,
+            )
+        except RenderDependencyError as exc:
+            sys.exit(str(exc))
 
     # Slice the rendered transcript *after* rendering: pyte replays the whole
     # byte stream as a VT100 emulator, so feeding it a byte-sliced fragment
@@ -6218,20 +6290,20 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_clean.add_argument(
         "--width",
         type=_positive_int,
-        default=120,
-        help="emulated terminal width in columns (default: 120)",
+        default=_RENDER_LOG_DEFAULT_WIDTH,
+        help=f"emulated terminal width in columns (default: {_RENDER_LOG_DEFAULT_WIDTH})",
     )
     sp_clean.add_argument(
         "--height",
         type=_positive_int,
-        default=60,
-        help="emulated viewport height in rows (default: 60)",
+        default=_RENDER_LOG_DEFAULT_HEIGHT,
+        help=f"emulated viewport height in rows (default: {_RENDER_LOG_DEFAULT_HEIGHT})",
     )
     sp_clean.add_argument(
         "--history",
         type=_nonnegative_int,
-        default=100000,
-        help="scrollback line budget for the emulator (default: 100000)",
+        default=_RENDER_LOG_DEFAULT_HISTORY,
+        help=f"scrollback line budget for the emulator (default: {_RENDER_LOG_DEFAULT_HISTORY})",
     )
     clean_slice = sp_clean.add_mutually_exclusive_group()
     clean_slice.add_argument(

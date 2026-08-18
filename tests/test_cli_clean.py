@@ -649,3 +649,194 @@ class TestCleanByteBudget:
         out = capsys.readouterr().out
         assert out == small
         assert agent_run._TRUNCATION_MARKER_STR not in out
+
+
+class TestCleanCache:
+    """cmd_clean reads log.clean when the cache is fresh and geometry matches.
+
+    Cache validity requires both a geometry match (width/height/history equal
+    the daemon's defaults) and a staleness check (log.clean mtime must not lag
+    log mtime by more than CLEAN_CACHE_MAX_STALENESS_SECONDS). The fallback
+    to raw rendering must be load-bearing: 32 of 301 run directories on macmini
+    have no log.clean (written only under --echo).
+    """
+
+    def _make_cached_run(
+        self,
+        runs_root,
+        name: str,
+        raw_bytes: bytes,
+        clean_text: str,
+        log_mtime: float,
+        clean_mtime: float,
+    ):
+        """Seed a run with both log and log.clean, with explicit mtimes."""
+        import os
+        log_d = _make_log_run(runs_root, name, raw_bytes)
+        log_path = log_d / "log"
+        clean_path = log_d / "log.clean"
+        clean_path.write_text(clean_text, encoding="utf-8")
+        os.utime(log_path, (log_mtime, log_mtime))
+        os.utime(clean_path, (clean_mtime, clean_mtime))
+        return log_d
+
+    def test_cache_hit_skips_render(self, isolated_runs_root, monkeypatch, capsys):
+        """When log.clean is present and fresh, _render_log is not called."""
+        now = 1_000_000.0
+        render_called = []
+        monkeypatch.setattr(
+            agent_run, "_render_log", lambda *_a, **_kw: render_called.append(1) or "wrong\n"
+        )
+        self._make_cached_run(
+            isolated_runs_root, "cache_hit",
+            raw_bytes=b"raw content\n",
+            clean_text="cached content\n",
+            log_mtime=now,
+            clean_mtime=now,  # zero gap: definitely fresh
+        )
+        args = argparse.Namespace(
+            name="cache_hit", out=None,
+            width=agent_run._RENDER_LOG_DEFAULT_WIDTH,
+            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
+            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
+            tail=None, head=None,
+        )
+        rc = agent_run.cmd_clean(args)
+        assert rc == 0
+        assert not render_called, "_render_log must not be called on a cache hit"
+        out = capsys.readouterr().out
+        assert "cached content" in out
+
+    def test_cache_absent_falls_back_to_render(self, isolated_runs_root, monkeypatch, capsys):
+        """When log.clean does not exist, cmd_clean renders from the raw log."""
+        rendered_text = "rendered from raw\n"
+        monkeypatch.setattr(agent_run, "_render_log", lambda *_a, **_kw: rendered_text)
+        _make_log_run(isolated_runs_root, "cache_absent", b"raw content\n")
+        # No log.clean written.
+        args = argparse.Namespace(
+            name="cache_absent", out=None,
+            width=agent_run._RENDER_LOG_DEFAULT_WIDTH,
+            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
+            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
+            tail=None, head=None,
+        )
+        rc = agent_run.cmd_clean(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "rendered from raw" in out
+
+    def test_cache_stale_falls_back_to_render(self, isolated_runs_root, monkeypatch, capsys):
+        """When log.clean mtime lags log mtime by more than the staleness
+        threshold, the cache is rejected and cmd_clean renders from raw.
+
+        This simulates the daemon freezing after the raw log crossed
+        ECHO_LOOP_MAX_RENDER_BYTES: log keeps growing (advancing its mtime)
+        while log.clean stops updating.
+        """
+        now = 1_000_000.0
+        stale_gap = agent_run.CLEAN_CACHE_MAX_STALENESS_SECONDS + 1.0
+        rendered_text = "freshly rendered\n"
+        monkeypatch.setattr(agent_run, "_render_log", lambda *_a, **_kw: rendered_text)
+        self._make_cached_run(
+            isolated_runs_root, "cache_stale",
+            raw_bytes=b"raw content\n",
+            clean_text="stale cached content\n",
+            log_mtime=now,
+            clean_mtime=now - stale_gap,  # log.clean is too far behind log
+        )
+        args = argparse.Namespace(
+            name="cache_stale", out=None,
+            width=agent_run._RENDER_LOG_DEFAULT_WIDTH,
+            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
+            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
+            tail=None, head=None,
+        )
+        rc = agent_run.cmd_clean(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "freshly rendered" in out
+        assert "stale cached content" not in out
+
+    def test_non_default_geometry_bypasses_cache(self, isolated_runs_root, monkeypatch, capsys):
+        """A non-default --width/--height/--history forces a re-render even when
+        a fresh log.clean exists, because the daemon always renders at the default
+        geometry and a different geometry produces different output."""
+        now = 1_000_000.0
+        rendered_text = "custom geometry render\n"
+        render_called = []
+
+        def fake_render(*_a, **_kw):
+            render_called.append(1)
+            return rendered_text
+
+        monkeypatch.setattr(agent_run, "_render_log", fake_render)
+        self._make_cached_run(
+            isolated_runs_root, "cache_geom",
+            raw_bytes=b"raw content\n",
+            clean_text="default geometry cached\n",
+            log_mtime=now,
+            clean_mtime=now,
+        )
+        args = argparse.Namespace(
+            name="cache_geom", out=None,
+            width=agent_run._RENDER_LOG_DEFAULT_WIDTH + 1,  # non-default
+            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
+            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
+            tail=None, head=None,
+        )
+        rc = agent_run.cmd_clean(args)
+        assert rc == 0
+        assert render_called, "_render_log must be called when geometry is non-default"
+        out = capsys.readouterr().out
+        assert "custom geometry render" in out
+        assert "default geometry cached" not in out
+
+    def test_fresh_cache_boundary(self, isolated_runs_root, monkeypatch, capsys):
+        """A gap exactly at CLEAN_CACHE_MAX_STALENESS_SECONDS is accepted;
+        one second beyond is rejected."""
+        now = 1_000_000.0
+        threshold = agent_run.CLEAN_CACHE_MAX_STALENESS_SECONDS
+
+        # At-threshold: cache is used.
+        render_called = []
+        monkeypatch.setattr(
+            agent_run, "_render_log", lambda *_a, **_kw: render_called.append(1) or "raw\n"
+        )
+        self._make_cached_run(
+            isolated_runs_root, "cache_at_threshold",
+            raw_bytes=b"raw\n",
+            clean_text="at threshold\n",
+            log_mtime=now,
+            clean_mtime=now - threshold,  # exactly at threshold: not stale
+        )
+        args = argparse.Namespace(
+            name="cache_at_threshold", out=None,
+            width=agent_run._RENDER_LOG_DEFAULT_WIDTH,
+            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
+            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
+            tail=None, head=None,
+        )
+        agent_run.cmd_clean(args)
+        assert not render_called, "cache exactly at threshold must be accepted"
+
+        # One second beyond threshold: cache is rejected.
+        render_called.clear()
+        monkeypatch.setattr(
+            agent_run, "_render_log", lambda *_a, **_kw: render_called.append(1) or "raw\n"
+        )
+        self._make_cached_run(
+            isolated_runs_root, "cache_beyond_threshold",
+            raw_bytes=b"raw\n",
+            clean_text="beyond threshold\n",
+            log_mtime=now,
+            clean_mtime=now - threshold - 1.0,  # one second over: stale
+        )
+        args2 = argparse.Namespace(
+            name="cache_beyond_threshold", out=None,
+            width=agent_run._RENDER_LOG_DEFAULT_WIDTH,
+            height=agent_run._RENDER_LOG_DEFAULT_HEIGHT,
+            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
+            tail=None, head=None,
+        )
+        agent_run.cmd_clean(args2)
+        assert render_called, "cache one second beyond threshold must be rejected"
