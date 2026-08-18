@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import builtins
 import io
+import json
 import os
 import signal
 import sys
@@ -487,6 +488,17 @@ class TestLogsFlags:
         out = stdout.buffer.getvalue()
         assert b"\x1b" not in out, "ANSI escape sequences must be stripped"
         assert b"visible" in out, "visible content must be preserved"
+    def test_osc_fragments_are_removed_from_logs_output(self, isolated_runs_root, monkeypatch):
+        log_content = b"\x1b]0;hidden\nmetadata\x07visible\n"
+        _make_log_run(isolated_runs_root, "oscfrag", log_content)
+        stdout = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout)
+        assert agent_run.cmd_logs(argparse.Namespace(name="oscfrag", tail=2, head=None)) == 0
+        out = stdout.buffer.getvalue()
+        assert b"hidden" not in out
+        assert b"metadata" not in out
+        assert b"visible" in out
+        assert b"hidden" not in agent_run._strip_ansi_bytes(b"\x1b]0;hidden")
 
 
 class TestCleanSlicing:
@@ -656,15 +668,23 @@ class TestCleanCache:
             clean_path = log_d / "log.clean"
             clean_path.write_text(clean_text, encoding="utf-8")
             os.utime(clean_path, (clean_mtime, clean_mtime))
+            log_stat = (log_d / "log").stat()
+            (log_d / "log.clean.meta.json").write_text(json.dumps({
+                "version": 1, "dev": log_stat.st_dev, "ino": log_stat.st_ino,
+                "offset": log_stat.st_size, "size": log_stat.st_size, "complete": True,
+                "width": agent_run._RENDER_LOG_DEFAULT_WIDTH,
+                "height": agent_run._RENDER_LOG_DEFAULT_HEIGHT,
+                "history": agent_run._RENDER_LOG_DEFAULT_HISTORY,
+                "updated_at": 0,
+            }))
         return log_d
 
     @pytest.mark.parametrize(
         "case, clean_text, gap, width_delta, expect_render",
         [
-            pytest.param("hit", "cached content\n", 0.0, 0, False, id="fresh-cache-reused"),
-            pytest.param("threshold", "cached content\n", None, 0, False, id="gap-at-threshold-reused"),
+            pytest.param("hit", "cached content\n", 0.0, 0, False, id="complete-cache-reused"),
             pytest.param("absent", None, 0.0, 0, True, id="no-cache-renders"),
-            pytest.param("stale", "cached content\n", None, 0, True, id="gap-past-threshold-renders"),
+            pytest.param("stale", "cached content\n", None, 0, False, id="mtime-does-not-control-cache"),
             pytest.param("geometry", "cached content\n", 0.0, 1, True, id="non-default-geometry-renders"),
         ],
     )

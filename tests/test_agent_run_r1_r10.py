@@ -1074,11 +1074,8 @@ def test_force_kill_reaps_wedged_echo_render_child(tmp_path, monkeypatch):
                 pass
 
 
-def test_echo_loop_skips_render_but_updates_mtime_over_size_cap(tmp_path, monkeypatch):
-    """Guards the per-tick delta cap: when a single tick's new bytes exceed
-    ECHO_LOOP_MAX_RENDER_BYTES, the loop writes a visible warning to log.clean
-    (not a silent skip) and advances the offset so the next tick sees only
-    genuinely new bytes."""
+def test_echo_loop_processes_capped_deltas_without_publishing_partial_output(tmp_path, monkeypatch):
+    """A cap limits one parse step while later ticks retain a complete prefix."""
     log_dir = tmp_path / "log"
     log_dir.mkdir()
     log = log_dir / "log"
@@ -1094,12 +1091,11 @@ def test_echo_loop_skips_render_but_updates_mtime_over_size_cap(tmp_path, monkey
     os.kill(pid, signal.SIGKILL)
     os.waitpid(pid, 0)
 
-    # The cap was exceeded, so log.clean must exist and contain a warning.
-    assert (log_dir / "log.clean").exists(), "log.clean was not created after cap exceeded"
-    content = (log_dir / "log.clean").read_text()
-    assert "ECHO_LOOP_MAX_RENDER_BYTES" in content or "skipped" in content.lower(), (
-        f"expected a warning in log.clean when cap exceeded; got: {content!r}"
-    )
+    assert (log_dir / "log.clean").exists()
+    assert (log_dir / "log.clean").read_text() == agent_run._render_log(log.read_bytes())
+    metadata = json.loads((log_dir / "log.clean.meta.json").read_text())
+    assert metadata["complete"] is True
+    assert metadata["offset"] == log.stat().st_size
 
 
 # ---------------------------------------------------------------------------

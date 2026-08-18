@@ -3,6 +3,7 @@ renderer used by `agent-run clean` and `--echo`)."""
 from __future__ import annotations
 
 import builtins
+import json
 import re
 import time
 from pathlib import Path
@@ -169,52 +170,38 @@ class TestRenderLogSizing:
 
 
 # ---------------------------------------------------------------------------
-# Incremental pyte feed — _serialize_screen produces the same output as a
-# single whole-file _render_log call when fed the same bytes in chunks.
-# Uses the real moon fixture, which contains Ink TUI redraws, cursor motions,
-# OSC title sequences, and escape sequences that span natural chunk boundaries.
+# Incremental pyte feed — every partition must produce the same transcript as
+# a whole-file feed under the renderer's shared screen semantics.
 # ---------------------------------------------------------------------------
 
 class TestIncrementalFeed:
-    def test_chunked_feed_byte_identical_to_whole_file(self, moon_log_bytes):
-        """Feeding the real TUI fixture in 64 KiB chunks into a persistent
-        pyte screen produces output byte-identical to a single whole-file
-        _render_log call.  Confirms that ByteStream correctly buffers partial
-        escape sequences across chunk boundaries."""
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b"A\x01BBBB\r\n",
+            "A\ufe0fBBBB\r\n".encode(),
+            "A\u200bBBBB\r\n".encode(),
+            b"A\x85BBBB\r\n",
+            b"A\x1b[31mB\x1b[0m\r\n",
+        ],
+    )
+    def test_every_split_matches_whole_render(self, raw):
         import pyte
 
-        whole = _render_log(moon_log_bytes)
-
-        chunk_size = 64 * 1024
-        screen = pyte.HistoryScreen(
-            agent_run._RENDER_LOG_DEFAULT_WIDTH,
-            agent_run._RENDER_LOG_DEFAULT_HEIGHT,
-            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
-            ratio=0.5,
-        )
-        stream = pyte.ByteStream(screen)
-        for i in range(0, len(moon_log_bytes), chunk_size):
-            agent_run._feed_pyte(stream, moon_log_bytes[i : i + chunk_size])
-
-        chunked = _serialize_screen(screen)
-        assert chunked == whole, (
-            f"chunked output ({len(chunked)} bytes) differs from whole-file "
-            f"output ({len(whole)} bytes)"
-        )
+        whole = _render_log(raw)
+        for cut in range(len(raw) + 1):
+            screen = agent_run._new_pyte_screen(pyte, 120, 60, 100000)
+            stream = pyte.ByteStream(screen)
+            agent_run._feed_pyte(stream, raw[:cut])
+            agent_run._feed_pyte(stream, raw[cut:])
+            assert _serialize_screen(screen) == whole, (raw, cut)
 
     def test_serialize_screen_matches_render_log(self, moon_log_bytes):
-        """_serialize_screen on a freshly-fed screen equals _render_log output."""
         import pyte
 
-        screen = pyte.HistoryScreen(
-            agent_run._RENDER_LOG_DEFAULT_WIDTH,
-            agent_run._RENDER_LOG_DEFAULT_HEIGHT,
-            history=agent_run._RENDER_LOG_DEFAULT_HISTORY,
-            ratio=0.5,
-        )
+        screen = agent_run._new_pyte_screen(pyte, 120, 60, 100000)
         stream = pyte.ByteStream(screen)
         agent_run._feed_pyte(stream, moon_log_bytes)
-
         assert _serialize_screen(screen) == _render_log(moon_log_bytes)
 
 
@@ -269,7 +256,7 @@ class TestEchoLoop:
         original_replace = Path.replace
 
         def track_replace(self, target):
-            if self.name == "log.clean.tmp":
+            if self.name.startswith(".log.clean.") and self.name.endswith(".clean"):
                 write_count[0] += 1
             return original_replace(self, target)
 
@@ -292,7 +279,7 @@ class TestEchoLoop:
         original_replace = Path.replace
 
         def track_replace(self, target):
-            if self.name == "log.clean.tmp":
+            if self.name.startswith(".log.clean.") and self.name.endswith(".clean"):
                 write_count[0] += 1
             return original_replace(self, target)
 
@@ -389,34 +376,87 @@ class TestEchoLoop:
         # Second attempt succeeded — log.clean must contain the content.
         assert "data" in (log_dir / "log.clean").read_text()
 
-    def test_per_tick_delta_cap_writes_warning(self, tmp_path, monkeypatch):
-        """When the new-bytes delta in one tick exceeds ECHO_LOOP_MAX_RENDER_BYTES,
-        log.clean receives a warning string rather than a silent skip."""
+    def test_failed_feed_and_serialization_rebuild_from_zero(self, tmp_path, monkeypatch):
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        raw = b"abcdef\r\n"
+        (log_dir / "log").write_bytes(raw)
+        original_feed = agent_run._feed_pyte
+        calls = [0]
+
+        def half_feed(stream, chunk):
+            calls[0] += 1
+            if calls[0] == 1:
+                original_feed(stream, chunk[:3])
+                raise ValueError("after prefix")
+            return original_feed(stream, chunk)
+
+        monkeypatch.setattr(agent_run, "_feed_pyte", half_feed)
+        _run_echo_loop_ticks(log_dir, ticks=4, monkeypatch=monkeypatch)
+        assert (log_dir / "log.clean").read_text() == _render_log(raw)
+
+    def test_failed_serialization_rebuilds_from_zero(self, tmp_path, monkeypatch):
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        raw = b"serialize\r\n"
+        (log_dir / "log").write_bytes(raw)
+        original_serialize = agent_run._serialize_screen
+        calls = [0]
+
+        def flaky_serialize(screen):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise ValueError("after feed")
+            return original_serialize(screen)
+
+        monkeypatch.setattr(agent_run, "_serialize_screen", flaky_serialize)
+        _run_echo_loop_ticks(log_dir, ticks=4, monkeypatch=monkeypatch)
+        assert (log_dir / "log.clean").read_text() == _render_log(raw)
+
+    def test_failed_publication_retries_on_quiet_log(self, tmp_path, monkeypatch):
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(b"quiet\r\n")
+        original_replace = Path.replace
+        calls = [0]
+
+        def flaky_replace(self, target):
+            if self.name.startswith(".log.clean.") and self.name.endswith(".clean"):
+                calls[0] += 1
+                if calls[0] == 1:
+                    raise OSError("rename failed")
+            return original_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", flaky_replace)
+        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch)
+        assert calls[0] >= 2
+        assert "quiet" in (log_dir / "log.clean").read_text()
+
+    def test_cap_then_small_append_preserves_continuous_prefix(self, tmp_path, monkeypatch):
         log_dir = tmp_path / "run"
         log_dir.mkdir()
         log_file = log_dir / "log"
         log_file.write_bytes(b"")
-
-        # Override the cap to a tiny value so the test does not need a 16 MiB file.
         monkeypatch.setattr(agent_run, "ECHO_LOOP_MAX_RENDER_BYTES", 5)
 
         def grow_on_tick(tick):
             if tick == 0:
-                log_file.write_bytes(b"A" * 100)  # 100 > 5-byte cap
+                log_file.write_bytes(b"A" * 100)
+            elif tick == 1:
+                with log_file.open("ab") as f:
+                    f.write(b"NEW\r\n")
 
-        _run_echo_loop_ticks(log_dir, ticks=2, monkeypatch=monkeypatch,
-                             extra_actions=grow_on_tick)
-
-        content = (log_dir / "log.clean").read_text()
-        assert "ECHO_LOOP_MAX_RENDER_BYTES" in content or "skipped" in content.lower(), (
-            f"expected a cap-exceeded warning in log.clean; got: {content!r}"
-        )
+        _run_echo_loop_ticks(log_dir, ticks=22, monkeypatch=monkeypatch, extra_actions=grow_on_tick)
+        assert (log_dir / "log.clean").read_text() == _render_log(log_file.read_bytes())
+        metadata = json.loads((log_dir / "log.clean.meta.json").read_text())
+        assert metadata["complete"] is True
+        assert metadata["offset"] == log_file.stat().st_size
 
     def test_echo_loop_max_render_bytes_constant_value(self):
         """Pin the cap value; any change must be a deliberate, test-breaking decision."""
         assert ECHO_LOOP_MAX_RENDER_BYTES == 16 * 1024 * 1024
 
-    def test_missing_pyte_writes_diagnostic_stub(self, tmp_path, monkeypatch):
+    def test_missing_pyte_does_not_publish_unverifiable_transcript(self, tmp_path, monkeypatch):
         log_dir = tmp_path / "run"
         log_dir.mkdir()
         (log_dir / "log").write_bytes(b"complete\r\n")
@@ -428,12 +468,8 @@ class TestEchoLoop:
             return real_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", no_pyte)
-
         agent_run._echo_loop(log_dir, 1.0)
-
-        stub = (log_dir / "log.clean").read_text()
-        assert "--echo requested" in stub
-        assert "pyte" in stub
+        assert not (log_dir / "log.clean").exists()
 
 
 # ---------------------------------------------------------------------------

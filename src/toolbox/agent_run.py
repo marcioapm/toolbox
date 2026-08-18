@@ -258,7 +258,9 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 import platform
+from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
@@ -273,11 +275,7 @@ MAX_PTY_INPUT_BUFFER = 1024 * 1024
 MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
 FINAL_RENDER_TIMEOUT_SECONDS = 10.0
 FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
-# Per-tick new-bytes cap for the echo daemon's incremental pyte feed.  Each
-# tick costs O(new bytes), so this bounds the parse cost per interval regardless
-# of total log size.  Exceeding this limit produces a visible warning in
-# log.clean rather than silently skipping — a silent skip was the failure mode
-# of the old whole-file design once the log crossed the (same-valued) size gate.
+# Per-tick new-bytes cap for the echo daemon's incremental pyte feed.
 ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
 # Per-line and total byte caps for `logs` and `clean` output. A single TUI line
 # can be megabytes long (one \n per session, many \r redraw frames), so a line
@@ -286,15 +284,13 @@ ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
 # LLM; anything above 32 KiB total is discarded before use.
 LOGS_MAX_LINE_BYTES = 8 * 1024
 LOGS_MAX_TOTAL_BYTES = 32 * 1024
-# Geometry the --echo daemon renders log.clean at, via _render_log_to_clean
-# calling _render_log with no arguments. cmd_clean reuses the cache only when
-# the caller's geometry matches, so these must equal _render_log's defaults.
+# Geometry used by the daemon cache and by clean's default rendering. Keeping
+# scrollback bounded limits the resident cost of a long-lived HistoryScreen.
 _RENDER_LOG_DEFAULT_WIDTH = 120
 _RENDER_LOG_DEFAULT_HEIGHT = 60
-_RENDER_LOG_DEFAULT_HISTORY = 100000
-# Maximum seconds log.clean may trail log by mtime and still be reused. The
-# daemon re-renders every echo_interval seconds (default 2.0), so a live cache
-# trails by ~2 s; 30 s allows 15x headroom for slow renders and scheduler jitter.
+_RENDER_LOG_DEFAULT_HISTORY = 2048
+# Cache metadata is the completeness contract; this remains only for callers
+# that retain compatibility with old caches, which are otherwise rejected.
 CLEAN_CACHE_MAX_STALENESS_SECONDS = 30.0
 
 # Statuses that are conclusively terminal: the run will never transition
@@ -3145,7 +3141,9 @@ def _slice_str_lines(text: str, n: int, *, from_end: bool) -> str:
 
 # Terminal-control sequences are invisible in a terminal but consume tokens and
 # corrupt matching for the LLM consumers that read `logs` output.
-_LOGS_OSC_RE = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_LOGS_OSC_RE = re.compile(rb"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
+_LOGS_PARTIAL_OSC_HEAD_RE = re.compile(rb"\x1b\].*\Z", re.DOTALL)
+_LOGS_PARTIAL_OSC_TAIL_RE = re.compile(rb"\A[^\x07]*(?:\x07|\x1b\\)", re.DOTALL)
 _LOGS_CSI_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]")
 _LOGS_ESC_RE = re.compile(rb"\x1b.", re.DOTALL)
 
@@ -3153,6 +3151,9 @@ _LOGS_ESC_RE = re.compile(rb"\x1b.", re.DOTALL)
 def _strip_ansi_bytes(data: bytes) -> bytes:
     """Remove ANSI CSI, OSC, and bare ESC sequences from a byte string."""
     data = _LOGS_OSC_RE.sub(b"", data)
+    data = _LOGS_PARTIAL_OSC_HEAD_RE.sub(b"", data)
+    if b"\x1b]" not in data:
+        data = _LOGS_PARTIAL_OSC_TAIL_RE.sub(b"", data)
     data = _LOGS_CSI_RE.sub(b"", data)
     return _LOGS_ESC_RE.sub(b"", data)
 
@@ -3386,6 +3387,72 @@ _RENDER_DEPENDENCY_MESSAGE = (
 )
 
 
+def _new_pyte_screen(pyte, width: int, height: int, history: int):
+    """Create a HistoryScreen that ignores unsupported zero-width controls.
+
+    Pyte 0.8 stops an entire plain-text draw batch at those characters.  Skipping
+    each unsupported character keeps replay independent of feed boundaries.
+    """
+    from pyte import modes as mo
+
+    class SafeHistoryScreen(pyte.HistoryScreen):
+        def draw(self, data: str) -> None:
+            data = data.translate(self.g1_charset if self.charset else self.g0_charset)
+            for char in data:
+                char_width = wcwidth(char)
+                if self.cursor.x == self.columns:
+                    if mo.DECAWM in self.mode:
+                        self.dirty.add(self.cursor.y)
+                        self.carriage_return()
+                        self.linefeed()
+                    elif char_width > 0:
+                        self.cursor.x -= char_width
+                if mo.IRM in self.mode and char_width > 0:
+                    self.insert_characters(char_width)
+                line = self.buffer[self.cursor.y]
+                if char_width == 1:
+                    line[self.cursor.x] = self.cursor.attrs._replace(data=char)
+                elif char_width == 2:
+                    line[self.cursor.x] = self.cursor.attrs._replace(data=char)
+                    if self.cursor.x + 1 < self.columns:
+                        line[self.cursor.x + 1] = self.cursor.attrs._replace(data="")
+                elif char_width == 0 and unicodedata.combining(char):
+                    if self.cursor.x:
+                        last = line[self.cursor.x - 1]
+                        line[self.cursor.x - 1] = last._replace(
+                            data=unicodedata.normalize("NFC", last.data + char)
+                        )
+                    elif self.cursor.y:
+                        last = self.buffer[self.cursor.y - 1][self.columns - 1]
+                        self.buffer[self.cursor.y - 1][self.columns - 1] = last._replace(
+                            data=unicodedata.normalize("NFC", last.data + char)
+                        )
+                elif char_width < 0 or char_width == 0:
+                    continue
+                if char_width > 0:
+                    self.cursor.x = min(self.cursor.x + char_width, self.columns)
+            self.dirty.add(self.cursor.y)
+
+    return SafeHistoryScreen(width, height, history=history, ratio=0.5)
+
+
+def _serialize_screen(screen) -> str:
+    """Serialize a pyte HistoryScreen to the transcript cache format."""
+    rows: List[str] = []
+    for entry in screen.history.top:
+        text = "".join(entry[col].data for col in sorted(entry)) if entry else ""
+        rows.append(text.rstrip())
+    for row in screen.display:
+        rows.append(row.rstrip())
+    deduped: List[str] = []
+    for line in rows:
+        if not deduped or deduped[-1] != line:
+            deduped.append(line)
+    while deduped and not deduped[-1]:
+        deduped.pop()
+    return "\n".join(deduped) + "\n"
+
+
 def _render_log(
     raw: bytes,
     width: int = _RENDER_LOG_DEFAULT_WIDTH,
@@ -3410,53 +3477,54 @@ def _render_log(
     except ImportError as exc:
         raise RenderDependencyError(_RENDER_DEPENDENCY_MESSAGE) from exc
 
-    screen = pyte.HistoryScreen(width, height, history=history, ratio=0.5)
+    screen = _new_pyte_screen(pyte, width, height, history)
     stream = pyte.ByteStream(screen)
     try:
         _feed_pyte(stream, raw)
     except Exception:
         return _strip_ansi_fallback(raw)
 
-    rows: List[str] = []
-    # Past history rows that have scrolled off the top.
-    for entry in screen.history.top:
-        text = "".join(entry[col].data for col in sorted(entry)) if entry else ""
-        rows.append(text.rstrip())
-    # Currently-visible viewport.
-    for row in screen.display:
-        rows.append(row.rstrip())
-
-    # Collapse adjacent duplicate lines (Ink redraws the same content many times).
-    deduped: List[str] = []
-    for line in rows:
-        if not deduped or deduped[-1] != line:
-            deduped.append(line)
-    # Trim trailing empties.
-    while deduped and not deduped[-1]:
-        deduped.pop()
-    return "\n".join(deduped) + "\n"
+    return _serialize_screen(screen)
 
 
-def _serialize_screen(screen) -> str:
-    """Walk a pyte HistoryScreen and return the same text _render_log would.
+def _cache_metadata_path(clean: Path) -> Path:
+    return clean.with_name(f"{clean.name}.meta.json")
 
-    Serialization is O(lines rendered so far): it walks history.top + display
-    regardless of how many new bytes were parsed in the latest tick.  Callers
-    must not describe this step as incremental.
-    """
-    rows: List[str] = []
-    for entry in screen.history.top:
-        text = "".join(entry[col].data for col in sorted(entry)) if entry else ""
-        rows.append(text.rstrip())
-    for row in screen.display:
-        rows.append(row.rstrip())
-    deduped: List[str] = []
-    for line in rows:
-        if not deduped or deduped[-1] != line:
-            deduped.append(line)
-    while deduped and not deduped[-1]:
-        deduped.pop()
-    return "\n".join(deduped) + "\n"
+
+def _atomic_write_text(path: Path, text: str, *, suffix: str) -> None:
+    """Atomically replace a text file with a process-unique temporary path."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.{suffix}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _publish_clean(clean: Path, rendered: str, *, stat_result, offset: int, complete: bool) -> None:
+    """Publish transcript then metadata identifying the raw prefix it covers."""
+    _atomic_write_text(clean, rendered, suffix="clean")
+    _publish_clean_metadata(clean, stat_result=stat_result, offset=offset, complete=complete)
+
+
+def _publish_clean_metadata(clean: Path, *, stat_result, offset: int, complete: bool) -> None:
+    """Publish cache health metadata without treating diagnostic state as text."""
+    metadata = {
+        "version": 1,
+        "dev": stat_result.st_dev,
+        "ino": stat_result.st_ino,
+        "offset": offset,
+        "size": stat_result.st_size,
+        "complete": complete,
+        "width": _RENDER_LOG_DEFAULT_WIDTH,
+        "height": _RENDER_LOG_DEFAULT_HEIGHT,
+        "history": _RENDER_LOG_DEFAULT_HISTORY,
+        "updated_at": time.time(),
+    }
+    _atomic_write_text(_cache_metadata_path(clean), json.dumps(metadata, sort_keys=True), suffix="meta")
 
 
 def _render_log_to_clean(log_dir: Path) -> None:
@@ -3465,9 +3533,11 @@ def _render_log_to_clean(log_dir: Path) -> None:
     clean = log_dir / "log.clean"
     raw = log.read_bytes()
     rendered = _render_log(raw)
-    tmp = clean.with_suffix(".clean.tmp")
-    tmp.write_text(rendered, encoding="utf-8")
-    tmp.replace(clean)
+    with _watch_open_validated_log(log) as f:
+        if f is None:
+            raise OSError("log is not a regular file")
+        stat_result = os.fstat(f.fileno())
+    _publish_clean(clean, rendered, stat_result=stat_result, offset=stat_result.st_size, complete=True)
 
 
 def _bounded_final_render(
@@ -3546,142 +3616,116 @@ def _bounded_final_render(
 
 
 def _echo_loop(log_dir: "Path", interval: float) -> None:
-    """Periodically parse new log bytes and write log_dir/log.clean.
+    """Incrementally render a verified raw-log prefix into ``log.clean``.
 
-    Runs in a detached child for the lifetime of the agent.  The parent's
-    signal handler kills us on shutdown so we don't outlive the run.
-
-    Parse strategy: one pyte HistoryScreen/ByteStream pair is kept alive for
-    the daemon's lifetime.  Each tick feeds only the bytes appended since the
-    previous tick (offset arithmetic on st_size), so parse cost is O(new bytes)
-    rather than O(total log size).
-
-    Serialize strategy: _serialize_screen walks history.top + display to
-    produce the full rendered text, regardless of how many new bytes were
-    parsed.  Serialization is O(lines rendered so far), not O(new bytes).  The
-    write is skipped entirely when the rendered text matches the last write,
-    saving an atomic write+rename on quiet ticks.
-
-    Reset triggers: if st_size < offset (truncation) or st_ino/st_dev changed
-    (file replacement), the screen/stream and offset are discarded and the
-    entire new file is re-parsed from byte zero.
-
-    The per-tick delta is capped at ECHO_LOOP_MAX_RENDER_BYTES.  Exceeding
-    the cap produces a visible warning in log.clean rather than a silent skip
-    (silent freezing was the failure mode of the previous design).
+    A successful metadata publication identifies the exact inode and byte prefix
+    represented by the cache. Parse or publication failures leave that contract
+    unpublished and are retried without retaining potentially mutated pyte state.
     """
     log = log_dir / "log"
     clean = log_dir / "log.clean"
-
     try:
-        import pyte  # noqa: F401  (just probe; real import is below)
+        import pyte  # type: ignore
     except ImportError:
-        clean.write_text(
-            "agent-run: --echo requested but `pyte` is not installed.\n"
-            "Install with: pipx inject mmartins-toolbox pyte\n"
-        )
         return
 
-    import pyte as _pyte  # type: ignore
-
-    def _new_screen():
-        scr = _pyte.HistoryScreen(
-            _RENDER_LOG_DEFAULT_WIDTH,
-            _RENDER_LOG_DEFAULT_HEIGHT,
-            history=_RENDER_LOG_DEFAULT_HISTORY,
-            ratio=0.5,
+    def new_state():
+        screen = _new_pyte_screen(
+            pyte, _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT,
+            _RENDER_LOG_DEFAULT_HISTORY,
         )
-        return scr, _pyte.ByteStream(scr)
+        return screen, pyte.ByteStream(screen)
 
-    screen, stream = _new_screen()
-    offset: int = 0          # bytes already fed into screen/stream
-    log_ino: int = -1        # inode of the file at offset
-    log_dev: int = -1        # device of the file at offset
-    last_rendered: str = ""  # text written on the last successful tick
+    screen, stream = new_state()
+    offset = 0
+    log_ino = -1
+    log_dev = -1
+    pending: Optional[tuple[Optional[str], Any, int]] = None
+    last_rendered: Optional[str] = None
+    failures = 0
+    blocked: Optional[tuple[int, int, int]] = None
 
     while True:
         try:
-            log_stat = log.stat()
-        except FileNotFoundError:
-            time.sleep(interval)
-            continue
-
-        cur_size = log_stat.st_size
-        cur_ino = log_stat.st_ino
-        cur_dev = log_stat.st_dev
-
-        # Reset on truncation or file replacement.
-        if cur_size < offset or (offset > 0 and (cur_ino != log_ino or cur_dev != log_dev)):
-            screen, stream = _new_screen()
-            offset = 0
-            last_rendered = ""
-
-        if cur_size == offset:
-            # Nothing new; no parse, no serialize, no write.
-            time.sleep(interval)
-            continue
-
-        # New bytes available — cap the per-tick delta.
-        delta = cur_size - offset
-        if delta > ECHO_LOOP_MAX_RENDER_BYTES:
-            warning = (
-                f"agent-run: --echo skipped {delta} new bytes this tick "
-                f"(ECHO_LOOP_MAX_RENDER_BYTES={ECHO_LOOP_MAX_RENDER_BYTES}); "
-                "log.clean may be stale\n"
-            )
-            try:
-                clean.write_text(warning)
-            except OSError:
-                pass
-            # The skipped bytes are not fed into screen/stream, so its state
-            # reflects only a prefix of the log at cur_size.  Discard it so the
-            # next tick does not produce output from an inconsistent screen.
-            screen, stream = _new_screen()
-            offset = cur_size
-            log_ino = cur_ino
-            log_dev = cur_dev
-            last_rendered = ""
-            time.sleep(interval)
-            continue
-
-        try:
-            with log.open("rb") as f:
-                f.seek(offset)
-                chunk = f.read(delta)
+            with _watch_open_validated_log(log) as f:
+                if f is None:
+                    raise OSError("cannot open regular log")
+                current = os.fstat(f.fileno())
+                if (
+                    current.st_size < offset
+                    or (offset and (current.st_ino, current.st_dev) != (log_ino, log_dev))
+                ):
+                    screen, stream = new_state()
+                    offset = 0
+                    log_ino = current.st_ino
+                    log_dev = current.st_dev
+                    pending = None
+                    failures = 0
+                if current.st_size > offset:
+                    read_size = min(current.st_size - offset, ECHO_LOOP_MAX_RENDER_BYTES)
+                    f.seek(offset)
+                    chunk = f.read(read_size)
+                    if len(chunk) != read_size:
+                        raise OSError("short read from log")
+                else:
+                    chunk = b""
         except OSError:
             time.sleep(interval)
             continue
 
-        if len(chunk) != delta:
-            # The file shrank between stat and read — treat as truncation.
-            screen, stream = _new_screen()
-            offset = 0
-            last_rendered = ""
-            time.sleep(interval)
-            continue
+        if chunk:
+            if blocked == (current.st_dev, current.st_ino, offset):
+                # A deterministic parser failure cannot make progress through
+                # this prefix. Metadata remains incomplete, so readers rerender.
+                time.sleep(interval)
+                continue
+            try:
+                _feed_pyte(stream, chunk)
+                rendered = _serialize_screen(screen)
+            except Exception:
+                # Feed and serialization can mutate pyte before raising. Restart
+                # from byte zero so no later publication uses partial state.
+                screen, stream = new_state()
+                offset = 0
+                log_ino = -1
+                log_dev = -1
+                pending = None
+                failures += 1
+                if failures >= 2:
+                    blocked = (current.st_dev, current.st_ino, offset)
+                    try:
+                        _publish_clean_metadata(
+                            clean, stat_result=current, offset=offset, complete=False,
+                        )
+                    except OSError:
+                        pass
+                time.sleep(interval)
+                continue
+            offset += len(chunk)
+            log_ino = current.st_ino
+            log_dev = current.st_dev
+            pending = (rendered if rendered != last_rendered else None, current, offset)
+            last_rendered = rendered
+            failures = 0
+            blocked = None
 
-        render_ok = False
-        try:
-            _feed_pyte(stream, chunk)
-            rendered = _serialize_screen(screen)
-            render_ok = True
-        except Exception:
-            # Transient or pathological pyte failure; retry next tick.
-            pass
-
-        if render_ok:
-            offset = cur_size
-            log_ino = cur_ino
-            log_dev = cur_dev
-            if rendered != last_rendered:
-                tmp = clean.with_suffix(".clean.tmp")
-                try:
-                    tmp.write_text(rendered, encoding="utf-8")
-                    tmp.replace(clean)
-                    last_rendered = rendered
-                except OSError:
-                    pass
-
+        if pending is not None:
+            rendered, source_stat, published_offset = pending
+            try:
+                if rendered is not None:
+                    _publish_clean(
+                        clean, rendered, stat_result=source_stat,
+                        offset=published_offset, complete=(published_offset == source_stat.st_size),
+                    )
+                else:
+                    _publish_clean_metadata(
+                        clean, stat_result=source_stat,
+                        offset=published_offset, complete=(published_offset == source_stat.st_size),
+                    )
+            except OSError:
+                time.sleep(interval)
+                continue
+            pending = None
         time.sleep(interval)
 
 
@@ -3691,43 +3735,45 @@ def _read_clean_cache(
     height: int,
     history: int,
 ) -> "Optional[str]":
-    """Return the text of ``log.clean`` if it is fresh and geometry-compatible.
-
-    Returns ``None``, meaning the caller must render from the raw log, when the
-    requested geometry is not the daemon's default, when ``log.clean`` is absent
-    or not a regular file, when its mtime lags ``log``'s by more than
-    CLEAN_CACHE_MAX_STALENESS_SECONDS, or on any OSError.
-
-    The staleness bound is what distinguishes a live cache from a stale one;
-    CLEAN_CACHE_MAX_STALENESS_SECONDS is wide enough to tolerate normal
-    scheduler jitter but narrow enough to detect a daemon that has stopped
-    updating log.clean.
-
-    Opened via ``_watch_open_validated_log`` for the same FIFO/symlink defence
-    as the raw log; mtime comes from fstat on the open fd, closing the
-    stat-then-read race.
-    """
+    """Return a compatible cache only when metadata proves it covers the raw log."""
     if (
         width != _RENDER_LOG_DEFAULT_WIDTH
         or height != _RENDER_LOG_DEFAULT_HEIGHT
         or history != _RENDER_LOG_DEFAULT_HISTORY
     ):
         return None
-    log_clean = log_path.parent / "log.clean"
-    try:
-        log_mtime = log_path.stat().st_mtime
-    except OSError:
-        return None
-    with _watch_open_validated_log(log_clean) as f:
-        if f is None:
+    with _watch_open_validated_log(log_path) as log_file:
+        if log_file is None:
             return None
         try:
-            clean_mtime = os.fstat(f.fileno()).st_mtime
-            if log_mtime - clean_mtime > CLEAN_CACHE_MAX_STALENESS_SECONDS:
-                return None
-            return f.read().decode("utf-8", errors="replace")
+            raw_stat = os.fstat(log_file.fileno())
         except OSError:
             return None
+    clean = log_path.parent / "log.clean"
+    metadata_path = _cache_metadata_path(clean)
+    try:
+        with _watch_open_validated_log(metadata_path) as metadata_file:
+            if metadata_file is None:
+                return None
+            metadata = json.loads(metadata_file.read().decode("utf-8"))
+        if not (
+            metadata.get("version") == 1
+            and metadata.get("complete") is True
+            and metadata.get("dev") == raw_stat.st_dev
+            and metadata.get("ino") == raw_stat.st_ino
+            and metadata.get("offset") == raw_stat.st_size
+            and metadata.get("size") == raw_stat.st_size
+            and metadata.get("width") == width
+            and metadata.get("height") == height
+            and metadata.get("history") == history
+        ):
+            return None
+        with _watch_open_validated_log(clean) as clean_file:
+            if clean_file is None:
+                return None
+            return clean_file.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
