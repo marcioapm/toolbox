@@ -2,7 +2,7 @@
 
 - `_worktree_classify`: linked worktree, main worktree, bare repo, non-git
   directory, missing path, worktree subdirectory, git failures.
-- `agent-run du --worktrees`: separate WORKTREE column, realpath
+- `agent-run du`: separate WORKTREE column, realpath
   deduplication, TOTAL reconciliation, --json shape, read-only guarantee.
 - `agent-run reap --include-worktrees`: age threshold, dirty/unpushed
   refusals, shared-cwd single removal, symlink and live-run guards,
@@ -106,7 +106,7 @@ def _make_state_run(
 
 
 def _du_args(**kw) -> argparse.Namespace:
-    base = dict(by_run=False, top=None, bytes=True, json=False, worktrees=True)
+    base = dict(by_run=False, top=None, bytes=True, json=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -264,23 +264,17 @@ class TestWorktreeResolveCwd:
 
 
 # ---------------------------------------------------------------------------
-# du --worktrees
+# du worktree accounting
 # ---------------------------------------------------------------------------
 
 class TestDuWorktrees:
-    def test_off_by_default_no_column_no_bytes(
-        self, isolated_runs_root, isolated_log_root, git_root, capsys
-    ):
-        repo = _make_repo(git_root)
-        wt = _add_worktree(repo, git_root / "wt", "feature")
-        (wt / "big").write_bytes(b"x" * 5000)
-        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt)
-
-        agent_run.cmd_du(_du_args(worktrees=False))
-
-        out = capsys.readouterr().out
-        assert "WORKTREE" not in out
-        assert "5000" not in out
+    def test_worktree_column_needs_no_flag(self):
+        """Worktree accounting is unconditional: `du` takes no flag for it,
+        and an unknown --worktrees is a parse error."""
+        parsed = agent_run._build_parser().parse_args(["du"])
+        assert not hasattr(parsed, "worktrees")
+        with pytest.raises(SystemExit):
+            agent_run._build_parser().parse_args(["du", "--worktrees"])
 
     def test_linked_worktree_counted_in_own_column(
         self, isolated_runs_root, isolated_log_root, git_root, capsys
@@ -402,7 +396,6 @@ class TestDuWorktrees:
         agent_run.cmd_du(_du_args(by_run=True, bytes=False, json=True))
 
         payload = json.loads(capsys.readouterr().out)
-        assert payload["worktrees_included"] is True
         assert "charged once" in payload["worktree_attribution"]
         by_name = {r["name"]: r for r in payload["runs"]}
         assert by_name["r1"]["worktree_bytes"] == size
@@ -413,19 +406,19 @@ class TestDuWorktrees:
             for k in ("state_bytes", "log_bytes", "scratch_bytes", "worktree_bytes")
         )
 
-    def test_json_omits_worktree_key_when_disabled(
+    def test_json_reports_zero_worktree_bytes_without_any_worktree(
         self, isolated_runs_root, isolated_log_root, capsys
     ):
         _make_state_run(isolated_runs_root, isolated_log_root, "r1", log_bytes=5)
 
-        agent_run.cmd_du(_du_args(by_run=True, bytes=False, json=True, worktrees=False))
+        agent_run.cmd_du(_du_args(by_run=True, bytes=False, json=True))
 
         payload = json.loads(capsys.readouterr().out)
-        assert payload["worktrees_included"] is False
-        assert "worktree_bytes" not in payload["total"]
-        assert "worktree_attribution" not in payload
+        assert payload["total"]["worktree_bytes"] == 0
+        assert payload["runs"][0]["worktree_bytes"] == 0
+        assert "charged once" in payload["worktree_attribution"]
 
-    def test_du_worktrees_never_mutates_the_worktree(
+    def test_du_never_mutates_the_worktree(
         self, isolated_runs_root, isolated_log_root, git_root, capsys
     ):
         repo = _make_repo(git_root)

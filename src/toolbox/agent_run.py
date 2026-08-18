@@ -5793,8 +5793,7 @@ class _DuRow(NamedTuple):
     """One accounting row: a single run (``--by-run``) or an aggregated
     group. ``count`` is the number of runs folded into the row (1 for a
     per-run row). Log bytes exclude the ``tmp/`` scratch subtree — total is
-    state + log + scratch + worktree, so nothing is double-counted.
-    ``worktree_bytes`` is 0 unless ``du --worktrees`` was requested."""
+    state + log + scratch + worktree, so nothing is double-counted."""
 
     key: str  # run name (--by-run) or group/status label (rollup)
     count: int
@@ -5834,7 +5833,7 @@ def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
     return out
 
 
-def _du_collect_rows(*, include_worktrees: bool = False) -> List[_DuRow]:
+def _du_collect_rows() -> List[_DuRow]:
     """One row per run, read-only: no locks, no heal, no prune, no mutation.
 
     Sizes are apparent size (sum of ``st_size``), matching ``_dir_size_bytes``
@@ -5842,10 +5841,9 @@ def _du_collect_rows(*, include_worktrees: bool = False) -> List[_DuRow]:
     line) — labelled explicitly in ``cmd_du``'s own header so the number's
     meaning isn't ambiguous with on-disk block usage.
 
-    ``include_worktrees`` additionally sizes each run's recorded launch
-    ``cwd`` when it is a linked git worktree; it is off by default because
-    those trees are typically far larger than STATE_ROOT and LOG_ROOT
-    combined and walking them dominates the command's runtime.
+    Each run's recorded launch ``cwd`` is sized too when it is a linked git
+    worktree; those trees are typically far larger than STATE_ROOT and
+    LOG_ROOT combined and walking them dominates the command's runtime.
     """
     state_names: set = set()
     if STATE_ROOT.is_dir():
@@ -5873,7 +5871,7 @@ def _du_collect_rows(*, include_worktrees: bool = False) -> List[_DuRow]:
         scratch_bytes = _dir_size_bytes(scratch_dir) if has_log else 0
         log_bytes = _dir_size_bytes(_log_dir(name), exclude=scratch_dir) if has_log else 0
         rows.append(_DuRow(name, 1, state_bytes, log_bytes, scratch_bytes))
-    return _du_charge_worktrees(rows) if include_worktrees else rows
+    return _du_charge_worktrees(rows)
 
 
 def _du_run_group(name: str) -> str:
@@ -5929,27 +5927,18 @@ def _du_print_table(
     label_header: str,
     as_bytes: bool,
     top: Optional[int],
-    show_worktree: bool = False,
 ) -> None:
     """Print one plain-aligned-columns table (no Markdown) plus a TOTAL row.
     ``total`` is passed in rather than recomputed so it always reflects
-    every run even when ``rows`` was truncated by ``--top``. The WORKTREE
-    column appears only under ``--worktrees``, so the default layout and its
-    column positions are unchanged."""
+    every run even when ``rows`` was truncated by ``--top``."""
     count_header = "RUNS"
     shown, omitted = _du_split_top(rows, top)
 
-    columns = [label_header, count_header, "STATE", "LOG", "SCRATCH"]
-    if show_worktree:
-        columns.append("WORKTREE")
-    columns.append("TOTAL")
+    columns = [label_header, count_header, "STATE", "LOG", "SCRATCH", "WORKTREE", "TOTAL"]
     widths = [max(len(columns[0]), *(len(r.key) for r in shown)) if shown else len(columns[0]), len(columns[1])]
 
     def size_fields(r: _DuRow) -> str:
-        sizes = [r.state_bytes, r.log_bytes, r.scratch_bytes]
-        if show_worktree:
-            sizes.append(r.worktree_bytes)
-        sizes.append(r.total_bytes)
+        sizes = [r.state_bytes, r.log_bytes, r.scratch_bytes, r.worktree_bytes, r.total_bytes]
         return "  ".join(f"{_du_fmt(b, as_bytes=as_bytes):>10}" for b in sizes)
 
     header_sizes = "  ".join(f"{c:>10}" for c in columns[2:])
@@ -5965,31 +5954,28 @@ def _du_print_table(
     print(f"{total.key:<{widths[0]}}  {total.count:>{widths[1]}}  {size_fields(total)}")
 
 
-def _du_row_to_dict(r: _DuRow, *, include_worktrees: bool) -> dict:
-    payload = {
+def _du_row_to_dict(r: _DuRow) -> dict:
+    return {
         "runs": r.count,
         "state_bytes": r.state_bytes,
         "log_bytes": r.log_bytes,
         "scratch_bytes": r.scratch_bytes,
+        "worktree_bytes": r.worktree_bytes,
         "total_bytes": r.total_bytes,
     }
-    if include_worktrees:
-        payload["worktree_bytes"] = r.worktree_bytes
-    return payload
 
 
 def cmd_du(args: argparse.Namespace) -> int:
     """Disk usage per effective status (default) or per run (``--by-run``),
     including preserved logs. Strictly read-only: no locks, no
     ``_opportunistic_heal``, no ``_prune_old_logs``, no mutation of any kind
-    — only ``os.scandir``/``stat`` reads via ``_dir_size_bytes``, plus (under
-    ``--worktrees``) ``git rev-parse`` reads, which neither create nor prune
-    anything in the inspected repository.
+    — only ``os.scandir``/``stat`` reads via ``_dir_size_bytes``, plus the
+    ``git rev-parse`` reads that classify each launch ``cwd``, which neither
+    create nor prune anything in the inspected repository.
     """
     as_bytes: bool = bool(getattr(args, "bytes", False))
     as_json: bool = bool(getattr(args, "json", False))
     by_run: bool = bool(getattr(args, "by_run", False))
-    include_worktrees: bool = bool(getattr(args, "worktrees", False))
     top: Optional[int] = getattr(args, "top", None)
     if as_bytes and as_json:
         # --json already emits exact integers; combining with --bytes would
@@ -5997,7 +5983,7 @@ def cmd_du(args: argparse.Namespace) -> int:
         # confusing. Reject rather than guess which the caller meant.
         sys.exit("agent-run: --bytes has no effect with --json, which always emits exact integers")
 
-    run_rows = _du_collect_rows(include_worktrees=include_worktrees)
+    run_rows = _du_collect_rows()
     all_rows = run_rows if by_run else _du_aggregate_groups(run_rows)
     total = _DuRow(
         "TOTAL",
@@ -6013,22 +5999,15 @@ def cmd_du(args: argparse.Namespace) -> int:
         payload = {
             "state_root": str(STATE_ROOT),
             "log_root": str(LOG_ROOT),
-            "worktrees_included": include_worktrees,
-            "total": _du_row_to_dict(total, include_worktrees=include_worktrees),
-        }
-        if include_worktrees:
             # Names the attribution rule the numbers were produced under, so a
             # consumer never has to infer it from the values.
-            payload["worktree_attribution"] = "charged once to the first run sharing the worktree"
+            "worktree_attribution": "charged once to the first run sharing the worktree",
+            "total": _du_row_to_dict(total),
+        }
         if by_run:
-            payload["runs"] = [
-                {"name": r.key, **_du_row_to_dict(r, include_worktrees=include_worktrees)}
-                for r in shown
-            ]
+            payload["runs"] = [{"name": r.key, **_du_row_to_dict(r)} for r in shown]
         else:
-            payload["groups"] = {
-                r.key: _du_row_to_dict(r, include_worktrees=include_worktrees) for r in shown
-            }
+            payload["groups"] = {r.key: _du_row_to_dict(r) for r in shown}
         if omitted:
             payload["omitted"] = {
                 "count": len(omitted),
@@ -6042,18 +6021,16 @@ def cmd_du(args: argparse.Namespace) -> int:
         f"agent-run du: apparent size (st_size), {size_label}, "
         f"STATE_ROOT={STATE_ROOT} LOG_ROOT={LOG_ROOT}"
     )
-    if include_worktrees:
-        print(
-            "worktrees: linked git worktrees at each run's recorded cwd, "
-            "deduplicated by realpath and charged once to the first run sharing them"
-        )
+    print(
+        "worktrees: linked git worktrees at each run's recorded cwd, "
+        "deduplicated by realpath and charged once to the first run sharing them"
+    )
     _du_print_table(
         all_rows,
         total,
         label_header="NAME" if by_run else "STATUS",
         as_bytes=as_bytes,
         top=top,
-        show_worktree=include_worktrees,
     )
     return 0
 
@@ -9444,7 +9421,16 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_du = sub.add_parser(
         "du",
         help="disk usage per effective status (or per run with --by-run), "
-        "including preserved logs; strictly read-only",
+        "including preserved logs and each run's launch cwd when that "
+        "directory is a linked git worktree (WORKTREE column, worktree_bytes "
+        "under --json); strictly read-only. Linked worktrees are usually far "
+        "larger than STATE_ROOT and LOG_ROOT combined, so walking them "
+        "dominates this command's runtime. Main worktrees, bare repos, "
+        "non-git directories, and any directory git cannot classify "
+        "contribute 0. A worktree shared by several runs is deduplicated by "
+        "realpath and charged once, to the first run sharing it (the others "
+        "show 0), so TOTAL counts every byte exactly once. Detection runs "
+        "git rev-parse only, never gc or worktree prune",
     )
     sp_du.add_argument(
         "--by-run",
@@ -9471,22 +9457,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="emit a machine-readable object instead of a table; always uses "
         "exact integers, so --bytes is rejected alongside it",
-    )
-    sp_du.add_argument(
-        "--worktrees",
-        action="store_true",
-        default=False,
-        help="also account for each run's recorded launch cwd when it is a "
-        "linked git worktree, in a separate WORKTREE column (and "
-        "worktree_bytes under --json). OFF BY DEFAULT: those trees are "
-        "usually far larger than STATE_ROOT and LOG_ROOT combined, so "
-        "walking them can multiply this command's runtime. Main worktrees, "
-        "bare repos, non-git directories, and any directory git cannot "
-        "classify contribute 0. A worktree shared by several runs is "
-        "deduplicated by realpath and charged once, to the first run sharing "
-        "it (the others show 0), so TOTAL counts every byte exactly once. "
-        "Read-only: detection runs git rev-parse only, never gc or "
-        "worktree prune",
     )
     sp_du.set_defaults(func=cmd_du)
 

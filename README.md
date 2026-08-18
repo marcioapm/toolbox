@@ -784,7 +784,7 @@ agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown
                 [--include-worktrees] [--worktree-min-age-hours N] [--force-dirty]
                 [--orphan-processes] [--orphan-min-age-hours N]
                 [--max-seconds N]
-agent-run du [--by-run] [--top N] [--bytes|--json] [--worktrees]  # disk usage; read-only
+agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage; read-only
 ```
 
 Unlike `tail`, which only streams output, `attach` gives live keyboard and
@@ -979,7 +979,7 @@ affecting the others:
 Linked worktrees are typically where the bytes actually are: on one measured
 host, 94 runs resolved to 23 launch directories, 20 of them linked worktrees
 totalling 18 GB, against a few hundred MB in `STATE_ROOT` plus `LOG_ROOT`.
-Run `agent-run du --worktrees --by-run --top 20` to see that, and
+Run `agent-run du --by-run --top 20` to see that, and
 `agent-run reap --include-worktrees --dry-run` before ever enabling the
 removal on a timer.
 
@@ -1117,21 +1117,20 @@ launchctl start com.example.agent-run-reap
 `agent-run du` reports apparent disk usage (`st_size`), by default one row
 per effective status (plus a `preserved-log-only` row) — pass `--by-run`
 for one row per run instead. Each row breaks down state-dir, log-dir
-(excluding `tmp/`), and scratch (`tmp/`) bytes, plus their total; rows sort
-by total descending, then name, with a `TOTAL` row last that always covers
-every run, even under `--top N`. `--bytes` prints exact integers instead of
-human-readable sizes (`1.2G`, `340M`, `12K`); `--json` emits a machine-
-readable object and always uses exact integers, so combining it with
-`--bytes` is rejected. `du` never mutates anything — no locks, no
+(excluding `tmp/`), scratch (`tmp/`), and linked-worktree bytes, plus their
+total; rows sort by total descending, then name, with a `TOTAL` row last
+that always covers every run, even under `--top N`. `--bytes` prints exact
+integers instead of human-readable sizes (`1.2G`, `340M`, `12K`); `--json`
+emits a machine-readable object and always uses exact integers, so combining
+it with `--bytes` is rejected. `du` never mutates anything — no locks, no
 `_opportunistic_heal`, no `_prune_old_logs` — and tolerates races
 (`FileNotFoundError`/`PermissionError`) by skipping the affected entry.
 
-#### Linked worktrees (`--worktrees`)
+#### Linked worktrees
 
 Agents are frequently launched inside a linked git worktree created for the
 task, and those trees usually hold far more bytes than `STATE_ROOT` and
-`LOG_ROOT` combined — invisible to plain `du`, which only walks those two
-roots. `agent-run du --worktrees` adds a `WORKTREE` column (and
+`LOG_ROOT` combined. `du` therefore adds a `WORKTREE` column (and
 `worktree_bytes` under `--json`) sizing each run's recorded launch `cwd`
 **when that directory is a linked worktree**. Main/root worktrees, bare
 repositories, non-git directories, missing directories, and anything git
@@ -1145,16 +1144,16 @@ shared by four runs would be reported as 3.6 GB. `TOTAL` therefore counts
 every byte exactly once, and `TOTAL` == `STATE` + `LOG` + `SCRATCH` +
 `WORKTREE` in both `--by-run` and rollup mode.
 
-**Off by default**, and deliberately so: worktrees are large and walking
-them can multiply the command's runtime several times over. Detection is
-read-only `git rev-parse` plumbing — it never runs `git gc` or
-`git worktree prune` and never writes to the inspected repository.
+Walking those trees dominates the command's runtime: worktrees are large,
+and sizing them costs several times a `STATE_ROOT`-plus-`LOG_ROOT`-only
+walk. Detection is read-only `git rev-parse` plumbing — it never runs
+`git gc` or `git worktree prune` and never writes to the inspected
+repository.
 
 ```bash
 agent-run du                    # per-status rollup, human-readable
 agent-run du --by-run --top 10  # 10 largest runs by total size
 agent-run du --json             # machine-readable, exact byte integers
-agent-run du --worktrees --by-run  # include linked-worktree bytes per run
 ```
 
 ### Files

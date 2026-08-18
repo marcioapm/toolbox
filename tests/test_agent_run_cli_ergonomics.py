@@ -91,11 +91,8 @@ def _du_args(
     top: Optional[int] = None,
     bytes_: bool = False,
     json_: bool = False,
-    worktrees: bool = False,
 ) -> argparse.Namespace:
-    return argparse.Namespace(
-        by_run=by_run, top=top, bytes=bytes_, json=json_, worktrees=worktrees
-    )
+    return argparse.Namespace(by_run=by_run, top=top, bytes=bytes_, json=json_)
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +140,7 @@ class TestDuGrouping:
         assert done_fields[2] == str(expected_state)
         assert done_fields[3] == str(expected_log)
         assert done_fields[4] == str(expected_scratch)
-        assert done_fields[5] == str(expected_state + expected_log + expected_scratch)
+        assert done_fields[-1] == str(expected_state + expected_log + expected_scratch)
         assert "running" in lines
         total_fields = lines["TOTAL"].split()
         assert total_fields[1] == "3"
@@ -188,7 +185,7 @@ class TestDuGrouping:
         assert fields[2] == str(expected_state)
         assert fields[3] == str(expected_log) == "100"  # LOG excludes scratch
         assert fields[4] == str(expected_scratch) == "900"  # SCRATCH
-        assert fields[5] == str(expected_state + expected_log + expected_scratch)
+        assert fields[-1] == str(expected_state + expected_log + expected_scratch)
 
     def test_by_run_one_row_per_run(self, isolated_runs_root, isolated_log_root, capsys):
         sdA, ldA = _make_run(
