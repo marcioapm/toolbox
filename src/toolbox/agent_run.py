@@ -5112,12 +5112,10 @@ def _worktree_foreign_nested_reason(path: Path) -> Optional[str]:
     followed.  Any ``scandir`` or ``lstat`` error fails closed.
     """
     _FOREIGN_WORKTREE_SCAN_DEPTH = 4
-    # Stack entries: (directory_path, current_depth)
     stack: List[Tuple[Path, int]] = [(path, 0)]
     while stack:
         current, depth = stack.pop()
         if current != path:
-            # Check whether this subdirectory is a git worktree root.
             try:
                 (current / ".git").lstat()
                 return f"nested git repository at {current}"
@@ -5125,8 +5123,6 @@ def _worktree_foreign_nested_reason(path: Path) -> Optional[str]:
                 pass
             except OSError as exc:
                 return f"cannot check .git in {current}: {exc}"
-        if depth >= _FOREIGN_WORKTREE_SCAN_DEPTH:
-            continue
         try:
             with os.scandir(current) as it:
                 subdirs = [
@@ -5136,6 +5132,12 @@ def _worktree_foreign_nested_reason(path: Path) -> Optional[str]:
                 ]
         except OSError as exc:
             return f"cannot scan {current} for nested repositories: {exc}"
+        if depth >= _FOREIGN_WORKTREE_SCAN_DEPTH:
+            # Depth limit reached with subdirectories unexamined: an unexplored
+            # subtree is an uncertainty, so fail closed rather than proceed.
+            if subdirs:
+                return f"scan depth limit reached with unexplored subdirectories at {current}"
+            continue
         stack.extend((d, depth + 1) for d in subdirs)
     return None
 

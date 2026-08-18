@@ -1498,6 +1498,33 @@ class TestReapWorktreeNested:
         assert "worktrees_removed=0 worktrees_skipped=1" in out
         assert "nested git repository" in out
 
+    def test_foreign_nested_worktree_at_depth_5_refused_under_force_dirty(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A foreign linked worktree 5 levels below the candidate is refused
+        under --force-dirty: the scan depth limit is reached with unexplored
+        subdirectories, which is an uncertainty that must fail closed."""
+        outer_repo = _make_repo(git_root, "outer-repo")
+        outer_wt = _add_worktree(outer_repo, git_root / "outer-wt", "f-outer")
+        deep = outer_wt / "a" / "b" / "c" / "d"
+        deep.mkdir(parents=True)
+
+        inner_repo = _make_repo(git_root, "inner-repo")
+        inner_wt = _add_worktree(inner_repo, deep / "inner-wt", "f-inner")
+        (inner_wt / "precious.txt").write_text("must survive\n")
+
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", cwd=outer_wt, age_hours=1000
+        )
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert inner_wt.is_dir(), "inner (foreign) worktree at depth 5 was DELETED"
+        assert outer_wt.is_dir(), "outer worktree was DELETED"
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+        assert "nested git repository" in out or "unexplored subdirectories" in out
+
 
 class TestReapWorktreeFinalRevalidation:
     """State captured at collection is re-read under the publication lock
@@ -1840,27 +1867,26 @@ class TestReapWorktreeActivityWalk:
     def test_walk_error_fails_closed_in_strict_mode(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
-        """A scandir failure during the activity walk causes _WALK_INCOMPLETE to
+        """A stat failure during the activity walk causes _WALK_INCOMPLETE to
         be returned, so the activity gate reports the worktree as unreadable
         rather than falling back to a stale timestamp."""
         repo = _make_repo(git_root)
         wt = _add_worktree(repo, git_root / "wt", "feature")
-        # Create a directory 5 levels deep inside the worktree.
-        # _worktree_foreign_nested_reason scans at most 4 levels deep, so it
-        # never reaches this level.  The mtime walk has no depth limit, so it
-        # will try to descend into it and fail closed.
-        deep = wt / "a" / "b" / "c" / "d" / "e"
-        deep.mkdir(parents=True)
+        # A flat directory with one file whose stat will be made to fail.
+        # No subdirectories, so the foreign-nested scan passes cleanly; only
+        # the mtime walk visits the file and hits the injected stat error.
+        secret = wt / "unreadable.txt"
+        secret.write_text("hidden content\n")
         _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
 
-        real_scandir = os.scandir
+        real_entry_stat = os.DirEntry.stat
 
-        def scandir_that_fails_at_depth5(path):
-            if str(path) == str(deep):
+        def stat_fails_for_secret(entry_self, *, follow_symlinks=True):
+            if entry_self.path == str(secret):
                 raise OSError("simulated permission denied")
-            return real_scandir(path)
+            return real_entry_stat(entry_self, follow_symlinks=follow_symlinks)
 
-        monkeypatch.setattr(os, "scandir", scandir_that_fails_at_depth5)
+        monkeypatch.setattr(os.DirEntry, "stat", stat_fails_for_secret)
 
         agent_run.cmd_reap(_reap_args())
 
