@@ -23,8 +23,9 @@ A4/A6/A7/A8 are hermetic and live in test_agent_run_harness.py:
   A7 (flags require --harness, appear in help, raw unaffected):
       TestParseLaunchArgvHarness, TestParserHelpShowsManagedMode.test_capability_flags_in_help
   A8 (policy reaches child through full managed launch path):
-      TestManagedClaudeLaunch.test_claude_oneshot_default_policy_delivers_positional_prompt
+      TestManagedClaudeLaunch.test_claude_oneshot_delivers_prompt_via_stdin_with_denies_in_argv
       TestEndToEndThroughMain.test_main_codex_questions_policy_reaches_appserver
+      TestEndToEndThroughMain.test_main_opencode_managed_launch_delivers_policy_env
 """
 from __future__ import annotations
 
@@ -401,6 +402,10 @@ class TestA3ClaudeDenyBeatsHonouredAllow:
 
         If either appears in the model's tool list this test fails, prompting
         implementation of the full A3 proof for those tools.
+
+        Requires Bash to appear in the tool list before trusting the absence
+        conclusion — a parse failure or empty response would otherwise silently
+        pass as "tools absent".
         """
         data = _claude_json(
             'List all tools you have. Reply ONLY with JSON: {"tools": [...]}. No prose.'
@@ -411,7 +416,19 @@ class TestA3ClaudeDenyBeatsHonouredAllow:
         except (json.JSONDecodeError, AttributeError):
             tools = []
 
-        if any("EnterPlanMode" in t or "AskUserQuestion" in t for t in tools):
+        # Serialise to catch dict-wrapped names such as [{"name": "EnterPlanMode"}].
+        flat = json.dumps(tools)
+
+        # Positive control: Bash must appear so we know the tool list was parsed.
+        # Without this, a refused/empty/unparseable response would read as "all clear".
+        if "Bash" not in flat:
+            pytest.fail(
+                f"Tripwire could not parse a valid tool list (positive control "
+                f"'Bash' absent) — absence of EnterPlanMode is not evidence. "
+                f"raw={data.get('result', '')[:300]!r}"
+            )
+
+        if "EnterPlanMode" in flat or "AskUserQuestion" in flat:
             pytest.fail(
                 "EnterPlanMode or AskUserQuestion is NOW available. "
                 "Implement the full A3 proof: trust the workspace, confirm the control "
