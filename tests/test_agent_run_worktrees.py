@@ -2146,3 +2146,41 @@ class TestDuWorktreeArithmetic:
         # four columns: the worktree charge excludes the two nested roots.
         assert worktree_b == whole_tree - state_b - log_b - scratch_b
         assert int(_row(out, "TOTAL")[6]) == whole_tree
+
+    def test_unrecognized_root_content_counted_in_worktree_total(
+        self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch, capsys
+    ):
+        """Root-level files, .locks, sentinels, and invalid-name entries inside
+        a STATE_ROOT or LOG_ROOT that is nested in a worktree must be counted
+        exactly once in TOTAL.  Excluding the whole configured root drops these
+        bytes from the total; excluding only the charged per-run subdirectories
+        leaves the remainder in the worktree column."""
+        repo = _make_repo(tmp_path / "inside-gitroots")
+        wt = _add_worktree(repo, tmp_path / "inside-gitroots" / "wt", "feature")
+        (wt / "payload.bin").write_bytes(b"p" * 7000)
+        state = wt / "nested-state"
+        logs = wt / "nested-logs"
+        state.mkdir()
+        logs.mkdir()
+        monkeypatch.setattr(agent_run, "STATE_ROOT", state)
+        monkeypatch.setattr(agent_run, "LOG_ROOT", logs)
+        _make_state_run(state, logs, "r1", cwd=wt, log_bytes=1234)
+
+        # Unrecognized content in the roots: .locks dir, a sentinel file, an
+        # orphan log file, and an invalid-name directory.
+        (state / ".locks").mkdir()
+        (state / ".locks" / "some.lock").write_bytes(b"L" * 100)
+        (state / "sentinel.del").write_bytes(b"S" * 50)
+        (logs / "orphan-file.txt").write_bytes(b"O" * 200)
+        (logs / "!!invalid-name").mkdir()
+        (logs / "!!invalid-name" / "junk.bin").write_bytes(b"J" * 75)
+
+        whole_tree = agent_run._dir_size_bytes(wt)
+
+        agent_run.cmd_du(_du_args(by_run=True))
+
+        out = capsys.readouterr().out
+        assert int(_row(out, "TOTAL")[6]) == whole_tree, (
+            "TOTAL must equal the whole worktree size; "
+            "unrecognized root content must not be silently excluded"
+        )

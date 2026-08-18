@@ -6204,7 +6204,15 @@ class _DuRow(NamedTuple):
 
 
 def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
-    """Charge each linked worktree once while excluding separately charged roots."""
+    """Charge each linked worktree once while excluding separately charged roots.
+
+    Excluding all of ``STATE_ROOT`` or ``LOG_ROOT`` would drop unrecognized
+    content (e.g. ``.locks``, sentinels, invalid-name entries) from the total,
+    because those bytes appear neither in the STATE/LOG/SCRATCH columns nor in
+    the worktree charge.  Instead, only the per-run directories actually charged
+    to a row are excluded, so any remainder in those roots falls through to the
+    worktree charge and is counted exactly once.
+    """
     owners: dict[str, int] = {}
     roots: dict[str, Path] = {}
     for index, row in enumerate(rows):
@@ -6220,12 +6228,18 @@ def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
     for key, owner in owners.items():
         root = roots[key]
         nested = [other for other in accounted if other != root and _path_is_within(other, root)]
-        external = [
-            configured.resolve()
-            for configured in (STATE_ROOT, LOG_ROOT)
-            if _path_is_within(configured.resolve(), root)
-        ]
-        charges[owner] = _dir_size_bytes(root, excludes=[*nested, *external])
+        # Exclude only the per-run state and log directories that are already
+        # charged to a row, not the entire configured roots.
+        charged_excludes: List[Path] = []
+        for configured in (STATE_ROOT, LOG_ROOT):
+            if not _path_is_within(configured.resolve(), root):
+                continue
+            for row in rows:
+                for per_run_dir in (_state_dir(row.key), _log_dir(row.key)):
+                    per_run_resolved = per_run_dir.resolve()
+                    if _path_is_within(per_run_resolved, root):
+                        charged_excludes.append(per_run_resolved)
+        charges[owner] = _dir_size_bytes(root, excludes=[*nested, *charged_excludes])
     return [row._replace(worktree_bytes=charges[index]) for index, row in enumerate(rows)]
 
 
