@@ -4797,6 +4797,8 @@ def _worktree_resolve_cwd(raw: str) -> Optional[Path]:
     """
     if not raw:
         return None
+    if not Path(raw).is_absolute():
+        return None
     try:
         resolved = Path(os.path.realpath(raw))
     except (OSError, ValueError):

@@ -273,6 +273,30 @@ class TestWorktreeResolveCwd:
         f.write_text("x")
         assert agent_run._worktree_resolve_cwd(str(f)) is None
 
+    def test_relative_path_is_none(self, git_root):
+        """A relative path is rejected inside _worktree_resolve_cwd itself so
+        os.path.realpath cannot silently resolve it against the process cwd."""
+        assert agent_run._worktree_resolve_cwd("relative/path") is None
+        assert agent_run._worktree_resolve_cwd("wt") is None
+
+    def test_relative_cwd_in_state_dir_is_refused(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A state dir whose cwd file holds a relative path is refused with
+        'is not absolute'; the candidate is skipped, not deleted."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        sd = _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000
+        )
+        (sd / "cwd").write_text("relative/path\n")
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "is not absolute" in out or "unresolvable cwd" in out
+
 
 # ---------------------------------------------------------------------------
 # du worktree accounting
