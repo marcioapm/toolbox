@@ -9158,17 +9158,14 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             continue
         # --cwd applies to both managed and raw launches; the value is validated
         # and entered by cmd_launch, not here (this parser touches no filesystem).
-        if tokens[0] == "--cwd":
-            if len(tokens) < 2:
-                raise _LaunchArgvError("agent-run: --cwd requires a directory")
-            cwd = tokens[1]
-            tokens = tokens[2:]
-            continue
-        if tokens[0].startswith("--cwd="):
-            cwd = tokens[0].split("=", 1)[1]
+        # Both spellings share one emptiness check so neither form can accept "".
+        if tokens[0] == "--cwd" or tokens[0].startswith("--cwd="):
+            if tokens[0] == "--cwd":
+                cwd, tokens = (tokens[1] if len(tokens) > 1 else ""), tokens[2:]
+            else:
+                cwd, tokens = tokens[0].split("=", 1)[1], tokens[1:]
             if not cwd:
                 raise _LaunchArgvError("agent-run: --cwd requires a directory")
-            tokens = tokens[1:]
             continue
         break
 
