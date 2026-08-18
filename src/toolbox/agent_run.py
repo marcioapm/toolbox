@@ -4985,15 +4985,45 @@ def _worktree_live_run_cwds(state_entries: List[Path]) -> _WorktreeLiveCwds:
     return _WorktreeLiveCwds(live, None, tuple(unresolved))
 
 
+def _worktree_empty_tree_oid(path: Path) -> Tuple[Optional[str], Optional[str]]:
+    """Object id of the empty tree in ``path``'s repository, for ``--attr-source``.
+
+    Hashing ``/dev/null`` as a tree is a pure computation: it writes no object,
+    reads no attributes, and yields the hash-algorithm-correct id for both sha1
+    and sha256 repositories.
+    """
+    probe = _watch_run_git_checked(path, ["hash-object", "-t", "tree", "/dev/null"])
+    if probe.stdout is None:
+        return None, f"cannot compute empty tree object ({probe.error_detail})"
+    oid = probe.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", oid):
+        return None, f"unexpected empty tree object {oid!r}"
+    return oid, None
+
+
 def _worktree_content_reason(path: Path) -> Optional[str]:
-    """Return a refusal for tracked, untracked, or ignored worktree content."""
+    """Return a refusal for tracked, untracked, or ignored worktree content.
+
+    ``ls-files --modified`` compares working-tree files through the clean
+    filter whenever the index stat cache is inconclusive, so a repository
+    supplying ``filter.<driver>.clean`` in ``.gitattributes`` would execute its
+    command under this inspection. ``--attr-source`` pointed at the empty tree
+    makes every path attribute-free, so no filter driver is ever selected.
+    ``core.hooksPath=/dev/null`` and ``core.fsmonitor=false`` in
+    ``_watch_run_git_checked`` close the hook and fsmonitor equivalents.
+    """
+    empty_tree, oid_error = _worktree_empty_tree_oid(path)
+    if oid_error is not None:
+        return oid_error
+    assert empty_tree is not None
+    attr_free = ["--attr-source", empty_tree]
     checks = (
         (["ls-files", "--modified", "--deleted", "-z"], "modified or deleted tracked file(s)"),
         (["ls-files", "--others", "--exclude-standard", "-z"], "untracked file(s)"),
         (["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], "ignored file(s) or directory content"),
     )
     for args, label in checks:
-        outcome = _watch_run_git_checked(path, args)
+        outcome = _watch_run_git_checked(path, [*attr_free, *args])
         if outcome.stdout is None:
             return f"cannot inspect {label} ({outcome.error_detail})"
         count = len([entry for entry in outcome.stdout.split("\0") if entry])
@@ -5153,16 +5183,24 @@ def _worktree_candidate_refusal(
     *,
     force_dirty: bool,
     min_age_threshold: float,
-    reconciled_this_pass: set[str],
+    reconciled_cwds: List[Path],
     unresolved_cwds: Optional[set[str]] = None,
 ) -> Tuple[Optional[str], Optional[_WorktreeInfo], Optional[float]]:
     """Run every deletion refusal check against one current filesystem view.
 
+    ``reconciled_cwds`` holds the resolved launch directories of runs this
+    invocation moved to a terminal status. ``_mark_terminal`` keeps any
+    ``ended_at`` already on disk, so such a run can present an arbitrarily old
+    age the moment it becomes a candidate; matching by path rather than by run
+    name also covers a sharer that was still ``running`` when candidates were
+    collected and therefore appears in no ``names`` list.
+
     ``unresolved_cwds`` accumulates the names of state directories the liveness
     scan could neither resolve nor prove live, for a single aggregate report.
     """
-    if reconciled_this_pass.intersection(cand.names):
-        return "a sharing run was reconciled in this invocation", None, None
+    for reconciled in reconciled_cwds:
+        if _path_is_within(reconciled, cand.resolved):
+            return "a sharing run was reconciled in this invocation", None, None
     if cand.age_seconds is None or cand.age_seconds < min_age_threshold:
         return "youngest sharing run is below the age threshold", None, None
     if _dir_identity(cand.resolved) != cand.identity:
@@ -5213,7 +5251,7 @@ def _worktree_gc_pass(
     dry_run: bool,
     force_dirty: bool,
     min_age_threshold: float,
-    reconciled_this_pass: set[str],
+    reconciled_cwds: List[Path],
     budget_expired,
 ) -> Tuple[int, int, int]:
     """Remove linked worktrees only after an all-state fail-closed scan."""
@@ -5249,7 +5287,7 @@ def _worktree_gc_pass(
                 final_scan.entries,
                 force_dirty=force_dirty,
                 min_age_threshold=min_age_threshold,
-                reconciled_this_pass=reconciled_this_pass,
+                reconciled_cwds=reconciled_cwds,
                 unresolved_cwds=unresolved_cwds,
             )
             if refusal is not None:
@@ -5387,7 +5425,16 @@ def cmd_reap(args: argparse.Namespace) -> int:
     deferred_count = 0
     found_target = False
     reconciled_this_pass = set()
-    worktree_reconciled_this_pass = set()
+    # Resolved launch directories of runs this invocation moved to a terminal
+    # status, captured while their cwd record is still readable. The worktree
+    # pass refuses any candidate containing one: _mark_terminal preserves a
+    # stale ended_at, so such a run can immediately look old enough to collect.
+    worktree_reconciled_cwds: List[Path] = []
+
+    def _record_reconciled_cwd(state_dir: Path) -> None:
+        resolved = _worktree_resolve_cwd(_watch_read_cwd_file(state_dir / "cwd"))
+        if resolved is not None:
+            worktree_reconciled_cwds.append(resolved)
     # Names whose whole log dir was collected (or reported under --dry-run) by
     # pass 2.5 in this invocation.  Pass 3 skips these to avoid counting the
     # same run's scratch as both a collected log and an orphaned scratch dir.
@@ -5437,7 +5484,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         pid_raw = _read(d / "pid")
         if not pid_raw:
             print(f"  {name}: dead (no pid recorded) [{'dry-run' if dry_run else 'marking died'}]")
-            worktree_reconciled_this_pass.add(name)
+            _record_reconciled_cwd(d)
             if not dry_run:
                 _mark_died(d, "no pid recorded")
                 reconciled_this_pass.add(name)
@@ -5448,7 +5495,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             pid = int(pid_raw)
         except ValueError:
             print(f"  {name}: dead (invalid pid {pid_raw!r}) [{'dry-run' if dry_run else 'marking died'}]")
-            worktree_reconciled_this_pass.add(name)
+            _record_reconciled_cwd(d)
             if not dry_run:
                 _mark_died(d, f"invalid pid: {pid_raw!r}")
                 reconciled_this_pass.add(name)
@@ -5457,10 +5504,10 @@ def cmd_reap(args: argparse.Namespace) -> int:
 
         if not _pid_alive(pid):
             print(f"  {name}: dead pid={pid} [{'dry-run' if dry_run else 'marking died'}]")
+            _record_reconciled_cwd(d)
             if not dry_run:
                 _mark_died(d, f"pid {pid} no longer alive")
                 reconciled_this_pass.add(name)
-                worktree_reconciled_this_pass.add(name)
             died_count += 1
             continue
 
@@ -5479,6 +5526,9 @@ def cmd_reap(args: argparse.Namespace) -> int:
         idle_h = idle_secs / 3600
         reason = f"idle>{idle_h:.1f}h"
         print(f"  {name}: idle pid={pid} idle={idle_h:.1f}h [{'dry-run' if dry_run else 'killing'}]")
+        # A run this invocation would reconcile keeps its worktree in both
+        # modes, so --dry-run predicts the same worktree outcome as a real pass.
+        _record_reconciled_cwd(d)
         if dry_run:
             killed_count += 1
             continue
@@ -5513,7 +5563,6 @@ def cmd_reap(args: argparse.Namespace) -> int:
         if not _pid_alive(pid):
             _mark_terminal(d, "killed", reason)
             reconciled_this_pass.add(name)
-            worktree_reconciled_this_pass.add(name)
             killed_count += 1
         else:
             print(
@@ -5992,7 +6041,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             dry_run=dry_run,
             force_dirty=force_dirty,
             min_age_threshold=worktree_min_age_threshold,
-            reconciled_this_pass=worktree_reconciled_this_pass,
+            reconciled_cwds=worktree_reconciled_cwds,
             budget_expired=lambda: time.monotonic() - reap_start > reap_budget,
         )
         worktrees_removed += wt_removed

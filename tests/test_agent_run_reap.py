@@ -1743,7 +1743,16 @@ class TestReapReviewerRegressions:
         assert agent_run._parse_reap_min_age_seconds() == 168 * 3600
         assert "not a finite, positive" in capsys.readouterr().err
 
-    @pytest.mark.parametrize("flag", ["--idle-hours", "--min-age-hours"])
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "--idle-hours",
+            "--min-age-hours",
+            "--log-min-age-hours",
+            "--orphan-min-age-hours",
+            "--worktree-min-age-hours",
+        ],
+    )
     @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "-1", "0"])
     def test_reap_cli_rejects_invalid_hour_flags(self, flag, raw, capsys):
         option = f"{flag}={raw}" if raw == "-inf" else flag
