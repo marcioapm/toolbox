@@ -612,13 +612,12 @@ All existing raw-mode launch forms keep working.
                                   or --auto; prompt: omits those flags so the harness's own
                                   permission UI is used
 --harness-arg FLAG                pass FLAG verbatim after the harness's own args; repeatable
---session-id UUID                 claude only: use this UUID instead of generating one
 ```
 
 #### One-shot examples
 
 ```bash
-# claude — sends --print, records session via --session-id (pushed UUID4)
+# claude — sends --print, records the session id agent-run pushed as a UUID4
 agent-run --harness claude --prompt 'Refactor X' build
 
 # opencode — mints a session via POST /session before launch
@@ -659,7 +658,7 @@ Each harness uses a different mechanism. All are `certain` — never a guess.
 
 | Harness | Mechanism | `acquisition` |
 |---------|-----------|---------------|
-| `claude` | agent-run generates a UUID4, passes `--session-id <uuid>` | `pushed` |
+| `claude` | agent-run always generates a UUID4 and passes it to the claude binary as `--session-id <uuid>`; the id is not caller-selectable | `pushed` |
 | `opencode` | launches `opencode --port N --auto`, polls `/global/health`, `POST /session`, then attaches with `--session <id>`; the returned `directory` is verified against the launch cwd so a foreign server that won the port race is rejected | `minted` |
 | `codex` | keeps a `codex app-server` process alive, sends `thread/start` over JSON-RPC to mint the thread id, then sends `turn/start` | `minted` |
 

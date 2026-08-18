@@ -52,7 +52,7 @@ Usage::
     agent-run --harness claude|opencode|codex   # managed mode (no trailing --)
               [--prompt <text> | --prompt-file <path>]
               [-i] [--model <model>] [--agent-mode <name>]
-              [--session-id <id>] [--harness-arg <flag>]...
+              [--harness-arg <flag>]...
               <name>
     agent-run attach <name>              # live keyboard + resize passthrough (Ctrl-C detaches)
     agent-run tail <name>                # follow log in real time
@@ -6223,7 +6223,6 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         managed_prompt = getattr(args, "prompt", None)
         managed_model = getattr(args, "model", None)
         managed_agent_mode: Optional[str] = getattr(args, "agent_mode", None)
-        managed_session_id_arg: Optional[str] = getattr(args, "session_id", None)
         managed_harness_args = getattr(args, "harness_args", [])
         managed_session_id: Optional[str] = None
 
@@ -6238,9 +6237,9 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                 _acquire_log_write(acquire_log, f"could not write prompt file: {exc}")
 
         if harness == "claude":
-            # Push acquisition: caller-supplied UUID4 (validated in
-            # _parse_launch_argv) or a fresh one.
-            managed_session_id = managed_session_id_arg or str(uuid.uuid4())
+            # Push acquisition: agent-run mints the UUID4 and claude is told to
+            # use it, so the id is known before exec.
+            managed_session_id = str(uuid.uuid4())
             _record_session(log_d, acquire_log, "claude", managed_session_id, "pushed", "certain")
 
         elif harness == "opencode":
@@ -8618,13 +8617,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--agent to the harness",
     )
     mg.add_argument(
-        "--session-id",
-        metavar="UUID",
-        default=argparse.SUPPRESS,
-        help="supply a specific session UUID instead of having agent-run generate one "
-        "(claude only; opencode and codex always mint a new session)",
-    )
-    mg.add_argument(
         "--harness-arg",
         metavar="FLAG",
         default=argparse.SUPPRESS,
@@ -8635,8 +8627,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--cwd",
         metavar="DIR",
         default=argparse.SUPPRESS,
-        help="(accepted by the parser but not yet implemented; run from the target directory "
-        "instead)",
+        help="run the launched command with DIR as its working directory (resolved to an "
+        "absolute path before any state is published); available in both managed and raw "
+        "mode",
     )
 
     sp_status = sub.add_parser("status", help="print one-line status")
@@ -8945,7 +8938,6 @@ class _LaunchArgv(NamedTuple):
       prompt        — inline prompt string (mutually exclusive with prompt_file)
       model         — model string forwarded to the harness
       agent_mode    — harness agent/mode name (opencode --agent)
-      session_id    — caller-supplied session id (--session-id)
       harness_args  — extra raw args forwarded verbatim after harness's own args
     """
     interactive: bool
@@ -8962,7 +8954,6 @@ class _LaunchArgv(NamedTuple):
     prompt: Optional[str] = None
     model: Optional[str] = None
     agent_mode: Optional[str] = None
-    session_id: Optional[str] = None
     harness_args: Tuple[str, ...] = ()
     # "bypass" (default) appends --permission-mode bypassPermissions / --auto.
     # "prompt" omits those flags so the harness's own permission UI is used.
@@ -8977,7 +8968,7 @@ _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
 # Managed-mode flags that take a value. Each accepts "--flag value" and
 # "--flag=value"; --harness-arg accumulates, the rest keep the last value.
 _MANAGED_VALUE_FLAGS: Tuple[str, ...] = (
-    "--harness", "--prompt", "--model", "--agent-mode", "--session-id", "--harness-arg",
+    "--harness", "--prompt", "--model", "--agent-mode", "--harness-arg",
     "--permissions",
 )
 
@@ -8996,7 +8987,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
       --submit-mode=cr|crlf
       --idle-timeout N / --idle-timeout=N
       the managed-mode flags in _MANAGED_VALUE_FLAGS
-      --cwd <dir>  (recognised only to reject it; not implemented)
+      --cwd <dir>  (working directory for the launched command)
 
     Preserves the -- separator semantics: name must precede --, everything
     after -- is taken verbatim.  Without --, a leading-dash token immediately
@@ -9021,7 +9012,6 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     prompt: Optional[str] = None
     model: Optional[str] = None
     agent_mode: Optional[str] = None
-    session_id: Optional[str] = None
     harness_args: List[str] = []
     permissions: str = _PERMISSIONS_BYPASS
 
@@ -9101,8 +9091,6 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                 model = value
             elif managed_flag == "--agent-mode":
                 agent_mode = value
-            elif managed_flag == "--session-id":
-                session_id = value
             elif managed_flag == "--harness-arg":
                 harness_args = harness_args + [value]
             elif managed_flag == "--permissions":
@@ -9125,11 +9113,10 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     # After the flag loop, reject managed-only flags on raw launches.
     if harness is None and (
         prompt is not None or model is not None or agent_mode is not None
-        or session_id is not None or bool(harness_args)
-        or permissions != _PERMISSIONS_BYPASS
+        or bool(harness_args) or permissions != _PERMISSIONS_BYPASS
     ):
         raise _LaunchArgvError(
-            "agent-run: --prompt/--model/--agent-mode/--session-id/--harness-arg/--permissions "
+            "agent-run: --prompt/--model/--agent-mode/--harness-arg/--permissions "
             "require --harness <claude|opencode|codex>"
         )
 
@@ -9146,7 +9133,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     any_launch_flag = (
         interactive or prompt_file or echo or submit_mode is not None
         or idle_timeout is not None or harness is not None or prompt is not None
-        or model is not None or agent_mode is not None or session_id is not None
+        or model is not None or agent_mode is not None
         or bool(harness_args) or permissions != _PERMISSIONS_BYPASS
     )
     if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
@@ -9164,7 +9151,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             idle_timeout=idle_timeout, name="", command=[],
             subcommand_tokens=None,
             harness=harness, prompt=prompt, model=model,
-            agent_mode=agent_mode, session_id=session_id, harness_args=harness_args,
+            agent_mode=agent_mode, harness_args=harness_args,
         )
 
     # Managed mode: the name is the only remaining token — agent-run builds the
@@ -9196,23 +9183,8 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             flag = ha.split("=", 1)[0]
             if flag in {"--session", "-s", "--session-id", "--port", "--prompt"}:
                 raise _LaunchArgvError(
-                    f"agent-run: --harness-arg {flag!r} is managed internally; "
-                    f"use the corresponding agent-run flag instead"
-                )
-        # Only claude can be told which id to use; opencode mints a session and
-        # codex starts a thread, both unconditionally.
-        if session_id is not None and harness in ("opencode", "codex"):
-            raise _LaunchArgvError(
-                f"agent-run: --session-id is not supported for --harness {harness}; "
-                f"it cannot be honoured because {harness} always creates a new session"
-            )
-        if session_id is not None and harness == "claude":
-            try:
-                uuid.UUID(session_id)
-            except ValueError:
-                raise _LaunchArgvError(
-                    f"agent-run: --session-id {session_id!r} is not a valid UUID; "
-                    "claude requires a UUID4"
+                    f"agent-run: --harness-arg {flag!r} is managed internally by "
+                    f"agent-run and cannot be overridden"
                 )
         # thread/start has no model field, so a forwarded --model would be
         # silently ignored rather than applied.
@@ -9235,7 +9207,6 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             prompt=prompt,
             model=model,
             agent_mode=agent_mode,
-            session_id=session_id,
             harness_args=tuple(harness_args),
             permissions=permissions,
         )
@@ -9327,7 +9298,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         prompt=parsed.prompt,
         model=parsed.model,
         agent_mode=parsed.agent_mode,
-        session_id=parsed.session_id,
         harness_args=list(parsed.harness_args),
         permissions=parsed.permissions,
     )

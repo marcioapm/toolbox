@@ -24,6 +24,7 @@ import re
 import signal
 import sys
 import time
+import uuid as _uuid
 from pathlib import Path
 from typing import Optional
 
@@ -105,12 +106,6 @@ class TestParseLaunchArgvHarness:
     def test_agent_mode_flag(self):
         r = _parse(["--harness", "opencode", "--agent-mode", "build", "--prompt", "hi", "myrun"])
         assert r.agent_mode == "build"
-
-    def test_session_id_flag(self):
-        import uuid
-        valid_uuid = str(uuid.uuid4())
-        r = _parse(["--harness", "claude", "--session-id", valid_uuid, "--prompt", "hi", "myrun"])
-        assert r.session_id == valid_uuid
 
     def test_harness_arg_single(self):
         r = _parse(["--harness", "claude", "--prompt", "hi", "--harness-arg", "--foo", "myrun"])
@@ -264,8 +259,9 @@ class TestParserHelpShowsManagedMode:
     def test_agent_mode_flag_in_help(self):
         assert "--agent-mode" in self._help_text()
 
-    def test_session_id_flag_in_help(self):
-        assert "--session-id" in self._help_text()
+    def test_session_id_flag_not_registered(self):
+        # The session id is minted internally; there is no caller-facing flag.
+        assert "--session-id" not in self._help_text()
 
     def test_harness_arg_flag_in_help(self):
         assert "--harness-arg" in self._help_text()
@@ -750,7 +746,6 @@ def _launch_and_wait(
         prompt=prompt,
         model=model,
         agent_mode=None,
-        session_id=None,
         harness_args=[],
         permissions="bypass",
     )
@@ -1269,7 +1264,6 @@ class TestManagedCodexInteractiveAppServer:
             prompt="say hi",
             model=None,
             agent_mode=None,
-            session_id=None,
             harness_args=[],
         )
         rc = agent_run.cmd_launch(ns)
@@ -1305,7 +1299,7 @@ class TestManagedCodexInteractiveAppServer:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="say hi", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
@@ -1336,7 +1330,7 @@ class TestManagedCodexInteractiveAppServer:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="initial prompt", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
@@ -1372,7 +1366,7 @@ class TestManagedCodexInteractiveAppServer:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="hi", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
@@ -1800,13 +1794,15 @@ class TestEndToEndThroughMain:
         # No state dir should have been created.
         assert not (isolated_runs_root / name).exists()
 
-    def test_main_session_id_rejected_for_opencode(self, isolated_runs_root, isolated_log_root, monkeypatch):
-        """main() with --session-id and --harness opencode exits non-zero before creating state."""
+    def test_main_session_id_flag_no_longer_accepted(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """--session-id was removed: main() rejects it before creating state."""
         import uuid as _uuid
-        name = "main-oc-sid-reject"
+        name = "main-sid-removed"
         with pytest.raises(SystemExit) as exc_info:
             agent_run.main([
-                "--harness", "opencode",
+                "--harness", "claude",
                 "--session-id", str(_uuid.uuid4()),
                 "--prompt", "hi",
                 name,
@@ -1829,22 +1825,23 @@ class TestEndToEndThroughMain:
         assert exc_info.value.code != 0
         assert not (isolated_runs_root / name).exists()
 
-    def test_main_bad_uuid_rejected_before_starting(
-        self, isolated_runs_root, isolated_log_root, monkeypatch
+    def test_main_claude_minted_id_matches_argv(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
-        """main() with an invalid --session-id UUID exits before publishing status=starting."""
-        name = "main-bad-uuid"
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run.main([
-                "--harness", "claude",
-                "--session-id", "not-a-uuid",
-                "--prompt", "hi",
-                name,
-            ])
-        assert exc_info.value.code != 0
-        # No phantom run with status=starting must be left behind.
+        """The internally minted UUID4 reaches claude's argv and session.json unchanged."""
+        bin_dir = self._make_fake_claude(tmp_path)
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        fixed_id = "11111111-2222-4333-8444-555555555555"
+        monkeypatch.setattr(agent_run.uuid, "uuid4", lambda: _uuid.UUID(fixed_id))
+        name = "main-claude-minted-id"
+        rc = agent_run.main(["--harness", "claude", "--prompt", "say hi", name])
+        assert rc == 0
         state_dir = isolated_runs_root / name
-        assert not state_dir.exists()
+        self._wait_terminal(state_dir)
+        argv = json.loads((state_dir / "argv").read_text())
+        assert argv[argv.index("--session-id") + 1] == fixed_id
+        session = agent_run._read_session_json(isolated_log_root / name)
+        assert session["session_id"] == fixed_id
 
 
 # ---------------------------------------------------------------------------
@@ -1937,7 +1934,7 @@ class TestAppServerTeardown:
             name=name, command=[], interactive=False, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="work hard", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         rc = agent_run.cmd_launch(ns)
         assert rc == 0
@@ -1986,7 +1983,7 @@ class TestAppServerTeardown:
             name=name, command=[], interactive=False, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="work hard", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         rc = agent_run.cmd_launch(ns)
         assert rc == 0
@@ -2170,7 +2167,7 @@ class TestCodexRpcEdgeCases:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="test prompt", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
@@ -2208,7 +2205,7 @@ class TestCodexRpcEdgeCases:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="initial", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
@@ -2251,7 +2248,7 @@ class TestCodexRpcEdgeCases:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="first", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
