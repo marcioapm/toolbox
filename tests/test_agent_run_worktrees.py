@@ -1655,6 +1655,54 @@ class TestReapWorktreeFinalRevalidation:
         assert wt.is_dir()
         assert "youngest sharing run is below the age threshold" in out
         assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    def test_validation_is_final_step_before_removal(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """No code runs between _worktree_candidate_refusal returning None and
+        _worktree_remove being called; the window between validation and
+        deletion is kept to the minimum achievable while using git worktree
+        remove."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        events: list = []
+        real_refusal = agent_run._worktree_candidate_refusal
+        real_remove = agent_run._worktree_remove
+
+        def recording_refusal(*a, **kw):
+            result = real_refusal(*a, **kw)
+            if result[0] is None:
+                # Only record successful (non-refusing) refusal checks so that
+                # spurious refusals from other candidates do not add noise.
+                events.append("refusal")
+            return result
+
+        def recording_remove(*a, **kw):
+            events.append("remove")
+            return real_remove(*a, **kw)
+
+        monkeypatch.setattr(agent_run, "_worktree_candidate_refusal", recording_refusal)
+        monkeypatch.setattr(agent_run, "_worktree_remove", recording_remove)
+
+        agent_run.cmd_reap(_reap_args())
+
+        capsys.readouterr()
+        assert "refusal" in events, "candidate refusal check must run"
+        assert "remove" in events, "_worktree_remove must be called"
+        # The first refusal check and the first remove call must be adjacent:
+        # no other refusal check or remove attempt may lie between them.
+        first_refusal = events.index("refusal")
+        first_remove = events.index("remove")
+        assert first_remove == first_refusal + 1, (
+            f"_worktree_remove must follow _worktree_candidate_refusal immediately "
+            f"(first refusal at index {first_refusal}, first remove at {first_remove}); "
+            f"events: {events}"
+        )
+
+
+class TestReapWorktreePublicationLock:
     """The shared publication lock must be held across cwd entry and state
     publication so a concurrent reaper cannot pass its exclusive lock and final
     scan in the interval between chdir and visible run state."""
@@ -1797,24 +1845,22 @@ class TestReapWorktreeActivityWalk:
         rather than falling back to a stale timestamp."""
         repo = _make_repo(git_root)
         wt = _add_worktree(repo, git_root / "wt", "feature")
-        # Add a subdirectory so that the walk recurses: the failure will occur
-        # when scanning the subdirectory, after the top-level scan succeeds and
-        # records its (old) mtime.
-        sub = wt / "subdir"
-        sub.mkdir()
+        # Create a directory 5 levels deep inside the worktree.
+        # _worktree_foreign_nested_reason scans at most 4 levels deep, so it
+        # never reaches this level.  The mtime walk has no depth limit, so it
+        # will try to descend into it and fail closed.
+        deep = wt / "a" / "b" / "c" / "d" / "e"
+        deep.mkdir(parents=True)
         _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
 
         real_scandir = os.scandir
-        call_count: dict = {"n": 0}
 
-        def scandir_that_fails_on_subdir(path):
-            # Fail when scanning the subdirectory: the top-level scan succeeds
-            # (recording the old mtime), but the subdir is unreadable.
-            if str(path).startswith(str(sub)):
+        def scandir_that_fails_at_depth5(path):
+            if str(path) == str(deep):
                 raise OSError("simulated permission denied")
             return real_scandir(path)
 
-        monkeypatch.setattr(os, "scandir", scandir_that_fails_on_subdir)
+        monkeypatch.setattr(os, "scandir", scandir_that_fails_at_depth5)
 
         agent_run.cmd_reap(_reap_args())
 

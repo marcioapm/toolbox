@@ -5383,18 +5383,30 @@ def _worktree_gc_pass(
                 continue
             assert info is not None and effective_age is not None
             age_h = effective_age / 3600
-            print(
-                f"{label}: linked worktree (conservative_age={age_h:.1f}h) "
-                f"[{'dry-run' if dry_run else 'removing'}]{shared}"
-            )
             if dry_run:
+                print(
+                    f"{label}: linked worktree (conservative_age={age_h:.1f}h) "
+                    f"[dry-run]{shared}"
+                )
                 removed += 1
                 continue
+            # Validation is the final step immediately preceding git worktree
+            # remove.  An external process can still create ignored content in
+            # the interval between the last ls-files check (inside
+            # _worktree_candidate_refusal above) and the remove call below; git
+            # removes ignored files without --force, so this window cannot be
+            # fully closed while using git worktree remove.  The exclusive
+            # publication lock prevents concurrent agent-run publication but
+            # does not fence non-agent processes.
             failure = _worktree_remove(info, cand.resolved, force=force_dirty)
             if failure is not None:
                 print(f"{label}: skipped: {failure}")
                 skipped += 1
                 continue
+            print(
+                f"{label}: linked worktree (conservative_age={age_h:.1f}h) "
+                f"[removing]{shared}"
+            )
             removed += 1
     if unresolved_cwds:
         names = ", ".join(sorted(unresolved_cwds))
