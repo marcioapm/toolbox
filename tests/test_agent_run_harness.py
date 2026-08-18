@@ -130,6 +130,22 @@ class TestParseLaunchArgvHarness:
         assert r.interactive is True
         assert r.harness == "claude"
 
+    def test_capability_flags_require_harness(self):
+        with pytest.raises(agent_run._LaunchArgvError):
+            _parse(["--enable-planning", "myrun", "--", "echo", "hi"])
+
+    def test_capability_flags_parse_for_managed_harnesses(self):
+        r = _parse([
+            "--harness", "opencode", "--enable-planning", "--enable-questions",
+            "--prompt", "hi", "myrun",
+        ])
+        assert r.enable_planning is True
+        assert r.enable_questions is True
+
+    def test_codex_enable_planning_fails_fast(self):
+        with pytest.raises(agent_run._LaunchArgvError, match="unsupported.*codex"):
+            _parse(["--harness", "codex", "--enable-planning", "--prompt", "hi", "myrun"])
+
     def test_all_harness_flags_combined(self):
         r = _parse([
             "-i", "--echo", "--harness", "opencode",
@@ -270,6 +286,10 @@ class TestParserHelpShowsManagedMode:
     def test_harness_arg_flag_in_help(self):
         assert "--harness-arg" in self._help_text()
 
+    @pytest.mark.parametrize("flag", ["--enable-planning", "--enable-questions"])
+    def test_capability_flags_in_help(self, flag):
+        assert flag in self._help_text()
+
     def test_raw_usage_line_present(self):
         # The raw-mode usage line must remain visible so the existing contract
         # is not obscured by the managed-mode additions.
@@ -339,6 +359,18 @@ class TestBuildManagedArgv:
         assert "--model" in argv
         i = argv.index("--model")
         assert argv[i + 1] == "claude-opus-4-5"
+
+    def test_claude_default_denies_planning_and_questions_after_prompt(self):
+        argv = self._build("claude", prompt="deliver this prompt", session_id="u")
+        assert argv.index("deliver this prompt") < argv.index("--disallowedTools")
+        denied = [argv[index + 1] for index, value in enumerate(argv[:-1]) if value == "--disallowedTools"]
+        assert denied == ["EnterPlanMode", "ExitPlanMode", "AskUserQuestion"]
+
+    def test_claude_escape_hatches_omit_corresponding_denies(self):
+        argv = self._build(
+            "claude", prompt="hi", enable_planning=True, enable_questions=True,
+        )
+        assert "--disallowedTools" not in argv
 
     # opencode one-shot
     def test_opencode_oneshot_uses_run_subcommand(self):
@@ -429,6 +461,32 @@ class TestBuildManagedArgv:
         argv = self._build("claude", session_id="u", harness_args=["--foo", "--bar=baz"])
         assert "--foo" in argv
         assert "--bar=baz" in argv
+
+
+class TestOpenCodePolicyConfig:
+    def test_preserves_unrelated_content_and_denies_by_default(self):
+        config = json.loads(agent_run._opencode_policy_config(
+            json.dumps({"model": "kept", "permission": {"bash": "allow"}}),
+            enable_planning=False,
+            enable_questions=False,
+        ))
+        assert config["model"] == "kept"
+        assert config["permission"] == {
+            "bash": "allow",
+            "question": "deny",
+            "plan_enter": "deny",
+            "plan_exit": "deny",
+        }
+
+    def test_escape_hatches_allow_only_requested_capabilities(self):
+        config = json.loads(agent_run._opencode_policy_config(
+            None, enable_planning=True, enable_questions=True,
+        ))
+        assert config["permission"] == {
+            "question": "allow",
+            "plan_enter": "allow",
+            "plan_exit": "allow",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +902,26 @@ class TestManagedClaudeLaunch:
                     break
             time.sleep(0.05)
         assert "--session-id" in log_content, f"Expected --session-id in log: {log_content!r}"
+
+    def test_claude_oneshot_default_policy_delivers_positional_prompt(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        fake = tmp_path / "claude"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n"
+            "printf '<stdin:%s>\\n' \"$(cat)\"\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        name = "claude-prompt-after-denies"
+        _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="claude", interactive=False, prompt="unique managed prompt",
+        )
+        delivered = (isolated_log_root / name / "log").read_text()
+        assert "<stdin:unique managed prompt>" in delivered
+        assert "<AskUserQuestion>" in delivered
 
     def test_claude_oneshot_never_emits_session_prompt_together_in_argv(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
@@ -1790,6 +1868,31 @@ class TestEndToEndThroughMain:
         assert session is not None
         assert session["session_id"] == "main-e2e-tid"
         assert session["confidence"] == "certain"
+
+    def test_main_codex_questions_policy_reaches_appserver(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        fake_dir = tmp_path / "codex-bin"
+        fake_dir.mkdir()
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "with open(sys.argv[0] + '.args', 'w') as f: json.dump(sys.argv[1:], f)\n"
+            "def recv(): return json.loads(sys.stdin.readline())\n"
+            "def send(obj): print(json.dumps(obj), flush=True)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {}}); recv()\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'thread': {'id': 'policy-thread'}}})\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}})\n"
+            "send({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        name = "main-codex-question-policy"
+        assert agent_run.main(["--harness", "codex", "--prompt", "hi", name]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+        args = json.loads((fake.with_name("codex.args")).read_text())
+        assert "tools.experimental_request_user_input={enabled=false}" in args
 
     def test_main_model_rejected_for_codex(self, isolated_runs_root, isolated_log_root, monkeypatch):
         """main() with --model and --harness codex exits non-zero before creating state."""

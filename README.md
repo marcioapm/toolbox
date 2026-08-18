@@ -611,9 +611,23 @@ All existing raw-mode launch forms keep working.
 --permissions bypass|prompt       bypass (default): appends --permission-mode bypassPermissions
                                   or --auto; prompt: omits those flags so the harness's own
                                   permission UI is used
+--enable-planning                 allow planning; disabled by default. Unsupported by codex,
+                                  whose managed app-server path does not expose plan mode
+--enable-questions                allow interactive questions; disabled by default
 --harness-arg FLAG                pass FLAG verbatim after the harness's own args; repeatable
+
 --session-id UUID                 claude only: use this UUID instead of generating one
 ```
+
+`--enable-planning` and `--enable-questions` are managed-mode escape hatches.
+Without them, agent-run disables planning and interactive questions for every
+managed child process: Claude receives per-process `--disallowedTools`,
+OpenCode receives a merged process-local `OPENCODE_CONFIG_CONTENT` permission
+policy, and Codex app-server receives
+`tools.experimental_request_user_input={enabled=false}`. Enabling questions
+changes that Codex setting to `enabled=true`. Codex's managed app-server API
+does not expose plan mode, so `--enable-planning --harness codex` fails before
+creating run state. Raw mode is unaffected.
 
 #### One-shot examples
 
@@ -698,6 +712,7 @@ Absent for raw-mode runs.
   "cwd": "/Users/you/project",
   "started_at": "2026-08-16T15:20:10Z",
   "harness": "claude",
+  "agent_run_version": "0.1.0",
   "interactive": false,
   "model": null,
   "agent_mode": null,
@@ -708,7 +723,8 @@ Absent for raw-mode runs.
 ```
 
 Written atomically at launch with the fields above, then updated at exit with
-`ended_at`, `exit_code`, and `status`. Present for both raw and managed runs.
+`ended_at`, `exit_code`, and `status`. `agent_run_version` records the harness
+version that created the run. Present for both raw and managed runs.
 Liveness state (`pid`, `status`, `stdin` FIFO, etc.) remains in the ephemeral
 `/tmp/agent-runs/<name>/` directory only — a missing entry there unambiguously
 means "not running", and that invariant is intact.
@@ -724,6 +740,7 @@ the run's persistent log dir, `session` is the parsed object; otherwise it is
 ```json
 {
   "schema": "agent-run.watch.v1",
+  "agent_run_version": "0.1.0",
   "name": "build",
   "status": "done",
   "terminal": true,

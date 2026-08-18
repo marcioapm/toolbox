@@ -19,7 +19,7 @@ from toolbox import agent_run
 
 
 WATCH_CONTRACT_KEYS = {
-    "schema", "name", "observed_at", "status", "exit_code", "pid",
+    "schema", "agent_run_version", "name", "observed_at", "status", "exit_code", "pid",
     "interactive", "started_at", "ended_at", "elapsed_s", "terminal",
     "launch_error", "log", "repo", "git", "git_error", "signals", "observation_error",
     "session", "scratch",
