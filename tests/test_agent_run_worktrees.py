@@ -1564,6 +1564,9 @@ class TestReapWorktreeFinalRevalidation:
     def test_live_run_published_after_collection_refuses(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
+        """A run that becomes live after candidate collection but while the
+        exclusive reaper lock is held causes the final rescan to find it and
+        refuse deletion."""
         repo = _make_repo(git_root)
         wt = _add_worktree(repo, git_root / "wt", "feature")
         _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
@@ -1585,6 +1588,136 @@ class TestReapWorktreeFinalRevalidation:
         assert wt.is_dir()
         assert "a live run is using this directory" in out
         assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+
+class TestReapWorktreePublicationLock:
+    """The shared publication lock must be held across cwd entry and state
+    publication so a concurrent reaper cannot pass its exclusive lock and final
+    scan in the interval between chdir and visible run state."""
+
+    def test_reaper_excluded_by_shared_publication_lock(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """A process holding the exclusive lock (reaper) blocks a concurrent
+        shared-lock attempt (launcher), and vice versa.  Tests the real flock
+        protocol via os.fork so no mock can hide a missing lock acquisition."""
+        import fcntl as _fcntl
+
+        lock_dir = agent_run.STATE_ROOT / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / "worktree-publication.lock"
+
+        # Phase 1: parent holds EXCLUSIVE; child tries SHARED (non-blocking).
+        r1, w1 = os.pipe()
+        r2, w2 = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(w1); os.close(r2)
+            os.read(r1, 1); os.close(r1)
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_SH | _fcntl.LOCK_NB)
+                os.write(w2, b"1")
+            except BlockingIOError:
+                os.write(w2, b"0")
+            finally:
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(fd)
+                os.close(w2)
+            os._exit(0)
+        os.close(r1); os.close(w2)
+        fd_ex = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        _fcntl.flock(fd_ex, _fcntl.LOCK_EX)
+        os.write(w1, b"1"); os.close(w1)
+        child_result = os.read(r2, 1); os.close(r2)
+        _fcntl.flock(fd_ex, _fcntl.LOCK_UN); os.close(fd_ex)
+        os.waitpid(pid, 0)
+        assert child_result == b"0", "shared lock must block while exclusive is held"
+
+        # Phase 2: child holds SHARED; parent tries EXCLUSIVE (non-blocking).
+        r3, w3 = os.pipe()
+        r4, w4 = os.pipe()
+        pid2 = os.fork()
+        if pid2 == 0:
+            os.close(w3); os.close(r4)
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            _fcntl.flock(fd, _fcntl.LOCK_SH)
+            os.write(w4, b"1"); os.close(w4)
+            os.read(r3, 1); os.close(r3)
+            _fcntl.flock(fd, _fcntl.LOCK_UN); os.close(fd)
+            os._exit(0)
+        os.close(r3); os.close(w4)
+        os.read(r4, 1); os.close(r4)
+        fd_ex2 = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        got_exclusive = False
+        try:
+            _fcntl.flock(fd_ex2, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            got_exclusive = True
+        except BlockingIOError:
+            pass
+        finally:
+            try:
+                _fcntl.flock(fd_ex2, _fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd_ex2)
+        os.write(w3, b"1"); os.close(w3)
+        os.waitpid(pid2, 0)
+        assert not got_exclusive, "exclusive lock must block while shared is held"
+
+    def test_lock_acquired_before_cwd_entry_in_cmd_launch(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
+    ):
+        """cmd_launch acquires the shared publication lock before calling
+        _apply_launch_cwd; the ordering is recorded here and asserted."""
+        from contextlib import contextmanager
+        import pytest
+
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+
+        events: list = []
+        real_lock = agent_run._worktree_publication_lock
+        real_apply = agent_run._apply_launch_cwd
+
+        @contextmanager
+        def recording_lock(*, exclusive):
+            events.append(("lock", exclusive))
+            with real_lock(exclusive=exclusive) as fd:
+                yield fd
+
+        def recording_apply(a):
+            events.append(("cwd",))
+            real_apply(a)
+
+        monkeypatch.setattr(agent_run, "_worktree_publication_lock", recording_lock)
+        monkeypatch.setattr(agent_run, "_apply_launch_cwd", recording_apply)
+
+        args = argparse.Namespace(
+            name="order-check",
+            cwd=str(wt),
+            prompt_file=None,
+            command=[],
+            harness=None,
+            interactive=False,
+            echo=False,
+            echo_interval=2.0,
+            idle_timeout=None,
+            submit_mode=None,
+        )
+        with pytest.raises(SystemExit):
+            agent_run.cmd_launch(args)
+
+        shared_positions = [i for i, e in enumerate(events) if e == ("lock", False)]
+        cwd_positions = [i for i, e in enumerate(events) if e[0] == "cwd"]
+        assert shared_positions, "shared publication lock must be acquired"
+        assert cwd_positions, "cwd must be entered"
+        assert min(shared_positions) < min(cwd_positions), (
+            "shared lock must be acquired before cwd entry"
+        )
 
 
 class TestReapWorktreeActivityWalk:

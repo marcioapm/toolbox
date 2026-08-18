@@ -6834,13 +6834,18 @@ def cmd_launch(args: argparse.Namespace) -> int:
     prompt_file: Optional[str] = getattr(args, "prompt_file", None)
     if prompt_file:
         args.prompt_file = os.path.abspath(prompt_file)
-    # chdir next: every path below (state, logs, git facts, the launched
-    # command) must observe one single effective working directory.
-    _apply_launch_cwd(args)
     # Pruning takes per-name locks itself.  Do it before acquiring this name's
     # lock so a stale log for this same name cannot self-deadlock on flock.
     _prune_old_logs()
+    # The shared publication lock must be acquired before entering the launch
+    # cwd: a concurrent reaper holds the exclusive lock during its final scan,
+    # so any run visible to that scan is protected.  Acquiring shared here
+    # ensures the reaper's exclusive-lock attempt blocks until this run's cwd
+    # and status are both published.
     with _worktree_publication_lock(exclusive=False):
+        # chdir next: every path below (state, logs, git facts, the launched
+        # command) must observe one single effective working directory.
+        _apply_launch_cwd(args)
         with _launch_lock(name) as lock_fd:
             return _cmd_launch_locked(args, name, lock_fd)
 
