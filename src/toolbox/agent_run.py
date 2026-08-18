@@ -5265,6 +5265,24 @@ def _worktree_candidate_refusal(
             return "a sharing run was reconciled in this invocation", None, None
     if cand.age_seconds is None or cand.age_seconds < min_age_threshold:
         return "youngest sharing run is below the age threshold", None, None
+    # Runs that became terminal after candidate collection are absent from
+    # cand.age_seconds.  A run that finished moments ago would have age≈0;
+    # without this check it could bypass the threshold because it never
+    # contributed to the frozen cand.age_seconds.
+    for d in state_entries:
+        if d.name in cand.names:
+            continue  # already counted in cand.age_seconds
+        if _read(d / "status") not in TERMINAL_STATUSES:
+            continue
+        raw = _watch_read_cwd_file(d / "cwd")
+        run_resolved = _worktree_resolve_cwd(raw)
+        if run_resolved is None or not _path_is_within(run_resolved, cand.resolved):
+            continue
+        late_age = _terminal_state_age_seconds(d)
+        if late_age is None:
+            return f"newly terminal run {d.name} has unparseable age", None, None
+        if late_age < min_age_threshold:
+            return "youngest sharing run is below the age threshold", None, None
     if _dir_identity(cand.resolved) != cand.identity:
         return "candidate path identity changed after collection", None, None
     symlink_reason = _worktree_symlink_free_reason(cand.raw)

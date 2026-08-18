@@ -1616,8 +1616,45 @@ class TestReapWorktreeFinalRevalidation:
         assert "a live run is using this directory" in out
         assert "worktrees_removed=0 worktrees_skipped=1" in out
 
+    def test_live_to_terminal_transition_after_collection_refuses(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A sharing run that was live at collection and finishes normally
+        before the final locked scan must keep the worktree safe for at least
+        worktree-min-age-hours after it ended.
 
-class TestReapWorktreePublicationLock:
+        At collection time the run is still running, so it does not appear in
+        cand.names and does not contribute to cand.age_seconds.  After it
+        transitions to terminal its ended_at is fresh (age≈0), which must be
+        caught by the final scan even though the collection age was satisfied."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        # r1: old terminal run that creates the candidate (age=1000h satisfies threshold).
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_scan = agent_run._worktree_state_scan
+        calls: dict = {"n": 0}
+
+        def scan_and_transition():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                # r2 finishes normally just before the final locked scan.  It
+                # was not present at collection, so it is absent from cand.names
+                # and its fresh ended_at must block deletion.
+                _make_state_run(
+                    isolated_runs_root, isolated_log_root, "r2",
+                    status="done", cwd=wt, age_hours=0
+                )
+            return real_scan()
+
+        monkeypatch.setattr(agent_run, "_worktree_state_scan", scan_and_transition)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "youngest sharing run is below the age threshold" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
     """The shared publication lock must be held across cwd entry and state
     publication so a concurrent reaper cannot pass its exclusive lock and final
     scan in the interval between chdir and visible run state."""
