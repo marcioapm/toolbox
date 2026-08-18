@@ -756,6 +756,140 @@ class TestReapWorktrees:
         assert "worktrees_removed=0" in capsys.readouterr().out
 
 
+def _make_legacy_state_dir(state_root: Path, name: str) -> Path:
+    """A pre-`status` state directory: bookkeeping files only, with no
+    ``status``, ``pid`` or ``cwd``. Reproduces the shape left by an old
+    agent-run release whose runner recorded only argv/exit metadata."""
+    sd = state_root / name
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / "argv").write_text("sleep 1\n")
+    (sd / "command").write_text("sleep 1\n")
+    (sd / "echo").write_text("0\n")
+    (sd / "ended_at").write_text("2020-01-01T00:00:00Z\n")
+    (sd / "exit_code").write_text("0\n")
+    (sd / "pgid").write_text("4242\n")
+    (sd / "reap_reason").write_text("legacy\n")
+    return sd
+
+
+class TestReapWorktreeLivenessEvidence:
+    """An unresolvable cwd is fatal to the pass only when the entry proves a
+    live runner; without that evidence it can protect no directory."""
+
+    def test_legacy_state_dir_does_not_abort_the_pass(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_legacy_state_dir(isolated_runs_root, "tc-example")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert not wt.exists()
+        assert "worktrees_removed=1" in out
+        assert "liveness scan failed" not in out
+        # Reported once in aggregate, naming the unusable state directory.
+        assert "no live runner and an unresolvable cwd: tc-example" in out
+        assert "worktrees_skipped=1" in out
+
+    def test_many_legacy_dirs_report_once(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt1 = _add_worktree(repo, git_root / "wt1", "f1")
+        wt2 = _add_worktree(repo, git_root / "wt2", "f2")
+        for legacy in ("tc-alpha", "tc-beta"):
+            _make_legacy_state_dir(isolated_runs_root, legacy)
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt1, age_hours=1000)
+        _make_state_run(isolated_runs_root, isolated_log_root, "r2", cwd=wt2, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert not wt1.exists() and not wt2.exists()
+        assert "worktrees_removed=2" in out
+        assert out.count("no live runner and an unresolvable cwd") == 1
+        assert "tc-alpha, tc-beta" in out
+        assert "worktrees_skipped=1" in out
+
+    def test_dead_recorded_pid_with_unresolvable_cwd_does_not_abort(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A recorded pid that has exited is not evidence of liveness."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        stale = _make_legacy_state_dir(isolated_runs_root, "tc-stale")
+        (stale / "pid").write_text(f"{dead.pid}\n")
+        (stale / "process_identity").write_text("stale-identity\n")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert not wt.exists()
+        assert "liveness scan failed" not in out
+        assert "no live runner and an unresolvable cwd: tc-stale" in out
+        assert "worktrees_removed=1" in out
+
+    def test_live_identity_matched_runner_with_unresolvable_cwd_aborts(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A verified live runner may hold any directory: its unreadable cwd
+        keeps every candidate in the pass."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        live = _make_state_run(
+            isolated_runs_root, isolated_log_root, "z-live", status="running"
+        )
+        (live / "pid").write_text(f"{os.getpid()}\n")
+        (live / "process_identity").write_text(f"{agent_run._process_identity(os.getpid())}\n")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "liveness scan failed: cannot resolve cwd for live run z-live" in out
+        assert "worktrees_removed=0" in out
+
+    def test_live_pid_with_unverifiable_identity_aborts(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """An identity that cannot be read at all is ambiguity, not absence."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        live = _make_state_run(
+            isolated_runs_root, isolated_log_root, "z-live", status="running"
+        )
+        (live / "pid").write_text(f"{os.getpid()}\n")
+        (live / "process_identity").write_text("recorded-token\n")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+        monkeypatch.setattr(agent_run, "_process_identity", lambda pid: None)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert "liveness scan failed" in out
+        assert "unverifiable identity" in out
+        assert "worktrees_removed=0" in out
+
+    def test_unresolvable_cwd_without_evidence_is_not_treated_as_live(self, tmp_path):
+        """`_worktree_live_run_cwds` reports the name instead of erroring."""
+        state_root = tmp_path / "state"
+        _make_legacy_state_dir(state_root, "tc-example")
+
+        result = agent_run._worktree_live_run_cwds([state_root / "tc-example"])
+
+        assert result.error is None
+        assert result.paths == []
+        assert result.unresolved == ("tc-example",)
+
+
 class TestReapWorktreesDryRun:
     def _run_both(self, args_kw, capsys):
         dry = capsys

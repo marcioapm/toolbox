@@ -4947,11 +4947,25 @@ def _worktree_state_has_live_runner(d: Path) -> Tuple[Optional[bool], Optional[s
 class _WorktreeLiveCwds(NamedTuple):
     paths: Optional[List[Path]]
     error: Optional[str]
+    unresolved: Tuple[str, ...] = ()
 
 
 def _worktree_live_run_cwds(state_entries: List[Path]) -> _WorktreeLiveCwds:
-    """Resolve every cwd that is live by status, process identity, or ambiguity."""
+    """Resolve every cwd that is live by status, process identity, or ambiguity.
+
+    An unresolvable cwd is scan-fatal only with evidence of a live runner: a
+    pid that is alive and identity-matched may hold any directory, so nothing
+    may be deleted. Ambiguity — a malformed pid, or a live pid whose identity
+    cannot be verified — is reported by ``_worktree_state_has_live_runner`` and
+    aborts the scan before the cwd is read.
+
+    An entry with no readable pid, or a pid that is not alive, has no process
+    to protect anything and no recorded path to overlap a candidate. Its name
+    is returned in ``unresolved`` and the scan continues, so one legacy state
+    directory missing ``status``/``pid``/``cwd`` cannot disable the whole pass.
+    """
     live: List[Path] = []
+    unresolved: List[str] = []
     for d in state_entries:
         status = _effective_status(d)
         process_live, process_error = _worktree_state_has_live_runner(d)
@@ -4963,9 +4977,12 @@ def _worktree_live_run_cwds(state_entries: List[Path]) -> _WorktreeLiveCwds:
         raw = _watch_read_cwd_file(d / "cwd")
         resolved = _worktree_resolve_cwd(raw)
         if resolved is None:
-            return _WorktreeLiveCwds(None, f"cannot resolve cwd for live run {d.name}")
+            if process_live is True:
+                return _WorktreeLiveCwds(None, f"cannot resolve cwd for live run {d.name}")
+            unresolved.append(d.name)
+            continue
         live.append(resolved)
-    return _WorktreeLiveCwds(live, None)
+    return _WorktreeLiveCwds(live, None, tuple(unresolved))
 
 
 def _worktree_content_reason(path: Path) -> Optional[str]:
@@ -5137,8 +5154,13 @@ def _worktree_candidate_refusal(
     force_dirty: bool,
     min_age_threshold: float,
     reconciled_this_pass: set[str],
+    unresolved_cwds: Optional[set[str]] = None,
 ) -> Tuple[Optional[str], Optional[_WorktreeInfo], Optional[float]]:
-    """Run every deletion refusal check against one current filesystem view."""
+    """Run every deletion refusal check against one current filesystem view.
+
+    ``unresolved_cwds`` accumulates the names of state directories the liveness
+    scan could neither resolve nor prove live, for a single aggregate report.
+    """
     if reconciled_this_pass.intersection(cand.names):
         return "a sharing run was reconciled in this invocation", None, None
     if cand.age_seconds is None or cand.age_seconds < min_age_threshold:
@@ -5160,6 +5182,8 @@ def _worktree_candidate_refusal(
     if live.error is not None:
         return f"liveness scan failed: {live.error}", None, None
     assert live.paths is not None
+    if unresolved_cwds is not None:
+        unresolved_cwds.update(live.unresolved)
     for live_cwd in live.paths:
         if _path_is_within(live_cwd, cand.resolved):
             return f"a live run is using this directory ({live_cwd})", None, None
@@ -5202,6 +5226,10 @@ def _worktree_gc_pass(
         print(f"  [worktree]: skipped: {reason}")
         skipped += 1
 
+    # State dirs the liveness scan could not resolve a cwd for and could not
+    # prove live. They protect nothing, so they are reported once in aggregate
+    # rather than aborting the pass per candidate.
+    unresolved_cwds: set[str] = set()
     for cand in collected.candidates:
         if budget_expired():
             deferred += 1
@@ -5222,6 +5250,7 @@ def _worktree_gc_pass(
                 force_dirty=force_dirty,
                 min_age_threshold=min_age_threshold,
                 reconciled_this_pass=reconciled_this_pass,
+                unresolved_cwds=unresolved_cwds,
             )
             if refusal is not None:
                 print(f"{label}: skipped: {refusal}{shared}")
@@ -5242,6 +5271,13 @@ def _worktree_gc_pass(
                 skipped += 1
                 continue
             removed += 1
+    if unresolved_cwds:
+        names = ", ".join(sorted(unresolved_cwds))
+        print(
+            f"  [worktree]: skipped: {len(unresolved_cwds)} run(s) with no live runner "
+            f"and an unresolvable cwd: {names}"
+        )
+        skipped += 1
     return removed, skipped, deferred
 
 
