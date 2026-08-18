@@ -121,6 +121,18 @@ class TestParseLaunchArgvHarness:
         ])
         assert list(r.harness_args) == ["--foo", "--bar=baz"]
 
+    @pytest.mark.parametrize("flag", ["--session", "-s", "--session-id", "--port", "--prompt"])
+    def test_harness_arg_rejects_flags_agent_run_owns(self, flag):
+        # --session/-s/--session-id/--port carry the identity agent-run mints and
+        # must not be forgeable; --prompt has an agent-run flag of its own. The
+        # "flag=value" spelling splits to the same name, so it is guarded too.
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            _parse([
+                "--harness", "claude", "--prompt", "hi",
+                "--harness-arg", f"{flag}=x", "myrun",
+            ])
+        assert flag in str(exc.value)
+
     def test_interactive_with_harness(self):
         r = _parse(["-i", "--harness", "claude", "--prompt", "hi", "myrun"])
         assert r.interactive is True
@@ -258,10 +270,6 @@ class TestParserHelpShowsManagedMode:
 
     def test_agent_mode_flag_in_help(self):
         assert "--agent-mode" in self._help_text()
-
-    def test_session_id_flag_not_registered(self):
-        # The session id is minted internally; there is no caller-facing flag.
-        assert "--session-id" not in self._help_text()
 
     def test_harness_arg_flag_in_help(self):
         assert "--harness-arg" in self._help_text()
