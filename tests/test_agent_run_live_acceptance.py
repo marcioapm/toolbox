@@ -12,12 +12,21 @@ A2 — OpenCode deny beats project allow (bash).
      is exercised in A1 and A5.
 
 A3 — Claude deny beats a genuinely honoured allow.
-     Bash is the concrete tool: it is genuinely callable (control, num_turns=2)
-     and suppressed by --disallowedTools Bash (deny, num_turns=1).
-     EnterPlanMode and AskUserQuestion are not exposed by this Claude Code
-     installation (2.1.207) for this workspace configuration — neither appears
-     in the model's own tool list.  Deny-vs-honoured-allow for those specific
-     tools cannot be demonstrated hermetically; test skips with precise reason.
+     Assertions are on tool-use records from --output-format stream-json --verbose,
+     never on side effects.  Denying a single tool does not remove the underlying
+     capability: with Bash denied, the model reproduced the intended file side
+     effect through Write.  Tool-level denial constrains the tool, not the effect.
+     Acceptance tests must assert on which tool was invoked, not on an effect
+     another tool can produce.
+
+     Bash is the concrete tool: it is genuinely callable (control arm stream
+     contains a tool_use block with name=="Bash") and suppressed by
+     --disallowedTools Bash (deny arm stream contains no "Bash" tool_use block).
+
+     EnterPlanMode and AskUserQuestion are not exposed by Claude Code 2.1.207
+     for this workspace configuration — neither appears in the model's own tool
+     list.  Deny-vs-honoured-allow for those specific tools cannot be
+     demonstrated hermetically; test skips with a precise reason.
 
 A4/A6/A7/A8 — Confirmed covered by hermetic tests in test_agent_run_harness.py:
   A4 (positional prompt survives variadic deny):
@@ -302,36 +311,70 @@ class TestA2OpenCodeDenyBeatsProjectAllow:
 # A3: Claude deny beats a genuinely honoured allow
 # ---------------------------------------------------------------------------
 
-def _claude_run(prompt_stdin: str, extra_argv: list[str] = (), timeout: int = 60) -> str:
-    """Run claude --print and return stdout text."""
+def _claude_stream_tool_names(
+    prompt_stdin: str,
+    extra_argv: list[str] = (),
+    timeout: int = 60,
+) -> tuple[list[str], str]:
+    """Run claude --print --output-format stream-json --verbose and return
+    (tool_names_invoked, result_text).
+
+    tool_names_invoked: names of every tool_use block in assistant messages.
+    result_text: the final result field from the result event, or "".
+
+    Raises subprocess.CalledProcessError if claude exits non-zero.
+    Raises json.JSONDecodeError if the result event is unparseable.
+    """
+    model_args = ["--model", _CLAUDE_MODEL] if _CLAUDE_MODEL else []
+    proc = subprocess.run(
+        [
+            "claude",
+            *model_args,
+            "--print",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--permission-mode", "bypassPermissions",
+            *extra_argv,
+        ],
+        input=prompt_stdin,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    tool_names: list[str] = []
+    result_text = ""
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "assistant":
+            for block in ev.get("message", {}).get("content", []):
+                if block.get("type") == "tool_use":
+                    name = block.get("name", "")
+                    if name:
+                        tool_names.append(name)
+        elif ev.get("type") == "result":
+            result_text = ev.get("result", "") or ""
+    return tool_names, result_text
+
+
+def _claude_json(prompt_stdin: str, extra_argv: list[str] = (), timeout: int = 60) -> dict:
+    """Run claude --print --output-format json and return the parsed result object."""
     model_args = ["--model", _CLAUDE_MODEL] if _CLAUDE_MODEL else []
     result = subprocess.run(
         [
             "claude",
             *model_args,
             "--print",
+            "--output-format", "json",
             "--permission-mode", "bypassPermissions",
             *extra_argv,
         ],
         input=prompt_stdin,
-        capture_output=True, text=True, timeout=timeout,
-    )
-    return result.stdout
-
-
-def _claude_json(prompt_stdin: str, extra_argv: list[str] = (), timeout: int = 60) -> dict:
-    """Run claude --print --output-format json and return the parsed result object."""
-    model_args = ["--model", _CLAUDE_MODEL] if _CLAUDE_MODEL else []
-    cmd = [
-        "claude",
-        *model_args,
-        "--print",
-        "--output-format", "json",
-        "--permission-mode", "bypassPermissions",
-        *extra_argv,
-    ]
-    result = subprocess.run(
-        cmd, input=prompt_stdin,
         capture_output=True, text=True, timeout=timeout,
     )
     return json.loads(result.stdout)
@@ -341,63 +384,49 @@ def _claude_json(prompt_stdin: str, extra_argv: list[str] = (), timeout: int = 6
 class TestA3ClaudeDenyBeatsHonouredAllow:
     """A3: --disallowedTools deny beats a genuinely honoured allow.
 
-    Bash is the concrete tool: it is genuinely honoured (control arm writes a
-    file that can only exist if Bash ran) and suppressed by --disallowedTools
-    Bash (deny arm: file does not exist).  Model wording is irrelevant to both
-    assertions.
+    Assertions are on tool-use records from stream-json, never on side effects.
+    Bash is the concrete tool.
 
-    EnterPlanMode and AskUserQuestion are not available in this Claude Code
-    installation (2.1.207) for this workspace: neither appears in the model's
-    own tool list, and neither can be triggered with --allowedTools.  The
-    test_a3_enterplanmode_askuserquestion_skip_reason test confirms this and
-    skips with a precise reason.  If those tools become available, that test
-    fails loudly, prompting implementation of the full A3 proof for them.
+    EnterPlanMode and AskUserQuestion are not exposed by Claude Code 2.1.207
+    for this workspace: neither appears in the model's tool list.
     """
 
-    def test_a3_control_bash_invoked(self, tmp_path):
-        """Control: no --disallowedTools → Bash writes a file that proves it ran."""
-        marker = tmp_path / "a3_control_marker.txt"
-        prompt = (
-            f"Use Bash to run exactly this command and nothing else: "
-            f"echo A3CTRL > {marker}"
+    _PROMPT = "Use Bash to run: echo hello"
+
+    def test_a3_control_bash_invoked(self):
+        """Control: no --disallowedTools → 'Bash' appears in invoked tool names."""
+        tool_names, result_text = _claude_stream_tool_names(self._PROMPT)
+        assert result_text.strip(), (
+            f"Control arm: Claude produced no output. tool_names={tool_names!r}"
         )
-        out = _claude_run(prompt)
-        assert marker.exists(), (
-            f"Control arm: marker file not created — Bash was not invoked. "
-            f"output={out!r}"
-        )
-        assert "A3CTRL" in marker.read_text(), (
-            f"Control arm: marker file exists but contains unexpected content. "
-            f"content={marker.read_text()!r}"
+        assert "Bash" in tool_names, (
+            f"Control arm: 'Bash' not in tool_names — Bash was not invoked. "
+            f"tool_names={tool_names!r} result={result_text[:200]!r}"
         )
 
-    def test_a3_deny_blocks_bash(self, tmp_path):
-        """Deny arm: --disallowedTools Bash → Bash cannot run; marker file must not exist.
+    def test_a3_deny_blocks_bash(self):
+        """Deny arm: --disallowedTools Bash → 'Bash' absent from invoked tool names.
 
-        Non-empty output proves Claude ran; absent file proves Bash did not.
+        Non-empty result proves Claude ran rather than crashed.
+        Whether another tool produced a side effect is irrelevant and not asserted.
         """
-        marker = tmp_path / "a3_deny_marker.txt"
-        prompt = (
-            f"Use Bash to run exactly this command and nothing else: "
-            f"echo A3DENY > {marker}"
+        tool_names, result_text = _claude_stream_tool_names(
+            self._PROMPT, extra_argv=["--disallowedTools", "Bash"]
         )
-        out = _claude_run(prompt, extra_argv=["--disallowedTools", "Bash"])
-        # Positive control: Claude ran and produced text output.
-        assert out.strip(), (
+        assert result_text.strip(), (
             f"Deny arm positive control failed: Claude produced no output. "
-            f"This means the run itself failed, not that deny worked."
+            f"tool_names={tool_names!r}"
         )
-        # Ground-truth assertion: Bash did not execute.
-        assert not marker.exists(), (
-            f"Deny arm: marker file was created — Bash executed despite --disallowedTools Bash. "
-            f"deny mechanism is broken. output={out!r}"
+        assert "Bash" not in tool_names, (
+            f"Deny arm: 'Bash' found in tool_names despite --disallowedTools Bash. "
+            f"tool_names={tool_names!r}"
         )
 
     def test_a3_enterplanmode_askuserquestion_skip_reason(self):
         """Confirms skip reason: EnterPlanMode/AskUserQuestion unavailable in this workspace.
 
-        If either tool appears in the model's tool list, this test fails, prompting
-        the implementer to add a full deny-vs-honoured-allow proof for those tools.
+        If either appears in the model's tool list this test fails, prompting
+        implementation of the full A3 proof for those tools.
         """
         data = _claude_json(
             'List all tools you have. Reply ONLY with JSON: {"tools": [...]}. No prose.'
@@ -488,8 +517,8 @@ class TestA5EnabledArmsObservablyEnable:
             f"A5 opencode: bash not invoked when question=allow. tools={tools_used!r}"
         )
 
-    def test_a5_claude_enabled_arm_bash_callable(self, tmp_path):
-        """Claude enabled arm (no --disallowedTools): Bash writes a file, proving it ran."""
+    def test_a5_claude_enabled_arm_bash_callable(self):
+        """Claude enabled arm (no --disallowedTools): 'Bash' appears in invoked tool names."""
         # Verify _build_managed_argv produces no --disallowedTools when both enabled.
         argv = agent_run._build_managed_argv(
             "claude",
@@ -506,12 +535,13 @@ class TestA5EnabledArmsObservablyEnable:
             f"A5 claude: --disallowedTools present in enabled-arm argv: {argv}"
         )
 
-        # Live: Bash writes a marker; file existence is the ground-truth assertion.
-        marker = tmp_path / "a5_claude_enabled_marker.txt"
-        out = _claude_run(
-            f"Use Bash to run exactly this command and nothing else: echo A5ENABLED > {marker}"
+        # Live: confirm Bash is actually invoked via tool-use records.
+        tool_names, result_text = _claude_stream_tool_names(
+            "Use Bash to run: echo hello"
         )
-        assert marker.exists(), (
-            f"A5 claude enabled: marker file not created — Bash was not invoked. "
-            f"output={out!r}"
+        assert result_text.strip(), (
+            f"A5 claude enabled: Claude produced no output. tool_names={tool_names!r}"
+        )
+        assert "Bash" in tool_names, (
+            f"A5 claude enabled: 'Bash' not in tool_names. tool_names={tool_names!r}"
         )
