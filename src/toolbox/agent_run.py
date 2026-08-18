@@ -5573,7 +5573,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         idle_timeout=getattr(args, "idle_timeout", None),
         managed_harness=harness,
         codex_appserver_args=(
-            managed_harness_args + _codex_policy_args(enable_questions=enable_questions)
+            _codex_policy_args(enable_questions=enable_questions) + managed_harness_args
             if harness == "codex" else None
         ),
         managed_prompt=managed_prompt if is_managed else None,
@@ -5866,6 +5866,9 @@ def _codex_policy_args(*, enable_questions: bool) -> List[str]:
     The value must be a struct literal; codex rejects a bare boolean here.
     Plan mode has no codex app-server equivalent, so only questions are set —
     --enable-planning is rejected before launch.
+
+    These args are prepended before any caller-supplied managed_harness_args so
+    that codex's last-occurrence-wins layering lets a caller's -c override ours.
     """
     enabled = "true" if enable_questions else "false"
     return ["-c", f"tools.experimental_request_user_input={{enabled={enabled}}}"]
@@ -5880,6 +5883,13 @@ def _opencode_policy_config(existing: Optional[str], *, enable_planning: bool, e
     global deny. Any other config the caller already had survives untouched.
     Unparseable or non-object input is replaced rather than raising — the policy
     must apply even if the inherited value is junk.
+
+    Ordering asymmetry vs claude/codex: opencode policy is delivered via env,
+    not argv, so --harness-arg has no effect on the three policy keys
+    (question, plan_enter, plan_exit).  A caller-supplied OPENCODE_CONFIG_CONTENT
+    in the parent environment is read here as the base but its policy keys are
+    always overwritten by the managed values.  Use --enable-planning or
+    --enable-questions to relax the policy; there is no per-key override path.
     """
     try:
         config = json.loads(existing) if existing else {}
@@ -7501,13 +7511,24 @@ def _build_managed_argv(
                 argv.append("--print")
                 if prompt and not prompt_file:
                     argv.append(prompt)
-        # --disallowedTools is variadic, so an inline positional prompt must
-        # precede every deny flag to keep it from being parsed as a tool name.
+        # --disallowedTools is variadic: claude consumes every bare (non-flag)
+        # token that follows it as a tool name.  Two hazards must both be
+        # avoided:
+        #   1. The inline prompt positional must precede every deny flag, or
+        #      claude would swallow it as a tool name.
+        #   2. harness_args must NOT immediately follow a --disallowedTools
+        #      block, or a bare caller token would be silently absorbed into
+        #      the deny list.
+        # Solution: place harness_args after the prompt but before the deny
+        # block.  The deny flags that follow terminate the preceding variadic
+        # with a flag-form token, so no bare harness_arg can be swallowed.
+        # --disallowedTools is additive (not last-wins), so positioning it
+        # last does not affect the user's ability to override other flags.
+        argv.extend(harness_args)
         if not enable_planning:
             argv.extend(["--disallowedTools", "EnterPlanMode", "--disallowedTools", "ExitPlanMode"])
         if not enable_questions:
             argv.extend(["--disallowedTools", "AskUserQuestion"])
-        argv.extend(harness_args)
 
     elif harness == "opencode":
         argv.append("opencode")
@@ -7683,8 +7704,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--harness-arg",
         metavar="FLAG",
         default=argparse.SUPPRESS,
-        help="pass FLAG verbatim to the harness command after agent-run's own constructed "
-        "arguments; repeatable escape hatch for flags agent-run does not model",
+        help="pass FLAG verbatim to the harness command; repeatable. "
+        "For claude and codex, values are appended after agent-run's own managed-mode args "
+        "so they can override injected flags (codex uses last-occurrence-wins for -c). "
+        "For opencode, policy is delivered via OPENCODE_CONFIG_CONTENT (env) and is not "
+        "overridable this way; --harness-arg still passes flags to the opencode process "
+        "but cannot override the three managed policy keys (question, plan_enter, plan_exit).",
     )
     mg.add_argument(
         "--enable-planning",

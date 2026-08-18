@@ -614,20 +614,39 @@ All existing raw-mode launch forms keep working.
 --enable-planning                 allow planning; disabled by default. Unsupported by codex,
                                   whose managed app-server path does not expose plan mode
 --enable-questions                allow interactive questions; disabled by default
---harness-arg FLAG                pass FLAG verbatim after the harness's own args; repeatable
+--harness-arg FLAG                pass FLAG verbatim to the harness command; repeatable.
+                                  For claude and codex, values are appended after
+                                  agent-run's own managed-mode args so a caller can
+                                  override injected flags (codex uses last-occurrence-wins
+                                  for -c). For opencode, the three managed policy keys
+                                  (question, plan_enter, plan_exit) are not overridable
+                                  this way; use --enable-planning / --enable-questions
+                                  to relax them.
 
 --session-id UUID                 claude only: use this UUID instead of generating one
 ```
 
 `--enable-planning` and `--enable-questions` are managed-mode escape hatches.
 Without them, agent-run disables planning and interactive questions for every
-managed child process: Claude receives per-process `--disallowedTools`,
-OpenCode receives a merged process-local `OPENCODE_CONFIG_CONTENT` permission
-policy, and Codex app-server receives
-`tools.experimental_request_user_input={enabled=false}`. Enabling questions
-changes that Codex setting to `enabled=true`. Codex's managed app-server API
-does not expose plan mode, so `--enable-planning --harness codex` fails before
-creating run state. Raw mode is unaffected.
+managed child process: Claude receives per-process `--disallowedTools` (the
+deny arm; the enabled arm simply omits those flags and falls back to the user's
+own Claude project config), OpenCode receives a merged process-local
+`OPENCODE_CONFIG_CONTENT` permission policy with explicit `allow`/`deny` for
+both states, and Codex app-server receives
+`tools.experimental_request_user_input={enabled=false}` or `enabled=true`.
+Codex's managed app-server API does not expose plan mode, so
+`--enable-planning --harness codex` fails before creating run state. Raw mode
+is unaffected.
+
+**`--harness-arg` precedence:** for claude and codex, values are appended after
+agent-run's injected managed-mode args so a caller can override them. Codex uses
+last-occurrence-wins for `-c` keys, so a duplicate key in `--harness-arg` takes
+effect. Claude's `--disallowedTools` is additive, so a caller cannot re-enable a
+denied tool via `--harness-arg` regardless of ordering. For opencode, policy is
+delivered via `OPENCODE_CONFIG_CONTENT` (env), not argv; `--harness-arg` passes
+flags to the opencode process but cannot override the three managed policy keys
+(`question`, `plan_enter`, `plan_exit`) — use `--enable-planning` or
+`--enable-questions` instead.
 
 #### One-shot examples
 

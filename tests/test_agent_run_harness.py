@@ -464,6 +464,38 @@ class TestBuildManagedArgv:
         assert "--foo" in argv
         assert "--bar=baz" in argv
 
+    def test_claude_bare_harness_arg_not_swallowed_by_disallowed_tools(self):
+        """A bare (non-flag) --harness-arg token must survive as its own argv element.
+
+        --disallowedTools is variadic: the claude CLI consumes every bare token
+        following it as a tool name.  harness_args must appear before the deny
+        block so a bare user arg cannot be silently absorbed into the deny list.
+        """
+        bare_token = "SomeBareArg"
+        argv = self._build(
+            "claude",
+            prompt="hi",
+            session_id="u",
+            harness_args=[bare_token],
+            # denies active so --disallowedTools is present
+            enable_planning=False,
+            enable_questions=False,
+        )
+        assert bare_token in argv, f"bare harness_arg {bare_token!r} missing from argv: {argv}"
+        # The token must not appear as the argument to any --disallowedTools entry.
+        deny_targets = [
+            argv[i + 1] for i, tok in enumerate(argv[:-1]) if tok == "--disallowedTools"
+        ]
+        assert bare_token not in deny_targets, (
+            f"bare harness_arg {bare_token!r} was absorbed into --disallowedTools targets: "
+            f"{deny_targets}; full argv: {argv}"
+        )
+        # harness_args must precede the first --disallowedTools flag.
+        if "--disallowedTools" in argv:
+            assert argv.index(bare_token) < argv.index("--disallowedTools"), (
+                f"bare harness_arg {bare_token!r} appears after --disallowedTools: {argv}"
+            )
+
 
 class TestOpenCodePolicyConfig:
     def test_preserves_unrelated_content_and_denies_by_default(self):
