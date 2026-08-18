@@ -2287,19 +2287,85 @@ class TestCwdParsing:
             _parse(["--cwd"])
         assert "--cwd" in str(exc.value)
 
-    def test_cwd_empty_equals_value(self):
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--cwd", "", "myrun", "--", "pwd"],
+            ["--cwd=", "myrun", "--", "pwd"],
+        ],
+        ids=["space-form", "equals-form"],
+    )
+    def test_cwd_empty_value_rejected(self, argv):
+        # An empty value would otherwise leave the run in the invocation
+        # directory and record that directory in <state_dir>/cwd.
         with pytest.raises(agent_run._LaunchArgvError) as exc:
-            _parse(["--cwd=", "myrun", "--", "pwd"])
+            _parse(argv)
         assert "--cwd" in str(exc.value)
 
-    def test_cwd_is_a_launch_flag_not_a_subcommand_prefix(self):
-        # --cwd before a subcommand name means a run named after the
-        # subcommand, not subcommand dispatch.
-        r = _parse(["--cwd", "/tmp", "myrun", "--", "pwd"])
+    def test_cwd_before_a_subcommand_name_makes_it_a_run_name(self):
+        # A launch flag suppresses subcommand dispatch, so the token is the
+        # name of a run rather than the subcommand it is spelled like.
+        r = _parse(["--cwd", "/tmp", "status", "--", "pwd"])
         assert r.subcommand_tokens is None
+        assert r.name == "status"
+        assert r.command == ["pwd"]
 
     def test_cwd_in_help(self):
         assert "--cwd" in agent_run._build_parser().format_help()
+
+
+class TestCwdResolution:
+    """_apply_launch_cwd resolves the requested DIR and enters it."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_cwd(self):
+        # _apply_launch_cwd chdirs the calling process; the CLI exits right
+        # after, but the test process must be put back or later tests inherit
+        # the move.
+        origin = os.getcwd()
+        yield
+        os.chdir(origin)
+
+    def _enter(self, requested: Optional[str]) -> None:
+        agent_run._apply_launch_cwd(argparse.Namespace(cwd=requested))
+
+    def test_absent_cwd_leaves_the_process_where_it_was(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        here = os.getcwd()
+        self._enter(None)
+        assert os.getcwd() == here
+
+    def test_relative_resolves_against_the_invocation_directory(self, tmp_path, monkeypatch):
+        (tmp_path / "workdir").mkdir()
+        monkeypatch.chdir(tmp_path)
+        self._enter("workdir")
+        assert os.getcwd() == str((tmp_path / "workdir").resolve())
+
+    def test_tilde_is_expanded(self, tmp_path, monkeypatch):
+        # argparse does not expand '~'; agent-run must.
+        home = tmp_path / "home"
+        (home / "sub").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        self._enter("~/sub")
+        assert os.getcwd() == str((home / "sub").resolve())
+
+    def test_symlinked_component_is_resolved(self, tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        (tmp_path / "link").symlink_to(real)
+        self._enter(str(tmp_path / "link" / "."))
+        assert os.getcwd() == str(real.resolve())
+
+    def test_pwd_is_repointed_and_oldpwd_dropped(self, tmp_path, monkeypatch):
+        # os.chdir moves only the kernel cwd; a stale PWD would make the
+        # launched command disagree with its own working directory.
+        target = tmp_path / "workdir"
+        target.mkdir()
+        monkeypatch.setenv("PWD", "/nowhere")
+        monkeypatch.setenv("OLDPWD", "/elsewhere")
+        self._enter(str(target))
+        assert os.environ["PWD"] == str(target.resolve())
+        assert "OLDPWD" not in os.environ
 
 
 class TestCwdLaunch:
@@ -2313,28 +2379,16 @@ class TestCwdLaunch:
         yield
         os.chdir(origin)
 
-    def _launch(self, argv: list[str]) -> int:
-        return agent_run.main(argv)
-
-    def test_command_runs_in_cwd(self, isolated_runs_root, isolated_log_root, tmp_path):
-        target = tmp_path / "workdir"
-        target.mkdir()
-        name = "cwd-basic"
-        assert self._launch(["--cwd", str(target), name, "--", "/bin/pwd"]) == 0
-        state_dir = isolated_runs_root / name
-        _wait_terminal(state_dir)
-        log = (isolated_log_root / name / "log").read_text()
-        assert str(target.resolve()) in log
-
-    def test_recorded_cwd_matches_effective_directory(
+    def test_command_runs_in_cwd_and_the_directory_is_recorded(
         self, isolated_runs_root, isolated_log_root, tmp_path
     ):
         target = tmp_path / "workdir"
         target.mkdir()
-        name = "cwd-state-file"
-        assert self._launch(["--cwd", str(target), name, "--", "/bin/pwd"]) == 0
+        name = "cwd-basic"
+        assert agent_run.main(["--cwd", str(target), name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
         _wait_terminal(state_dir)
+        assert str(target.resolve()) in (isolated_log_root / name / "log").read_text()
         assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
         run_json = json.loads((isolated_log_root / name / "run.json").read_text())
         assert run_json["cwd"] == str(target.resolve())
@@ -2355,51 +2409,18 @@ class TestCwdLaunch:
             capture_output=True, text=True, env=env,
         ).stdout.strip()
         name = "cwd-launch-head"
-        assert self._launch(["--cwd", str(repo), name, "--", "/bin/pwd"]) == 0
+        assert agent_run.main(["--cwd", str(repo), name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
         _wait_terminal(state_dir)
         assert (state_dir / "launch_head").read_text().strip() == head
         assert (state_dir / "cwd").read_text().strip() == str(repo.resolve())
 
-    def test_relative_cwd_resolves_against_the_invocation_directory(
-        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
-    ):
-        target = tmp_path / "workdir"
-        target.mkdir()
-        monkeypatch.chdir(tmp_path)
-        name = "cwd-relative"
-        assert self._launch(["--cwd", "workdir", name, "--", "/bin/pwd"]) == 0
-        state_dir = isolated_runs_root / name
-        _wait_terminal(state_dir)
-        assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
-
-    def test_symlinked_component_is_resolved(
-        self, isolated_runs_root, isolated_log_root, tmp_path
-    ):
-        real = tmp_path / "real"
-        real.mkdir()
-        link = tmp_path / "link"
-        link.symlink_to(real)
-        name = "cwd-symlink"
-        assert self._launch(["--cwd", str(link / "."), name, "--", "/bin/pwd"]) == 0
-        state_dir = isolated_runs_root / name
-        _wait_terminal(state_dir)
-        assert (state_dir / "cwd").read_text().strip() == str(real.resolve())
-
-    def test_equals_form_launches(self, isolated_runs_root, isolated_log_root, tmp_path):
-        target = tmp_path / "workdir"
-        target.mkdir()
-        name = "cwd-equals"
-        assert self._launch([f"--cwd={target}", name, "--", "/bin/pwd"]) == 0
-        state_dir = isolated_runs_root / name
-        _wait_terminal(state_dir)
-        assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
-
     def test_interactive_run_uses_cwd(self, isolated_runs_root, isolated_log_root, tmp_path):
+        # The interactive path launches through a pty rather than a plain fork.
         target = tmp_path / "workdir"
         target.mkdir()
         name = "cwd-interactive"
-        assert self._launch(["-i", "--cwd", str(target), name, "--", "/bin/pwd"]) == 0
+        assert agent_run.main(["-i", "--cwd", str(target), name, "--", "/bin/pwd"]) == 0
         state_dir = isolated_runs_root / name
         _wait_terminal(state_dir)
         assert (state_dir / "interactive").read_text().strip() == "1"
@@ -2409,6 +2430,7 @@ class TestCwdLaunch:
     def test_managed_run_uses_cwd(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
+        # Managed mode builds the argv itself, so it reaches exec by another route.
         fake = tmp_path / "claude"
         fake.write_text("#!/bin/sh\npwd\nexit 0\n")
         fake.chmod(0o755)
@@ -2416,7 +2438,7 @@ class TestCwdLaunch:
         target = tmp_path / "workdir"
         target.mkdir()
         name = "cwd-managed"
-        assert self._launch([
+        assert agent_run.main([
             "--harness", "claude", "--prompt", "hi", "--cwd", str(target), name,
         ]) == 0
         state_dir = isolated_runs_root / name
@@ -2440,19 +2462,36 @@ class TestCwdLaunch:
         target.mkdir()
         monkeypatch.chdir(launch_dir)
         name = "cwd-prompt-file"
-        assert self._launch([
+        assert agent_run.main([
             "--harness", "claude", "--prompt-file", "brief.md", "--cwd", str(target), name,
         ]) == 0
         state_dir = isolated_runs_root / name
         _wait_terminal(state_dir)
         assert (isolated_log_root / name / "prompt").read_text() == "do the thing\n"
 
+    @pytest.mark.parametrize(
+        "cwd_argv", [["--cwd", ""], ["--cwd="]], ids=["space-form", "equals-form"]
+    )
+    def test_empty_cwd_exits_and_creates_no_run_dir(
+        self, cwd_argv, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        # An unset shell variable expands to an empty argument; running in the
+        # invocation directory instead would record the wrong <state_dir>/cwd.
+        monkeypatch.chdir(tmp_path)
+        name = "cwd-empty"
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.main([*cwd_argv, name, "--", "/bin/pwd"])
+        assert exc_info.value.code != 0
+        assert "--cwd" in str(exc_info.value.code)
+        assert not (isolated_runs_root / name).exists()
+        assert not (isolated_log_root / name).exists()
+
     def test_nonexistent_cwd_exits_and_creates_no_run_dir(
         self, isolated_runs_root, isolated_log_root, tmp_path
     ):
         name = "cwd-missing"
         with pytest.raises(SystemExit) as exc_info:
-            self._launch(["--cwd", str(tmp_path / "nope"), name, "--", "/bin/pwd"])
+            agent_run.main(["--cwd", str(tmp_path / "nope"), name, "--", "/bin/pwd"])
         assert exc_info.value.code != 0
         assert not (isolated_runs_root / name).exists()
         assert not (isolated_log_root / name).exists()
@@ -2464,7 +2503,7 @@ class TestCwdLaunch:
         target.write_text("x\n")
         name = "cwd-is-file"
         with pytest.raises(SystemExit) as exc_info:
-            self._launch(["--cwd", str(target), name, "--", "/bin/pwd"])
+            agent_run.main(["--cwd", str(target), name, "--", "/bin/pwd"])
         assert exc_info.value.code != 0
         assert "not a directory" in str(exc_info.value.code).lower()
         assert not (isolated_runs_root / name).exists()
@@ -2479,18 +2518,8 @@ class TestCwdLaunch:
         name = "cwd-unenterable"
         try:
             with pytest.raises(SystemExit) as exc_info:
-                self._launch(["--cwd", str(target), name, "--", "/bin/pwd"])
+                agent_run.main(["--cwd", str(target), name, "--", "/bin/pwd"])
             assert exc_info.value.code != 0
             assert not (isolated_runs_root / name).exists()
         finally:
             target.chmod(0o700)
-
-    def test_tilde_is_expanded(self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch):
-        home = tmp_path / "home"
-        (home / "sub").mkdir(parents=True)
-        monkeypatch.setenv("HOME", str(home))
-        name = "cwd-tilde"
-        assert self._launch(["--cwd", "~/sub", name, "--", "/bin/pwd"]) == 0
-        state_dir = isolated_runs_root / name
-        _wait_terminal(state_dir)
-        assert (state_dir / "cwd").read_text().strip() == str((home / "sub").resolve())
