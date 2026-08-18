@@ -102,6 +102,11 @@ def _make_state_run(
         )
         for p in (sd / "status", sd):
             os.utime(p, (old, old))
+        if cwd is not None and cwd.is_dir():
+            for root, dirs, files in os.walk(cwd):
+                for entry in [*dirs, *files]:
+                    os.utime(Path(root) / entry, (old, old), follow_symlinks=False)
+            os.utime(cwd, (old, old))
     return sd
 
 
@@ -496,8 +501,8 @@ class TestReapWorktrees:
         out = capsys.readouterr().out
         assert "worktrees_removed=0" in out
         if kind == "missing":
-            # Nothing to classify: not even reported as a candidate.
-            assert "worktrees_skipped=0" in out
+            assert "unresolvable cwd" in out
+            assert "worktrees_skipped=1" in out
         else:
             assert cwd.is_dir()
             assert "not a linked worktree" in out
@@ -592,6 +597,7 @@ class TestReapWorktrees:
             isolated_runs_root, isolated_log_root, "b-live", status="running", cwd=wt
         )
         (live / "pid").write_text(f"{os.getpid()}\n")
+        (live / "process_identity").write_text(f"{agent_run._process_identity(os.getpid())}\n")
 
         agent_run.cmd_reap(_reap_args())
 
@@ -813,6 +819,9 @@ class TestReapWorktreesDryRun:
                 isolated_runs_root, isolated_log_root, "z-live", status="running", cwd=wt
             )
             (live / "pid").write_text(f"{os.getpid()}\n")
+            (live / "process_identity").write_text(
+                f"{agent_run._process_identity(os.getpid())}\n"
+            )
         age = 1 if hazard == "young" else 1000
         _make_state_run(
             isolated_runs_root, isolated_log_root, "a-run", cwd=cwd, age_hours=age

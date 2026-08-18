@@ -1339,6 +1339,21 @@ def _reap_stale_sentinels(root: Path) -> int:
 
 
 @contextmanager
+def _worktree_publication_lock(*, exclusive: bool):
+    """Serialize launch-state publication with destructive worktree removal."""
+    lock_dir = STATE_ROOT / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "worktree-publication.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield fd
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
 def _launch_lock(name: str):
     """Serialize launch setup for one run name across processes.
 
@@ -1870,11 +1885,12 @@ def _newest_mtime_recursive(
     return newest
 
 
-def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
+def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None,
+                    excludes: Sequence[Path] = ()) -> int:
     """Apparent size (sum of ``st_size``) of every regular file at or below
-    ``d``, in bytes, excluding anything at or below ``exclude`` (if given —
-    used to report a log dir's size without double-counting its ``tmp/``
-    scratch subdirectory). Read-only: uses ``os.scandir`` and never follows
+    ``d``, in bytes, excluding anything at or below ``exclude`` or ``excludes``.
+    The singular argument keeps log/scratch callers concise; the sequence is
+    used when several separately charged roots are nested in one worktree.
     symlinks (``entry.stat(follow_symlinks=False)``), so neither the walk
     interior nor ``d`` itself can be a symlink that redirects the count
     outside ``d``. Tolerates races (a file vanishing between scan and stat)
@@ -1892,10 +1908,13 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
     if not _stat_module.S_ISDIR(top_st.st_mode):
         return 0
     total = 0
+    excluded = {p.resolve() for p in excludes}
+    if exclude is not None:
+        excluded.add(exclude.resolve())
     stack = [d]
     while stack:
         current = stack.pop()
-        if exclude is not None and current == exclude:
+        if current.resolve() in excluded:
             continue
         try:
             entries = list(os.scandir(current))
@@ -2573,13 +2592,17 @@ def _watch_parse_iso(raw: Optional[str]) -> Optional[datetime]:
 
 
 class _WatchGitOutcome(NamedTuple):
-    """Result of one bounded git read: exactly one field is set. ``error``
-    populates the watch contract's ``git_error`` discriminator, since
-    collapsing every failure to a bare ``None`` hides *why* facts are
-    unavailable."""
+    """Result of one bounded git command, including operator-visible failure detail."""
 
     stdout: Optional[str]
     error: Optional[str]
+    stderr: Optional[str] = None
+
+    @property
+    def error_detail(self) -> str:
+        if self.stderr:
+            return f"{self.error}: {self.stderr.strip()}"
+        return self.error or "git_failed"
 
 
 # "No commits yet" has no single stable stderr wording across the git
@@ -2619,6 +2642,10 @@ def _watch_run_git_checked(
                 "-c",
                 "diff.external=",
                 "-c",
+                "filter.allowProcess=false",
+                "-c",
+                "filter.required=false",
+                "-c",
                 "core.pager=cat",
                 *git_args,
             ],
@@ -2635,10 +2662,10 @@ def _watch_run_git_checked(
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or b"").decode("utf-8", errors="replace")
         if _WATCH_GIT_NOT_A_REPO_STDERR in stderr.lower():
-            return _WatchGitOutcome(None, "not_a_repo")
-        return _WatchGitOutcome(None, "git_failed")
-    except (OSError, subprocess.SubprocessError):
-        return _WatchGitOutcome(None, "git_failed")
+            return _WatchGitOutcome(None, "not_a_repo", stderr)
+        return _WatchGitOutcome(None, "git_failed", stderr)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _WatchGitOutcome(None, "git_failed", str(exc))
     return _WatchGitOutcome(result.stdout.decode("utf-8", errors="replace"), None)
 
 
@@ -4863,62 +4890,158 @@ def _worktree_symlink_free_reason(raw: str) -> Optional[str]:
     return None
 
 
-def _worktree_live_run_cwds() -> set:
-    """Resolved launch directories of every run whose effective status is not
-    conclusively terminal. A worktree in this set is still in use by a live
-    run and must never be removed, however old the terminal run that shares
-    it. Unreadable and unrecognized statuses count as live: only
-    ``TERMINAL_STATUSES`` releases a directory."""
-    live: set = set()
-    if not STATE_ROOT.is_dir():
-        return live
+class _WorktreeStateScan(NamedTuple):
+    entries: Optional[List[Path]]
+    error: Optional[str]
+
+
+def _worktree_state_scan() -> _WorktreeStateScan:
+    """Return every real named state directory, or one fail-closed error."""
     try:
+        root_st = STATE_ROOT.lstat()
+        if not _stat_module.S_ISDIR(root_st.st_mode):
+            return _WorktreeStateScan(None, f"state root is missing or not a real directory: {STATE_ROOT}")
         entries = sorted(STATE_ROOT.iterdir())
-    except OSError:
-        return live
+    except OSError as exc:
+        return _WorktreeStateScan(None, f"cannot read state root {STATE_ROOT}: {exc}")
+
+    states: List[Path] = []
     for d in entries:
         if d.name.startswith("."):
             continue
         try:
             _validate_run_name(d.name)
+            st = d.lstat()
         except SystemExit:
+            return _WorktreeStateScan(None, f"invalid state directory name {d.name!r}")
+        except OSError as exc:
+            return _WorktreeStateScan(None, f"cannot inspect state directory {d}: {exc}")
+        if not _stat_module.S_ISDIR(st.st_mode):
+            return _WorktreeStateScan(None, f"state entry is not a real directory: {d}")
+        states.append(d)
+    return _WorktreeStateScan(states, None)
+
+
+def _worktree_state_has_live_runner(d: Path) -> Tuple[Optional[bool], Optional[str]]:
+    """Determine whether a state directory's recorded runner is still alive."""
+    pid_raw = _read(d / "pid")
+    if not pid_raw:
+        return False, None
+    try:
+        pid = int(pid_raw)
+    except ValueError:
+        return None, f"run {d.name} has malformed pid {pid_raw!r}"
+    if pid <= 0:
+        return None, f"run {d.name} has invalid pid {pid}"
+    if not _pid_alive(pid):
+        return False, None
+    recorded = _read(d / "process_identity")
+    if not recorded:
+        return None, f"run {d.name} has live pid {pid} but no process identity"
+    current = _process_identity(pid)
+    if current is None:
+        return None, f"run {d.name} has live pid {pid} with unverifiable identity"
+    return current == recorded, None
+
+
+class _WorktreeLiveCwds(NamedTuple):
+    paths: Optional[List[Path]]
+    error: Optional[str]
+
+
+def _worktree_live_run_cwds(state_entries: List[Path]) -> _WorktreeLiveCwds:
+    """Resolve every cwd that is live by status, process identity, or ambiguity."""
+    live: List[Path] = []
+    for d in state_entries:
+        status = _effective_status(d)
+        process_live, process_error = _worktree_state_has_live_runner(d)
+        if process_error is not None:
+            return _WorktreeLiveCwds(None, process_error)
+        protects_cwd = status not in TERMINAL_STATUSES or process_live is True
+        if not protects_cwd:
             continue
-        if _dir_identity(d) is None:
-            continue
-        if _effective_status(d) in TERMINAL_STATUSES:
-            continue
-        resolved = _worktree_resolve_cwd(_watch_read_cwd_file(d / "cwd"))
-        if resolved is not None:
-            live.add(str(resolved))
-    return live
+        raw = _watch_read_cwd_file(d / "cwd")
+        resolved = _worktree_resolve_cwd(raw)
+        if resolved is None:
+            return _WorktreeLiveCwds(None, f"cannot resolve cwd for live run {d.name}")
+        live.append(resolved)
+    return _WorktreeLiveCwds(live, None)
 
 
-def _worktree_unsaved_work_reason(path: Path) -> Optional[str]:
-    """``None`` when removing the worktree at ``path`` would destroy no work,
-    else the reason it would.
+def _worktree_content_reason(path: Path) -> Optional[str]:
+    """Return a refusal for tracked, untracked, or ignored worktree content."""
+    checks = (
+        (["ls-files", "--modified", "--deleted", "-z"], "modified or deleted tracked file(s)"),
+        (["ls-files", "--others", "--exclude-standard", "-z"], "untracked file(s)"),
+        (["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], "ignored file(s) or directory content"),
+    )
+    for args, label in checks:
+        outcome = _watch_run_git_checked(path, args)
+        if outcome.stdout is None:
+            return f"cannot inspect {label} ({outcome.error_detail})"
+        count = len([entry for entry in outcome.stdout.split("\0") if entry])
+        if count:
+            return f"{count} {label}"
+    return None
 
-    Two independent hazards are checked: a dirty working tree (modified
-    tracked files or untracked files, per ``status --porcelain``; ignored
-    files are excluded, matching git's own default) and commits reachable
-    from HEAD but from no remote-tracking ref. Every git failure is itself a
-    refusal — an unanswerable question about unsaved work is not a "no".
-    """
-    status = _watch_run_git_checked(path, ["status", "--porcelain"])
-    if status.stdout is None:
-        return f"cannot read git status ({status.error})"
-    dirty_entries = [ln for ln in status.stdout.splitlines() if ln.strip()]
-    if dirty_entries:
-        return f"{len(dirty_entries)} uncommitted or untracked file(s)"
 
+def _worktree_unpushed_reason(path: Path) -> Optional[str]:
     unpushed = _watch_run_git_checked(path, ["rev-list", "--count", "HEAD", "--not", "--remotes"])
     if unpushed.stdout is None:
-        return f"cannot count unpushed commits ({unpushed.error})"
+        return f"cannot count unpushed commits ({unpushed.error_detail})"
     count = _safe_int(unpushed.stdout.strip())
     if count is None:
         return "unparseable unpushed commit count"
     if count > 0:
         return f"{count} commit(s) not on any remote"
     return None
+
+
+def _worktree_registered_roots(info: _WorktreeInfo) -> Tuple[Optional[List[Path]], Optional[str]]:
+    """Enumerate all registered roots owned by the candidate repository."""
+    if not info.common_dir:
+        return None, "owning repository is unknown"
+    outcome = _watch_run_git_checked(
+        Path(info.common_dir), ["worktree", "list", "--porcelain", "-z"]
+    )
+    if outcome.stdout is None:
+        return None, f"cannot enumerate registered worktrees ({outcome.error_detail})"
+    roots: List[Path] = []
+    for field in outcome.stdout.split("\0"):
+        if not field:
+            continue
+        if field.startswith("worktree "):
+            raw = field[len("worktree "):]
+            resolved = _worktree_resolve_cwd(raw)
+            if resolved is None:
+                return None, f"cannot resolve registered worktree {raw!r}"
+            roots.append(resolved)
+    if not roots:
+        return None, "worktree list returned no roots"
+    return roots, None
+
+
+def _worktree_nested_reason(info: _WorktreeInfo, path: Path) -> Optional[str]:
+    roots, error = _worktree_registered_roots(info)
+    if error is not None:
+        return error
+    assert roots is not None
+    for root in roots:
+        try:
+            root.relative_to(path)
+        except ValueError:
+            continue
+        if root != path:
+            return f"registered worktree {root} is nested inside the candidate"
+    return None
+
+
+def _worktree_activity_age_seconds(path: Path) -> Tuple[Optional[float], Optional[str]]:
+    """Age of the newest recursively observed filesystem mtime in a worktree."""
+    newest = _newest_mtime_recursive(path)
+    if newest is None or newest is _WALK_INCOMPLETE:
+        return None, "cannot determine worktree filesystem activity"
+    return max(0.0, time.time() - newest), None
 
 
 def _worktree_remove(info: _WorktreeInfo, path: Path, *, force: bool) -> Optional[str]:
@@ -4939,125 +5062,186 @@ def _worktree_remove(info: _WorktreeInfo, path: Path, *, force: bool) -> Optiona
         Path(info.common_dir), args, timeout=WORKTREE_REMOVE_TIMEOUT_SECONDS
     )
     if outcome.stdout is None:
-        return f"git worktree remove failed ({outcome.error})"
+        return f"git worktree remove failed ({outcome.error_detail})"
     return None
 
 
 class _WorktreeCandidate(NamedTuple):
-    """One deduplicated launch directory shared by ``names`` terminal runs.
-    ``raw`` is the path exactly as recorded (used for the symlink guard),
-    ``resolved`` its realpath (used for identity and every git call).
-    ``age_seconds`` is the *youngest* sharing run's terminal-state age, so a
-    directory a recently finished run used is never removed on the strength
-    of an older sibling."""
+    """One deduplicated worktree candidate attributed across all run state."""
 
     resolved: Path
     raw: str
     names: List[str]
     age_seconds: Optional[float]
+    identity: Tuple[int, int]
 
 
-def _worktree_collect_candidates(state_candidates: List[Path]) -> List[_WorktreeCandidate]:
-    """Group terminal runs' recorded launch directories by realpath.
+class _WorktreeCandidates(NamedTuple):
+    candidates: List[_WorktreeCandidate]
+    skipped: List[str]
 
-    Only runs in ``TERMINAL_STATUSES`` contribute; a shared directory is
-    returned once, listing every run that recorded it. ``--force-unknown``
-    deliberately does not widen this: an unrecognized status is not evidence
-    that a working tree is finished with.
-    """
-    by_path: dict = {}
-    for d in state_candidates:
+
+def _worktree_collect_candidates(
+    state_entries: List[Path], selected_names: Optional[set[str]]
+) -> _WorktreeCandidates:
+    """Group terminal run cwd records using all-state safety attribution."""
+    by_path: dict[str, _WorktreeCandidate] = {}
+    skipped: List[str] = []
+    for d in state_entries:
         if _read(d / "status") not in TERMINAL_STATUSES:
             continue
         raw = _watch_read_cwd_file(d / "cwd")
         resolved = _worktree_resolve_cwd(raw)
         if resolved is None:
+            if selected_names is None or d.name in selected_names:
+                skipped.append(f"run {d.name} has an unresolvable cwd")
+            continue
+        identity = _dir_identity(resolved)
+        if identity is None:
+            if selected_names is None or d.name in selected_names:
+                skipped.append(f"run {d.name} cwd is not a real directory")
             continue
         age = _terminal_state_age_seconds(d)
         key = str(resolved)
         if key not in by_path:
-            by_path[key] = _WorktreeCandidate(resolved, raw, [d.name], age)
+            by_path[key] = _WorktreeCandidate(resolved, raw, [d.name], age, identity)
             continue
         existing = by_path[key]
-        # An unknown age is treated as the youngest possible: it must not be
-        # discarded in favour of a sibling's known, older age.
-        if age is None or existing.age_seconds is None:
-            merged_age = None
-        else:
-            merged_age = min(existing.age_seconds, age)
+        merged_age = None if age is None or existing.age_seconds is None else min(
+            existing.age_seconds, age
+        )
         by_path[key] = existing._replace(
             names=[*existing.names, d.name], age_seconds=merged_age
         )
-    return [by_path[k] for k in sorted(by_path)]
+
+    candidates = [
+        by_path[key]
+        for key in sorted(by_path)
+        if selected_names is None or selected_names.intersection(by_path[key].names)
+    ]
+    return _WorktreeCandidates(candidates, skipped)
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _worktree_candidate_refusal(
+    cand: _WorktreeCandidate,
+    state_entries: List[Path],
+    *,
+    force_dirty: bool,
+    min_age_threshold: float,
+    reconciled_this_pass: set[str],
+) -> Tuple[Optional[str], Optional[_WorktreeInfo], Optional[float]]:
+    """Run every deletion refusal check against one current filesystem view."""
+    if reconciled_this_pass.intersection(cand.names):
+        return "a sharing run was reconciled in this invocation", None, None
+    if cand.age_seconds is None or cand.age_seconds < min_age_threshold:
+        return "youngest sharing run is below the age threshold", None, None
+    if _dir_identity(cand.resolved) != cand.identity:
+        return "candidate path identity changed after collection", None, None
+    symlink_reason = _worktree_symlink_free_reason(cand.raw)
+    if symlink_reason is not None:
+        return symlink_reason, None, None
+
+    info = _worktree_classify(cand.resolved)
+    if info.kind != _WORKTREE_LINKED:
+        return f"not a linked worktree ({info.detail or info.kind})", None, None
+    nested = _worktree_nested_reason(info, cand.resolved)
+    if nested is not None:
+        return nested, None, None
+
+    live = _worktree_live_run_cwds(state_entries)
+    if live.error is not None:
+        return f"liveness scan failed: {live.error}", None, None
+    assert live.paths is not None
+    for live_cwd in live.paths:
+        if _path_is_within(live_cwd, cand.resolved):
+            return f"a live run is using this directory ({live_cwd})", None, None
+
+    activity_age, activity_error = _worktree_activity_age_seconds(cand.resolved)
+    if activity_error is not None:
+        return activity_error, None, None
+    assert activity_age is not None
+    effective_age = min(cand.age_seconds, activity_age)
+    if effective_age < min_age_threshold:
+        return "worktree filesystem activity is below the age threshold", None, effective_age
+
+    if not force_dirty:
+        content = _worktree_content_reason(cand.resolved)
+        if content is not None:
+            return f"{content} — use --force-dirty to override", None, effective_age
+    unpushed = _worktree_unpushed_reason(cand.resolved)
+    if unpushed is not None:
+        return unpushed, None, effective_age
+    return None, info, effective_age
 
 
 def _worktree_gc_pass(
-    state_candidates: List[Path],
     *,
+    collected: Optional[_WorktreeCandidates],
+    scan_error: Optional[str],
     dry_run: bool,
     force_dirty: bool,
     min_age_threshold: float,
+    reconciled_this_pass: set[str],
     budget_expired,
 ) -> Tuple[int, int, int]:
-    """Remove linked git worktrees left behind by terminal runs.
-
-    Returns ``(removed, skipped, deferred)``. Each directory is handled once
-    however many runs share it. Every refusal prints its reason, and the same
-    read-only checks run under ``--dry-run``, so a preview never predicts an
-    action a real invocation would refuse.
-
-    Only ``_WORKTREE_LINKED`` directories are ever removed. A run's ``cwd`` is
-    routinely a real project checkout or ``$HOME``; a non-git directory, a
-    main worktree, a bare repo, and every git failure are all refusals.
-    """
+    """Remove linked worktrees only after an all-state fail-closed scan."""
     removed = skipped = deferred = 0
-    live_cwds = _worktree_live_run_cwds()
+    if scan_error is not None:
+        print(f"  [worktree]: skipped: {scan_error}")
+        return 0, 1, 0
+    assert collected is not None
+    for reason in collected.skipped:
+        print(f"  [worktree]: skipped: {reason}")
+        skipped += 1
 
-    for cand in _worktree_collect_candidates(state_candidates):
+    for cand in collected.candidates:
         if budget_expired():
             deferred += 1
             continue
         label = f"  [worktree] {cand.resolved}"
         shared = f" (runs: {', '.join(cand.names)})" if len(cand.names) > 1 else ""
 
-        if cand.age_seconds is None or cand.age_seconds < min_age_threshold:
-            continue
-        age_h = cand.age_seconds / 3600
-
-        info = _worktree_classify(cand.resolved)
-        if info.kind != _WORKTREE_LINKED:
-            print(f"{label}: skipped: not a linked worktree ({info.detail or info.kind}){shared}")
-            skipped += 1
-            continue
-        if str(cand.resolved) in live_cwds:
-            print(f"{label}: skipped: a live run is using this directory{shared}")
-            skipped += 1
-            continue
-        symlink_reason = _worktree_symlink_free_reason(cand.raw)
-        if symlink_reason is not None:
-            print(f"{label}: skipped: {symlink_reason}{shared}")
-            skipped += 1
-            continue
-        if not force_dirty:
-            unsaved = _worktree_unsaved_work_reason(cand.resolved)
-            if unsaved is not None:
-                print(f"{label}: skipped: {unsaved} — use --force-dirty to override{shared}")
+        with _worktree_publication_lock(exclusive=True):
+            final_scan = _worktree_state_scan()
+            if final_scan.error is not None:
+                print(f"{label}: skipped: {final_scan.error}{shared}")
                 skipped += 1
                 continue
-
-        print(
-            f"{label}: linked worktree (age={age_h:.1f}h) "
-            f"[{'dry-run' if dry_run else 'removing'}]{shared}"
-        )
-        if dry_run:
+            assert final_scan.entries is not None
+            refusal, info, effective_age = _worktree_candidate_refusal(
+                cand,
+                final_scan.entries,
+                force_dirty=force_dirty,
+                min_age_threshold=min_age_threshold,
+                reconciled_this_pass=reconciled_this_pass,
+            )
+            if refusal is not None:
+                print(f"{label}: skipped: {refusal}{shared}")
+                skipped += 1
+                continue
+            assert info is not None and effective_age is not None
+            age_h = effective_age / 3600
+            print(
+                f"{label}: linked worktree (conservative_age={age_h:.1f}h) "
+                f"[{'dry-run' if dry_run else 'removing'}]{shared}"
+            )
+            if dry_run:
+                removed += 1
+                continue
+            failure = _worktree_remove(info, cand.resolved, force=force_dirty)
+            if failure is not None:
+                print(f"{label}: skipped: {failure}")
+                skipped += 1
+                continue
             removed += 1
-            continue
-        failure = _worktree_remove(info, cand.resolved, force=force_dirty)
-        if failure is not None:
-            print(f"{label}: skipped: {failure}")
-            skipped += 1
-            continue
-        removed += 1
     return removed, skipped, deferred
 
 
@@ -5167,6 +5351,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
     deferred_count = 0
     found_target = False
     reconciled_this_pass = set()
+    worktree_reconciled_this_pass = set()
     # Names whose whole log dir was collected (or reported under --dry-run) by
     # pass 2.5 in this invocation.  Pass 3 skips these to avoid counting the
     # same run's scratch as both a collected log and an orphaned scratch dir.
@@ -5189,6 +5374,20 @@ def cmd_reap(args: argparse.Namespace) -> int:
         state_candidates.append(d)
         found_target = True
 
+    # Capture worktree attribution before routine state GC removes cwd records.
+    worktree_candidates: Optional[_WorktreeCandidates] = None
+    worktree_scan_error: Optional[str] = None
+    worktree_state_names: set[str] = set()
+    if include_worktrees:
+        worktree_scan = _worktree_state_scan()
+        worktree_scan_error = worktree_scan.error
+        if worktree_scan.entries is not None:
+            selected = {target_name} if target_name is not None else None
+            worktree_candidates = _worktree_collect_candidates(worktree_scan.entries, selected)
+            worktree_state_names = {
+                name for candidate in worktree_candidates.candidates for name in candidate.names
+            }
+
     # Pass 1: stale-running reconciliation and identity-verified idle kill.
     for d in state_candidates:
         if time.monotonic() - reap_start > reap_budget:
@@ -5202,6 +5401,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         pid_raw = _read(d / "pid")
         if not pid_raw:
             print(f"  {name}: dead (no pid recorded) [{'dry-run' if dry_run else 'marking died'}]")
+            worktree_reconciled_this_pass.add(name)
             if not dry_run:
                 _mark_died(d, "no pid recorded")
                 reconciled_this_pass.add(name)
@@ -5212,6 +5412,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             pid = int(pid_raw)
         except ValueError:
             print(f"  {name}: dead (invalid pid {pid_raw!r}) [{'dry-run' if dry_run else 'marking died'}]")
+            worktree_reconciled_this_pass.add(name)
             if not dry_run:
                 _mark_died(d, f"invalid pid: {pid_raw!r}")
                 reconciled_this_pass.add(name)
@@ -5223,6 +5424,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             if not dry_run:
                 _mark_died(d, f"pid {pid} no longer alive")
                 reconciled_this_pass.add(name)
+                worktree_reconciled_this_pass.add(name)
             died_count += 1
             continue
 
@@ -5275,6 +5477,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         if not _pid_alive(pid):
             _mark_terminal(d, "killed", reason)
             reconciled_this_pass.add(name)
+            worktree_reconciled_this_pass.add(name)
             killed_count += 1
         else:
             print(
@@ -5282,23 +5485,6 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 "force-kill; leaving status as published by force-kill"
             )
             skipped_count += 1
-
-    # Pass 1.5 (--include-worktrees): remove linked git worktrees whose
-    # only users are terminal runs. Runs before pass 2 because the launch
-    # directory it reads lives in the state dir pass 2 deletes; a run
-    # reconciled in pass 1 has a fresh ended_at and so fails the age gate here
-    # rather than being collected in the same invocation.
-    if include_worktrees:
-        wt_removed, wt_skipped, wt_deferred = _worktree_gc_pass(
-            state_candidates,
-            dry_run=dry_run,
-            force_dirty=force_dirty,
-            min_age_threshold=worktree_min_age_threshold,
-            budget_expired=lambda: time.monotonic() - reap_start > reap_budget,
-        )
-        worktrees_removed += wt_removed
-        worktrees_skipped += wt_skipped
-        deferred_count += wt_deferred
 
     # Pass 2: collect terminal state dirs older than the threshold. The
     # explicit set is structural protection for H1: an old ended_at left by a
@@ -5310,6 +5496,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
             continue
         name = d.name
         if name in reconciled_this_pass:
+            continue
+        if include_worktrees and name in worktree_state_names:
             continue
         try:
             before = d.lstat()
@@ -5759,6 +5947,22 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     pass
                 orphan_procs_killed += 1
 
+    # Worktree deletion runs last so its long removal timeout cannot starve
+    # routine state, log, scratch, or orphan-process cleanup.
+    if include_worktrees:
+        wt_removed, wt_skipped, wt_deferred = _worktree_gc_pass(
+            collected=worktree_candidates,
+            scan_error=worktree_scan_error,
+            dry_run=dry_run,
+            force_dirty=force_dirty,
+            min_age_threshold=worktree_min_age_threshold,
+            reconciled_this_pass=worktree_reconciled_this_pass,
+            budget_expired=lambda: time.monotonic() - reap_start > reap_budget,
+        )
+        worktrees_removed += wt_removed
+        worktrees_skipped += wt_skipped
+        deferred_count += wt_deferred
+
     if target_name and not found_target:
         if _known(target_name):
             print(f"reap: '{target_name}' has no ephemeral state (log preserved); nothing to reconcile")
@@ -5816,29 +6020,29 @@ class _DuRow(NamedTuple):
 
 
 def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
-    """Charge each linked worktree's size to exactly one of the rows whose
-    recorded ``cwd`` resolves to it.
-
-    Attribution rule: the worktree is charged in full to the first run in the
-    ``rows`` order (run name ascending), and every other run sharing it shows
-    0. Charging every sharer would multiply one directory's size by the number
-    of runs launched in it — on the measured host, 94 runs resolve to 23
-    directories — and TOTAL would then be meaningless.
-
-    Only ``_WORKTREE_LINKED`` directories are counted; main worktrees, bare
-    repos, non-repos, and every git failure contribute 0. Read-only.
-    """
-    charged: set[str] = set()
-    out: List[_DuRow] = []
-    for row in rows:
+    """Charge each linked worktree once while excluding separately charged roots."""
+    owners: dict[str, int] = {}
+    roots: dict[str, Path] = {}
+    for index, row in enumerate(rows):
         cwd = _worktree_run_cwd(row.key)
-        worktree_bytes = 0
-        if cwd is not None and str(cwd) not in charged:
-            charged.add(str(cwd))
-            if _worktree_classify(cwd).kind == _WORKTREE_LINKED:
-                worktree_bytes = _dir_size_bytes(cwd)
-        out.append(row._replace(worktree_bytes=worktree_bytes))
-    return out
+        if cwd is None or _worktree_classify(cwd).kind != _WORKTREE_LINKED:
+            continue
+        key = str(cwd)
+        owners.setdefault(key, index)
+        roots[key] = cwd
+
+    charges = [0] * len(rows)
+    accounted = list(roots.values())
+    for key, owner in owners.items():
+        root = roots[key]
+        nested = [other for other in accounted if other != root and _path_is_within(other, root)]
+        external = [
+            configured.resolve()
+            for configured in (STATE_ROOT, LOG_ROOT)
+            if _path_is_within(configured.resolve(), root)
+        ]
+        charges[owner] = _dir_size_bytes(root, excludes=[*nested, *external])
+    return [row._replace(worktree_bytes=charges[index]) for index, row in enumerate(rows)]
 
 
 def _du_collect_rows() -> List[_DuRow]:
@@ -6536,8 +6740,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
     # Pruning takes per-name locks itself.  Do it before acquiring this name's
     # lock so a stale log for this same name cannot self-deadlock on flock.
     _prune_old_logs()
-    with _launch_lock(name) as lock_fd:
-        return _cmd_launch_locked(args, name, lock_fd)
+    with _worktree_publication_lock(exclusive=False):
+        with _launch_lock(name) as lock_fd:
+            return _cmd_launch_locked(args, name, lock_fd)
 
 
 def _apply_launch_cwd(args: argparse.Namespace) -> None:
@@ -9400,9 +9605,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "classify are all refused, as is any path with a symlinked "
         "component. Removal goes through 'git worktree remove' against the "
         "owning repository, so the parent's .git/worktrees/<name> admin entry "
-        "is unregistered too. A worktree with uncommitted changes, untracked "
-        "files, or commits on no remote is refused unless --force-dirty is "
-        "given, and one still used by a live run is always refused. A "
+        "is unregistered too. A worktree with modified/deleted tracked files, "
+        "ordinary untracked files, ignored files or directory content, or "
+        "commits on no remote is refused. --force-dirty overrides only the "
+        "tracked, untracked, and ignored content checks; unpushed commits and "
+        "every structural, liveness, scan, identity, nested-worktree, and git "
+        "failure remain refusals. A worktree still used by a live run is always "
         "worktree shared by several terminal runs is removed once. Off by "
         "default; also enabled by --all",
     )
@@ -9413,7 +9621,9 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="override the linked-worktree GC age threshold used by "
         "--include-worktrees (hours, float, must be finite and > 0), measured "
-        "from the youngest terminal run sharing the directory; independent of "
+        "from the younger of the youngest terminal run and the newest recursive "
+        "filesystem mtime under the worktree. Directory/file mtimes are only a "
+        "conservative activity signal and can be reset externally; independent of "
         "--min-age-hours, --log-min-age-hours and --orphan-min-age-hours, "
         "since it governs destruction of a working tree rather than of "
         "bookkeeping; default from AGENT_RUN_WORKTREE_MIN_AGE_HOURS or 168h "
@@ -9423,9 +9633,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force-dirty",
         action="store_true",
         default=False,
-        help="with --include-worktrees, remove a linked worktree even when it "
-        "has uncommitted changes, untracked files, or commits not present on "
-        "any remote.  This destroys unpushed work irreversibly; off by "
+        help="with --include-worktrees, override only refusals for modified or "
+        "deleted tracked files, ordinary untracked files, and ignored files or "
+        "directory content. It never overrides unpushed commits, classification, "
+        "live use, nested worktrees, symlink/path identity, state-scan failures, "
+        "or git failures. This destroys local content irreversibly; off by "
         "default and never implied by --all or any other flag",
     )
     sp_reap.add_argument(
