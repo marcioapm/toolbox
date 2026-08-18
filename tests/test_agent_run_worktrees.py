@@ -515,23 +515,134 @@ class TestReapWorktrees:
         if kind == "plain":
             assert (cwd / "precious.txt").exists()
 
-    def test_git_failure_never_removes(
+    def test_classify_failure_refuses_without_reaching_downstream_checks(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
+        """Classification failure terminates the check pipeline immediately;
+        nested-worktree and content checks are never reached."""
         repo = _make_repo(git_root)
         wt = _add_worktree(repo, git_root / "wt", "feature")
         _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        nested_calls: list = []
+        content_calls: list = []
         monkeypatch.setattr(
-            agent_run, "_watch_run_git_checked",
-            lambda *a, **k: agent_run._WatchGitOutcome(None, "git_missing"),
+            agent_run, "_worktree_nested_reason",
+            lambda *a, **k: nested_calls.append(1) or None,
         )
+        monkeypatch.setattr(
+            agent_run, "_worktree_content_reason",
+            lambda *a, **k: content_calls.append(1) or None,
+        )
+
+        # Fail only the rev-parse that _worktree_classify uses; all other git
+        # calls succeed so the test isolates the classification check.
+        real_git = agent_run._watch_run_git_checked
+
+        def git_fails_classify(path, args, **kw):
+            if list(args[:2]) == ["rev-parse", "--path-format=absolute"]:
+                return agent_run._WatchGitOutcome(None, "git_failed")
+            return real_git(path, args, **kw)
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", git_fails_classify)
 
         agent_run.cmd_reap(_reap_args())
 
         out = capsys.readouterr().out
         assert wt.is_dir()
-        assert "worktrees_removed=0" in out
-        assert "worktrees_skipped=1" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+        assert not nested_calls, "nested check must not be reached after classify failure"
+        assert not content_calls, "content check must not be reached after classify failure"
+
+    def test_ls_files_modified_failure_refuses(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A failure in the ls-files --modified check refuses deletion; the
+        worktree is never passed to _worktree_remove."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_git = agent_run._watch_run_git_checked
+
+        def git_fails_ls_modified(path, args, **kw):
+            if "ls-files" in list(args) and "--modified" in list(args):
+                return agent_run._WatchGitOutcome(None, "git_failed")
+            return real_git(path, args, **kw)
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", git_fails_ls_modified)
+
+        remove_calls: list = []
+        monkeypatch.setattr(
+            agent_run, "_worktree_remove",
+            lambda *a, **k: remove_calls.append(1) or None,
+        )
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert not remove_calls, "_worktree_remove must not be called on git failure"
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    def test_worktree_list_failure_refuses(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A failure in the worktree-list call used by _worktree_nested_reason
+        refuses deletion; no content checks or removal follow."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_git = agent_run._watch_run_git_checked
+
+        def git_fails_worktree_list(path, args, **kw):
+            if list(args[:2]) == ["worktree", "list"]:
+                return agent_run._WatchGitOutcome(None, "git_failed")
+            return real_git(path, args, **kw)
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", git_fails_worktree_list)
+
+        remove_calls: list = []
+        monkeypatch.setattr(
+            agent_run, "_worktree_remove",
+            lambda *a, **k: remove_calls.append(1) or None,
+        )
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert not remove_calls, "_worktree_remove must not be called on nested-check failure"
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    def test_rev_list_failure_refuses(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A failure in the rev-list --count call used by _worktree_unpushed_reason
+        refuses deletion; the worktree is never passed to _worktree_remove."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_git = agent_run._watch_run_git_checked
+
+        def git_fails_rev_list(path, args, **kw):
+            if list(args[:2]) == ["rev-list", "--count"]:
+                return agent_run._WatchGitOutcome(None, "git_failed")
+            return real_git(path, args, **kw)
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", git_fails_rev_list)
+
+        remove_calls: list = []
+        monkeypatch.setattr(
+            agent_run, "_worktree_remove",
+            lambda *a, **k: remove_calls.append(1) or None,
+        )
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert not remove_calls, "_worktree_remove must not be called on rev-list failure"
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
 
     def test_untracked_files_refused(
         self, isolated_runs_root, isolated_log_root, git_root, capsys
