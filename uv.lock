@@ -41,11 +41,6 @@ dependencies = [
     { name = "pyte" },
 ]
 
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-]
-
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -55,12 +50,10 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "pyte", specifier = ">=0.8" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
 ]
-provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.1.1" }]
+dev = [{ name = "pytest", specifier = ">=7" }]
 
 [[package]]
 name = "packaging"
