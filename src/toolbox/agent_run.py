@@ -4768,8 +4768,7 @@ class _WorktreeInfo(NamedTuple):
     owning repository's absolute ``--git-common-dir``, populated only for
     ``_WORKTREE_LINKED``: ``git worktree remove`` must run against it so the
     parent repo's ``.git/worktrees/<name>`` admin entry is unregistered along
-    with the checkout. ``detail`` names the specific reason behind a
-    non-actionable ``kind``, for operator-visible skip messages."""
+    with the checkout."""
 
     kind: str
     common_dir: Optional[str] = None
@@ -4788,13 +4787,7 @@ def _dir_identity(path: Path) -> Optional[Tuple[int, int]]:
 
 def _worktree_resolve_cwd(raw: str) -> Optional[Path]:
     """Canonicalize a recorded launch ``cwd`` to an absolute, symlink-free
-    path naming a real directory, or ``None``.
-
-    Resolving up front is what makes deduplication correct: several runs
-    launched in the same worktree through different symlinked prefixes record
-    different strings for one directory, and summing those separately would
-    multiply the reported size by the number of runs.
-    """
+    path naming a real directory, or ``None``."""
     if not raw:
         return None
     if not Path(raw).is_absolute():
@@ -5031,9 +5024,8 @@ def _worktree_content_reason(path: Path) -> Optional[str]:
     filter whenever the index stat cache is inconclusive, so a repository
     supplying ``filter.<driver>.clean`` in ``.gitattributes`` would execute its
     command under this inspection. ``--attr-source`` pointed at the empty tree
-    makes every path attribute-free, so no filter driver is ever selected.
-    ``core.hooksPath=/dev/null`` and ``core.fsmonitor=false`` in
-    ``_watch_run_git_checked`` close the hook and fsmonitor equivalents.
+    makes every path attribute-free, so no filter driver is ever selected;
+    see ``_watch_run_git_checked`` for hook and fsmonitor hardening.
     """
     empty_tree, oid_error = _worktree_empty_tree_oid(path)
     if oid_error is not None:
@@ -5097,11 +5089,7 @@ def _worktree_nested_reason(info: _WorktreeInfo, path: Path) -> Optional[str]:
         return error
     assert roots is not None
     for root in roots:
-        try:
-            root.relative_to(path)
-        except ValueError:
-            continue
-        if root != path:
+        if root != path and _path_is_within(root, path):
             return f"registered worktree {root} is nested inside the candidate"
     return None
 
@@ -5261,20 +5249,9 @@ def _worktree_candidate_refusal(
     force_dirty: bool,
     min_age_threshold: float,
     reconciled_cwds: List[Path],
-    unresolved_cwds: Optional[set[str]] = None,
+    unresolved_cwds: set[str],
 ) -> Tuple[Optional[str], Optional[_WorktreeInfo], Optional[float]]:
-    """Run every deletion refusal check against one current filesystem view.
-
-    ``reconciled_cwds`` holds the resolved launch directories of runs this
-    invocation moved to a terminal status. ``_mark_terminal`` keeps any
-    ``ended_at`` already on disk, so such a run can present an arbitrarily old
-    age the moment it becomes a candidate; matching by path rather than by run
-    name also covers a sharer that was still ``running`` when candidates were
-    collected and therefore appears in no ``names`` list.
-
-    ``unresolved_cwds`` accumulates the names of state directories the liveness
-    scan could neither resolve nor prove live, for a single aggregate report.
-    """
+    """Run every deletion refusal check against one current filesystem view."""
     for reconciled in reconciled_cwds:
         if _path_is_within(reconciled, cand.resolved):
             return "a sharing run was reconciled in this invocation", None, None
@@ -5310,10 +5287,6 @@ def _worktree_candidate_refusal(
     nested = _worktree_nested_reason(info, cand.resolved)
     if nested is not None:
         return nested, None, None
-    # Check for worktree roots belonging to other repositories; this check
-    # uses filesystem structure rather than repository metadata, so it catches
-    # foreign worktrees that _worktree_nested_reason cannot see.  Always runs,
-    # including under --force-dirty where content checks are skipped.
     foreign_nested = _worktree_foreign_nested_reason(cand.resolved)
     if foreign_nested is not None:
         return foreign_nested, None, None
@@ -5322,8 +5295,7 @@ def _worktree_candidate_refusal(
     if live.error is not None:
         return f"liveness scan failed: {live.error}", None, None
     assert live.paths is not None
-    if unresolved_cwds is not None:
-        unresolved_cwds.update(live.unresolved)
+    unresolved_cwds.update(live.unresolved)
     for live_cwd in live.paths:
         if _path_is_within(live_cwd, cand.resolved):
             return f"a live run is using this directory ({live_cwd})", None, None
@@ -5366,9 +5338,6 @@ def _worktree_gc_pass(
         print(f"  [worktree]: skipped: {reason}")
         skipped += 1
 
-    # State dirs the liveness scan could not resolve a cwd for and could not
-    # prove live. They protect nothing, so they are reported once in aggregate
-    # rather than aborting the pass per candidate.
     unresolved_cwds: set[str] = set()
     for cand in collected.candidates:
         if budget_expired():
@@ -6230,11 +6199,16 @@ def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
     """
     owners: dict[str, int] = {}
     roots: dict[str, Path] = {}
+    linked: dict[str, bool] = {}
     for index, row in enumerate(rows):
         cwd = _worktree_run_cwd(row.key)
-        if cwd is None or _worktree_classify(cwd).kind != _WORKTREE_LINKED:
+        if cwd is None:
             continue
         key = str(cwd)
+        if key not in linked:
+            linked[key] = _worktree_classify(cwd).kind == _WORKTREE_LINKED
+        if not linked[key]:
+            continue
         owners.setdefault(key, index)
         roots[key] = cwd
 
@@ -9829,7 +9803,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "tracked, untracked, and ignored content checks; unpushed commits and "
         "every structural, liveness, scan, identity, nested-worktree, and git "
         "failure remain refusals. A worktree still used by a live run is always "
-        "worktree shared by several terminal runs is removed once. Off by "
+        "refused, whatever its age. A worktree shared by several terminal runs "
+        "is removed once. Off by "
         "default; also enabled by --all",
     )
     sp_reap.add_argument(
