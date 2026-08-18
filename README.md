@@ -587,6 +587,26 @@ flag typed after the name without `--` (e.g. `agent-run build --foo`) is
 still rejected, since it would otherwise silently become `argv[0]`; the
 error names the offending token and points at `--`.
 
+#### Working directory (`--cwd DIR`)
+
+```bash
+agent-run --cwd ~/git/myrepo build -- claude --print 'Build the thing'
+agent-run --cwd=../myrepo --harness claude --prompt 'Refactor X' build
+```
+
+`--cwd DIR` runs the launched command with `DIR` as its working directory,
+in raw and managed mode and on both the one-shot and interactive (`-i`)
+paths. `DIR` may be relative (resolved against the invocation directory) and
+may start with `~` (expanded by agent-run; argparse does not do this). The
+directory is entered before any run state is published, so `<state_dir>/cwd`
+and `<state_dir>/launch_head` — which `watch` reads to report git facts —
+record the directory the command actually runs in.
+
+Symlinked components are collapsed: the recorded `cwd` is the real path. A
+relative `--prompt-file` is resolved against the invocation directory, not
+against `DIR`. A `DIR` that does not exist, is not a directory, or cannot be
+entered exits non-zero and creates no run dir.
+
 ### Managed mode
 
 `--harness claude|opencode|codex` switches to managed mode: agent-run builds
@@ -612,6 +632,7 @@ All existing raw-mode launch forms keep working.
                                   or --auto; prompt: omits those flags so the harness's own
                                   permission UI is used
 --harness-arg FLAG                pass FLAG verbatim after the harness's own args; repeatable
+--cwd DIR                         working directory for the launched command (also raw mode)
 ```
 
 #### One-shot examples
@@ -1081,6 +1102,8 @@ Ephemeral, under `$AGENT_RUN_STATE_DIR/<name>/` (default `/tmp/agent-runs`):
 | `process_identity` | platform-specific runner birth token, verified before `kill` signals the runner |
 | `command` | pretty-printed launch command |
 | `argv` | JSON-encoded argv (authoritative form for replay) |
+| `cwd` | absolute working directory the command runs in (`--cwd` if given, else the invocation directory) |
+| `launch_head` | full git commit hash `HEAD` pointed at when the run started, if `cwd` is a repo; `watch` counts commits from it |
 | `started_at`, `ended_at` | ISO-8601 UTC timestamps |
 | `stdin` | FIFO for `steer` (only when launched with `-i`) |
 | `resize` | FIFO for terminal-resize records used by `attach` (only when launched with `-i`) |

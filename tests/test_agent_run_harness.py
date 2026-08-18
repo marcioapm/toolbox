@@ -22,6 +22,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 import uuid as _uuid
@@ -215,11 +216,10 @@ class TestParseLaunchArgvHarness:
         with pytest.raises(agent_run._LaunchArgvError):
             _parse(["--model", "foo", "myrun", "--", "echo"])
 
-    def test_cwd_flag_is_rejected_not_silently_dropped(self):
-        """--cwd is not yet implemented; must error, not silently drop."""
-        with pytest.raises(agent_run._LaunchArgvError) as exc:
-            _parse(["--harness", "claude", "--prompt", "hi", "--cwd", "/tmp", "myrun"])
-        assert "not yet implemented" in str(exc.value).lower() or "--cwd" in str(exc.value)
+    def test_cwd_flag_parsed_in_managed_mode(self):
+        r = _parse(["--harness", "claude", "--prompt", "hi", "--cwd", "/tmp", "myrun"])
+        assert r.cwd == "/tmp"
+        assert r.name == "myrun"
 
     @pytest.mark.parametrize("sub", sorted(agent_run._KNOWN_SUBCOMMANDS))
     def test_subcommand_dispatch_unaffected(self, sub):
@@ -2271,3 +2271,258 @@ class TestCodexRpcEdgeCases:
             f"Acquire log must show idle-path turn/start (active_turn_id was cleared): {log_text!r}"
         )
 
+
+
+# ---------------------------------------------------------------------------
+# --cwd: working directory for the launched command
+# ---------------------------------------------------------------------------
+
+class TestCwdParsing:
+    """_parse_launch_argv accepts --cwd in both raw and managed mode."""
+
+    def test_cwd_space_form_raw(self):
+        r = _parse(["--cwd", "/tmp", "myrun", "--", "pwd"])
+        assert r.cwd == "/tmp"
+        assert r.command == ["pwd"]
+
+    def test_cwd_equals_form_raw(self):
+        r = _parse(["--cwd=/tmp", "myrun", "--", "pwd"])
+        assert r.cwd == "/tmp"
+
+    def test_cwd_equals_form_managed(self):
+        r = _parse(["--harness", "claude", "--prompt", "hi", "--cwd=/tmp", "myrun"])
+        assert r.cwd == "/tmp"
+        assert r.harness == "claude"
+
+    def test_cwd_relative_value_passed_through_unresolved(self):
+        # The parser is pure; resolution happens in cmd_launch.
+        r = _parse(["--cwd", "sub/dir", "myrun", "--", "pwd"])
+        assert r.cwd == "sub/dir"
+
+    def test_cwd_missing_value(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            _parse(["--cwd"])
+        assert "--cwd" in str(exc.value)
+
+    def test_cwd_empty_equals_value(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            _parse(["--cwd=", "myrun", "--", "pwd"])
+        assert "--cwd" in str(exc.value)
+
+    def test_cwd_is_a_launch_flag_not_a_subcommand_prefix(self):
+        # --cwd before a subcommand name means a run named after the
+        # subcommand, not subcommand dispatch.
+        r = _parse(["--cwd", "/tmp", "myrun", "--", "pwd"])
+        assert r.subcommand_tokens is None
+
+    def test_cwd_in_help(self):
+        assert "--cwd" in agent_run._build_parser().format_help()
+
+
+class TestCwdLaunch:
+    """--cwd is validated and entered before any run state is published."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_cwd(self):
+        # cmd_launch chdirs the calling process; the CLI exits right after, but
+        # the test process must be put back or later tests inherit the move.
+        origin = os.getcwd()
+        yield
+        os.chdir(origin)
+
+    def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
+        deadline = time.monotonic() + timeout
+        status = "starting"
+        while time.monotonic() < deadline:
+            try:
+                status = (state_dir / "status").read_text().strip()
+            except FileNotFoundError:
+                pass
+            if status in agent_run.TERMINAL_STATUSES:
+                break
+            time.sleep(0.05)
+        if status not in agent_run.TERMINAL_STATUSES:
+            _kill_run_pid(state_dir)
+        return status
+
+    def _launch(self, argv: list[str]) -> int:
+        return agent_run.main(argv)
+
+    def test_command_runs_in_cwd(self, isolated_runs_root, isolated_log_root, tmp_path):
+        target = tmp_path / "workdir"
+        target.mkdir()
+        name = "cwd-basic"
+        assert self._launch(["--cwd", str(target), name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        log = (isolated_log_root / name / "log").read_text()
+        assert str(target.resolve()) in log
+
+    def test_recorded_cwd_matches_effective_directory(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        target = tmp_path / "workdir"
+        target.mkdir()
+        name = "cwd-state-file"
+        assert self._launch(["--cwd", str(target), name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
+        run_json = json.loads((isolated_log_root / name / "run.json").read_text())
+        assert run_json["cwd"] == str(target.resolve())
+
+    def test_launch_head_is_read_from_the_cwd_repo(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        # The launch directory is not a repo, so a launch_head at all proves it
+        # came from --cwd rather than from the invoking directory.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.com",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.com"}
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "initial", "--allow-empty"]):
+            subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, env=env)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True, env=env,
+        ).stdout.strip()
+        name = "cwd-launch-head"
+        assert self._launch(["--cwd", str(repo), name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        assert (state_dir / "launch_head").read_text().strip() == head
+        assert (state_dir / "cwd").read_text().strip() == str(repo.resolve())
+
+    def test_relative_cwd_resolves_against_the_invocation_directory(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "workdir"
+        target.mkdir()
+        monkeypatch.chdir(tmp_path)
+        name = "cwd-relative"
+        assert self._launch(["--cwd", "workdir", name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
+
+    def test_symlinked_component_is_resolved(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        name = "cwd-symlink"
+        assert self._launch(["--cwd", str(link / "."), name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        assert (state_dir / "cwd").read_text().strip() == str(real.resolve())
+
+    def test_equals_form_launches(self, isolated_runs_root, isolated_log_root, tmp_path):
+        target = tmp_path / "workdir"
+        target.mkdir()
+        name = "cwd-equals"
+        assert self._launch([f"--cwd={target}", name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
+
+    def test_interactive_run_uses_cwd(self, isolated_runs_root, isolated_log_root, tmp_path):
+        target = tmp_path / "workdir"
+        target.mkdir()
+        name = "cwd-interactive"
+        assert self._launch(["-i", "--cwd", str(target), name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        assert (state_dir / "interactive").read_text().strip() == "1"
+        assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
+        assert str(target.resolve()) in (isolated_log_root / name / "log").read_text()
+
+    def test_managed_run_uses_cwd(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        fake = tmp_path / "claude"
+        fake.write_text("#!/bin/sh\npwd\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        target = tmp_path / "workdir"
+        target.mkdir()
+        name = "cwd-managed"
+        assert self._launch([
+            "--harness", "claude", "--prompt", "hi", "--cwd", str(target), name,
+        ]) == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
+        assert str(target.resolve()) in (isolated_log_root / name / "log").read_text()
+
+    def test_prompt_file_relative_to_invocation_dir(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        # A relative --prompt-file names a file the caller typed, so it is
+        # resolved against the invocation directory, not against --cwd.
+        fake = tmp_path / "claude"
+        fake.write_text("#!/bin/sh\npwd\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        launch_dir = tmp_path / "launch"
+        launch_dir.mkdir()
+        (launch_dir / "brief.md").write_text("do the thing\n")
+        target = tmp_path / "workdir"
+        target.mkdir()
+        monkeypatch.chdir(launch_dir)
+        name = "cwd-prompt-file"
+        assert self._launch([
+            "--harness", "claude", "--prompt-file", "brief.md", "--cwd", str(target), name,
+        ]) == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        assert (isolated_log_root / name / "prompt").read_text() == "do the thing\n"
+
+    def test_nonexistent_cwd_exits_and_creates_no_run_dir(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        name = "cwd-missing"
+        with pytest.raises(SystemExit) as exc_info:
+            self._launch(["--cwd", str(tmp_path / "nope"), name, "--", "/bin/pwd"])
+        assert exc_info.value.code != 0
+        assert not (isolated_runs_root / name).exists()
+        assert not (isolated_log_root / name).exists()
+
+    def test_cwd_that_is_a_file_exits_and_creates_no_run_dir(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        target = tmp_path / "afile"
+        target.write_text("x\n")
+        name = "cwd-is-file"
+        with pytest.raises(SystemExit) as exc_info:
+            self._launch(["--cwd", str(target), name, "--", "/bin/pwd"])
+        assert exc_info.value.code != 0
+        assert "not a directory" in str(exc_info.value.code).lower()
+        assert not (isolated_runs_root / name).exists()
+
+    def test_unenterable_cwd_exits_and_creates_no_run_dir(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        if os.getuid() == 0:
+            pytest.skip("root bypasses directory permission checks")
+        target = tmp_path / "locked"
+        target.mkdir(mode=0o000)
+        name = "cwd-unenterable"
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                self._launch(["--cwd", str(target), name, "--", "/bin/pwd"])
+            assert exc_info.value.code != 0
+            assert not (isolated_runs_root / name).exists()
+        finally:
+            target.chmod(0o700)
+
+    def test_tilde_is_expanded(self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        (home / "sub").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        name = "cwd-tilde"
+        assert self._launch(["--cwd", "~/sub", name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        self._wait_terminal(state_dir)
+        assert (state_dir / "cwd").read_text().strip() == str((home / "sub").resolve())

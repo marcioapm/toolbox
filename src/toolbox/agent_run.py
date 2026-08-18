@@ -49,6 +49,7 @@ Usage::
     agent-run -i <name> -- <cmd...>      # interactive (PTY-wrapped, steerable)
     agent-run --echo <name> -- <cmd...>  # also render a cleaned live transcript
     agent-run --idle-timeout N <name> -- <cmd...>  # self-terminate after N idle seconds
+    agent-run --cwd <dir> <name> -- <cmd...>  # run the command in <dir> (managed mode too)
     agent-run --harness claude|opencode|codex   # managed mode (no trailing --)
               [--prompt <text> | --prompt-file <path>]
               [-i] [--model <model>] [--agent-mode <name>]
@@ -132,8 +133,10 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     started_at   ISO-8601 UTC
     ended_at     ISO-8601 UTC (after completion)
     interactive  "1" if launched with -i, else "0"
-    cwd          absolute launch-time working directory (used by `watch` to
-                 locate the repo for git facts; may be absent on legacy runs)
+    cwd          absolute working directory the command runs in: --cwd when
+                 given, otherwise the launch-time working directory (used by
+                 `watch` to locate the repo for git facts; may be absent on
+                 legacy runs)
     launch_head  full git commit hash HEAD pointed to at launch, if `cwd` was
                  a git repo (used by `watch` to count commits made during the
                  run without trusting commit timestamps; absent when `cwd`
@@ -6065,11 +6068,46 @@ def cmd_kill(args: argparse.Namespace) -> int:
 
 def cmd_launch(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
+    # chdir first: every path below (state, logs, git facts, the launched
+    # command) must observe one single effective working directory.
+    _apply_launch_cwd(args)
     # Pruning takes per-name locks itself.  Do it before acquiring this name's
     # lock so a stale log for this same name cannot self-deadlock on flock.
     _prune_old_logs()
     with _launch_lock(name) as lock_fd:
         return _cmd_launch_locked(args, name, lock_fd)
+
+
+def _apply_launch_cwd(args: argparse.Namespace) -> None:
+    """Enter the ``--cwd`` directory, before any run state exists.
+
+    Rewrites ``args.cwd`` to the effective absolute directory reported by
+    ``os.getcwd()`` after the chdir, so ``<state_dir>/cwd`` and ``launch_head``
+    record the directory the command actually runs in.  A relative
+    ``--prompt-file`` is made absolute against the invocation directory first,
+    since it names a file the caller typed, not one inside DIR.
+
+    ``~`` is expanded (argparse does not).  An unusable DIR exits non-zero here,
+    before the state dir is created, so no run is left at status=starting.
+    """
+    requested: Optional[str] = getattr(args, "cwd", None)
+    if not requested:
+        return
+    # resolve() collapses symlinked components, so is_dir() below judges the
+    # real target rather than the link.
+    target = Path(os.path.expanduser(requested)).resolve()
+    if not target.exists():
+        sys.exit(f"agent-run: --cwd directory does not exist: {requested}")
+    if not target.is_dir():
+        sys.exit(f"agent-run: --cwd is not a directory: {requested}")
+    prompt_file: Optional[str] = getattr(args, "prompt_file", None)
+    if prompt_file:
+        args.prompt_file = os.path.abspath(prompt_file)
+    try:
+        os.chdir(target)
+        args.cwd = os.getcwd()
+    except OSError as exc:
+        sys.exit(f"agent-run: cannot enter --cwd {requested}: {exc}")
 
 
 def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int:
@@ -6177,11 +6215,17 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
 
     # Written before "starting" is published: Path.cwd() raises if the launch
     # directory is gone, and that must not happen once the run already looks
-    # active with nothing behind it.
-    try:
-        cwd = str(Path.cwd())
-    except OSError:
-        cwd = None
+    # active with nothing behind it. An explicit --cwd cannot hit that case —
+    # _apply_launch_cwd already entered the directory and resolved its absolute
+    # path, exiting non-zero if either step failed.
+    explicit_cwd: Optional[str] = getattr(args, "cwd", None)
+    if explicit_cwd:
+        cwd: Optional[str] = explicit_cwd
+    else:
+        try:
+            cwd = str(Path.cwd())
+        except OSError:
+            cwd = None
     if cwd is not None:
         _write(d / "cwd", cwd + "\n")
         # Best-effort, only when cwd is itself a git repo: `watch` counts
@@ -6257,7 +6301,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
 
             if opencode_port is not None:
                 managed_session_id = _opencode_prefork_mint(
-                    opencode_port, name, str(Path.cwd()), acquire_log, state_dir=d
+                    opencode_port, name, cwd or str(Path.cwd()), acquire_log, state_dir=d
                 )
                 if managed_session_id:
                     _record_session(log_d, acquire_log, "opencode", managed_session_id,
@@ -8574,6 +8618,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "managed mode (--harness claude|opencode|codex)",
         "agent-run builds the launch command itself; requires --prompt or --prompt-file",
     )
+    # --cwd applies to raw and managed launches alike, so it is registered on the
+    # top-level parser rather than in the managed-mode group.
+    p.add_argument(
+        "--cwd",
+        metavar="DIR",
+        default=argparse.SUPPRESS,
+        help="run the launched command with DIR as its working directory; DIR may be "
+        "relative and may start with '~', is resolved to an absolute path with symlinks "
+        "collapsed, and is entered before any run state is published so <state_dir>/cwd "
+        "records it; available in both managed and raw mode",
+    )
     mg.add_argument(
         "--harness",
         metavar="claude|opencode|codex",
@@ -8622,14 +8677,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="pass FLAG verbatim to the harness command after agent-run's own constructed "
         "arguments; repeatable escape hatch for flags agent-run does not model",
-    )
-    mg.add_argument(
-        "--cwd",
-        metavar="DIR",
-        default=argparse.SUPPRESS,
-        help="run the launched command with DIR as its working directory (resolved to an "
-        "absolute path before any state is published); available in both managed and raw "
-        "mode",
     )
 
     sp_status = sub.add_parser("status", help="print one-line status")
@@ -8949,6 +8996,8 @@ class _LaunchArgv(NamedTuple):
     name: str
     command: List[str]
     subcommand_tokens: Optional[List[str]]
+    # Working directory for the launched command; None means inherit.
+    cwd: Optional[str] = None
     # Managed-mode fields; all None/empty for raw runs.
     harness: Optional[str] = None
     prompt: Optional[str] = None
@@ -9014,6 +9063,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     agent_mode: Optional[str] = None
     harness_args: List[str] = []
     permissions: str = _PERMISSIONS_BYPASS
+    cwd: Optional[str] = None
 
     # Consume flags in any order before the name.
     while tokens:
@@ -9101,13 +9151,20 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                     )
                 permissions = value
             continue
-        # --cwd is parsed only to reject it: accepting and ignoring it would
-        # silently run in the wrong directory.
-        if tokens[0] == "--cwd" or tokens[0].startswith("--cwd="):
-            raise _LaunchArgvError(
-                "agent-run: --cwd is not yet implemented; "
-                "run the command from the target directory instead"
-            )
+        # --cwd applies to both managed and raw launches; the value is validated
+        # and entered by cmd_launch, not here (this parser touches no filesystem).
+        if tokens[0] == "--cwd":
+            if len(tokens) < 2:
+                raise _LaunchArgvError("agent-run: --cwd requires a directory")
+            cwd = tokens[1]
+            tokens = tokens[2:]
+            continue
+        if tokens[0].startswith("--cwd="):
+            cwd = tokens[0].split("=", 1)[1]
+            if not cwd:
+                raise _LaunchArgvError("agent-run: --cwd requires a directory")
+            tokens = tokens[1:]
+            continue
         break
 
     # After the flag loop, reject managed-only flags on raw launches.
@@ -9133,7 +9190,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     any_launch_flag = (
         interactive or prompt_file or echo or submit_mode is not None
         or idle_timeout is not None or harness is not None or prompt is not None
-        or model is not None or agent_mode is not None
+        or model is not None or agent_mode is not None or cwd is not None
         or bool(harness_args) or permissions != _PERMISSIONS_BYPASS
     )
     if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
@@ -9149,7 +9206,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             interactive=interactive, prompt_file=prompt_file, echo=echo,
             echo_interval=echo_interval, submit_mode=submit_mode,
             idle_timeout=idle_timeout, name="", command=[],
-            subcommand_tokens=None,
+            subcommand_tokens=None, cwd=cwd,
             harness=harness, prompt=prompt, model=model,
             agent_mode=agent_mode, harness_args=harness_args,
         )
@@ -9203,6 +9260,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             name=name,
             command=[],
             subcommand_tokens=None,
+            cwd=cwd,
             harness=harness,
             prompt=prompt,
             model=model,
@@ -9248,6 +9306,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         name=name,
         command=command,
         subcommand_tokens=None,
+        cwd=cwd,
     )
 
 
@@ -9300,6 +9359,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         agent_mode=parsed.agent_mode,
         harness_args=list(parsed.harness_args),
         permissions=parsed.permissions,
+        cwd=parsed.cwd,
     )
     return cmd_launch(ns)
 
