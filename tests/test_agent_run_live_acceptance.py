@@ -12,35 +12,19 @@ A2 — OpenCode deny beats project allow (bash).
      is exercised in A1 and A5.
 
 A3 — Claude deny beats a genuinely honoured allow.
-     Assertions are on tool-use records from --output-format stream-json --verbose,
-     never on side effects.  Denying a single tool does not remove the underlying
-     capability: with Bash denied, the model reproduced the intended file side
-     effect through Write.  Tool-level denial constrains the tool, not the effect.
-     Acceptance tests must assert on which tool was invoked, not on an effect
-     another tool can produce.
 
-     Bash is the concrete tool: it is genuinely callable (control arm stream
-     contains a tool_use block with name=="Bash") and suppressed by
-     --disallowedTools Bash (deny arm stream contains no "Bash" tool_use block).
+A5 — Enabled arms observably enable per harness.
 
-     EnterPlanMode and AskUserQuestion are not exposed by Claude Code 2.1.207
-     for this workspace configuration — neither appears in the model's own tool
-     list.  Deny-vs-honoured-allow for those specific tools cannot be
-     demonstrated hermetically; test skips with a precise reason.
-
-A4/A6/A7/A8 — Confirmed covered by hermetic tests in test_agent_run_harness.py:
+A4/A6/A7/A8 are hermetic and live in test_agent_run_harness.py:
   A4 (positional prompt survives variadic deny):
       TestBuildManagedArgv.test_claude_default_denies_planning_and_questions_after_prompt
   A6 (--enable-planning codex fails fast):
-      TestParseLaunchArgvHarness.test_codex_enable_planning_fails_fast +
-      _cmd_launch_locked guard (test_main_model_rejected_for_codex pattern)
+      TestParseLaunchArgvHarness.test_codex_enable_planning_fails_fast
   A7 (flags require --harness, appear in help, raw unaffected):
       TestParseLaunchArgvHarness, TestParserHelpShowsManagedMode.test_capability_flags_in_help
   A8 (policy reaches child through full managed launch path):
       TestManagedClaudeLaunch.test_claude_oneshot_default_policy_delivers_positional_prompt
       TestEndToEndThroughMain.test_main_codex_questions_policy_reaches_appserver
-
-A5 — Enabled arms observably enable per harness.
 """
 from __future__ import annotations
 
@@ -48,7 +32,6 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 import time
 import argparse
 from pathlib import Path
@@ -311,28 +294,17 @@ class TestA2OpenCodeDenyBeatsProjectAllow:
 # A3: Claude deny beats a genuinely honoured allow
 # ---------------------------------------------------------------------------
 
-def _claude_stream_tool_names(
-    prompt_stdin: str,
-    extra_argv: list[str] = (),
-    timeout: int = 60,
-) -> tuple[list[str], str]:
-    """Run claude --print --output-format stream-json --verbose and return
-    (tool_names_invoked, result_text).
-
-    tool_names_invoked: names of every tool_use block in assistant messages.
-    result_text: the final result field from the result event, or "".
-
-    Raises subprocess.CalledProcessError if claude exits non-zero.
-    Raises json.JSONDecodeError if the result event is unparseable.
-    """
+def _claude_run(output_format: str, prompt_stdin: str, extra_argv: list[str], timeout: int) -> str:
+    """Run claude --print in the given output format and return its stdout."""
     model_args = ["--model", _CLAUDE_MODEL] if _CLAUDE_MODEL else []
+    verbose = ["--verbose"] if output_format == "stream-json" else []
     proc = subprocess.run(
         [
             "claude",
             *model_args,
             "--print",
-            "--output-format", "stream-json",
-            "--verbose",
+            "--output-format", output_format,
+            *verbose,
             "--permission-mode", "bypassPermissions",
             *extra_argv,
         ],
@@ -341,9 +313,23 @@ def _claude_stream_tool_names(
         text=True,
         timeout=timeout,
     )
+    return proc.stdout
+
+
+def _claude_stream_tool_names(
+    prompt_stdin: str,
+    extra_argv: list[str] = (),
+    timeout: int = 60,
+) -> tuple[list[str], str]:
+    """Return (names of every tool_use block in assistant messages, result text).
+
+    result text is the final result event's `result` field, or "" if the run
+    produced no result event — callers use it as the positive control that
+    claude ran at all.
+    """
     tool_names: list[str] = []
     result_text = ""
-    for line in proc.stdout.splitlines():
+    for line in _claude_run("stream-json", prompt_stdin, list(extra_argv), timeout).splitlines():
         line = line.strip()
         if not line:
             continue
@@ -364,31 +350,20 @@ def _claude_stream_tool_names(
 
 def _claude_json(prompt_stdin: str, extra_argv: list[str] = (), timeout: int = 60) -> dict:
     """Run claude --print --output-format json and return the parsed result object."""
-    model_args = ["--model", _CLAUDE_MODEL] if _CLAUDE_MODEL else []
-    result = subprocess.run(
-        [
-            "claude",
-            *model_args,
-            "--print",
-            "--output-format", "json",
-            "--permission-mode", "bypassPermissions",
-            *extra_argv,
-        ],
-        input=prompt_stdin,
-        capture_output=True, text=True, timeout=timeout,
-    )
-    return json.loads(result.stdout)
+    return json.loads(_claude_run("json", prompt_stdin, list(extra_argv), timeout))
 
 
 @live_only
 class TestA3ClaudeDenyBeatsHonouredAllow:
     """A3: --disallowedTools deny beats a genuinely honoured allow.
 
-    Assertions are on tool-use records from stream-json, never on side effects.
-    Bash is the concrete tool.
+    Assertions are on tool_use records, never on side effects: denying one tool
+    removes the tool, not the capability, so the model can reproduce the same
+    effect through another tool.
 
-    EnterPlanMode and AskUserQuestion are not exposed by Claude Code 2.1.207
-    for this workspace: neither appears in the model's tool list.
+    Bash stands in for the policy's own tools. EnterPlanMode and AskUserQuestion
+    are not exposed by Claude Code 2.1.207 for this workspace, so deny-vs-allow
+    cannot be demonstrated for them here; the third test tripwires that.
     """
 
     _PROMPT = "Use Bash to run: echo hello"
@@ -408,7 +383,6 @@ class TestA3ClaudeDenyBeatsHonouredAllow:
         """Deny arm: --disallowedTools Bash → 'Bash' absent from invoked tool names.
 
         Non-empty result proves Claude ran rather than crashed.
-        Whether another tool produced a side effect is irrelevant and not asserted.
         """
         tool_names, result_text = _claude_stream_tool_names(
             self._PROMPT, extra_argv=["--disallowedTools", "Bash"]
@@ -483,12 +457,7 @@ class TestA5EnabledArmsObservablyEnable:
         )
 
     def test_a5_opencode_policy_merge_preserves_bash(self, tmp_path):
-        """OpenCode: OPENCODE_CONFIG_CONTENT with question=allow does not block bash.
-
-        _opencode_policy_config merges only the permission.question/plan_enter/plan_exit keys.
-        An existing bash allow in the project opencode.json must survive.
-        """
-        # Unit-level: verify the merge does not corrupt an unrelated value.
+        """OpenCode: OPENCODE_CONFIG_CONTENT with question=allow does not block bash."""
         merged = agent_run._opencode_policy_config(
             json.dumps({"permission": {"bash": "allow"}, "extra": "kept"}),
             enable_planning=False,
@@ -500,7 +469,6 @@ class TestA5EnabledArmsObservablyEnable:
         assert cfg["permission"]["question"] == "allow"
         assert cfg["permission"]["plan_enter"] == "deny"
 
-        # Live: run opencode with the enable-questions env and confirm bash still works.
         project = tmp_path / "project"
         project.mkdir()
         (project / "opencode.json").write_text(json.dumps({"permission": {"bash": "allow"}}))
@@ -519,7 +487,6 @@ class TestA5EnabledArmsObservablyEnable:
 
     def test_a5_claude_enabled_arm_bash_callable(self):
         """Claude enabled arm (no --disallowedTools): 'Bash' appears in invoked tool names."""
-        # Verify _build_managed_argv produces no --disallowedTools when both enabled.
         argv = agent_run._build_managed_argv(
             "claude",
             interactive=False,
@@ -535,7 +502,6 @@ class TestA5EnabledArmsObservablyEnable:
             f"A5 claude: --disallowedTools present in enabled-arm argv: {argv}"
         )
 
-        # Live: confirm Bash is actually invoked via tool-use records.
         tool_names, result_text = _claude_stream_tool_names(
             "Use Bash to run: echo hello"
         )
