@@ -9446,16 +9446,20 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_du = sub.add_parser(
         "du",
         help="disk usage per effective status (or per run with --by-run), "
-        "including preserved logs and each run's launch cwd when that "
-        "directory is a linked git worktree (WORKTREE column, worktree_bytes "
-        "under --json); strictly read-only. Linked worktrees are usually far "
+        "including preserved logs and linked-worktree launch dirs; "
+        "strictly read-only",
+        description="Disk usage per effective status (or per run with "
+        "--by-run), including preserved logs and each run's recorded launch "
+        "cwd when that directory is a linked git worktree (WORKTREE column, "
+        "worktree_bytes under --json). Linked worktrees are usually far "
         "larger than STATE_ROOT and LOG_ROOT combined, so walking them "
         "dominates this command's runtime. Main worktrees, bare repos, "
         "non-git directories, and any directory git cannot classify "
         "contribute 0. A worktree shared by several runs is deduplicated by "
         "realpath and charged once, to the first run sharing it (the others "
-        "show 0), so TOTAL counts every byte exactly once. Detection runs "
-        "git rev-parse only, never gc or worktree prune",
+        "show 0), so TOTAL counts every byte exactly once. Strictly "
+        "read-only: worktree detection runs git rev-parse only, never gc or "
+        "worktree prune.",
     )
     sp_du.add_argument(
         "--by-run",
