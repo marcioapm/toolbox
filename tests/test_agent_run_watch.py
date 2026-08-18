@@ -272,7 +272,7 @@ class TestStatusMapping:
             isolated_runs_root, isolated_log_root, "r30",
             status="running", pid=111, log_text="line-a\nline-b\n",
         )
-        rc = agent_run.cmd_logs(argparse.Namespace(name="r30", n=50))
+        rc = agent_run.cmd_logs(argparse.Namespace(name="r30", tail=50, head=None))
         assert rc == 0
         out = capsys.readouterr().out
         assert out == "line-a\nline-b\n"

@@ -85,7 +85,7 @@ def test_logs_resets_terminal_modes_on_tty(isolated_runs_root, monkeypatch):
     stdout = _FakeStdout(tty=True)
     monkeypatch.setattr(sys, "stdout", stdout)
 
-    assert agent_run.cmd_logs(argparse.Namespace(name="tty", n=1)) == 0
+    assert agent_run.cmd_logs(argparse.Namespace(name="tty", tail=1, head=None)) == 0
     assert stdout.buffer.getvalue() == b"captured output\n" + agent_run._TERMINAL_MODE_RESET
 
 
@@ -96,7 +96,7 @@ def test_logs_does_not_reset_terminal_modes_when_not_a_tty(
     stdout = _FakeStdout(tty=False)
     monkeypatch.setattr(sys, "stdout", stdout)
 
-    assert agent_run.cmd_logs(argparse.Namespace(name="pipe", n=1)) == 0
+    assert agent_run.cmd_logs(argparse.Namespace(name="pipe", tail=1, head=None)) == 0
     assert stdout.buffer.getvalue() == b"captured output\n"
 
 
@@ -120,7 +120,7 @@ def test_logs_survives_broken_stdout(isolated_runs_root, monkeypatch):
     _make_run(isolated_runs_root, "broken", b"captured output\n")
     monkeypatch.setattr(sys, "stdout", _BrokenPipeStdout())
 
-    assert agent_run.cmd_logs(argparse.Namespace(name="broken", n=1)) == 0
+    assert agent_run.cmd_logs(argparse.Namespace(name="broken", tail=1, head=None)) == 0
 
 
 def test_reset_survives_closed_stdout(monkeypatch):
@@ -135,11 +135,16 @@ class TestCliNumericValidation:
     @pytest.mark.parametrize(
         "argv",
         [
-            ["logs", "run", "0"],
-            ["logs", "run", "-1"],
+            ["logs", "run", "--tail", "0"],
+            ["logs", "run", "--tail", "-1"],
+            ["logs", "run", "--head", "0"],
+            ["logs", "run", "--head", "-1"],
             ["clean", "run", "--width", "0"],
             ["clean", "run", "--height", "-1"],
             ["clean", "run", "--history", "-1"],
+            ["clean", "run", "--tail", "0"],
+            ["clean", "run", "--tail", "-1"],
+            ["clean", "run", "--head", "0"],
         ],
     )
     def test_argparse_rejects_out_of_range_integers(self, argv, capsys):
@@ -279,3 +284,177 @@ class TestCmdCleanCustomSizing:
         assert "craters" in narrow
         # The two transcripts are not identical (different wrapping).
         assert wide != narrow
+
+
+# ---------------------------------------------------------------------------
+# logs --tail / --head
+# ---------------------------------------------------------------------------
+
+def _make_log_run(runs_root, name: str, log_bytes: bytes):
+    """Seed a log-only run (no state dir needed for logs command)."""
+    from toolbox import agent_run as ar
+    log_d = ar.LOG_ROOT / name
+    log_d.mkdir(parents=True, exist_ok=True)
+    (log_d / "log").write_bytes(log_bytes)
+    # State dir required for _require_log fallback path resolution.
+    state_d = runs_root / name
+    state_d.mkdir(parents=True, exist_ok=True)
+    (state_d / "status").write_text("done\n")
+    return log_d
+
+
+class TestLogsFlags:
+    def test_tail_n_returns_last_n_lines(self, isolated_runs_root, monkeypatch, capsys):
+        log_content = "\n".join(f"line{i}" for i in range(1, 21)) + "\n"
+        _make_log_run(isolated_runs_root, "tailrun", log_content.encode())
+        stdout = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout)
+        rc = agent_run.cmd_logs(argparse.Namespace(name="tailrun", tail=5, head=None))
+        assert rc == 0
+        output = stdout.buffer.getvalue().decode()
+        lines = output.splitlines()
+        assert lines == [f"line{i}" for i in range(16, 21)]
+
+    def test_head_n_returns_first_n_lines(self, isolated_runs_root, monkeypatch):
+        log_content = "\n".join(f"line{i}" for i in range(1, 21)) + "\n"
+        _make_log_run(isolated_runs_root, "headrun", log_content.encode())
+        stdout = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout)
+        rc = agent_run.cmd_logs(argparse.Namespace(name="headrun", tail=None, head=5))
+        assert rc == 0
+        output = stdout.buffer.getvalue().decode()
+        lines = output.splitlines()
+        assert lines == [f"line{i}" for i in range(1, 6)]
+
+    def test_default_is_tail_50(self, isolated_runs_root, monkeypatch):
+        # 60 lines; default (no flag) should return last 50.
+        log_content = "\n".join(f"L{i:03d}" for i in range(1, 61)) + "\n"
+        _make_log_run(isolated_runs_root, "defrun", log_content.encode())
+        stdout = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout)
+        rc = agent_run.cmd_logs(argparse.Namespace(name="defrun", tail=None, head=None))
+        assert rc == 0
+        lines = stdout.buffer.getvalue().decode().splitlines()
+        assert len(lines) == 50
+        assert lines[0] == "L011"  # lines 11-60 are the last 50
+
+    def test_tail_and_head_together_is_usage_error(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run._build_parser().parse_args(["logs", "run", "--tail", "5", "--head", "3"])
+        assert exc_info.value.code == 2
+
+    def test_stale_positional_form_exits_nonzero(self, capsys):
+        """agent-run logs <name> 200 (old positional) must be rejected non-zero."""
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run._build_parser().parse_args(["logs", "myrun", "200"])
+        assert exc_info.value.code != 0
+
+    def test_single_line_8mb_log_tail_1(self, isolated_runs_root, monkeypatch):
+        """An 8 MB single-line log (the wtgc5 shape): --tail 1 returns that one line
+        without materialising the whole file in one go."""
+        big_line = b"x" * (8 * 1024 * 1024)
+        log_content = big_line + b"\n"
+        _make_log_run(isolated_runs_root, "bigrun_tail", log_content)
+        stdout = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout)
+        rc = agent_run.cmd_logs(argparse.Namespace(name="bigrun_tail", tail=1, head=None))
+        assert rc == 0
+        assert stdout.buffer.getvalue() == big_line + b"\n"
+
+    def test_single_line_8mb_log_head_1(self, isolated_runs_root, monkeypatch):
+        """An 8 MB single-line log: --head 1 returns that one line, terminating
+        after reading at most one 8 KiB chunk beyond the first (and only) newline."""
+        big_line = b"y" * (8 * 1024 * 1024)
+        log_content = big_line + b"\n"
+        _make_log_run(isolated_runs_root, "bigrun_head", log_content)
+        stdout = _FakeStdout(tty=False)
+        monkeypatch.setattr(sys, "stdout", stdout)
+        rc = agent_run.cmd_logs(argparse.Namespace(name="bigrun_head", tail=None, head=1))
+        assert rc == 0
+        assert stdout.buffer.getvalue() == big_line + b"\n"
+
+    def test_tail_zero_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run._build_parser().parse_args(["logs", "run", "--tail", "0"])
+        assert exc_info.value.code == 2
+
+    def test_head_zero_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run._build_parser().parse_args(["logs", "run", "--head", "0"])
+        assert exc_info.value.code == 2
+
+
+class TestCleanSlicing:
+    def test_tail_n_bounds_stdout(self, isolated_runs_root, moon_log_bytes, capsys):
+        _make_run(isolated_runs_root, "moon_tail", moon_log_bytes)
+        args = argparse.Namespace(
+            name="moon_tail", out=None, width=120, height=60, history=100000, tail=3, head=None
+        )
+        rc = agent_run.cmd_clean(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert len(out.splitlines()) == 3
+
+    def test_head_n_bounds_stdout(self, isolated_runs_root, moon_log_bytes, capsys):
+        _make_run(isolated_runs_root, "moon_head", moon_log_bytes)
+        args = argparse.Namespace(
+            name="moon_head", out=None, width=120, height=60, history=100000, tail=None, head=3
+        )
+        rc = agent_run.cmd_clean(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert len(out.splitlines()) == 3
+
+    def test_tail_n_bounds_file_out(self, isolated_runs_root, moon_log_bytes, tmp_path, capsys):
+        _make_run(isolated_runs_root, "moon_tail_file", moon_log_bytes)
+        out_file = tmp_path / "sliced.txt"
+        args = argparse.Namespace(
+            name="moon_tail_file",
+            out=str(out_file),
+            width=120,
+            height=60,
+            history=100000,
+            tail=3,
+            head=None,
+        )
+        rc = agent_run.cmd_clean(args)
+        assert rc == 0
+        text = out_file.read_text(encoding="utf-8")
+        assert len(text.splitlines()) == 3
+        # Byte count on stderr matches the bytes actually written.
+        stderr = capsys.readouterr().err
+        written = len(text.encode("utf-8"))
+        assert str(written) in stderr
+
+    def test_no_flag_is_byte_identical_to_unsliced(
+        self, isolated_runs_root, moon_log_bytes, capsys
+    ):
+        """clean with neither --tail nor --head must produce the same output as before."""
+        _make_run(isolated_runs_root, "moon_unsliced", moon_log_bytes)
+        args_sliced = argparse.Namespace(
+            name="moon_unsliced", out=None, width=120, height=60, history=100000,
+            tail=None, head=None,
+        )
+        agent_run.cmd_clean(args_sliced)
+        unsliced_out = capsys.readouterr().out
+
+        # Render again without the new attributes at all (simulates pre-change callers).
+        args_old_style = argparse.Namespace(
+            name="moon_unsliced", out=None, width=120, height=60, history=100000
+        )
+        agent_run.cmd_clean(args_old_style)
+        old_out = capsys.readouterr().out
+
+        assert unsliced_out == old_out
+
+    def test_clean_tail_and_head_together_is_usage_error(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run._build_parser().parse_args(
+                ["clean", "run", "--tail", "5", "--head", "3"]
+            )
+        assert exc_info.value.code == 2
+
+    def test_clean_tail_zero_rejected(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run._build_parser().parse_args(["clean", "run", "--tail", "0"])
+        assert exc_info.value.code == 2

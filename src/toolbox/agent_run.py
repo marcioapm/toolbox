@@ -50,7 +50,7 @@ Usage::
     agent-run --echo <name> -- <cmd...>  # also render a cleaned live transcript
     agent-run --idle-timeout N <name> -- <cmd...>  # self-terminate after N idle seconds
     agent-run tail <name>                # follow log in real time
-    agent-run logs <name> [N]            # last N lines (default 50)
+    agent-run logs <name> [--tail N | --head N]  # last/first N lines (default --tail 50)
     agent-run status <name>              # one-line status
     agent-run watch <name> [--json] [--repo PATH]  # stateless fact snapshot for pollers
     agent-run steer <name> <msg...>      # send text to agent stdin (needs -i)
@@ -3036,24 +3036,79 @@ def _reset_terminal_modes() -> None:
         pass
 
 
+def _tail_bytes(f: "BinaryIO", n: int) -> List[bytes]:
+    """Return the last ``n`` lines from ``f`` without reading the entire file.
+
+    Uses a reverse block-read: start at EOF and walk backwards in 8 KiB chunks,
+    accumulating data until at least n+1 newlines have been seen so that
+    splitlines() can return a clean slice. Terminates on the first block that
+    takes pos to 0, so a file with fewer than n lines returns all lines.
+    """
+    f.seek(0, os.SEEK_END)
+    pos = f.tell()
+    block = 8192
+    data = b""
+    while pos > 0 and data.count(b"\n") <= n:
+        read_size = min(block, pos)
+        pos -= read_size
+        f.seek(pos)
+        data = f.read(read_size) + data
+    return data.splitlines()[-n:]
+
+
+def _head_bytes(f: "BinaryIO", n: int) -> List[bytes]:
+    """Return the first ``n`` lines from ``f`` with a bounded forward read.
+
+    Reads in 8 KiB chunks and stops as soon as n newlines have been collected,
+    so even an 8 MB single-line log terminates after reading at most one chunk
+    beyond the n-th newline — it never materialises the whole file.
+    """
+    lines: List[bytes] = []
+    buf = b""
+    while len(lines) < n:
+        chunk = f.read(8192)
+        if not chunk:
+            # EOF; emit whatever partial last line remains.
+            if buf:
+                lines.append(buf)
+            break
+        buf += chunk
+        parts = buf.split(b"\n")
+        # The last element is an incomplete line (no trailing newline yet).
+        for part in parts[:-1]:
+            lines.append(part)
+            if len(lines) == n:
+                break
+        buf = parts[-1] if len(lines) < n else b""
+    return lines[:n]
+
+
+def _slice_str_tail(text: str, n: int) -> str:
+    """Return the last ``n`` lines of ``text``, preserving the trailing newline."""
+    lines = text.splitlines()
+    return "\n".join(lines[-n:]) + "\n"
+
+
+def _slice_str_head(text: str, n: int) -> str:
+    """Return the first ``n`` lines of ``text``, preserving the trailing newline."""
+    lines = text.splitlines()
+    return "\n".join(lines[:n]) + "\n"
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
-    n = max(1, args.n)
+    # Exactly one of tail/head is set; default is tail=50 (set by the parser).
+    tail_n: Optional[int] = getattr(args, "tail", None)
+    head_n: Optional[int] = getattr(args, "head", None)
     try:
-        # Read tail-n efficiently for large logs.
         with log.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            end = f.tell()
-            block = 8192
-            data = b""
-            pos = end
-            while pos > 0 and data.count(b"\n") <= n:
-                read_size = min(block, pos)
-                pos -= read_size
-                f.seek(pos)
-                data = f.read(read_size) + data
-        lines = data.splitlines()
-        for line in lines[-n:]:
+            if head_n is not None:
+                lines = _head_bytes(f, head_n)
+            else:
+                # Default: tail 50.
+                n = tail_n if tail_n is not None else 50
+                lines = _tail_bytes(f, n)
+        for line in lines:
             try:
                 sys.stdout.buffer.write(line + b"\n")
             except BrokenPipeError:
@@ -3395,10 +3450,24 @@ def cmd_clean(args: argparse.Namespace) -> int:
         )
     except RenderDependencyError as exc:
         sys.exit(str(exc))
+
+    # Slice the rendered transcript *after* rendering: pyte replays the whole
+    # byte stream as a VT100 emulator, so feeding it a byte-sliced fragment
+    # starts mid-escape-sequence and produces garbage. Slice lines from the
+    # already-decoded string instead.
+    tail_n: Optional[int] = getattr(args, "tail", None)
+    head_n: Optional[int] = getattr(args, "head", None)
+    if tail_n is not None:
+        rendered = _slice_str_tail(rendered, tail_n)
+    elif head_n is not None:
+        rendered = _slice_str_head(rendered, head_n)
+    # Neither flag: unbounded — preserves existing behaviour for interactive use.
+
     out_path = getattr(args, "out", None)
     if out_path:
-        Path(out_path).write_text(rendered, encoding="utf-8")
-        size = len(rendered.encode("utf-8"))
+        data = rendered.encode("utf-8")
+        Path(out_path).write_bytes(data)
+        size = len(data)
         sys.stderr.write(f"agent-run: wrote {size} bytes of cleaned transcript to {out_path}\n")
         return 0
     sys.stdout.write(rendered)
@@ -5926,9 +5995,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_watch.set_defaults(func=cmd_watch)
 
-    sp_logs = sub.add_parser("logs", help="print last N lines of the log")
+    sp_logs = sub.add_parser("logs", help="print last N lines of the log (default --tail 50)")
     sp_logs.add_argument("name")
-    sp_logs.add_argument("n", nargs="?", type=_positive_int, default=50)
+    logs_slice = sp_logs.add_mutually_exclusive_group()
+    logs_slice.add_argument(
+        "--tail",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="print the last N lines (default when neither flag is given: 50)",
+    )
+    logs_slice.add_argument(
+        "--head",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="print the first N lines; bounded forward read, never loads whole file",
+    )
     sp_logs.set_defaults(func=cmd_logs)
 
     sp_tail = sub.add_parser("tail", help="follow log in real time (tail -f)")
@@ -5963,6 +6046,21 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_nonnegative_int,
         default=100000,
         help="scrollback line budget for the emulator (default: 100000)",
+    )
+    clean_slice = sp_clean.add_mutually_exclusive_group()
+    clean_slice.add_argument(
+        "--tail",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="print the last N lines of the rendered transcript (default: unbounded)",
+    )
+    clean_slice.add_argument(
+        "--head",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="print the first N lines of the rendered transcript (default: unbounded)",
     )
     sp_clean.set_defaults(func=cmd_clean)
 
