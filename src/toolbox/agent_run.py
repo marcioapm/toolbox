@@ -5874,25 +5874,59 @@ def _codex_policy_args(*, enable_questions: bool) -> List[str]:
 def _opencode_policy_config(existing: Optional[str], *, enable_planning: bool, enable_questions: bool) -> str:
     """Merge the managed permission policy into an OPENCODE_CONFIG_CONTENT value.
 
-    Only the three policy keys are set; any other config the caller already had
-    survives. Unparseable or non-object input is replaced rather than raising —
-    the policy must apply even if the inherited value is junk.
+    Sets the three policy keys at global scope and in every per-agent permission
+    block, because OpenCode merges per-agent config after global config and the
+    last matching rule wins — an agent-level allow would otherwise defeat a
+    global deny. Any other config the caller already had survives untouched.
+    Unparseable or non-object input is replaced rather than raising — the policy
+    must apply even if the inherited value is junk.
     """
     try:
         config = json.loads(existing) if existing else {}
     except json.JSONDecodeError:
+        if existing:
+            print(
+                f"agent-run: warning: OPENCODE_CONFIG_CONTENT is not valid JSON; "
+                f"managed policy applied to empty config. "
+                f"first 200 chars: {existing[:200]!r}",
+                file=sys.stderr,
+            )
         config = {}
     if not isinstance(config, dict):
+        if existing:
+            print(
+                f"agent-run: warning: OPENCODE_CONFIG_CONTENT parsed to a non-object "
+                f"({type(config).__name__}); managed policy applied to empty config.",
+                file=sys.stderr,
+            )
         config = {}
+
+    policy_values = {
+        "question": "allow" if enable_questions else "deny",
+        "plan_enter": "allow" if enable_planning else "deny",
+        "plan_exit": "allow" if enable_planning else "deny",
+    }
+
+    # Set at global scope.
     permission = config.get("permission")
     if not isinstance(permission, dict):
         permission = {}
         config["permission"] = permission
-    permission.update({
-        "question": "allow" if enable_questions else "deny",
-        "plan_enter": "allow" if enable_planning else "deny",
-        "plan_exit": "allow" if enable_planning else "deny",
-    })
+    permission.update(policy_values)
+
+    # Force the same values in every per-agent block so an agent-level allow
+    # cannot override the global deny. Absent keys fall through to the global
+    # value in OpenCode's ruleset, but present keys win regardless of order.
+    agents = config.get("agent")
+    if isinstance(agents, dict):
+        for agent_cfg in agents.values():
+            if not isinstance(agent_cfg, dict):
+                continue
+            agent_perm = agent_cfg.get("permission")
+            if not isinstance(agent_perm, dict):
+                continue
+            agent_perm.update(policy_values)
+
     return json.dumps(config, separators=(",", ":"))
 
 
@@ -5921,6 +5955,11 @@ def _runner(
     a PTY child and shuttles FIFO <-> PTY master <-> log (interactive), or drives
     codex over app-server JSON-RPC (managed_harness == "codex"). Any prompt has
     already been materialised to prompt_file by the launcher.
+
+    Must only be called in the post-setsid grandchild. This function mutates
+    process-global os.environ (OPENCODE_CONFIG_CONTENT, TMPDIR, BUN_TMPDIR) and
+    terminates via os._exit — calling it pre-fork leaks env mutations into the
+    parent and any concurrent agent-run invocations sharing that process.
     """
     my_pid = os.getpid()
     log_fd = -1
