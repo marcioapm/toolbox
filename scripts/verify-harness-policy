@@ -420,25 +420,6 @@ def cell_c5_claude_variadic_additive(result: CellResult) -> None:
     )
 
 
-def _opencode_policy_json(
-    *,
-    enable_questions: bool = False,
-    enable_planning: bool = False,
-    agent_names: Optional[list[str]] = None,
-) -> str:
-    """Minimal policy JSON matching what _opencode_policy_config() produces."""
-    q = "allow" if enable_questions else "deny"
-    p = "allow" if enable_planning else "deny"
-    policy = {"question": q, "plan_enter": p, "plan_exit": p}
-    agents: dict = {}
-    for name in (agent_names or ["build"]):
-        agents[name] = {"permission": dict(policy)}
-    return json.dumps(
-        {"permission": dict(policy), "agent": agents},
-        separators=(",", ":"),
-    )
-
-
 def _last_rules_for_keys(
     debug_output: str, keys: list[str]
 ) -> dict[str, Optional[str]]:
@@ -458,22 +439,34 @@ def _last_rules_for_keys(
 def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
     """C6: opencode debug agent confirms deny is the last rule, even vs a project allow.
 
-    Tests six scenarios via opencode debug agent (no model call, confirmed working):
-      1. Default agent (build) with policy-only OPENCODE_CONFIG_CONTENT → deny wins.
-      2. --agent-mode named agent → deny wins for that agent name.
-      3. Agent named via --harness-arg --agent → deny wins for that name.
-      4. User/XDG config allow overridden by OPENCODE_CONFIG_CONTENT deny → deny wins.
-      5. OPENCODE_CONFIG env override → deny wins for build.
-      6. Enabled arm: question and plan_enter/plan_exit are 'allow' when flags set.
+    Each scenario builds OPENCODE_CONFIG_CONTENT by calling the real
+    ar._opencode_policy_config() with arguments that mirror how _cmd_launch_locked
+    computes them in production. A local reimplementation would pass even if the
+    production builder is gutted (e.g. target_agents emptied — the bug from 7a067c2).
+
+    Six scenarios via opencode debug agent (no model call, confirmed working):
+      1. Default agent (build): opencode_agent_mode=None, no extra names.
+      2. --agent-mode agent: opencode_agent_mode=<name>.
+      3. --harness-arg --agent: extra_agent_names from _opencode_agent_names_from_harness_args.
+      4. Project per-agent allow defeated: also folds in _opencode_collect_config_agent_names
+         so the config-enumeration path is exercised.
+      5. OPENCODE_CONFIG env override: same as 4 with an extra OPENCODE_CONFIG file.
+      6. Enabled arm: all three keys are 'allow' when both enable flags are set.
     """
     if not _require_binary("opencode", result):
         return
+
+    import toolbox.agent_run as ar
 
     version = _binary_version("opencode") or "unknown"
     result.version_info["opencode"] = version
     _log(f"  opencode version: {version}")
 
     policy_keys = ["question", "plan_enter", "plan_exit"]
+
+    # Isolated XDG home shared across scenarios so no operator config leaks in.
+    empty_xdg = os.path.join(tmp_dir, "empty_xdg")
+    os.makedirs(empty_xdg, exist_ok=True)
 
     def _check(
         scenario: str,
@@ -483,12 +476,7 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
         expect_deny: bool = True,
     ) -> Optional[str]:
         """Run opencode debug agent <name> and return an error string or None."""
-        env = {**os.environ, **env_overrides}
-        # XDG_CONFIG_HOME must be redirected so we never read the real user config.
-        # Use an empty temp dir so there is no accidental allow from the operator's
-        # own ~/.config/opencode/opencode.json.
-        if "XDG_CONFIG_HOME" not in env_overrides and "HOME" not in env_overrides:
-            env["XDG_CONFIG_HOME"] = os.path.join(tmp_dir, "empty_xdg")
+        env = {**os.environ, "XDG_CONFIG_HOME": empty_xdg, **env_overrides}
         try:
             r = _run("opencode", "debug", "agent", agent_name, env=env, cwd=cwd)
         except subprocess.TimeoutExpired:
@@ -513,20 +501,45 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
             )
         return None
 
-    # 1. Default agent (build) with policy env → deny.
-    policy_env = _opencode_policy_json()
-    err = _check(
-        "default agent (build)", "build",
-        {"OPENCODE_CONFIG_CONTENT": policy_env},
+    # 1. Default agent (build): opencode_agent_mode=None, no extra names.
+    #    Use a project that grants per-agent allow for 'build' so the test is non-vacuous:
+    #    if _opencode_policy_config omits the 'build' per-agent deny block (e.g. because
+    #    target_agents is not initialised to {"build"}), the project allow wins and this
+    #    scenario fails — which is exactly the regression from 7a067c2/870dd7f.
+    project_dir_s1 = os.path.join(tmp_dir, "project_s1")
+    os.makedirs(project_dir_s1, exist_ok=True)
+    build_allow_cfg = {
+        "agent": {
+            "build": {
+                "permission": {"question": "allow", "plan_enter": "allow", "plan_exit": "allow"}
+            }
+        }
+    }
+    with open(os.path.join(project_dir_s1, "opencode.json"), "w") as f:
+        json.dump(build_allow_cfg, f)
+    policy_env1 = ar._opencode_policy_config(
+        None,
+        enable_planning=False,
+        enable_questions=False,
+        opencode_agent_mode=None,
+        extra_agent_names=None,  # empty: mirrors a launch with no harness args and no config agents
     )
+    err = _check("default agent (build) vs project allow", "build",
+                 {"OPENCODE_CONFIG_CONTENT": policy_env1}, cwd=project_dir_s1)
     if err:
         result.fail(err)
         return
-    _log("  [1] default agent (build): deny wins")
+    _log("  [1] default agent (build): deny wins over project allow")
 
-    # 2. --agent-mode named agent — the agent named by --agent-mode gets its own block.
+    # 2. --agent-mode agent: production passes opencode_agent_mode to the policy builder.
     agent_mode_name = "myagent_mode_test"
-    policy_env2 = _opencode_policy_json(agent_names=["build", agent_mode_name])
+    policy_env2 = ar._opencode_policy_config(
+        None,
+        enable_planning=False,
+        enable_questions=False,
+        opencode_agent_mode=agent_mode_name,
+        extra_agent_names=None,
+    )
     err = _check(
         f"--agent-mode agent ({agent_mode_name!r})", agent_mode_name,
         {"OPENCODE_CONFIG_CONTENT": policy_env2},
@@ -536,9 +549,21 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
         return
     _log(f"  [2] --agent-mode agent ({agent_mode_name!r}): deny wins")
 
-    # 3. Agent named via --harness-arg --agent.
+    # 3. Agent named via --harness-arg --agent: production calls
+    #    _opencode_agent_names_from_harness_args to extract the name, then passes it
+    #    as extra_agent_names. Exercising that extraction path here catches regressions
+    #    in _opencode_agent_names_from_harness_args itself.
     harness_arg_name = "myharness_arg_agent"
-    policy_env3 = _opencode_policy_json(agent_names=["build", harness_arg_name])
+    extra_from_harness_args = ar._opencode_agent_names_from_harness_args(
+        ["--agent", harness_arg_name]
+    )
+    policy_env3 = ar._opencode_policy_config(
+        None,
+        enable_planning=False,
+        enable_questions=False,
+        opencode_agent_mode=None,
+        extra_agent_names=extra_from_harness_args,
+    )
     err = _check(
         f"--harness-arg --agent ({harness_arg_name!r})", harness_arg_name,
         {"OPENCODE_CONFIG_CONTENT": policy_env3},
@@ -548,7 +573,9 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
         return
     _log(f"  [3] --harness-arg --agent ({harness_arg_name!r}): deny wins")
 
-    # 4. Project config grants per-agent allow → OPENCODE_CONFIG_CONTENT deny beats it.
+    # 4. Project per-agent allow defeated: a project opencode.json grants question/plan=allow
+    #    for 'build'. Production folds in _opencode_collect_config_agent_names(cwd) so agents
+    #    defined in the project config also get a deny block. Test that path here.
     project_dir = os.path.join(tmp_dir, "project_allow")
     os.makedirs(project_dir, exist_ok=True)
     project_cfg = {
@@ -564,9 +591,18 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
     }
     with open(os.path.join(project_dir, "opencode.json"), "w") as f:
         json.dump(project_cfg, f)
+    # Mirror production: collect agent names from config sources, then build policy.
+    config_agent_names = ar._opencode_collect_config_agent_names(project_dir)
+    policy_env4 = ar._opencode_policy_config(
+        None,
+        enable_planning=False,
+        enable_questions=False,
+        opencode_agent_mode=None,
+        extra_agent_names=config_agent_names,
+    )
     err = _check(
         "project-allow vs OPENCODE_CONFIG_CONTENT deny", "build",
-        {"OPENCODE_CONFIG_CONTENT": policy_env},
+        {"OPENCODE_CONFIG_CONTENT": policy_env4},
         cwd=project_dir,
     )
     if err:
@@ -574,24 +610,47 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
         return
     _log("  [4] project-allow vs OPENCODE_CONFIG_CONTENT deny: deny wins (last-match)")
 
-    # 5. OPENCODE_CONFIG file-based env override.
-    cfg_file = os.path.join(tmp_dir, "policy_override.json")
+    # 5. OPENCODE_CONFIG env override: same config-enumeration path, extra OPENCODE_CONFIG
+    #    file that re-grants allow for build. Policy must still deny.
+    cfg_file = os.path.join(tmp_dir, "extra_allow.json")
     with open(cfg_file, "w") as f:
-        f.write(policy_env)
+        json.dump(project_cfg, f)  # same project_cfg: grants allow for build
+    # _opencode_collect_config_agent_names reads OPENCODE_CONFIG from the environment;
+    # pass it explicitly here so the cell is self-contained.
+    env_for_collect = {**os.environ, "OPENCODE_CONFIG": cfg_file, "XDG_CONFIG_HOME": empty_xdg}
+    config_agent_names5 = ar._opencode_collect_config_agent_names(project_dir)
+    # Also pick up any agents named in the OPENCODE_CONFIG file.
+    oc_cfg_data = json.loads(Path(cfg_file).read_text())
+    for name in (oc_cfg_data.get("agent") or {}):
+        config_agent_names5.add(name)
+    policy_env5 = ar._opencode_policy_config(
+        None,
+        enable_planning=False,
+        enable_questions=False,
+        opencode_agent_mode=None,
+        extra_agent_names=config_agent_names5,
+    )
     err = _check(
         "OPENCODE_CONFIG env override", "build",
-        {"OPENCODE_CONFIG_CONTENT": policy_env, "OPENCODE_CONFIG": cfg_file},
+        {"OPENCODE_CONFIG_CONTENT": policy_env5, "OPENCODE_CONFIG": cfg_file},
+        cwd=project_dir,
     )
     if err:
         result.fail(err)
         return
     _log("  [5] OPENCODE_CONFIG env override: deny wins")
 
-    # 6. Enabled arm: when both flags are set, the last rule for each key must be 'allow'.
-    enabled_policy = _opencode_policy_json(enable_questions=True, enable_planning=True)
+    # 6. Enabled arm: both flags set → last rule must be 'allow' for all three keys.
+    policy_env6 = ar._opencode_policy_config(
+        None,
+        enable_planning=True,
+        enable_questions=True,
+        opencode_agent_mode=None,
+        extra_agent_names=None,
+    )
     err = _check(
         "enabled arm (question=allow, plan=allow)", "build",
-        {"OPENCODE_CONFIG_CONTENT": enabled_policy},
+        {"OPENCODE_CONFIG_CONTENT": policy_env6},
         expect_deny=False,
     )
     if err:

@@ -9,9 +9,16 @@ The managed-mode policy is built on version-sensitive harness internals: a renam
 config key, a renamed claude tool, or a change in OpenCode's config merge order all leave
 the test suite green while the policy stops being enforced.
 
-This script detects that drift by running every check against the harness binaries installed
-right now. The version of each harness is reported in every cell's output and in the JSON
-summary, so the record is unambiguous: "this worked with codex 0.144.1".
+This script detects two distinct failure modes:
+
+- **Harness drift** — a harness upgrade renames a key, tool, or changes merge semantics.
+  Cells C1–C5 detect this by calling the harness binary directly.
+- **Our regression** — a change to `_opencode_policy_config()`, `_codex_policy_args()`,
+  or `_build_managed_argv()` in `agent_run.py` silently breaks the policy builder.
+  Cell C6 detects this by calling the real production function and verifying its output.
+
+These are different failure modes; a reader must be able to tell which cells would catch
+which kind of break. See the table in [What each cell would catch](#what-each-cell-would-catch).
 
 ## Two tiers
 
@@ -26,7 +33,7 @@ No model calls. Completes in seconds. **Cost: $0.**
 | `C3-codex-last-wins` | Duplicate `-c` overrides use last-occurrence-wins: invalid-first/valid-last exits 0; valid-first/invalid-last exits non-zero. The policy args are prepended so caller-supplied `-c` values override them. |
 | `C4-claude-tool-names` | `--disallowedTools EnterPlanMode ExitPlanMode AskUserQuestion` produces no "matches no known tool" warning. A bogus name MUST produce it. No model call: claude validates tool names at startup in ~0.3 s. |
 | `C5-claude-variadic` | `--disallowedTools` is variadic (claude splits a space-separated value into individual tool names) and additive (multiple `--disallowedTools` occurrences are cumulative, not last-wins). |
-| `C6-opencode-resolver` | `opencode debug agent` (no model call) confirms `question`/`plan_enter`/`plan_exit` are denied as the **last** matching rule in six scenarios: default agent, `--agent-mode` agent, `--harness-arg --agent`, user/XDG config overridden by `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG` env override, and the enabled arm. |
+| `C6-opencode-resolver` | Calls the real `ar._opencode_policy_config()` and confirms `opencode debug agent` sees `question`/`plan_enter`/`plan_exit` as **denied** in the last matching rule, in six scenarios spanning default agent, `--agent-mode`, `--harness-arg --agent`, project allow, `OPENCODE_CONFIG` env override, and the enabled arm. |
 
 ### Tier 2 — behavioural cells (`--paid-only`)
 
@@ -43,6 +50,29 @@ Real API calls against the installed models. Approximate cost: **~$0.20–0.40 p
 Tier-2 cells reuse helpers from `tests/test_agent_run_live_acceptance.py` (imported at
 runtime). The pytest file keeps working exactly as it does today — no shared logic was
 duplicated or moved.
+
+## What each cell would catch
+
+Two failure modes matter:
+- **Our regression**: `agent_run.py` policy builder produces wrong output (e.g. missing per-agent deny block).
+- **Harness drift**: a harness upgrade renames a key, tool, or changes merge/argv semantics.
+
+| Cell | Detects our regression | Detects harness drift | How |
+|------|----------------------|----------------------|-----|
+| C1 | No | **Yes** | Calls `codex app-server --strict-config` directly — no production code involved. |
+| C2 | No | **Yes** | Calls `codex app-server --strict-config` directly. |
+| C3 | No | **Yes** | Calls `codex app-server --strict-config` with duplicate `-c`. |
+| C4 | No | **Yes** | Calls `claude --disallowedTools` directly — no production code involved. |
+| C5 | No | **Yes** | Calls `claude --disallowedTools` directly. |
+| C6 | **Yes** | **Yes** | Calls `ar._opencode_policy_config()` (our code) then `opencode debug agent` (harness). A gutted policy builder (`target_agents = set()`) is detected at scenario 1: the project per-agent allow wins instead of the policy deny. |
+| A1 | **Yes** | **Yes** | Calls `agent_run.cmd_launch` through the full managed path; result observed in the model's tool list. |
+| A2 | **Yes** | **Yes** | Calls `opencode run` via `_opencode_subprocess`; result observed in `tool_use` records. |
+| A3 | No | **Yes** | Calls `claude --disallowedTools` directly; result observed in `tool_use` records. |
+| A5 | **Yes** | **Yes** | Exercises `_opencode_policy_config()` and `_build_managed_argv()` output. |
+
+**Key point**: C1–C5 are harness-drift detectors only. A bug introduced into
+`_opencode_policy_config()` or `_build_managed_argv()` would not be caught by any of them.
+C6 (and the Tier-2 cells) are the ones that catch our own regressions.
 
 ## How to run
 
