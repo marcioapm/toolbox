@@ -747,7 +747,7 @@ agent-run list --all                      # every recognized run, including done
 agent-run list --status died,killed       # only runs whose status is in this set
 agent-run list --include-logs             # also show preserved-log-only runs
 agent-run status <name>                   # one-line status
-agent-run logs <name> [N]                 # last N lines (default 50)
+agent-run logs <name> [--tail N | --head N]    # last/first N lines (default --tail 50)
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
 agent-run attach <name>                   # attach interactively (Ctrl-C detaches)

@@ -47,7 +47,7 @@ Usage::
     agent-run [flags] <name> -- <cmd...>  # recommended: explicit separator
     agent-run <name> <cmd...>            # non-interactive (one-shot)
     agent-run -i <name> -- <cmd...>      # interactive (PTY-wrapped, steerable)
-    agent-run --echo <name> -- <cmd...>  # also render a cleaned live transcript
+    agent-run --echo <name> -- <cmd...>  # accepted for backward compat; log.clean is now always produced
     agent-run --idle-timeout N <name> -- <cmd...>  # self-terminate after N idle seconds
     agent-run --harness claude|opencode|codex   # managed mode (no trailing --)
               [--prompt <text> | --prompt-file <path>]
@@ -56,7 +56,7 @@ Usage::
               <name>
     agent-run attach <name>              # live keyboard + resize passthrough (Ctrl-C detaches)
     agent-run tail <name>                # follow log in real time
-    agent-run logs <name> [N]            # last N lines (default 50)
+    agent-run logs <name> [--tail N | --head N]  # last/first N lines (default --tail 50)
     agent-run status <name>              # one-line status
     agent-run watch <name> [--json] [--repo PATH]  # stateless fact snapshot for pollers
     agent-run steer <name> <msg...>      # send text to agent stdin (needs -i)
@@ -121,11 +121,10 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     pty_pid      PTY child pid (interactive only)
     keeper_pid   FIFO-keeper pid (interactive only)
     prompt_pid   initial-prompt helper pid (when -f and interactive)
-    echo_pid     transcript renderer pid (when --echo)
-    render_pid   final-transcript-render child pid (when --echo; present only
-                 while the bounded final render is in flight, so
-                 ``_force_kill`` can discover and reap it if the runner
-                 itself is wedged)
+    echo_pid     transcript renderer pid (live incremental renderer, always present)
+    render_pid   final-transcript-render child pid (present only while the
+                 bounded final render is in flight, so ``_force_kill`` can
+                 discover and reap it if the runner itself is wedged)
     command      pretty-printed launch command
     argv         JSON-encoded argv (authoritative form for replay)
     submit_mode  cr | crlf (selected from argv for interactive submission)
@@ -146,7 +145,7 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs)::
 
     log          captured stdout+stderr (PTY-captured when interactive)
-    log.clean    rendered transcript (only when launched with --echo)
+    log.clean    rendered transcript (produced for every run that generates output)
     prompt       copy of the -f/--prompt-file input, if one was given
     session.json session attribution (managed mode only): session_id, harness,
                  acquisition, confidence, observed_at; absent for raw runs
@@ -281,13 +280,15 @@ import threading
 import time
 import traceback
 import tty
-import platform
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
+import platform
+from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
@@ -322,7 +323,20 @@ MAX_TERMINAL_DIMENSION = 2000
 MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
 FINAL_RENDER_TIMEOUT_SECONDS = 10.0
 FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
+# Per-tick new-bytes cap for the echo daemon's incremental pyte feed.
 ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
+# Per-line and total byte caps for `logs` and `clean` output. A single TUI line
+# can be megabytes long (one \n per session, many \r redraw frames), so a line
+# count alone does not bound output. The primary consumer, the threadctl drift
+# check, reads at most 32 000 bytes and forwards the last 4 000 characters to an
+# LLM; anything above 32 KiB total is discarded before use.
+LOGS_MAX_LINE_BYTES = 8 * 1024
+LOGS_MAX_TOTAL_BYTES = 32 * 1024
+# Geometry used by the daemon cache and by clean's default rendering. Keeping
+# scrollback bounded limits the resident cost of a long-lived HistoryScreen.
+_RENDER_LOG_DEFAULT_WIDTH = 120
+_RENDER_LOG_DEFAULT_HEIGHT = 60
+_RENDER_LOG_DEFAULT_HISTORY = 2048
 
 # Statuses that are conclusively terminal: the run will never transition
 # again on its own. "done"/"failed"/"launch_failed" are published by the
@@ -3627,28 +3641,194 @@ def _terminal_restored_on_signal_death(restore):
                 pass
 
 
+def _tail_bytes(f: BinaryIO, n: int) -> List[bytes]:
+    """Return the last ``n`` lines of ``f``, walking backward from EOF.
+
+    Reads 8 KiB blocks in reverse until n+1 newlines are seen or byte 0 is
+    reached, collecting chunks in a list and joining once; repeated ``bytes``
+    concatenation would be O(size**2). A log containing fewer than n+1
+    newlines is therefore read in full — a single-line multi-megabyte log
+    costs one whole-file read, and the caller's byte budget, not this
+    function, is what bounds the emitted output.
+
+    Lines are split on ``\\n`` only, with a trailing ``\\r`` stripped from each
+    segment: terminal logs use ``\\r`` as an in-line cursor-home for progress
+    redraws, not as a line terminator. Returns [] for n < 1.
+    """
+    if n < 1:
+        return []
+    f.seek(0, os.SEEK_END)
+    pos = f.tell()
+    chunks: List[bytes] = []
+    newline_count = 0
+    while pos > 0 and newline_count <= n:
+        read_size = min(8192, pos)
+        pos -= read_size
+        f.seek(pos)
+        chunk = f.read(read_size)
+        chunks.append(chunk)
+        newline_count += chunk.count(b"\n")
+    lines = [seg.rstrip(b"\r") for seg in b"".join(reversed(chunks)).split(b"\n")]
+    if lines[-1] == b"":
+        lines = lines[:-1]  # trailing empty segment from a file-final \n
+    return lines[-n:]
+
+
+def _head_bytes(f: BinaryIO, n: int) -> List[bytes]:
+    """Return the first ``n`` lines of ``f``, scanning forward in 8 KiB reads.
+
+    Each chunk is scanned once for ``\\n`` rather than re-scanning accumulated
+    bytes, so cost is O(bytes read). Reading stops after the n-th complete line
+    or at EOF; an unterminated final line at EOF counts as a line. A log whose
+    first n lines span the whole file — again, the single-line multi-megabyte
+    case — is read in full, and the caller's byte budget bounds the output.
+
+    Same line grammar as ``_tail_bytes``. Returns [] for n < 1.
+    """
+    if n < 1:
+        return []
+    lines: List[bytes] = []
+    pending: List[bytes] = []  # bytes of the current incomplete line
+    while len(lines) < n:
+        chunk = f.read(8192)
+        if not chunk:
+            if pending:
+                lines.append(b"".join(pending).rstrip(b"\r"))  # unterminated final line
+            break
+        start = 0
+        while start < len(chunk) and len(lines) < n:
+            nl = chunk.find(b"\n", start)
+            if nl == -1:
+                pending.append(chunk[start:])
+                start = len(chunk)
+            else:
+                pending.append(chunk[start:nl])
+                lines.append(b"".join(pending).rstrip(b"\r"))
+                pending = []
+                start = nl + 1
+    return lines
+
+
+def _slice_str_lines(text: str, n: int, *, from_end: bool) -> str:
+    """Return the last (``from_end``) or first ``n`` lines of ``text``, newline-terminated.
+
+    Splits on ``\\n`` only so that ``\\r``, ``\\f``, ``\\v``, U+2028, and other
+    Unicode line-break characters occurring inside a rendered transcript are
+    neither treated as separators nor rewritten. Returns ``""`` for empty
+    ``text`` or n < 1.
+    """
+    if n < 1 or not text:
+        return ""
+    parts = text.split("\n")
+    if parts[-1] == "":
+        parts = parts[:-1]  # trailing empty part from a final \n
+    selected = parts[-n:] if from_end else parts[:n]
+    return "".join(line + "\n" for line in selected)
+
+
+# Terminal-control sequences are invisible in a terminal but consume tokens and
+# corrupt matching for the LLM consumers that read `logs` output.
+_LOGS_OSC_RE = re.compile(rb"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
+_LOGS_PARTIAL_OSC_HEAD_RE = re.compile(rb"\x1b\].*\Z", re.DOTALL)
+_LOGS_PARTIAL_OSC_TAIL_RE = re.compile(rb"\A[^\x07]*(?:\x07|\x1b\\)", re.DOTALL)
+_LOGS_CSI_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]")
+_LOGS_ESC_RE = re.compile(rb"\x1b.", re.DOTALL)
+
+
+def _strip_ansi_bytes(data: bytes) -> bytes:
+    """Remove ANSI CSI, OSC, and bare ESC sequences from a byte string."""
+    data = _LOGS_OSC_RE.sub(b"", data)
+    data = _LOGS_PARTIAL_OSC_HEAD_RE.sub(b"", data)
+    if b"\x1b]" not in data:
+        data = _LOGS_PARTIAL_OSC_TAIL_RE.sub(b"", data)
+    data = _LOGS_CSI_RE.sub(b"", data)
+    return _LOGS_ESC_RE.sub(b"", data)
+
+
+_TRUNCATION_MARKER_STR = "[agent-run: output truncated]\n"
+_TRUNCATION_MARKER_BYTES = _TRUNCATION_MARKER_STR.encode("utf-8")
+
+
+def _budget_bytes_lines(lines: "Iterable[bytes]") -> "tuple[bytes, bool]":
+    """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to raw log lines.
+
+    ANSI-strips each line, caps it at LOGS_MAX_LINE_BYTES, and stops once the
+    running total (including one newline per emitted line) reaches
+    LOGS_MAX_TOTAL_BYTES. Returns (output, truncated).
+    """
+    out_parts: "list[bytes]" = []
+    total = 0
+    truncated = False
+    for line in lines:
+        clean = _strip_ansi_bytes(line)
+        if len(clean) > LOGS_MAX_LINE_BYTES:
+            clean = clean[:LOGS_MAX_LINE_BYTES]
+            truncated = True
+        remaining = LOGS_MAX_TOTAL_BYTES - total
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(clean) > remaining:
+            clean = clean[:remaining]
+            truncated = True
+        out_parts.append(clean + b"\n")
+        total += len(clean) + 1
+    return b"".join(out_parts), truncated
+
+
+def _budget_str(text: str) -> "tuple[str, bool]":
+    """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to a rendered transcript.
+
+    Counterpart of ``_budget_bytes_lines`` for the ``str`` produced by
+    ``_render_log``. Kept separate rather than merged: caps here are measured on
+    the UTF-8 encoding and a cut that lands mid-code-point is dropped by
+    ``errors="ignore"``, so an accepted line can bill fewer bytes than the cap it
+    was cut at. Routing this through the bytes version would change that
+    accounting and therefore the truncation point.
+
+    Returns (output, truncated); output stays newline-terminated.
+    """
+    stripped = text.rstrip("\n")
+    lines = stripped.split("\n") if stripped else []
+    out_parts: "list[str]" = []
+    total = 0
+    truncated = False
+    for line in lines:
+        line_bytes = line.encode("utf-8")
+        if len(line_bytes) > LOGS_MAX_LINE_BYTES:
+            line_bytes = line_bytes[:LOGS_MAX_LINE_BYTES]
+            line = line_bytes.decode("utf-8", errors="ignore")
+            truncated = True
+        remaining = LOGS_MAX_TOTAL_BYTES - total
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(line_bytes) > remaining:
+            line_bytes = line_bytes[:remaining]
+            line = line_bytes.decode("utf-8", errors="ignore")
+            truncated = True
+        out_parts.append(line + "\n")
+        total += len(line.encode("utf-8")) + 1
+    return "".join(out_parts), truncated
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
-    n = max(1, args.n)
     try:
-        # Read tail-n efficiently for large logs.
-        with log.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            end = f.tell()
-            block = 8192
-            data = b""
-            pos = end
-            while pos > 0 and data.count(b"\n") <= n:
-                read_size = min(block, pos)
-                pos -= read_size
-                f.seek(pos)
-                data = f.read(read_size) + data
-        lines = data.splitlines()
-        for line in lines[-n:]:
-            try:
-                sys.stdout.buffer.write(line + b"\n")
-            except BrokenPipeError:
-                break
+        with _watch_open_validated_log(log) as f:
+            if f is None:
+                sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
+            if args.head is not None:
+                lines = _head_bytes(f, args.head)
+            else:
+                lines = _tail_bytes(f, args.tail if args.tail is not None else 50)
+        out, truncated = _budget_bytes_lines(lines)
+        try:
+            sys.stdout.buffer.write(out)
+            if truncated:
+                sys.stdout.buffer.write(_TRUNCATION_MARKER_BYTES)
+        except BrokenPipeError:
+            pass
     finally:
         _reset_terminal_modes()
     return 0
@@ -4471,12 +4651,91 @@ class RenderDependencyError(RuntimeError):
 
 
 _RENDER_DEPENDENCY_MESSAGE = (
-    "agent-run: `pyte` is required for `clean` / --echo. "
+    "agent-run: `pyte` is required for `clean` and the live transcript renderer. "
     "Install with: pipx inject mmartins-toolbox pyte  (or uv tool install --with pyte ...)"
 )
 
 
-def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 100000) -> str:
+def _new_pyte_screen(pyte, width: int, height: int, history: int):
+    """Create a HistoryScreen that ignores unsupported zero-width controls.
+
+    Pyte 0.8 stops an entire plain-text draw batch at those characters.  Skipping
+    each unsupported character keeps replay independent of feed boundaries.
+
+    LNM (Line New Mode) is enabled so bare LF moves the cursor to column 0 as
+    well as down one row.  Without it, a one-shot (non-PTY) run's bare-LF line
+    endings leave the cursor column unchanged and every subsequent line is
+    indented by the length of the previous one — a staircase artifact.  PTY
+    output carries CRLF and renders identically with LNM on.
+    """
+    from pyte import modes as mo
+
+    class SafeHistoryScreen(pyte.HistoryScreen):
+        def draw(self, data: str) -> None:
+            data = data.translate(self.g1_charset if self.charset else self.g0_charset)
+            for char in data:
+                char_width = wcwidth(char)
+                if self.cursor.x == self.columns:
+                    if mo.DECAWM in self.mode:
+                        self.dirty.add(self.cursor.y)
+                        self.carriage_return()
+                        self.linefeed()
+                    elif char_width > 0:
+                        self.cursor.x -= char_width
+                if mo.IRM in self.mode and char_width > 0:
+                    self.insert_characters(char_width)
+                line = self.buffer[self.cursor.y]
+                if char_width == 1:
+                    line[self.cursor.x] = self.cursor.attrs._replace(data=char)
+                elif char_width == 2:
+                    line[self.cursor.x] = self.cursor.attrs._replace(data=char)
+                    if self.cursor.x + 1 < self.columns:
+                        line[self.cursor.x + 1] = self.cursor.attrs._replace(data="")
+                elif char_width == 0 and unicodedata.combining(char):
+                    if self.cursor.x:
+                        last = line[self.cursor.x - 1]
+                        line[self.cursor.x - 1] = last._replace(
+                            data=unicodedata.normalize("NFC", last.data + char)
+                        )
+                    elif self.cursor.y:
+                        last = self.buffer[self.cursor.y - 1][self.columns - 1]
+                        self.buffer[self.cursor.y - 1][self.columns - 1] = last._replace(
+                            data=unicodedata.normalize("NFC", last.data + char)
+                        )
+                elif char_width < 0 or char_width == 0:
+                    continue
+                if char_width > 0:
+                    self.cursor.x = min(self.cursor.x + char_width, self.columns)
+            self.dirty.add(self.cursor.y)
+
+    screen = SafeHistoryScreen(width, height, history=history, ratio=0.5)
+    screen.set_mode(mo.LNM)
+    return screen
+
+
+def _serialize_screen(screen) -> str:
+    """Serialize a pyte HistoryScreen to the transcript cache format."""
+    rows: List[str] = []
+    for entry in screen.history.top:
+        text = "".join(entry[col].data for col in sorted(entry)) if entry else ""
+        rows.append(text.rstrip())
+    for row in screen.display:
+        rows.append(row.rstrip())
+    deduped: List[str] = []
+    for line in rows:
+        if not deduped or deduped[-1] != line:
+            deduped.append(line)
+    while deduped and not deduped[-1]:
+        deduped.pop()
+    return "\n".join(deduped) + "\n"
+
+
+def _render_log(
+    raw: bytes,
+    width: int = _RENDER_LOG_DEFAULT_WIDTH,
+    height: int = _RENDER_LOG_DEFAULT_HEIGHT,
+    history: int = _RENDER_LOG_DEFAULT_HISTORY,
+) -> str:
     """Render a raw PTY-captured log (with ANSI/Ink redraw artifacts) into a
     plain-text transcript by replaying the byte stream through a VT100
     emulator (pyte). Returns the deduplicated screen history + final visible
@@ -4495,31 +4754,54 @@ def _render_log(raw: bytes, width: int = 120, height: int = 60, history: int = 1
     except ImportError as exc:
         raise RenderDependencyError(_RENDER_DEPENDENCY_MESSAGE) from exc
 
-    screen = pyte.HistoryScreen(width, height, history=history, ratio=0.5)
+    screen = _new_pyte_screen(pyte, width, height, history)
     stream = pyte.ByteStream(screen)
     try:
         _feed_pyte(stream, raw)
     except Exception:
         return _strip_ansi_fallback(raw)
 
-    rows: List[str] = []
-    # Past history rows that have scrolled off the top.
-    for entry in screen.history.top:
-        text = "".join(entry[col].data for col in sorted(entry)) if entry else ""
-        rows.append(text.rstrip())
-    # Currently-visible viewport.
-    for row in screen.display:
-        rows.append(row.rstrip())
+    return _serialize_screen(screen)
 
-    # Collapse adjacent duplicate lines (Ink redraws the same content many times).
-    deduped: List[str] = []
-    for line in rows:
-        if not deduped or deduped[-1] != line:
-            deduped.append(line)
-    # Trim trailing empties.
-    while deduped and not deduped[-1]:
-        deduped.pop()
-    return "\n".join(deduped) + "\n"
+
+def _cache_metadata_path(clean: Path) -> Path:
+    return clean.with_name(f"{clean.name}.meta.json")
+
+
+def _atomic_write_text(path: Path, text: str, *, suffix: str) -> None:
+    """Atomically replace a text file with a process-unique temporary path."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.{suffix}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _publish_clean(clean: Path, rendered: str, *, stat_result, offset: int, complete: bool) -> None:
+    """Publish transcript then metadata identifying the raw prefix it covers."""
+    _atomic_write_text(clean, rendered, suffix="clean")
+    _publish_clean_metadata(clean, stat_result=stat_result, offset=offset, complete=complete)
+
+
+def _publish_clean_metadata(clean: Path, *, stat_result, offset: int, complete: bool) -> None:
+    """Publish cache health metadata without treating diagnostic state as text."""
+    metadata = {
+        "version": 1,
+        "dev": stat_result.st_dev,
+        "ino": stat_result.st_ino,
+        "offset": offset,
+        "size": stat_result.st_size,
+        "complete": complete,
+        "width": _RENDER_LOG_DEFAULT_WIDTH,
+        "height": _RENDER_LOG_DEFAULT_HEIGHT,
+        "history": _RENDER_LOG_DEFAULT_HISTORY,
+        "updated_at": time.time(),
+    }
+    _atomic_write_text(_cache_metadata_path(clean), json.dumps(metadata, sort_keys=True), suffix="meta")
 
 
 def _render_log_to_clean(log_dir: Path) -> None:
@@ -4528,9 +4810,11 @@ def _render_log_to_clean(log_dir: Path) -> None:
     clean = log_dir / "log.clean"
     raw = log.read_bytes()
     rendered = _render_log(raw)
-    tmp = clean.with_suffix(".clean.tmp")
-    tmp.write_text(rendered, encoding="utf-8")
-    tmp.replace(clean)
+    with _watch_open_validated_log(log) as f:
+        if f is None:
+            raise OSError("log is not a regular file")
+        stat_result = os.fstat(f.fileno())
+    _publish_clean(clean, rendered, stat_result=stat_result, offset=stat_result.st_size, complete=True)
 
 
 def _bounded_final_render(
@@ -4556,6 +4840,10 @@ def _bounded_final_render(
         size = (log_dir / "log").stat().st_size
     except OSError as exc:
         return f"cannot stat log: {exc}"
+    if size == 0:
+        # An empty log carries no transcript to render; producing log.clean
+        # with an empty rendering and complete=True would be a misleading artifact.
+        return None
     if size > MAX_FINAL_RENDER_BYTES:
         return f"log is {size} bytes; final render limit is {MAX_FINAL_RENDER_BYTES} bytes"
 
@@ -4609,72 +4897,206 @@ def _bounded_final_render(
 
 
 def _echo_loop(log_dir: "Path", interval: float) -> None:
-    """Periodically render log_dir/log into log_dir/log.clean.
+    """Incrementally render a verified raw-log prefix into ``log.clean``.
 
-    Runs in a detached child for the lifetime of the agent. The parent's
-    signal handler kills us on shutdown so we don't outlive the run. We
-    only re-render when the raw log's mtime has changed, so a quiet run
-    doesn't burn CPU. Renders are skipped (not crashed) once the raw log
-    exceeds ECHO_LOOP_MAX_RENDER_BYTES, so an unbounded long-running log
-    cannot make each periodic tick progressively more expensive; the final
-    render at exit applies its own independent, stricter size cap.
+    Each tick feeds only the bytes appended since the last verified offset, so a
+    published cache always identifies the exact (dev, ino, offset) prefix it
+    covers via ``log.clean.meta.json``. Any parse or publication failure leaves
+    that contract unpublished and is retried after discarding mutated pyte state.
     """
     log = log_dir / "log"
     clean = log_dir / "log.clean"
-    last_mtime = -1.0
-    # Soft cap: if pyte isn't installed, write a friendly stub and exit.
     try:
-        import pyte  # noqa: F401  (just probe; real import is in _render_log)
+        import pyte  # type: ignore
     except ImportError:
-        clean.write_text(
-            "agent-run: --echo requested but `pyte` is not installed.\n"
-            "Install with: pipx inject mmartins-toolbox pyte\n"
-        )
         return
+
+    def new_state():
+        screen = _new_pyte_screen(
+            pyte, _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT,
+            _RENDER_LOG_DEFAULT_HISTORY,
+        )
+        return screen, pyte.ByteStream(screen)
+
+    screen, stream = new_state()
+    offset = 0
+    log_ino = -1
+    log_dev = -1
+    # (rendered-or-None, source stat, offset) awaiting publication; retried on a
+    # publish failure. rendered None means the text is unchanged (metadata only).
+    pending: Optional[tuple[Optional[str], Any, int]] = None
+    last_rendered: Optional[str] = None
+    failures = 0
+    # (dev, ino) whose byte-zero prefix deterministically fails to parse; its
+    # cache stays marked incomplete so readers re-render instead of trusting it.
+    blocked: Optional[tuple[int, int]] = None
+
     while True:
         try:
-            log_stat = log.stat()
-        except FileNotFoundError:
+            with _watch_open_validated_log(log) as f:
+                if f is None:
+                    raise OSError("cannot open regular log")
+                current = os.fstat(f.fileno())
+                identity = (current.st_dev, current.st_ino)
+                if current.st_size < offset or (offset and identity != (log_dev, log_ino)):
+                    # Truncation or replacement: re-parse the new file from zero.
+                    screen, stream = new_state()
+                    offset = 0
+                    log_ino = current.st_ino
+                    log_dev = current.st_dev
+                    pending = None
+                    failures = 0
+                if current.st_size > offset:
+                    read_size = min(current.st_size - offset, ECHO_LOOP_MAX_RENDER_BYTES)
+                    f.seek(offset)
+                    chunk = f.read(read_size)
+                    if len(chunk) != read_size:
+                        raise OSError("short read from log")
+                else:
+                    chunk = b""
+        except OSError:
             time.sleep(interval)
             continue
-        mtime = log_stat.st_mtime
-        if mtime != last_mtime:
-            if log_stat.st_size > ECHO_LOOP_MAX_RENDER_BYTES:
-                last_mtime = mtime
+
+        if chunk:
+            if blocked == identity:
                 time.sleep(interval)
                 continue
             try:
-                _render_log_to_clean(log_dir)
+                _feed_pyte(stream, chunk)
+                rendered = _serialize_screen(screen)
             except Exception:
-                # Don't crash the helper on transient render errors;
-                # next tick may succeed.
-                pass
-            else:
-                # Failed renders must be retried even when the raw log's mtime
-                # remains unchanged.
-                last_mtime = mtime
+                # Feed/serialize can mutate pyte before raising; rebuild from
+                # zero so no later publication uses partial state.
+                screen, stream = new_state()
+                offset = 0
+                pending = None
+                failures += 1
+                if failures >= 2:
+                    blocked = identity
+                    try:
+                        _publish_clean_metadata(clean, stat_result=current, offset=0, complete=False)
+                    except OSError:
+                        pass
+                time.sleep(interval)
+                continue
+            offset += len(chunk)
+            log_ino = current.st_ino
+            log_dev = current.st_dev
+            pending = (rendered if rendered != last_rendered else None, current, offset)
+            last_rendered = rendered
+            failures = 0
+            blocked = None
+
+        if pending is not None:
+            rendered, source_stat, published_offset = pending
+            complete = published_offset == source_stat.st_size
+            try:
+                if rendered is not None:
+                    _publish_clean(clean, rendered, stat_result=source_stat,
+                                   offset=published_offset, complete=complete)
+                else:
+                    _publish_clean_metadata(clean, stat_result=source_stat,
+                                            offset=published_offset, complete=complete)
+            except OSError:
+                time.sleep(interval)
+                continue
+            pending = None
         time.sleep(interval)
+
+
+def _read_clean_cache(
+    log_path: Path,
+    width: int,
+    height: int,
+    history: int,
+) -> "Optional[str]":
+    """Return a compatible cache only when metadata proves it covers the raw log."""
+    if (
+        width != _RENDER_LOG_DEFAULT_WIDTH
+        or height != _RENDER_LOG_DEFAULT_HEIGHT
+        or history != _RENDER_LOG_DEFAULT_HISTORY
+    ):
+        return None
+    with _watch_open_validated_log(log_path) as log_file:
+        if log_file is None:
+            return None
+        try:
+            raw_stat = os.fstat(log_file.fileno())
+        except OSError:
+            return None
+    clean = log_path.parent / "log.clean"
+    metadata_path = _cache_metadata_path(clean)
+    try:
+        with _watch_open_validated_log(metadata_path) as metadata_file:
+            if metadata_file is None:
+                return None
+            metadata = json.loads(metadata_file.read().decode("utf-8"))
+        if not (
+            metadata.get("version") == 1
+            and metadata.get("complete") is True
+            and metadata.get("dev") == raw_stat.st_dev
+            and metadata.get("ino") == raw_stat.st_ino
+            and metadata.get("offset") == raw_stat.st_size
+            and metadata.get("size") == raw_stat.st_size
+            and metadata.get("width") == width
+            and metadata.get("height") == height
+            and metadata.get("history") == history
+        ):
+            return None
+        with _watch_open_validated_log(clean) as clean_file:
+            if clean_file is None:
+                return None
+            return clean_file.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
-    raw = log.read_bytes()
-    try:
-        rendered = _render_log(
-            raw,
-            width=args.width,
-            height=args.height,
-            history=args.history,
-        )
-    except RenderDependencyError as exc:
-        sys.exit(str(exc))
+
+    # Prefer log.clean, written by the --echo daemon, over re-rendering.
+    # Reusing the cache saves cmd_clean the pyte replay on large logs.
+    rendered = _read_clean_cache(log, width=args.width, height=args.height, history=args.history)
+    if rendered is None:
+        with _watch_open_validated_log(log) as f:
+            if f is None:
+                sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
+            raw = f.read()
+        try:
+            rendered = _render_log(
+                raw,
+                width=args.width,
+                height=args.height,
+                history=args.history,
+            )
+        except RenderDependencyError as exc:
+            sys.exit(str(exc))
+
+    # Slice after rendering, never before: pyte replays the byte stream as a
+    # VT100 emulator, so a byte-sliced fragment starts mid-escape-sequence.
+    # getattr: internal callers construct Namespaces without tail/head.
+    tail_n: Optional[int] = getattr(args, "tail", None)
+    head_n: Optional[int] = getattr(args, "head", None)
+    if tail_n is not None:
+        rendered = _slice_str_lines(rendered, tail_n, from_end=True)
+    elif head_n is not None:
+        rendered = _slice_str_lines(rendered, head_n, from_end=False)
+
+    # Same byte budget as cmd_logs: real renders reach hundreds of KB, which
+    # would otherwise flood both the -o file and the stdout consumer.
+    budgeted, truncated = _budget_str(rendered)
+    if truncated:
+        budgeted = budgeted + _TRUNCATION_MARKER_STR
+
     out_path = getattr(args, "out", None)
     if out_path:
-        Path(out_path).write_text(rendered, encoding="utf-8")
-        size = len(rendered.encode("utf-8"))
+        data = budgeted.encode("utf-8")
+        Path(out_path).write_bytes(data)
+        size = len(data)
         sys.stderr.write(f"agent-run: wrote {size} bytes of cleaned transcript to {out_path}\n")
         return 0
-    sys.stdout.write(rendered)
+    sys.stdout.write(budgeted)
     return 0
 
 
@@ -6847,26 +7269,26 @@ def _runner(
         signal.signal(signal.SIGINT, _on_signal)
         signal.signal(signal.SIGHUP, _on_signal)
 
-        # If --echo was requested, fork a background renderer that periodically
-        # writes a cleaned transcript next to the raw log. Stays alive for the
-        # whole run; the signal handler tears it down on shutdown.
-        if echo:
-            with _block_handled_runner_signals():
-                echo_pid = os.fork()
-                if echo_pid != 0:
-                    _publish_or_reap_child(state_dir, "echo_pid", echo_pid)
-                else:
-                    _reset_runner_signal_handlers()
-            if echo_pid == 0:
+        # Fork a background renderer that periodically writes a cleaned
+        # transcript next to the raw log.  Runs unconditionally for every
+        # launch mode so log.clean is always present; stays alive for the
+        # whole run and is torn down by the signal handler on shutdown.
+        with _block_handled_runner_signals():
+            echo_pid = os.fork()
+            if echo_pid != 0:
+                _publish_or_reap_child(state_dir, "echo_pid", echo_pid)
+            else:
                 _reset_runner_signal_handlers()
-                try:
-                    os.close(ready_fd)
-                except OSError:
-                    pass
-                try:
-                    _echo_loop(log_dir, echo_interval)
-                finally:
-                    os._exit(0)
+        if echo_pid == 0:
+            _reset_runner_signal_handlers()
+            try:
+                os.close(ready_fd)
+            except OSError:
+                pass
+            try:
+                _echo_loop(log_dir, echo_interval)
+            finally:
+                os._exit(0)
 
         # Opt-in stall guard: a sibling child watching log mtime, so a wedged
         # agent reaches a terminal status instead of running forever.
@@ -6998,47 +7420,46 @@ def _runner(
             ready_sent = True
         exit_code = 1
 
-    # Persistent helpers (notably --echo) outlive the agent by design, so reap
-    # them on successful completion as well as on crashes and external signals.
+    # Persistent helpers outlive the agent by design, so reap them on
+    # successful completion as well as on crashes and external signals.
     _teardown_children(state_dir)
     # Publish the agent's terminal state *before* producing a convenience
     # transcript artifact.  A pathological renderer can never leave a dead
     # agent reported as starting/running.
     _finalize(exit_code)
-    if echo:
-        # The periodic renderer may never tick on a short run, or may have run
-        # just before the agent's final output.  Render once in a bounded child
-        # after stopping it.  The status is already terminal if this times out.
-        def _track_render_pid(pid: Optional[int]) -> None:
-            nonlocal render_pid
-            if pid is None:
-                render_pid = None
-                try:
-                    (state_dir / "render_pid").unlink()
-                except FileNotFoundError:
-                    pass
-                return
-            render_pid = pid
+    # The periodic renderer may never tick on a short run, or may have run
+    # just before the agent's final output.  Render once in a bounded child
+    # after stopping it.  The status is already terminal if this times out.
+    def _track_render_pid(pid: Optional[int]) -> None:
+        nonlocal render_pid
+        if pid is None:
+            render_pid = None
             try:
-                # Same publish-or-reap path used at every other fork site, so
-                # a state-file write failure for render_pid cannot orphan the
-                # render child either -- _publish_or_reap_child kills and
-                # reaps it itself before raising.
-                _publish_or_reap_child(state_dir, "render_pid", pid)
-            except OSError:
-                render_pid = None
-
-        render_error = _bounded_final_render(log_dir, register=_track_render_pid)
-        if render_error:
-            try:
-                os.write(
-                    log_fd,
-                    f"\nagent-run: final echo render failed: {render_error}\n".encode(
-                        errors="replace"
-                    ),
-                )
-            except OSError:
+                (state_dir / "render_pid").unlink()
+            except FileNotFoundError:
                 pass
+            return
+        render_pid = pid
+        try:
+            # Same publish-or-reap path used at every other fork site, so
+            # a state-file write failure for render_pid cannot orphan the
+            # render child either -- _publish_or_reap_child kills and
+            # reaps it itself before raising.
+            _publish_or_reap_child(state_dir, "render_pid", pid)
+        except OSError:
+            render_pid = None
+
+    render_error = _bounded_final_render(log_dir, register=_track_render_pid)
+    if render_error:
+        try:
+            os.write(
+                log_fd,
+                f"\nagent-run: final render failed: {render_error}\n".encode(
+                    errors="replace"
+                ),
+            )
+        except OSError:
+            pass
     os._exit(exit_code)
 
 
@@ -8660,9 +9081,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_watch.set_defaults(func=cmd_watch)
 
-    sp_logs = sub.add_parser("logs", help="print last N lines of the log")
+    sp_logs = sub.add_parser(
+        "logs",
+        help="print last N lines of the log (default --tail 50)",
+        allow_abbrev=False,
+    )
     sp_logs.add_argument("name")
-    sp_logs.add_argument("n", nargs="?", type=_positive_int, default=50)
+    logs_slice = sp_logs.add_mutually_exclusive_group()
+    logs_slice.add_argument(
+        "--tail",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="print the last N lines (default when neither flag is given: 50)",
+    )
+    logs_slice.add_argument(
+        "--head",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="print the first N lines; reads forward until N newlines found or EOF",
+    )
     sp_logs.set_defaults(func=cmd_logs)
 
     sp_tail = sub.add_parser("tail", help="follow log in real time (tail -f)")
@@ -8696,6 +9135,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_clean = sub.add_parser(
         "clean",
         help="render PTY-captured TUI log into a readable transcript via pyte",
+        allow_abbrev=False,
     )
     sp_clean.add_argument("name")
     sp_clean.add_argument(
@@ -8707,20 +9147,35 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_clean.add_argument(
         "--width",
         type=_positive_int,
-        default=120,
-        help="emulated terminal width in columns (default: 120)",
+        default=_RENDER_LOG_DEFAULT_WIDTH,
+        help=f"emulated terminal width in columns (default: {_RENDER_LOG_DEFAULT_WIDTH})",
     )
     sp_clean.add_argument(
         "--height",
         type=_positive_int,
-        default=60,
-        help="emulated viewport height in rows (default: 60)",
+        default=_RENDER_LOG_DEFAULT_HEIGHT,
+        help=f"emulated viewport height in rows (default: {_RENDER_LOG_DEFAULT_HEIGHT})",
     )
     sp_clean.add_argument(
         "--history",
         type=_nonnegative_int,
-        default=100000,
-        help="scrollback line budget for the emulator (default: 100000)",
+        default=_RENDER_LOG_DEFAULT_HISTORY,
+        help=f"scrollback line budget for the emulator (default: {_RENDER_LOG_DEFAULT_HISTORY})",
+    )
+    clean_slice = sp_clean.add_mutually_exclusive_group()
+    clean_slice.add_argument(
+        "--tail",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="print the last N lines of the rendered transcript (default: unbounded)",
+    )
+    clean_slice.add_argument(
+        "--head",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="print the first N lines of the rendered transcript (default: unbounded)",
     )
     sp_clean.set_defaults(func=cmd_clean)
 

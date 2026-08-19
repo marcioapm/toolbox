@@ -23,7 +23,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "pytest-timeout>=2"]
+dev = ["pytest-timeout>=2"]
 
 [project.urls]
 Homepage = "https://github.com/marcioapm/toolbox"

@@ -43,7 +43,6 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "pytest" },
     { name = "pytest-timeout" },
 ]
 
@@ -56,7 +55,6 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "pyte", specifier = ">=0.8" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2" },
 ]
 provides-extras = ["dev"]
