@@ -131,6 +131,7 @@ def _reap_args(
     log_min_age_hours: Optional[float] = None,
     orphan_processes: bool = False,
     orphan_min_age_hours: Optional[float] = None,
+    all: bool = False,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         dry_run=dry_run,
@@ -142,6 +143,7 @@ def _reap_args(
         log_min_age_hours=log_min_age_hours,
         orphan_processes=orphan_processes,
         orphan_min_age_hours=orphan_min_age_hours,
+        all=all,
     )
 
 
@@ -269,6 +271,48 @@ class TestOrphanProcessesAbsent:
         line = _extract_summary(capsys)
         assert "orphan_procs_killed=0" in line
         assert "orphan_procs_skipped=0" in line
+
+
+# ---------------------------------------------------------------------------
+# --all enables the orphan pass
+# ---------------------------------------------------------------------------
+
+class TestOrphanProcessesUnderAll:
+    def test_all_terms_the_orphan(self, isolated_runs_root, orphan_harness, capsys):
+        entry = _make_proc_entry(9150, "allorphan")
+        _make_log_dir("allorphan")
+        signals = orphan_harness([entry])
+
+        cmd_reap(_reap_args(all=True))
+
+        assert (9150, signal.SIGTERM) in signals
+        assert _summary_field(_extract_summary(capsys), "orphan_procs_killed") == 1
+
+    def test_dry_run_all_sends_no_signals(
+        self, isolated_runs_root, orphan_harness, capsys
+    ):
+        entry = _make_proc_entry(9151, "allorphandry")
+        _make_log_dir("allorphandry")
+        signals = orphan_harness([entry])
+
+        cmd_reap(_reap_args(all=True, dry_run=True))
+
+        assert not signals
+        assert _summary_field(_extract_summary(capsys), "orphan_procs_killed") == 1
+
+    def test_all_honours_orphan_min_age_hours(
+        self, isolated_runs_root, orphan_harness, capsys
+    ):
+        """--all changes no threshold: a process younger than
+        --orphan-min-age-hours is still ineligible."""
+        entry = _make_proc_entry(9152, "youngorphan", start_time=time.time() - 600)
+        _make_log_dir("youngorphan")
+        signals = orphan_harness([entry])
+
+        cmd_reap(_reap_args(all=True, orphan_min_age_hours=24))
+
+        assert not signals
+        assert _summary_field(_extract_summary(capsys), "orphan_procs_killed") == 0
 
 
 # ---------------------------------------------------------------------------

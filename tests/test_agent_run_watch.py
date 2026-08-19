@@ -1100,13 +1100,18 @@ class TestGitHardening:
         assert result.stdout.strip() == expected_head
 
     def test_undecodable_output_does_not_raise(self, tmp_path, monkeypatch):
+        """Non-UTF-8 bytes in git output are preserved as surrogate escapes
+        (PEP 383 / errors='surrogateescape') rather than silently replaced.
+        Surrogates allow the original bytes to be recovered and detected by
+        _has_surrogate(), which fails closed on non-round-trippable paths."""
         repo = tmp_path / "repo"
         _init_repo(repo)
         monkeypatch.setattr(
             agent_run.subprocess, "run", _fake_git_run(stdout=b"A\xff\xfeB"),
         )
         result = agent_run._watch_run_git_checked(repo, ["status", "--porcelain"])
-        assert result.stdout == "A\ufffd\ufffdB"
+        # \xff and \xfe are mapped to surrogate code points U+DCFF and U+DCFE.
+        assert result.stdout == "A\udcff\udcfeB"
 
 
 # ---------------------------------------------------------------------------

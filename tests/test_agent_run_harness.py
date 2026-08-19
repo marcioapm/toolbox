@@ -22,8 +22,10 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
+import uuid as _uuid
 from pathlib import Path
 from typing import Optional
 
@@ -106,12 +108,6 @@ class TestParseLaunchArgvHarness:
         r = _parse(["--harness", "opencode", "--agent-mode", "build", "--prompt", "hi", "myrun"])
         assert r.agent_mode == "build"
 
-    def test_session_id_flag(self):
-        import uuid
-        valid_uuid = str(uuid.uuid4())
-        r = _parse(["--harness", "claude", "--session-id", valid_uuid, "--prompt", "hi", "myrun"])
-        assert r.session_id == valid_uuid
-
     def test_harness_arg_single(self):
         r = _parse(["--harness", "claude", "--prompt", "hi", "--harness-arg", "--foo", "myrun"])
         assert list(r.harness_args) == ["--foo"]
@@ -124,6 +120,18 @@ class TestParseLaunchArgvHarness:
             "myrun",
         ])
         assert list(r.harness_args) == ["--foo", "--bar=baz"]
+
+    @pytest.mark.parametrize("flag", ["--session", "-s", "--session-id", "--port", "--prompt"])
+    def test_harness_arg_rejects_flags_agent_run_owns(self, flag):
+        # --session/-s/--session-id/--port carry the identity agent-run mints and
+        # must not be forgeable; --prompt has an agent-run flag of its own. The
+        # "flag=value" spelling splits to the same name, so it is guarded too.
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            _parse([
+                "--harness", "claude", "--prompt", "hi",
+                "--harness-arg", f"{flag}=x", "myrun",
+            ])
+        assert flag in str(exc.value)
 
     def test_interactive_with_harness(self):
         r = _parse(["-i", "--harness", "claude", "--prompt", "hi", "myrun"])
@@ -220,11 +228,10 @@ class TestParseLaunchArgvHarness:
         with pytest.raises(agent_run._LaunchArgvError):
             _parse(["--model", "foo", "myrun", "--", "echo"])
 
-    def test_cwd_flag_is_rejected_not_silently_dropped(self):
-        """--cwd is not yet implemented; must error, not silently drop."""
-        with pytest.raises(agent_run._LaunchArgvError) as exc:
-            _parse(["--harness", "claude", "--prompt", "hi", "--cwd", "/tmp", "myrun"])
-        assert "not yet implemented" in str(exc.value).lower() or "--cwd" in str(exc.value)
+    def test_cwd_flag_parsed_in_managed_mode(self):
+        r = _parse(["--harness", "claude", "--prompt", "hi", "--cwd", "/tmp", "myrun"])
+        assert r.cwd == "/tmp"
+        assert r.name == "myrun"
 
     @pytest.mark.parametrize("sub", sorted(agent_run._KNOWN_SUBCOMMANDS))
     def test_subcommand_dispatch_unaffected(self, sub):
@@ -263,9 +270,6 @@ class TestParserHelpShowsManagedMode:
 
     def test_agent_mode_flag_in_help(self):
         assert "--agent-mode" in self._help_text()
-
-    def test_session_id_flag_in_help(self):
-        assert "--session-id" in self._help_text()
 
     def test_harness_arg_flag_in_help(self):
         assert "--harness-arg" in self._help_text()
@@ -720,6 +724,27 @@ def _kill_run_pid(state_dir: Path) -> None:
             time.sleep(0.3)
 
 
+def _wait_terminal(state_dir: Path, timeout: float = 15.0) -> str:
+    """Poll <state_dir>/status until it is terminal; return the last status seen.
+
+    On timeout the runner is killed so a slow fake harness cannot outlive the
+    test, and the non-terminal status is returned for the caller to assert on.
+    """
+    deadline = time.monotonic() + timeout
+    status = "starting"
+    while time.monotonic() < deadline:
+        try:
+            status = (state_dir / "status").read_text().strip()
+        except FileNotFoundError:
+            status = "starting"
+        if status in agent_run.TERMINAL_STATUSES:
+            break
+        time.sleep(0.05)
+    if status not in agent_run.TERMINAL_STATUSES:
+        _kill_run_pid(state_dir)
+    return status
+
+
 def _launch_and_wait(
     state_root: Path,
     log_root: Path,
@@ -750,7 +775,6 @@ def _launch_and_wait(
         prompt=prompt,
         model=model,
         agent_mode=None,
-        session_id=None,
         harness_args=[],
         permissions="bypass",
     )
@@ -759,21 +783,7 @@ def _launch_and_wait(
 
     state_dir = state_root / name
     log_dir = log_root / name
-    deadline = time.monotonic() + timeout
-    status = "starting"
-    while time.monotonic() < deadline:
-        try:
-            status = (state_dir / "status").read_text().strip()
-        except FileNotFoundError:
-            status = "starting"
-        if status in agent_run.TERMINAL_STATUSES:
-            break
-        time.sleep(0.05)
-
-    if status not in agent_run.TERMINAL_STATUSES:
-        # Timed out: kill whatever we started so the process does not outlive
-        # the test, then let the caller's assertion fail with the last status.
-        _kill_run_pid(state_dir)
+    status = _wait_terminal(state_dir, timeout=timeout)
 
     session_data = agent_run._read_session_json(log_dir)
     return status, session_data
@@ -1269,7 +1279,6 @@ class TestManagedCodexInteractiveAppServer:
             prompt="say hi",
             model=None,
             agent_mode=None,
-            session_id=None,
             harness_args=[],
         )
         rc = agent_run.cmd_launch(ns)
@@ -1305,7 +1314,7 @@ class TestManagedCodexInteractiveAppServer:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="say hi", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
@@ -1336,7 +1345,7 @@ class TestManagedCodexInteractiveAppServer:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="initial prompt", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
@@ -1372,7 +1381,7 @@ class TestManagedCodexInteractiveAppServer:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="hi", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
@@ -1742,22 +1751,6 @@ class TestEndToEndThroughMain:
         fake.chmod(0o755)
         return str(fake_dir)
 
-    def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
-        """Wait for terminal status. Kills the runner on timeout."""
-        deadline = time.monotonic() + timeout
-        status = "starting"
-        while time.monotonic() < deadline:
-            try:
-                status = (state_dir / "status").read_text().strip()
-            except FileNotFoundError:
-                pass
-            if status in agent_run.TERMINAL_STATUSES:
-                break
-            time.sleep(0.05)
-        if status not in agent_run.TERMINAL_STATUSES:
-            _kill_run_pid(state_dir)
-        return status
-
     def test_main_claude_oneshot_produces_session_json(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
@@ -1768,7 +1761,7 @@ class TestEndToEndThroughMain:
         rc = agent_run.main(["--harness", "claude", "--prompt", "say hi", name])
         assert rc == 0, f"main() returned non-zero: {rc}"
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         session = agent_run._read_session_json(isolated_log_root / name)
         assert session is not None
         assert session["harness"] == "claude"
@@ -1785,7 +1778,7 @@ class TestEndToEndThroughMain:
         rc = agent_run.main(["--harness", "codex", "--prompt", "say hello", name])
         assert rc == 0
         state_dir = isolated_runs_root / name
-        self._wait_terminal(state_dir)
+        _wait_terminal(state_dir)
         session = agent_run._read_session_json(isolated_log_root / name)
         assert session is not None
         assert session["session_id"] == "main-e2e-tid"
@@ -1800,13 +1793,15 @@ class TestEndToEndThroughMain:
         # No state dir should have been created.
         assert not (isolated_runs_root / name).exists()
 
-    def test_main_session_id_rejected_for_opencode(self, isolated_runs_root, isolated_log_root, monkeypatch):
-        """main() with --session-id and --harness opencode exits non-zero before creating state."""
+    def test_main_session_id_flag_no_longer_accepted(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """--session-id was removed: main() rejects it before creating state."""
         import uuid as _uuid
-        name = "main-oc-sid-reject"
+        name = "main-sid-removed"
         with pytest.raises(SystemExit) as exc_info:
             agent_run.main([
-                "--harness", "opencode",
+                "--harness", "claude",
                 "--session-id", str(_uuid.uuid4()),
                 "--prompt", "hi",
                 name,
@@ -1829,22 +1824,23 @@ class TestEndToEndThroughMain:
         assert exc_info.value.code != 0
         assert not (isolated_runs_root / name).exists()
 
-    def test_main_bad_uuid_rejected_before_starting(
-        self, isolated_runs_root, isolated_log_root, monkeypatch
+    def test_main_claude_minted_id_matches_argv(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
-        """main() with an invalid --session-id UUID exits before publishing status=starting."""
-        name = "main-bad-uuid"
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run.main([
-                "--harness", "claude",
-                "--session-id", "not-a-uuid",
-                "--prompt", "hi",
-                name,
-            ])
-        assert exc_info.value.code != 0
-        # No phantom run with status=starting must be left behind.
+        """The internally minted UUID4 reaches claude's argv and session.json unchanged."""
+        bin_dir = self._make_fake_claude(tmp_path)
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        fixed_id = "11111111-2222-4333-8444-555555555555"
+        monkeypatch.setattr(agent_run.uuid, "uuid4", lambda: _uuid.UUID(fixed_id))
+        name = "main-claude-minted-id"
+        rc = agent_run.main(["--harness", "claude", "--prompt", "say hi", name])
+        assert rc == 0
         state_dir = isolated_runs_root / name
-        assert not state_dir.exists()
+        _wait_terminal(state_dir)
+        argv = json.loads((state_dir / "argv").read_text())
+        assert argv[argv.index("--session-id") + 1] == fixed_id
+        session = agent_run._read_session_json(isolated_log_root / name)
+        assert session["session_id"] == fixed_id
 
 
 # ---------------------------------------------------------------------------
@@ -1937,7 +1933,7 @@ class TestAppServerTeardown:
             name=name, command=[], interactive=False, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="work hard", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         rc = agent_run.cmd_launch(ns)
         assert rc == 0
@@ -1986,7 +1982,7 @@ class TestAppServerTeardown:
             name=name, command=[], interactive=False, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="work hard", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         rc = agent_run.cmd_launch(ns)
         assert rc == 0
@@ -2139,22 +2135,6 @@ class TestCodexRpcEdgeCases:
         _kill_run_pid(state_dir)
         return False
 
-    def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
-        """Wait for terminal status. Kills the runner on timeout."""
-        deadline = time.monotonic() + timeout
-        status = "starting"
-        while time.monotonic() < deadline:
-            try:
-                status = (state_dir / "status").read_text().strip()
-            except FileNotFoundError:
-                pass
-            if status in agent_run.TERMINAL_STATUSES:
-                break
-            time.sleep(0.05)
-        if status not in agent_run.TERMINAL_STATUSES:
-            _kill_run_pid(state_dir)
-        return status
-
     def test_result_null_frame_does_not_crash_interactive_runner(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
@@ -2170,13 +2150,13 @@ class TestCodexRpcEdgeCases:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="test prompt", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
         log_dir = isolated_log_root / name
 
-        self._wait_terminal(state_dir, timeout=15.0)
+        _wait_terminal(state_dir, timeout=15.0)
 
         # Run must not crash (status must be a normal terminal, not a traceback-induced failure)
         status = agent_run._read(state_dir / "status", "").strip()
@@ -2208,7 +2188,7 @@ class TestCodexRpcEdgeCases:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="initial", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
@@ -2223,7 +2203,7 @@ class TestCodexRpcEdgeCases:
         steer_ns = argparse.Namespace(name=name, message=["DO SOMETHING"], raw=False, esc=False)
         agent_run.cmd_steer(steer_ns)
 
-        self._wait_terminal(state_dir, timeout=12.0)
+        _wait_terminal(state_dir, timeout=12.0)
 
         acquire_log = log_dir / "session-acquire.log"
         log_text = acquire_log.read_text() if acquire_log.exists() else ""
@@ -2251,7 +2231,7 @@ class TestCodexRpcEdgeCases:
             name=name, command=[], interactive=True, prompt_file=None,
             echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
             harness="codex", prompt="first", model=None, agent_mode=None,
-            session_id=None, harness_args=[],
+            harness_args=[],
         )
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
@@ -2264,7 +2244,7 @@ class TestCodexRpcEdgeCases:
         # Send steer: if active_turn_id was cleared correctly, this becomes turn/start.
         steer_ns = argparse.Namespace(name=name, message=["after-turn"], raw=False, esc=False)
         agent_run.cmd_steer(steer_ns)
-        self._wait_terminal(state_dir, timeout=12.0)
+        _wait_terminal(state_dir, timeout=12.0)
 
         acquire_log = log_dir / "session-acquire.log"
         log_text = acquire_log.read_text() if acquire_log.exists() else ""
@@ -2274,3 +2254,272 @@ class TestCodexRpcEdgeCases:
             f"Acquire log must show idle-path turn/start (active_turn_id was cleared): {log_text!r}"
         )
 
+
+
+# ---------------------------------------------------------------------------
+# --cwd: working directory for the launched command
+# ---------------------------------------------------------------------------
+
+class TestCwdParsing:
+    """_parse_launch_argv accepts --cwd in both raw and managed mode."""
+
+    def test_cwd_space_form_raw(self):
+        r = _parse(["--cwd", "/tmp", "myrun", "--", "pwd"])
+        assert r.cwd == "/tmp"
+        assert r.command == ["pwd"]
+
+    def test_cwd_equals_form_raw(self):
+        r = _parse(["--cwd=/tmp", "myrun", "--", "pwd"])
+        assert r.cwd == "/tmp"
+
+    def test_cwd_equals_form_managed(self):
+        r = _parse(["--harness", "claude", "--prompt", "hi", "--cwd=/tmp", "myrun"])
+        assert r.cwd == "/tmp"
+        assert r.harness == "claude"
+
+    def test_cwd_relative_value_passed_through_unresolved(self):
+        # The parser is pure; resolution happens in cmd_launch.
+        r = _parse(["--cwd", "sub/dir", "myrun", "--", "pwd"])
+        assert r.cwd == "sub/dir"
+
+    def test_cwd_missing_value(self):
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            _parse(["--cwd"])
+        assert "--cwd" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--cwd", "", "myrun", "--", "pwd"],
+            ["--cwd=", "myrun", "--", "pwd"],
+        ],
+        ids=["space-form", "equals-form"],
+    )
+    def test_cwd_empty_value_rejected(self, argv):
+        # An empty value would otherwise leave the run in the invocation
+        # directory and record that directory in <state_dir>/cwd.
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            _parse(argv)
+        assert "--cwd" in str(exc.value)
+
+    def test_cwd_before_a_subcommand_name_makes_it_a_run_name(self):
+        # A launch flag suppresses subcommand dispatch, so the token is the
+        # name of a run rather than the subcommand it is spelled like.
+        r = _parse(["--cwd", "/tmp", "status", "--", "pwd"])
+        assert r.subcommand_tokens is None
+        assert r.name == "status"
+        assert r.command == ["pwd"]
+
+    def test_cwd_in_help(self):
+        assert "--cwd" in agent_run._build_parser().format_help()
+
+
+class TestCwdResolution:
+    """_apply_launch_cwd resolves the requested DIR and enters it."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_cwd(self):
+        # _apply_launch_cwd chdirs the calling process; the CLI exits right
+        # after, but the test process must be put back or later tests inherit
+        # the move.
+        origin = os.getcwd()
+        yield
+        os.chdir(origin)
+
+    def _enter(self, requested: Optional[str]) -> None:
+        agent_run._apply_launch_cwd(argparse.Namespace(cwd=requested))
+
+    def test_absent_cwd_leaves_the_process_where_it_was(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        here = os.getcwd()
+        self._enter(None)
+        assert os.getcwd() == here
+
+    def test_relative_resolves_against_the_invocation_directory(self, tmp_path, monkeypatch):
+        (tmp_path / "workdir").mkdir()
+        monkeypatch.chdir(tmp_path)
+        self._enter("workdir")
+        assert os.getcwd() == str((tmp_path / "workdir").resolve())
+
+    def test_tilde_is_expanded(self, tmp_path, monkeypatch):
+        # argparse does not expand '~'; agent-run must.
+        home = tmp_path / "home"
+        (home / "sub").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        self._enter("~/sub")
+        assert os.getcwd() == str((home / "sub").resolve())
+
+    def test_symlinked_component_is_resolved(self, tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        (tmp_path / "link").symlink_to(real)
+        self._enter(str(tmp_path / "link" / "."))
+        assert os.getcwd() == str(real.resolve())
+
+    def test_pwd_is_repointed_and_oldpwd_dropped(self, tmp_path, monkeypatch):
+        # os.chdir moves only the kernel cwd; a stale PWD would make the
+        # launched command disagree with its own working directory.
+        target = tmp_path / "workdir"
+        target.mkdir()
+        monkeypatch.setenv("PWD", "/nowhere")
+        monkeypatch.setenv("OLDPWD", "/elsewhere")
+        self._enter(str(target))
+        assert os.environ["PWD"] == str(target.resolve())
+        assert "OLDPWD" not in os.environ
+
+
+class TestCwdLaunch:
+    """--cwd is validated and entered before any run state is published."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_cwd(self):
+        # cmd_launch chdirs the calling process; the CLI exits right after, but
+        # the test process must be put back or later tests inherit the move.
+        origin = os.getcwd()
+        yield
+        os.chdir(origin)
+
+    def test_command_runs_in_cwd_and_the_directory_is_recorded(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        target = tmp_path / "workdir"
+        target.mkdir()
+        name = "cwd-basic"
+        assert agent_run.main(["--cwd", str(target), name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        _wait_terminal(state_dir)
+        assert str(target.resolve()) in (isolated_log_root / name / "log").read_text()
+        assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
+        run_json = json.loads((isolated_log_root / name / "run.json").read_text())
+        assert run_json["cwd"] == str(target.resolve())
+
+    def test_launch_head_is_read_from_the_cwd_repo(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        # The launch directory is not a repo, so a launch_head at all proves it
+        # came from --cwd rather than from the invoking directory.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.com",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.com"}
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "initial", "--allow-empty"]):
+            subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, env=env)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True, env=env,
+        ).stdout.strip()
+        name = "cwd-launch-head"
+        assert agent_run.main(["--cwd", str(repo), name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        _wait_terminal(state_dir)
+        assert (state_dir / "launch_head").read_text().strip() == head
+        assert (state_dir / "cwd").read_text().strip() == str(repo.resolve())
+
+    def test_interactive_run_uses_cwd(self, isolated_runs_root, isolated_log_root, tmp_path):
+        # The interactive path launches through a pty rather than a plain fork.
+        target = tmp_path / "workdir"
+        target.mkdir()
+        name = "cwd-interactive"
+        assert agent_run.main(["-i", "--cwd", str(target), name, "--", "/bin/pwd"]) == 0
+        state_dir = isolated_runs_root / name
+        _wait_terminal(state_dir)
+        assert (state_dir / "interactive").read_text().strip() == "1"
+        assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
+        assert str(target.resolve()) in (isolated_log_root / name / "log").read_text()
+
+    def test_managed_run_uses_cwd(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        # Managed mode builds the argv itself, so it reaches exec by another route.
+        fake = tmp_path / "claude"
+        fake.write_text("#!/bin/sh\npwd\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        target = tmp_path / "workdir"
+        target.mkdir()
+        name = "cwd-managed"
+        assert agent_run.main([
+            "--harness", "claude", "--prompt", "hi", "--cwd", str(target), name,
+        ]) == 0
+        state_dir = isolated_runs_root / name
+        _wait_terminal(state_dir)
+        assert (state_dir / "cwd").read_text().strip() == str(target.resolve())
+        assert str(target.resolve()) in (isolated_log_root / name / "log").read_text()
+
+    def test_prompt_file_relative_to_invocation_dir(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        # A relative --prompt-file names a file the caller typed, so it is
+        # resolved against the invocation directory, not against --cwd.
+        fake = tmp_path / "claude"
+        fake.write_text("#!/bin/sh\npwd\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        launch_dir = tmp_path / "launch"
+        launch_dir.mkdir()
+        (launch_dir / "brief.md").write_text("do the thing\n")
+        target = tmp_path / "workdir"
+        target.mkdir()
+        monkeypatch.chdir(launch_dir)
+        name = "cwd-prompt-file"
+        assert agent_run.main([
+            "--harness", "claude", "--prompt-file", "brief.md", "--cwd", str(target), name,
+        ]) == 0
+        state_dir = isolated_runs_root / name
+        _wait_terminal(state_dir)
+        assert (isolated_log_root / name / "prompt").read_text() == "do the thing\n"
+
+    @pytest.mark.parametrize(
+        "cwd_argv", [["--cwd", ""], ["--cwd="]], ids=["space-form", "equals-form"]
+    )
+    def test_empty_cwd_exits_and_creates_no_run_dir(
+        self, cwd_argv, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        # An unset shell variable expands to an empty argument; running in the
+        # invocation directory instead would record the wrong <state_dir>/cwd.
+        monkeypatch.chdir(tmp_path)
+        name = "cwd-empty"
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.main([*cwd_argv, name, "--", "/bin/pwd"])
+        assert exc_info.value.code != 0
+        assert "--cwd" in str(exc_info.value.code)
+        assert not (isolated_runs_root / name).exists()
+        assert not (isolated_log_root / name).exists()
+
+    def test_nonexistent_cwd_exits_and_creates_no_run_dir(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        name = "cwd-missing"
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.main(["--cwd", str(tmp_path / "nope"), name, "--", "/bin/pwd"])
+        assert exc_info.value.code != 0
+        assert not (isolated_runs_root / name).exists()
+        assert not (isolated_log_root / name).exists()
+
+    def test_cwd_that_is_a_file_exits_and_creates_no_run_dir(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        target = tmp_path / "afile"
+        target.write_text("x\n")
+        name = "cwd-is-file"
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.main(["--cwd", str(target), name, "--", "/bin/pwd"])
+        assert exc_info.value.code != 0
+        assert "not a directory" in str(exc_info.value.code).lower()
+        assert not (isolated_runs_root / name).exists()
+
+    def test_unenterable_cwd_exits_and_creates_no_run_dir(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        if os.getuid() == 0:
+            pytest.skip("root bypasses directory permission checks")
+        target = tmp_path / "locked"
+        target.mkdir(mode=0o000)
+        name = "cwd-unenterable"
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                agent_run.main(["--cwd", str(target), name, "--", "/bin/pwd"])
+            assert exc_info.value.code != 0
+            assert not (isolated_runs_root / name).exists()
+        finally:
+            target.chmod(0o700)

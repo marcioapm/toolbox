@@ -141,6 +141,7 @@ def _reap_args(
     force_unknown: bool = False,
     include_logs: bool = False,
     log_min_age_hours: Optional[float] = None,
+    all: bool = False,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         dry_run=dry_run,
@@ -150,7 +151,13 @@ def _reap_args(
         force_unknown=force_unknown,
         include_logs=include_logs,
         log_min_age_hours=log_min_age_hours,
+        all=all,
     )
+
+
+def _summary_line(out: str) -> str:
+    """The single 'reap done:' line from cmd_reap's captured stdout."""
+    return next(ln for ln in out.splitlines() if "reap done:" in ln)
 
 
 def _shrink_escalation(monkeypatch, escalation=0.2, poll=0.05, reap_timeout=2.0):
@@ -1736,7 +1743,16 @@ class TestReapReviewerRegressions:
         assert agent_run._parse_reap_min_age_seconds() == 168 * 3600
         assert "not a finite, positive" in capsys.readouterr().err
 
-    @pytest.mark.parametrize("flag", ["--idle-hours", "--min-age-hours"])
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "--idle-hours",
+            "--min-age-hours",
+            "--log-min-age-hours",
+            "--orphan-min-age-hours",
+            "--worktree-min-age-hours",
+        ],
+    )
     @pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "-1", "0"])
     def test_reap_cli_rejects_invalid_hour_flags(self, flag, raw, capsys):
         option = f"{flag}={raw}" if raw == "-inf" else flag
@@ -2626,3 +2642,144 @@ class TestLogGCAfterScratchDeletion:
             f"output was:\n{out}"
         )
         assert "logs_collected=1" in out
+
+
+# ---------------------------------------------------------------------------
+# reap --all: every opt-in pass, no refusal override
+# ---------------------------------------------------------------------------
+
+class TestReapAll:
+    """--all enables --include-logs, --orphan-processes and
+    --include-worktrees. It changes no age threshold and overrides neither
+    --force-dirty nor --force-unknown."""
+
+    OLD_SECS = (agent_run.PRUNE_AFTER_DAYS + 1) * 86400
+
+    def test_all_collects_preserved_log(self, isolated_runs_root, isolated_log_root):
+        ld = _make_preserved_log(isolated_log_root, "alllog", age_secs=self.OLD_SECS)
+
+        rc = agent_run.cmd_reap(_reap_args(all=True))
+
+        assert rc == 0
+        assert not ld.exists()
+
+    def test_all_runs_orphan_process_scan(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        scans = []
+        monkeypatch.setattr(
+            agent_run, "_scan_process_table", lambda: scans.append(1) or []
+        )
+
+        agent_run.cmd_reap(_reap_args())
+        assert scans == []
+
+        agent_run.cmd_reap(_reap_args(all=True))
+        assert scans == [1]
+
+    def test_all_runs_worktree_pass(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        calls = []
+        monkeypatch.setattr(
+            agent_run, "_worktree_gc_pass",
+            lambda *a, **kw: calls.append(1) or (0, 0, 0),
+        )
+
+        agent_run.cmd_reap(_reap_args())
+        assert calls == []
+
+        agent_run.cmd_reap(_reap_args(all=True))
+        assert calls == [1]
+
+    def test_all_does_not_imply_force_unknown(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """An unrecognized status is a refusal, not a pass: --all must leave
+        the state dir intact and require an explicit --force-unknown."""
+        sd, _ld = _make_run(
+            isolated_runs_root, isolated_log_root, "weirdstatus",
+            status="bogus-legacy", ended_at_age_secs=self.OLD_SECS,
+        )
+
+        rc = agent_run.cmd_reap(_reap_args(all=True, min_age_hours=0.001))
+
+        assert rc == 0
+        assert sd.exists()
+        assert "collected=0" in capsys.readouterr().out
+
+        agent_run.cmd_reap(_reap_args(force_unknown=True, min_age_hours=0.001))
+        assert not sd.exists()
+
+    def test_all_leaves_force_flags_off_in_parsed_args(self):
+        parsed = agent_run._build_parser().parse_args(["reap", "--all"])
+
+        assert parsed.all is True
+        assert parsed.force_dirty is False
+        assert parsed.force_unknown is False
+
+    def test_all_accepts_redundant_individual_flags(self):
+        parsed = agent_run._build_parser().parse_args(
+            ["reap", "--all", "--include-logs", "--orphan-processes",
+             "--include-worktrees"]
+        )
+
+        assert parsed.all is True
+        assert parsed.include_logs is True
+
+    def test_all_plus_explicit_flag_matches_all_alone(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        _make_preserved_log(isolated_log_root, "dup-a", age_secs=self.OLD_SECS)
+        _make_preserved_log(isolated_log_root, "dup-b", age_secs=self.OLD_SECS)
+
+        agent_run.cmd_reap(_reap_args(all=True, dry_run=True, name="dup-a"))
+        all_only = _summary_line(capsys.readouterr().out)
+        agent_run.cmd_reap(
+            _reap_args(all=True, include_logs=True, dry_run=True, name="dup-a")
+        )
+        all_plus_flag = _summary_line(capsys.readouterr().out)
+
+        assert all_only == all_plus_flag
+
+    def test_all_keeps_each_pass_threshold(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """A log younger than --log-min-age-hours and a terminal state dir
+        younger than --min-age-hours both survive --all."""
+        young_log = _make_preserved_log(isolated_log_root, "younglogall", age_secs=3600)
+        sd, _ld = _make_run(
+            isolated_runs_root, isolated_log_root, "youngstate",
+            status="done", ended_at_age_secs=3600,
+        )
+
+        rc = agent_run.cmd_reap(_reap_args(all=True))
+
+        assert rc == 0
+        assert young_log.exists()
+        assert sd.exists()
+        out = capsys.readouterr().out
+        assert "logs_collected=0" in out
+        assert "collected=0" in out
+
+    def test_dry_run_all_mutates_nothing_and_predicts_the_real_pass(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        ld = _make_preserved_log(isolated_log_root, "drylogall", age_secs=self.OLD_SECS)
+        sd, _sd_log = _make_run(
+            isolated_runs_root, isolated_log_root, "drystateall",
+            status="done", ended_at_age_secs=self.OLD_SECS,
+        )
+
+        rc = agent_run.cmd_reap(_reap_args(all=True, dry_run=True, min_age_hours=0.001))
+
+        assert rc == 0
+        assert ld.exists()
+        assert sd.exists()
+        predicted = _summary_line(capsys.readouterr().out).replace("[dry-run] ", "")
+
+        agent_run.cmd_reap(_reap_args(all=True, min_age_hours=0.001))
+
+        assert not ld.exists()
+        assert not sd.exists()
+        assert _summary_line(capsys.readouterr().out) == predicted

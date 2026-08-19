@@ -587,6 +587,33 @@ flag typed after the name without `--` (e.g. `agent-run build --foo`) is
 still rejected, since it would otherwise silently become `argv[0]`; the
 error names the offending token and points at `--`.
 
+#### Working directory (`--cwd DIR`)
+
+```bash
+agent-run --cwd ~/git/myrepo build -- claude --print 'Build the thing'
+agent-run --cwd=../myrepo --harness claude --prompt 'Refactor X' build
+```
+
+`--cwd DIR` runs the launched command with `DIR` as its working directory,
+in raw and managed mode and on both the one-shot and interactive (`-i`)
+paths. `DIR` may be relative (resolved against the invocation directory) and
+may start with `~` (expanded by agent-run; argparse does not do this). The
+directory is entered before any run state is published, so `<state_dir>/cwd`
+and `<state_dir>/launch_head` — which `watch` reads to report git facts —
+record the directory the command actually runs in.
+
+Symlinked components are collapsed: the recorded `cwd` is the real path. A
+`DIR` that does not exist, is not a directory, or cannot be entered exits
+non-zero and creates no run dir.
+
+Relative paths on the command line resolve against two different directories,
+deliberately. A relative *command* path (`agent-run --cwd ~/git/myrepo build --
+./scripts/run.sh`) is resolved by the launched command after the chdir, so it is
+relative to `DIR` — that is what makes `--cwd` useful for repo-local scripts. A
+relative `-f/--prompt-file` names a file the caller typed at their shell, so it
+is resolved against the invocation directory before the chdir; the recorded
+`<state_dir>/prompt_file` is the resulting absolute path.
+
 ### Managed mode
 
 `--harness claude|opencode|codex` switches to managed mode: agent-run builds
@@ -612,13 +639,13 @@ All existing raw-mode launch forms keep working.
                                   or --auto; prompt: omits those flags so the harness's own
                                   permission UI is used
 --harness-arg FLAG                pass FLAG verbatim after the harness's own args; repeatable
---session-id UUID                 claude only: use this UUID instead of generating one
+--cwd DIR                         working directory for the launched command (also raw mode)
 ```
 
 #### One-shot examples
 
 ```bash
-# claude — sends --print, records session via --session-id (pushed UUID4)
+# claude — sends --print, records the session id agent-run pushed as a UUID4
 agent-run --harness claude --prompt 'Refactor X' build
 
 # opencode — mints a session via POST /session before launch
@@ -659,7 +686,7 @@ Each harness uses a different mechanism. All are `certain` — never a guess.
 
 | Harness | Mechanism | `acquisition` |
 |---------|-----------|---------------|
-| `claude` | agent-run generates a UUID4, passes `--session-id <uuid>` | `pushed` |
+| `claude` | agent-run always generates a UUID4 and passes it to the claude binary as `--session-id <uuid>`; the id is not caller-selectable | `pushed` |
 | `opencode` | launches `opencode --port N --auto`, polls `/global/health`, `POST /session`, then attaches with `--session <id>`; the returned `directory` is verified against the launch cwd so a foreign server that won the port race is rejected | `minted` |
 | `codex` | keeps a `codex app-server` process alive, sends `thread/start` over JSON-RPC to mint the thread id, then sends `turn/start` | `minted` |
 
@@ -753,7 +780,9 @@ agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
 agent-run attach <name>                   # attach interactively (Ctrl-C detaches)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
+                [--all]
                 [--include-logs] [--log-min-age-hours N]
+                [--include-worktrees] [--worktree-min-age-hours N] [--force-dirty]
                 [--orphan-processes] [--orphan-min-age-hours N]
                 [--max-seconds N]
 agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage; read-only
@@ -815,7 +844,29 @@ single-directory layout for runs launched before the state/log split.
     `--idle-hours` (or `AGENT_RUN_IDLE_KILL_HOURS`, default 24h) is
     idle-killed through the same identity-verified escalation
     `agent-run kill <name> KILL` uses, and marked `killed`.
-2. **Terminal-state and orphan-scratch garbage collection**: runs whose
+2. **Linked-worktree garbage collection** (opt-in, `--include-worktrees`):
+    a terminal run's recorded launch `cwd` is removed **only when that
+    directory is a linked git worktree** and the *youngest* terminal run
+    sharing it is older than `--worktree-min-age-hours` (or
+    `AGENT_RUN_WORKTREE_MIN_AGE_HOURS`, default 168h/7 days — its own
+    independent threshold, because this destroys a working tree rather than
+    bookkeeping). **A non-git directory is never removed**: a run's `cwd` is
+    frequently a real project checkout or `$HOME`, so main/root worktrees,
+    bare repositories, non-git directories, and anything git cannot classify
+    are all refused, as is any path with a symlinked component. A git failure
+    of any kind (git missing, timeout, unreadable repo) is a refusal, never a
+    green light. Removal goes through `git worktree remove` against the
+    owning repository, so the parent's `.git/worktrees/<name>` administrative
+    entry is unregistered as well — an `rmtree` would strand it. Also
+    refused, with the reason printed: a worktree with uncommitted changes,
+    untracked files, or commits present on no remote (override with
+    `--force-dirty`, off by default, which destroys unpushed work
+    irreversibly), and one whose directory any live (non-terminal) run is
+    still using. A worktree shared by several terminal runs is handled once,
+    not once per run. Runs before step 3, because the `cwd` it reads lives in
+    the state dir step 3 deletes. The summary line always reports
+    `worktrees_removed=N worktrees_skipped=N`.
+3. **Terminal-state and orphan-scratch garbage collection**: runs whose
     status is conclusively terminal (`done`, `failed`, `died`, `killed`) and
     whose `ended_at` is older than `--min-age-hours` (or preferred
     `AGENT_RUN_MIN_AGE_HOURS`; compatible alias `AGENT_RUN_REAP_MIN_AGE_HOURS`,
@@ -826,7 +877,7 @@ single-directory layout for runs launched before the state/log split.
     this invocation is never collected in the same invocation. Unknown/
     legacy/corrupt statuses are left intact by default and require
     `--force-unknown` to collect after review.
-3. **Preserved-log garbage collection** (opt-in, `--include-logs`): whole
+4. **Preserved-log garbage collection** (opt-in, `--include-logs`): whole
     preserved-log-only run directories (state dir already gone) whose
     newest recursive mtime is older than `--log-min-age-hours` (or
     `AGENT_RUN_LOG_MIN_AGE_HOURS`, default 21 days — matching the existing
@@ -837,14 +888,14 @@ single-directory layout for runs launched before the state/log split.
     longer retention window and is never influenced by the state-dir
     threshold. Off by default — without `--include-logs`, reap never
     touches a preserved log, matching the persistent `log`/`log.clean`/
-    `prompt` behaviour of step 2. A run with a live state dir is never
-    touched by this step regardless of age. Runs after step 2 (so a state
-    dir step 2 just removed can become log-only and eligible in the same
+    `prompt` behaviour of step 3. A run with a live state dir is never
+    touched by this step regardless of age. Runs after step 3 (so a state
+    dir step 3 just removed can become log-only and eligible in the same
     invocation) and before the orphan-scratch sweep (so a log dir removed
     whole here is never also probed for a leftover `tmp/`).
-4. **Orphan-process termination** (opt-in, `--orphan-processes`): find and
+5. **Orphan-process termination** (opt-in, `--orphan-processes`): find and
     terminate live agent-run runner processes that have **no state directory**
-    — invisible to passes 1-3 because they hold no entry in
+    — invisible to passes 1-4 because they hold no entry in
     `$AGENT_RUN_STATE_DIR`. This kills processes agent-run has **no state
     record for**, selected by argv parsing, and is opt-in for that reason.
     Candidates are identified by strict argv matching (basename check, not a
@@ -871,6 +922,18 @@ serialize relaunches). State/log GC first atomically renames a directory to
 a reserved sentinel so an interrupted deletion is resumed by the next reap;
 `--dry-run` runs the same read-only eligibility checks and prints only actions
 a real reap would take, without mutating or deleting anything.
+
+`--all` enables every opt-in pass at once — `--include-logs`,
+`--orphan-processes` and `--include-worktrees` — and nothing else. It changes
+no age threshold: `--min-age-hours`, `--log-min-age-hours`,
+`--orphan-min-age-hours` and `--worktree-min-age-hours` all keep their
+values and defaults. **It does not imply `--force-dirty` or
+`--force-unknown`**: those override *refusals* (unpushed or uncommitted work,
+unclassifiable status) rather than enable a pass, so "do all the passes"
+never silently means "ignore the safety refusals" — request either
+explicitly, after review. Passing `--all` together with an individual pass
+flag is redundant, not an error. `--dry-run --all` previews every pass with
+the same accuracy each pass has on its own.
 
 `--max-seconds N` sets a soft candidate-admission budget. The monotonic budget
 is checked between candidates in every pass, not during an operation already in
@@ -920,6 +983,18 @@ affecting the others:
 - **`--orphan-min-age-hours N`** — live processes with no state directory
   must have been running for at least this long before they are eligible for
   orphan termination. Independent of all GC thresholds. Default 24 h.
+- **`--worktree-min-age-hours N`** — a linked git worktree used as a
+  terminal run's launch `cwd` is removed (only under `--include-worktrees`)
+  once the youngest run sharing it is older than this. Independent of every
+  threshold above because it destroys a working tree, not bookkeeping.
+  Default 168 h (7 days).
+
+Linked worktrees are typically where the bytes actually are: on one measured
+host, 94 runs resolved to 23 launch directories, 20 of them linked worktrees
+totalling 18 GB, against a few hundred MB in `STATE_ROOT` plus `LOG_ROOT`.
+Run `agent-run du --by-run --top 20` to see that, and
+`agent-run reap --include-worktrees --dry-run` before ever enabling the
+removal on a timer.
 
 On disk, `--log-min-age-hours` mainly affects the long tail of old logs: on a
 busy host, most bytes are in *recent* logs, and PTY-captured `--echo` runs are
@@ -1055,14 +1130,43 @@ launchctl start com.example.agent-run-reap
 `agent-run du` reports apparent disk usage (`st_size`), by default one row
 per effective status (plus a `preserved-log-only` row) — pass `--by-run`
 for one row per run instead. Each row breaks down state-dir, log-dir
-(excluding `tmp/`), and scratch (`tmp/`) bytes, plus their total; rows sort
-by total descending, then name, with a `TOTAL` row last that always covers
-every run, even under `--top N`. `--bytes` prints exact integers instead of
-human-readable sizes (`1.2G`, `340M`, `12K`); `--json` emits a machine-
-readable object and always uses exact integers, so combining it with
-`--bytes` is rejected. `du` never mutates anything — no locks, no
+(excluding `tmp/`), scratch (`tmp/`), and linked-worktree bytes, plus their
+total; rows sort by total descending, then name, with a `TOTAL` row last
+that always covers every run, even under `--top N`. `--bytes` prints exact
+integers instead of human-readable sizes (`1.2G`, `340M`, `12K`); `--json`
+emits a machine-readable object and always uses exact integers, so combining
+it with `--bytes` is rejected. `du` never mutates anything — no locks, no
 `_opportunistic_heal`, no `_prune_old_logs` — and tolerates races
 (`FileNotFoundError`/`PermissionError`) by skipping the affected entry.
+When a permission error is encountered during a walk, the affected row is
+marked incomplete: the table prints a WARNING line and `--json` adds
+`"complete": false` to the row.  Totals for incomplete rows are lower
+bounds, not exact byte counts.
+
+#### Linked worktrees
+
+Agents are frequently launched inside a linked git worktree created for the
+task, and those trees usually hold far more bytes than `STATE_ROOT` and
+`LOG_ROOT` combined. `du` therefore adds a `WORKTREE` column (and
+`worktree_bytes` under `--json`) sizing each run's recorded launch `cwd`
+**when that directory is a linked worktree**. Main/root worktrees, bare
+repositories, non-git directories, missing directories, and anything git
+cannot classify all contribute 0 — a git failure is never read as a
+countable worktree.
+
+Attribution: launch directories are deduplicated by realpath, and each
+worktree is charged in full to the **first run** (by run name) that recorded
+it; every other run sharing it shows 0. Without that, one 900 MB worktree
+shared by four runs would be reported as 3.6 GB. `TOTAL` therefore counts
+every readable byte exactly once, and `TOTAL` == `STATE` + `LOG` + `SCRATCH` +
+`WORKTREE` in both `--by-run` and rollup mode, subject to any incomplete
+walks noted above.
+
+Walking those trees dominates the command's runtime: worktrees are large,
+and sizing them costs several times a `STATE_ROOT`-plus-`LOG_ROOT`-only
+walk. Detection is read-only `git rev-parse` plumbing — it never runs
+`git gc` or `git worktree prune` and never writes to the inspected
+repository.
 
 ```bash
 agent-run du                    # per-status rollup, human-readable
@@ -1082,6 +1186,8 @@ Ephemeral, under `$AGENT_RUN_STATE_DIR/<name>/` (default `/tmp/agent-runs`):
 | `process_identity` | platform-specific runner birth token, verified before `kill` signals the runner |
 | `command` | pretty-printed launch command |
 | `argv` | JSON-encoded argv (authoritative form for replay) |
+| `cwd` | absolute working directory the command runs in (`--cwd` if given, else the invocation directory) |
+| `launch_head` | full git commit hash `HEAD` pointed at when the run started, if `cwd` is a repo; `watch` counts commits from it |
 | `started_at`, `ended_at` | ISO-8601 UTC timestamps |
 | `stdin` | FIFO for `steer` (only when launched with `-i`) |
 | `resize` | FIFO for terminal-resize records used by `attach` (only when launched with `-i`) |

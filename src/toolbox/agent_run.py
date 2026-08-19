@@ -49,10 +49,11 @@ Usage::
     agent-run -i <name> -- <cmd...>      # interactive (PTY-wrapped, steerable)
     agent-run --echo <name> -- <cmd...>  # accepted for backward compat; log.clean is now always produced
     agent-run --idle-timeout N <name> -- <cmd...>  # self-terminate after N idle seconds
+    agent-run --cwd <dir> <name> -- <cmd...>  # run the command in <dir> (managed mode too)
     agent-run --harness claude|opencode|codex   # managed mode (no trailing --)
               [--prompt <text> | --prompt-file <path>]
               [-i] [--model <model>] [--agent-mode <name>]
-              [--session-id <id>] [--harness-arg <flag>]...
+              [--harness-arg <flag>]...
               <name>
     agent-run attach <name>              # live keyboard + resize passthrough (Ctrl-C detaches)
     agent-run tail <name>                # follow log in real time
@@ -131,8 +132,10 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     started_at   ISO-8601 UTC
     ended_at     ISO-8601 UTC (after completion)
     interactive  "1" if launched with -i, else "0"
-    cwd          absolute launch-time working directory (used by `watch` to
-                 locate the repo for git facts; may be absent on legacy runs)
+    cwd          absolute working directory the command runs in: --cwd when
+                 given, otherwise the launch-time working directory (used by
+                 `watch` to locate the repo for git facts; may be absent on
+                 legacy runs)
     launch_head  full git commit hash HEAD pointed to at launch, if `cwd` was
                  a git repo (used by `watch` to count commits made during the
                  run without trusting commit timestamps; absent when `cwd`
@@ -234,6 +237,18 @@ already gone) once their newest recursive mtime is older than
 --min-age-hours; see ``--log-min-age-hours`` help. Off by default; a run
 with a live state dir is never touched regardless of age.
 
+`agent-run reap --include-worktrees` additionally removes a terminal run's
+recorded launch `cwd` when — and only when — that directory is a *linked*
+git worktree older than --worktree-min-age-hours (default 7 days, its own
+independent threshold). A non-git directory is never removed: a run's cwd
+is frequently a real project checkout or $HOME. Removal goes through `git
+worktree remove` against the owning repository so the parent's
+.git/worktrees/<name> admin entry is unregistered too. Uncommitted changes,
+untracked files, commits absent from every remote, a live run sharing the
+directory, and any symlinked path component are all refusals; only
+--force-dirty overrides the unsaved-work refusals. A worktree shared by
+several terminal runs is removed once. Off by default.
+
 `agent-run list` defaults to showing only runs whose effective status is
 *not* conclusively terminal (`starting`, `running`, `stalled`; a `died` or
 `killed` run is terminal and hidden by default, matching reap's own
@@ -251,8 +266,13 @@ stdout, so `agent-run list | grep ...` stays honest.
 
 `agent-run du` reports disk usage per effective status (or per run with
 `--by-run`), including preserved logs, and never mutates anything — no
-locks, no heal, no prune. See its own `--help` for `--top`, `--bytes`, and
-`--json`.
+locks, no heal, no prune. With `--worktrees` it additionally sizes each
+run's recorded launch `cwd` when that directory is a *linked* git worktree,
+in its own WORKTREE column; a worktree shared by several runs is
+deduplicated by realpath and charged once, so TOTAL counts every byte
+exactly once. Off by default because those trees are typically much larger
+than STATE_ROOT and LOG_ROOT combined. See its own `--help` for `--top`,
+`--bytes`, and `--json`.
 """
 
 from __future__ import annotations
@@ -291,8 +311,12 @@ from pathlib import Path
 from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 
-STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
-LOG_ROOT = Path(os.environ.get("AGENT_RUN_LOG_DIR", "/var/tmp/agent-runs"))
+# Absolutised against the invocation directory at import: --cwd chdirs the
+# launcher, and a relative root would otherwise re-base into the target
+# directory, creating run state (and running _prune_old_logs deletions) inside
+# it rather than under the configured root.
+STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs")).absolute()
+LOG_ROOT = Path(os.environ.get("AGENT_RUN_LOG_DIR", "/var/tmp/agent-runs")).absolute()
 PRUNE_AFTER_DAYS = 21
 SUBMIT_MODE_CR = "cr"
 SUBMIT_MODE_CRLF = "crlf"
@@ -535,6 +559,15 @@ def _parse_log_min_age_seconds() -> float:
 def _parse_orphan_min_age_seconds() -> float:
     raw = os.environ.get("AGENT_RUN_ORPHAN_MIN_AGE_HOURS", "24")
     return _positive_finite_hours(raw, "AGENT_RUN_ORPHAN_MIN_AGE_HOURS", 24.0)
+
+
+# Linked-worktree GC threshold, independent of every threshold above:
+# removing a worktree destroys a working tree rather than bookkeeping, so it
+# defaults to the same conservative week the state-dir threshold uses and is
+# tuned separately from it.
+def _parse_worktree_min_age_seconds() -> float:
+    raw = os.environ.get("AGENT_RUN_WORKTREE_MIN_AGE_HOURS", "168")
+    return _positive_finite_hours(raw, "AGENT_RUN_WORKTREE_MIN_AGE_HOURS", 168.0)
 
 
 def _parse_reap_max_seconds() -> float:
@@ -1320,6 +1353,21 @@ def _reap_stale_sentinels(root: Path) -> int:
 
 
 @contextmanager
+def _worktree_publication_lock(*, exclusive: bool):
+    """Serialize launch-state publication with destructive worktree removal."""
+    lock_dir = STATE_ROOT / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "worktree-publication.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield fd
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
 def _launch_lock(name: str):
     """Serialize launch setup for one run name across processes.
 
@@ -1785,6 +1833,7 @@ def _newest_mtime_recursive(
     cutoff: Optional[float] = None,
     *,
     skip_top_dir_mtime: bool = False,
+    strict: bool = False,
 ) -> Optional[float]:
     """Newest mtime anywhere below ``d`` (including ``d`` itself unless
     ``skip_top_dir_mtime`` is set), without following symlinks.
@@ -1810,6 +1859,11 @@ def _newest_mtime_recursive(
     walk to O(1).  When the directory is genuinely old the full walk runs,
     which is correct — that directory is about to be deleted anyway.
 
+    When ``strict`` is ``True``, any ``scandir`` or ``stat`` failure returns
+    ``_WALK_INCOMPLETE`` immediately.  Use this when a partially-observed tree
+    must not be treated as old: a recent file in an unreadable subtree would
+    otherwise be invisible, making a live worktree appear idle.
+
     Symlinks are never followed (``entry.stat(follow_symlinks=False)``), so a
     malicious scratch tree cannot redirect the walk outside its log directory.
     """
@@ -1832,12 +1886,16 @@ def _newest_mtime_recursive(
             with os.scandir(current) as it:
                 entries = list(it)
         except OSError:
+            if strict:
+                return _WALK_INCOMPLETE  # type: ignore[return-value]
             walk_error = True
             continue
         for entry in entries:
             try:
                 st = entry.stat(follow_symlinks=False)
             except OSError:
+                if strict:
+                    return _WALK_INCOMPLETE  # type: ignore[return-value]
                 continue
             mtime = st.st_mtime
             if newest is None or mtime > newest:
@@ -1851,12 +1909,13 @@ def _newest_mtime_recursive(
     return newest
 
 
-def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
+def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None,
+                    excludes: Sequence[Path] = ()) -> int:
     """Apparent size (sum of ``st_size``) of every regular file at or below
-    ``d``, in bytes, excluding anything at or below ``exclude`` (if given —
-    used to report a log dir's size without double-counting its ``tmp/``
-    scratch subdirectory). Read-only: uses ``os.scandir`` and never follows
-    symlinks (``entry.stat(follow_symlinks=False)``), so neither the walk
+    ``d``, in bytes, excluding anything at or below ``exclude`` or ``excludes``.
+    The singular argument keeps log/scratch callers concise; the sequence is
+    used when several separately charged roots are nested in one worktree.
+    Uses lstat (``entry.stat(follow_symlinks=False)``), so neither the walk
     interior nor ``d`` itself can be a symlink that redirects the count
     outside ``d``. Tolerates races (a file vanishing between scan and stat)
     by skipping the entry rather than raising; an unreadable or non-real-
@@ -1864,23 +1923,45 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
 
     Shared by `reap --include-logs` (per-candidate size in its report line)
     and `du` (per-group/per-run totals), so both report the same notion of
-    "size" for a log directory.
+    "size" for a log directory.  Callers that need completeness information
+    should use ``_dir_size_bytes_complete``.
+    """
+    size, _ = _dir_size_bytes_complete(d, exclude=exclude, excludes=excludes)
+    return size
+
+
+def _dir_size_bytes_complete(d: Path, *, exclude: Optional[Path] = None,
+                             excludes: Sequence[Path] = ()) -> Tuple[int, bool]:
+    """Like ``_dir_size_bytes`` but also returns whether the walk was complete.
+
+    Returns ``(size, complete)`` where ``complete`` is ``True`` when every
+    entry was successfully read.  A permission error on the root directory
+    returns ``(0, False)``; a permission error on a subtree directory returns
+    ``(partial, False)``.  Both cases mean the reported size is a lower bound.
     """
     try:
         top_st = d.lstat()
+    except FileNotFoundError:
+        # Missing directory is not an error: a run may have no scratch dir.
+        return 0, True
     except OSError:
-        return 0
+        return 0, False
     if not _stat_module.S_ISDIR(top_st.st_mode):
-        return 0
+        return 0, True
     total = 0
+    complete = True
+    excluded = {p.resolve() for p in excludes}
+    if exclude is not None:
+        excluded.add(exclude.resolve())
     stack = [d]
     while stack:
         current = stack.pop()
-        if exclude is not None and current == exclude:
+        if current.resolve() in excluded:
             continue
         try:
             entries = list(os.scandir(current))
         except OSError:
+            complete = False
             continue
         for entry in entries:
             try:
@@ -1890,8 +1971,9 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None) -> int:
                     st = entry.stat(follow_symlinks=False)
                     total += st.st_size
             except OSError:
+                complete = False
                 continue
-    return total
+    return total, complete
 
 
 _SIZE_UNITS = ("B", "K", "M", "G", "T", "P")
@@ -2554,13 +2636,17 @@ def _watch_parse_iso(raw: Optional[str]) -> Optional[datetime]:
 
 
 class _WatchGitOutcome(NamedTuple):
-    """Result of one bounded git read: exactly one field is set. ``error``
-    populates the watch contract's ``git_error`` discriminator, since
-    collapsing every failure to a bare ``None`` hides *why* facts are
-    unavailable."""
+    """Result of one bounded git command, including operator-visible failure detail."""
 
     stdout: Optional[str]
     error: Optional[str]
+    stderr: Optional[str] = None
+
+    @property
+    def error_detail(self) -> str:
+        if self.stderr:
+            return f"{self.error}: {self.stderr.strip()}"
+        return self.error or "git_failed"
 
 
 # "No commits yet" has no single stable stderr wording across the git
@@ -2600,6 +2686,10 @@ def _watch_run_git_checked(
                 "-c",
                 "diff.external=",
                 "-c",
+                "filter.allowProcess=false",
+                "-c",
+                "filter.required=false",
+                "-c",
                 "core.pager=cat",
                 *git_args,
             ],
@@ -2616,11 +2706,11 @@ def _watch_run_git_checked(
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or b"").decode("utf-8", errors="replace")
         if _WATCH_GIT_NOT_A_REPO_STDERR in stderr.lower():
-            return _WatchGitOutcome(None, "not_a_repo")
-        return _WatchGitOutcome(None, "git_failed")
-    except (OSError, subprocess.SubprocessError):
-        return _WatchGitOutcome(None, "git_failed")
-    return _WatchGitOutcome(result.stdout.decode("utf-8", errors="replace"), None)
+            return _WatchGitOutcome(None, "not_a_repo", stderr)
+        return _WatchGitOutcome(None, "git_failed", stderr)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _WatchGitOutcome(None, "git_failed", str(exc))
+    return _WatchGitOutcome(result.stdout.decode("utf-8", errors="surrogateescape"), None)
 
 
 _WATCH_SHORTSTAT_RES = (
@@ -5100,10 +5190,913 @@ def cmd_clean(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# linked git worktree detection (shared by du and reap)
+# ---------------------------------------------------------------------------
+
+# Classification of a run's recorded launch ``cwd``. Only _WORKTREE_LINKED is
+# ever acted on: a linked worktree is a disposable checkout whose repository
+# data lives in another directory that is not being touched. Every other
+# value — including every git failure — means "leave this directory alone".
+_WORKTREE_LINKED = "linked"
+_WORKTREE_MAIN = "main"
+_WORKTREE_BARE = "bare"
+_WORKTREE_NOT_A_REPO = "not_a_repo"
+_WORKTREE_UNKNOWN = "unknown"
+
+
+class _WorktreeInfo(NamedTuple):
+    """``kind`` is one of the ``_WORKTREE_*`` constants. ``common_dir`` is the
+    owning repository's absolute ``--git-common-dir``, populated only for
+    ``_WORKTREE_LINKED``: ``git worktree remove`` must run against it so the
+    parent repo's ``.git/worktrees/<name>`` admin entry is unregistered along
+    with the checkout."""
+
+    kind: str
+    common_dir: Optional[str] = None
+    detail: Optional[str] = None
+
+
+def _dir_identity(path: Path) -> Optional[Tuple[int, int]]:
+    """``(st_dev, st_ino)`` of ``path`` if it is a real directory (lstat, so a
+    symlink never qualifies), else ``None``."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino) if _stat_module.S_ISDIR(st.st_mode) else None
+
+
+def _worktree_resolve_cwd(raw: str) -> Optional[Path]:
+    """Canonicalize a recorded launch ``cwd`` to an absolute, symlink-free
+    path naming a real directory, or ``None``."""
+    if not raw:
+        return None
+    if not Path(raw).is_absolute():
+        return None
+    try:
+        resolved = Path(os.path.realpath(raw))
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_absolute() or _dir_identity(resolved) is None:
+        return None
+    return resolved
+
+
+def _worktree_classify(path: Path) -> _WorktreeInfo:
+    """Classify ``path`` as a linked worktree, a main worktree, a bare repo,
+    not a repo, or unknown. Read-only: only ``rev-parse`` plumbing runs, so
+    nothing is created, pruned or garbage-collected in the inspected repo.
+
+    A linked worktree's ``--git-dir`` is ``<common>/worktrees/<name>`` while
+    its ``--git-common-dir`` is the owning repo's git dir; for a main worktree
+    the two are the same path. ``--path-format=absolute`` (git >= 2.31) makes
+    that comparison meaningful; an older git fails the whole ``rev-parse``,
+    which is reported as ``_WORKTREE_UNKNOWN`` rather than guessed at.
+
+    Every failure mode — git not installed, a timeout, unparseable output,
+    an unreadable directory — yields ``_WORKTREE_UNKNOWN``. No caller may read
+    that as permission to delete.
+    """
+    if _dir_identity(path) is None:
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail="not a real directory")
+
+    # `--show-toplevel` is deliberately absent from this call: it aborts the
+    # whole rev-parse in a bare repository, which would mask the bare case as
+    # a generic failure. It is asked for separately, only when needed.
+    probe = _watch_run_git_checked(path, [
+        "rev-parse", "--path-format=absolute",
+        "--is-bare-repository", "--is-inside-work-tree",
+        "--git-dir", "--git-common-dir",
+    ])
+    if probe.stdout is None:
+        if probe.error == "not_a_repo":
+            return _WorktreeInfo(_WORKTREE_NOT_A_REPO, detail="not a git repository")
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail=probe.error or "git_failed")
+
+    lines = [ln.strip() for ln in probe.stdout.splitlines()]
+    if len(lines) != 4:
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail="unexpected rev-parse output")
+    is_bare, inside_work_tree, git_dir, common_dir = lines
+    if is_bare == "true":
+        return _WorktreeInfo(_WORKTREE_BARE, detail="bare repository")
+    if inside_work_tree != "true":
+        # Inside a .git directory, or a git version answering something other
+        # than true/false. Neither is a work tree this may act on.
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail="not inside a work tree")
+    if not git_dir or not common_dir:
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail="empty rev-parse path")
+    if git_dir == common_dir:
+        return _WorktreeInfo(_WORKTREE_MAIN, common_dir=common_dir)
+
+    top_probe = _watch_run_git_checked(
+        path, ["rev-parse", "--path-format=absolute", "--show-toplevel"]
+    )
+    if top_probe.stdout is None:
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail=top_probe.error or "git_failed")
+    toplevel = top_probe.stdout.strip()
+    top_identity = _dir_identity(Path(toplevel)) if toplevel else None
+    if top_identity is None or top_identity != _dir_identity(path):
+        # A subdirectory of a linked worktree reports the same pair of git
+        # dirs as the worktree's top. `git worktree remove` only accepts the
+        # top, and sizing a subdirectory would account for part of a tree that
+        # another candidate already covers in full.
+        return _WorktreeInfo(_WORKTREE_UNKNOWN, detail="not the top of its worktree")
+    return _WorktreeInfo(_WORKTREE_LINKED, common_dir=common_dir)
+
+
+def _worktree_run_cwd(name: str) -> Optional[Path]:
+    """Resolved launch directory recorded for run ``name``, or ``None`` when
+    the run has no readable ``cwd`` state file or it no longer names a real
+    directory."""
+    return _worktree_resolve_cwd(_watch_read_cwd_file(_state_dir(name) / "cwd"))
+
+
+def _worktree_du_root(cwd: Path) -> Optional[Path]:
+    """Linked-worktree root for disk-accounting of ``cwd``, or ``None``.
+
+    ``_worktree_classify`` returns UNKNOWN for a subdirectory of a linked
+    worktree, because ``git worktree remove`` requires the top-level path.
+    For accounting the top-level root is correct — charging a subdirectory
+    would count part of a tree that another run sharing the same worktree
+    root already covers.  This function resolves the actual top-level so runs
+    launched from a subdirectory still contribute their worktree bytes.
+
+    Returns ``None`` when ``cwd`` is not inside any linked worktree, or when
+    any git query fails (fail-safe: unclassifiable paths contribute 0 bytes
+    rather than blocking the entire ``du`` pass).
+    """
+    probe = _watch_run_git_checked(cwd, [
+        "rev-parse", "--path-format=absolute",
+        "--is-bare-repository", "--is-inside-work-tree",
+        "--git-dir", "--git-common-dir",
+    ])
+    if probe.stdout is None:
+        return None
+    lines = [ln.strip() for ln in probe.stdout.splitlines()]
+    if len(lines) != 4:
+        return None
+    is_bare, inside_work_tree, git_dir, common_dir = lines
+    if is_bare == "true" or inside_work_tree != "true":
+        return None
+    if not git_dir or not common_dir or git_dir == common_dir:
+        return None
+    top_probe = _watch_run_git_checked(
+        cwd, ["rev-parse", "--path-format=absolute", "--show-toplevel"]
+    )
+    if top_probe.stdout is None:
+        return None
+    toplevel_str = top_probe.stdout.strip()
+    if not toplevel_str:
+        return None
+    toplevel = Path(toplevel_str)
+    top_identity = _dir_identity(toplevel)
+    if top_identity is None:
+        return None
+    # Verify the recorded cwd is at or below this toplevel.
+    try:
+        cwd.relative_to(toplevel)
+    except ValueError:
+        return None
+    # Classify the toplevel itself to confirm it is a registered linked worktree.
+    if _worktree_classify(toplevel).kind != _WORKTREE_LINKED:
+        return None
+    return toplevel
+
+
+# `git worktree remove` unlinks the whole checkout, so it needs far more than
+# the plumbing-read budget a rev-parse gets; a multi-gigabyte tree on a slow
+# disk would otherwise time out mid-deletion.
+WORKTREE_REMOVE_TIMEOUT_SECONDS: float = 300.0
+
+
+def _worktree_symlink_free_reason(raw: str) -> Optional[str]:
+    """``None`` when ``raw`` is an absolute path whose every component is an
+    lstat-confirmed real directory, else the reason it is not.
+
+    Deletion never follows a mutable pathname: if any component is a symlink,
+    the directory eventually removed is not the one that was inspected. This
+    mirrors the lstat-only guards the LOG_ROOT passes apply before deleting.
+    """
+    if not raw:
+        return "no cwd recorded"
+    path = Path(raw)
+    if not path.is_absolute():
+        return f"recorded cwd {raw!r} is not absolute"
+    for component in [path, *path.parents]:
+        if _dir_identity(component) is None:
+            return f"path component {component} is not a real directory"
+    return None
+
+
+class _WorktreeStateScan(NamedTuple):
+    entries: Optional[List[Path]]
+    error: Optional[str]
+
+
+def _worktree_state_scan() -> _WorktreeStateScan:
+    """Return every real named state directory, or one fail-closed error."""
+    try:
+        root_st = STATE_ROOT.lstat()
+        if not _stat_module.S_ISDIR(root_st.st_mode):
+            return _WorktreeStateScan(None, f"state root is missing or not a real directory: {STATE_ROOT}")
+        entries = sorted(STATE_ROOT.iterdir())
+    except OSError as exc:
+        return _WorktreeStateScan(None, f"cannot read state root {STATE_ROOT}: {exc}")
+
+    states: List[Path] = []
+    for d in entries:
+        if d.name.startswith("."):
+            continue
+        try:
+            _validate_run_name(d.name)
+            st = d.lstat()
+        except SystemExit:
+            return _WorktreeStateScan(None, f"invalid state directory name {d.name!r}")
+        except OSError as exc:
+            return _WorktreeStateScan(None, f"cannot inspect state directory {d}: {exc}")
+        if not _stat_module.S_ISDIR(st.st_mode):
+            return _WorktreeStateScan(None, f"state entry is not a real directory: {d}")
+        states.append(d)
+    return _WorktreeStateScan(states, None)
+
+
+def _worktree_state_has_live_runner(d: Path) -> Tuple[Optional[bool], Optional[str]]:
+    """Determine whether a state directory's recorded runner is still alive.
+
+    A missing pid file with no other evidence is not scan-fatal: a legacy
+    state dir without a pid should not abort the whole pass.  An unreadable
+    pid file (mode 000, a directory in its place) is ambiguity, not absence:
+    it blocks GC the same way a live pid does, mirroring _gc_live_runner_pid.
+    """
+    try:
+        pid_raw = (d / "pid").read_text().strip()
+    except FileNotFoundError:
+        return False, None
+    except (OSError, UnicodeError) as exc:
+        return None, f"run {d.name} has unreadable pid file: {exc}"
+    if not pid_raw:
+        return False, None
+    try:
+        pid = int(pid_raw)
+    except ValueError:
+        return None, f"run {d.name} has malformed pid {pid_raw!r}"
+    if pid <= 0:
+        return None, f"run {d.name} has invalid pid {pid}"
+    if not _pid_alive(pid):
+        return False, None
+    recorded = _read(d / "process_identity")
+    if not recorded:
+        return None, f"run {d.name} has live pid {pid} but no process identity"
+    current = _process_identity(pid)
+    if current is None:
+        return None, f"run {d.name} has live pid {pid} with unverifiable identity"
+    return current == recorded, None
+
+
+class _WorktreeLiveCwds(NamedTuple):
+    paths: Optional[List[Path]]
+    error: Optional[str]
+    unresolved: Tuple[str, ...] = ()
+
+
+def _worktree_live_run_cwds(state_entries: List[Path]) -> _WorktreeLiveCwds:
+    """Resolve every cwd that is live by status, process identity, or ambiguity.
+
+    An unresolvable cwd is scan-fatal only with evidence of a live runner: a
+    pid that is alive and identity-matched may hold any directory, so nothing
+    may be deleted. Ambiguity — a malformed pid, or a live pid whose identity
+    cannot be verified — is reported by ``_worktree_state_has_live_runner`` and
+    aborts the scan before the cwd is read.
+
+    An entry with no readable pid, or a pid that is not alive, has no process
+    to protect anything and no recorded path to overlap a candidate. Its name
+    is returned in ``unresolved`` and the scan continues, so one legacy state
+    directory missing ``status``/``pid``/``cwd`` cannot disable the whole pass.
+    """
+    live: List[Path] = []
+    unresolved: List[str] = []
+    for d in state_entries:
+        status = _effective_status(d)
+        process_live, process_error = _worktree_state_has_live_runner(d)
+        if process_error is not None:
+            return _WorktreeLiveCwds(None, process_error)
+        protects_cwd = status not in TERMINAL_STATUSES or process_live is True
+        if not protects_cwd:
+            continue
+        raw = _watch_read_cwd_file(d / "cwd")
+        resolved = _worktree_resolve_cwd(raw)
+        if resolved is None:
+            if process_live is True:
+                return _WorktreeLiveCwds(None, f"cannot resolve cwd for live run {d.name}")
+            unresolved.append(d.name)
+            continue
+        live.append(resolved)
+    return _WorktreeLiveCwds(live, None, tuple(unresolved))
+
+
+def _worktree_empty_tree_oid(path: Path) -> Tuple[Optional[str], Optional[str]]:
+    """Object id of the empty tree in ``path``'s repository, for ``--attr-source``.
+
+    Hashing ``/dev/null`` as a tree is a pure computation: it writes no object,
+    reads no attributes, and yields the hash-algorithm-correct id for both sha1
+    and sha256 repositories.
+    """
+    probe = _watch_run_git_checked(path, ["hash-object", "-t", "tree", "/dev/null"])
+    if probe.stdout is None:
+        return None, f"cannot compute empty tree object ({probe.error_detail})"
+    oid = probe.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", oid):
+        return None, f"unexpected empty tree object {oid!r}"
+    return oid, None
+
+
+def _worktree_content_reason(path: Path) -> Optional[str]:
+    """Return a refusal for tracked, untracked, or ignored worktree content.
+
+    ``ls-files --modified`` compares working-tree files through the clean
+    filter whenever the index stat cache is inconclusive, so a repository
+    supplying ``filter.<driver>.clean`` in ``.gitattributes`` would execute its
+    command under this inspection. ``--attr-source`` pointed at the empty tree
+    makes every path attribute-free, so no filter driver is ever selected;
+    see ``_watch_run_git_checked`` for hook and fsmonitor hardening.
+    """
+    empty_tree, oid_error = _worktree_empty_tree_oid(path)
+    if oid_error is not None:
+        return oid_error
+    assert empty_tree is not None
+    attr_free = ["--attr-source", empty_tree]
+    checks = (
+        (["ls-files", "--modified", "--deleted", "-z"], "modified or deleted tracked file(s)"),
+        (["ls-files", "--others", "--exclude-standard", "-z"], "untracked file(s)"),
+        (["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], "ignored file(s) or directory content"),
+    )
+    for args, label in checks:
+        outcome = _watch_run_git_checked(path, [*attr_free, *args])
+        if outcome.stdout is None:
+            return f"cannot inspect {label} ({outcome.error_detail})"
+        count = len([entry for entry in outcome.stdout.split("\0") if entry])
+        if count:
+            return f"{count} {label}"
+    return None
+
+
+def _worktree_unpushed_reason(path: Path) -> Optional[str]:
+    """Refusal reason when HEAD is not reachable from any local remote-tracking ref.
+
+    Uses ``git rev-list --count HEAD --not --remotes``, which compares HEAD
+    against ``refs/remotes/*`` in the local repository.  It does NOT contact
+    remote servers and does NOT prune stale tracking refs.  A branch that was
+    deleted on the remote but whose local tracking ref has not been pruned
+    (e.g. via ``git fetch --prune``) still shows count=0, so the commit would
+    not block removal even though it is no longer on any actual remote.
+
+    This is a deliberate gap: any network call in a GC path can hang, require
+    authentication, or fail in ways that make deletion decisions depend on
+    connectivity.  The documented contract is "commits not reachable from any
+    local remote-tracking ref".  Callers that need current remote state should
+    run ``git fetch --prune`` before invoking reap.
+    """
+    unpushed = _watch_run_git_checked(path, ["rev-list", "--count", "HEAD", "--not", "--remotes"])
+    if unpushed.stdout is None:
+        return f"cannot count unpushed commits ({unpushed.error_detail})"
+    count = _safe_int(unpushed.stdout.strip())
+    if count is None:
+        return "unparseable unpushed commit count"
+    if count > 0:
+        return f"{count} commit(s) not on any remote-tracking ref"
+    return None
+
+
+def _worktree_registered_roots(info: _WorktreeInfo) -> Tuple[Optional[List[Path]], Optional[str]]:
+    """Enumerate all registered roots owned by the candidate repository."""
+    if not info.common_dir:
+        return None, "owning repository is unknown"
+    outcome = _watch_run_git_checked(
+        Path(info.common_dir), ["worktree", "list", "--porcelain", "-z"]
+    )
+    if outcome.stdout is None:
+        return None, f"cannot enumerate registered worktrees ({outcome.error_detail})"
+    roots: List[Path] = []
+    for field in outcome.stdout.split("\0"):
+        if not field:
+            continue
+        if field.startswith("worktree "):
+            raw = field[len("worktree "):]
+            resolved = _worktree_resolve_cwd(raw)
+            if resolved is None:
+                return None, f"cannot resolve registered worktree {raw!r}"
+            roots.append(resolved)
+    if not roots:
+        return None, "worktree list returned no roots"
+    return roots, None
+
+
+def _worktree_nested_reason(info: _WorktreeInfo, path: Path) -> Optional[str]:
+    roots, error = _worktree_registered_roots(info)
+    if error is not None:
+        return error
+    assert roots is not None
+    for root in roots:
+        if root != path and _path_is_within(root, path):
+            return f"registered worktree {root} is nested inside the candidate"
+    return None
+
+
+def _has_surrogate(s: str) -> bool:
+    """True if ``s`` contains any UTF-16 surrogate code point (U+D800–U+DFFF).
+
+    ``_watch_run_git_checked`` decodes git output with ``errors="surrogateescape"``,
+    which maps each non-UTF-8 byte to a private surrogate (U+DC80–U+DCFF).
+    A surrogate in a path component means the original byte sequence was not
+    valid UTF-8: the path cannot be safely round-tripped through Python's str
+    layer without re-encoding via ``os.fsencode``.  Any such path must be
+    treated as unresolvable to avoid acting on a mangled name.
+    """
+    return any("\ud800" <= c <= "\udfff" for c in s)
+
+
+def _worktree_submodule_reason(path: Path) -> Optional[str]:
+    """Return a refusal if any initialized submodule exists in the worktree.
+
+    An initialized submodule is a mode-160000 gitlink in the index whose
+    checkout directory contains a `.git` file pointing into the parent
+    repository's modules store.  It is absent from both ``ls-files --others``
+    queries (gitlinks are tracked, not untracked) and invisible to
+    ``_worktree_foreign_nested_reason``.  Under ``--force-dirty`` the content
+    checks are skipped entirely; this check runs unconditionally so neither
+    code path reaches ``git worktree remove --force`` with an initialized
+    submodule checkout present.
+
+    A deinitialized submodule has a mode-160000 index entry but an empty
+    checkout directory (no `.git` file or directory); removing it loses nothing
+    irreplaceable and is permitted.  The test is whether the checkout directory
+    has a `.git` entry, not merely whether the index entry exists.
+
+    Uses NUL-delimited output for path safety.  Fails closed on command
+    failure or malformed output.  A `.git` lstat error other than
+    ``FileNotFoundError`` also fails closed.  A non-UTF-8 submodule path
+    (surrogate in the decoded string) is treated as unresolvable and fails
+    closed rather than acting on a mangled name.
+    """
+    outcome = _watch_run_git_checked(path, ["ls-files", "--stage", "-z"])
+    if outcome.stdout is None:
+        return f"cannot enumerate index entries ({outcome.error_detail})"
+    for entry in outcome.stdout.split("\0"):
+        if not entry:
+            continue
+        # Stage output format: "<mode> <object> <stage>\t<path>"
+        fields = entry.split("\t", 1)
+        if len(fields) != 2:
+            return f"malformed ls-files --stage output: {entry!r}"
+        meta = fields[0].split()
+        if not meta:
+            return f"malformed ls-files --stage output: {entry!r}"
+        if meta[0] != "160000":
+            continue
+        submodule_path = fields[1]
+        if _has_surrogate(submodule_path):
+            return f"submodule path contains non-UTF-8 bytes: {submodule_path!r}"
+        checkout = path / submodule_path
+        git_entry = checkout / ".git"
+        try:
+            git_entry.lstat()
+            # .git present: initialized checkout with submodule data.
+            return f"initialized submodule at {submodule_path}"
+        except FileNotFoundError:
+            # No .git entry: deinitialized (empty directory), safe to remove.
+            continue
+        except OSError as exc:
+            return f"cannot check submodule at {submodule_path}: {exc}"
+    return None
+
+
+def _worktree_bare_repo_check(candidate_dir: Path) -> Optional[str]:
+    """Return a refusal if ``candidate_dir`` is a bare git repository.
+
+    Called for directories that ``ls-files`` descended into (emitting individual
+    files) rather than reporting as a boundary (slash-terminated entry).  Git
+    descends into bare repositories because they have no ``.git`` marker to stop
+    traversal; those files therefore appear as ordinary untracked paths rather
+    than a single ``bare.git/`` entry.
+
+    Uses ``git rev-parse --is-bare-repository`` via the hardened subprocess
+    wrapper to remain consistent with the rest of the classification machinery.
+    A non-zero exit (not a repository) is silently ignored; any other failure
+    or a ``true`` answer is a refusal.
+    """
+    probe = _watch_run_git_checked(candidate_dir, [
+        "rev-parse", "--is-bare-repository",
+    ])
+    if probe.stdout is None:
+        if probe.error == "not_a_repo":
+            return None
+        return f"cannot check bare-repository status of {candidate_dir} ({probe.error_detail})"
+    if probe.stdout.strip() == "true":
+        return f"nested bare git repository at {candidate_dir}"
+    return None
+
+
+def _worktree_foreign_nested_reason(path: Path) -> Optional[str]:
+    """Detect git repository roots structurally nested inside the candidate directory.
+
+    ``_worktree_nested_reason`` only queries the candidate's own repository, so
+    a linked worktree or bare repository of a different repository is invisible
+    to it.  This check uses ``git ls-files --others`` to enumerate untracked and
+    ignored paths, exploiting two complementary mechanisms:
+
+    Non-bare repositories: git halts at the repository boundary and emits a
+    single slash-terminated directory entry (e.g. ``nested.git/``); ``lstat``
+    on ``.git`` inside confirms the boundary.
+
+    Bare repositories: git has no ``.git`` marker to stop traversal and
+    descends into the bare repo, emitting individual files such as
+    ``precious.git/HEAD`` and ``precious.git/config``.  The trailing-``/``
+    filter skips all of these.  The second pass below collects all unique
+    directory prefixes from non-slash entries and calls
+    ``_worktree_bare_repo_check`` on each.  This is bounded because git only
+    descends into directories it cannot identify as repositories (i.e. bare
+    repos and plain untracked dirs); the rev-parse check is fast (one read).
+    Prefixes already confirmed as non-repositories by the slash scan are skipped.
+
+    Two ls-files passes cover both gitignored and non-gitignored content:
+    - ``--others --exclude-standard``: untracked content outside ignored dirs.
+    - ``--others --ignored --exclude-standard``: repos inside ``node_modules/``
+      or ``.venv/`` appear as a directory entry, not as individual files.
+
+    A path entry containing non-UTF-8 bytes is decoded with surrogate escapes
+    by ``_watch_run_git_checked``; ``_has_surrogate`` detects such entries and
+    fails closed rather than acting on a mangled name.
+
+    Called unconditionally, including under ``--force-dirty``.
+    """
+    checks = (
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    )
+    seen_dirs: set[str] = set()
+    # All unique directory prefixes from non-slash entries, to probe for bare repos.
+    bare_candidates: set[str] = set()
+    for git_args in checks:
+        outcome = _watch_run_git_checked(path, git_args)
+        if outcome.stdout is None:
+            return f"cannot enumerate untracked paths ({outcome.error_detail})"
+        for entry in outcome.stdout.split("\0"):
+            if not entry:
+                continue
+            if _has_surrogate(entry):
+                # Non-UTF-8 byte in path: cannot safely resolve the name.
+                return f"untracked path contains non-UTF-8 bytes: {entry!r}"
+            if entry.endswith("/"):
+                if entry in seen_dirs:
+                    continue
+                seen_dirs.add(entry)
+                # Trailing / marks a git repository boundary; verify via lstat.
+                candidate_git = path / entry.rstrip("/") / ".git"
+                try:
+                    candidate_git.lstat()
+                    return f"nested git repository at {path / entry.rstrip('/')}"
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    return f"cannot check .git in {path / entry.rstrip('/')}: {exc}"
+            else:
+                # No slash terminator: git descended into this directory, which
+                # cannot be a non-bare repo (git would have halted there).
+                # Collect every directory prefix of this entry so nested bare
+                # repos at any depth (e.g. vendor/cached.git/HEAD) are found.
+                parts = entry.split("/")
+                for depth in range(1, len(parts)):
+                    prefix = "/".join(parts[:depth])
+                    if prefix and prefix + "/" not in seen_dirs:
+                        bare_candidates.add(prefix)
+
+    for prefix in bare_candidates:
+        candidate_dir = path / prefix
+        reason = _worktree_bare_repo_check(candidate_dir)
+        if reason is not None:
+            return reason
+    return None
+
+
+def _worktree_activity_age_seconds(path: Path) -> Tuple[Optional[float], Optional[str]]:
+    """Age of the newest recursively observed filesystem mtime in a worktree.
+
+    Uses strict mode so any unreadable subtree returns an error rather than a
+    stale timestamp: a recent file hidden by a permission error must not make
+    the worktree appear idle.
+    """
+    newest = _newest_mtime_recursive(path, strict=True)
+    if newest is None or newest is _WALK_INCOMPLETE:
+        return None, "cannot determine worktree filesystem activity"
+    return max(0.0, time.time() - newest), None
+
+
+def _worktree_remove(info: _WorktreeInfo, path: Path, *, force: bool) -> Optional[str]:
+    """Remove the linked worktree at ``path`` via ``git worktree remove``,
+    returning ``None`` on success or the failure reason.
+
+    The command runs against the owning repository's ``--git-common-dir`` so
+    the ``.git/worktrees/<name>`` administrative entry is unregistered along
+    with the checkout; an ``rmtree`` would leave that registration stranded.
+    ``force`` is passed only under ``reap --force-dirty``: without it git
+    itself refuses a worktree with modified or untracked files, which is a
+    second line of defence behind ``_worktree_unsaved_work_reason``.
+    """
+    if not info.common_dir:
+        return "owning repository is unknown"
+    args = ["worktree", "remove", *(["--force"] if force else []), str(path)]
+    outcome = _watch_run_git_checked(
+        Path(info.common_dir), args, timeout=WORKTREE_REMOVE_TIMEOUT_SECONDS
+    )
+    if outcome.stdout is None:
+        return f"git worktree remove failed ({outcome.error_detail})"
+    return None
+
+
+class _WorktreeCandidate(NamedTuple):
+    """One deduplicated worktree candidate attributed across all run state."""
+
+    resolved: Path
+    raw: str
+    names: List[str]
+    age_seconds: Optional[float]
+    identity_fd: int
+
+
+class _WorktreeCandidates(NamedTuple):
+    candidates: List[_WorktreeCandidate]
+    skipped: List[str]
+
+
+def _worktree_collect_candidates(
+    state_entries: List[Path], selected_names: Optional[set[str]]
+) -> _WorktreeCandidates:
+    """Group terminal run cwd records using all-state safety attribution."""
+    by_path: dict[str, _WorktreeCandidate] = {}
+    skipped: List[str] = []
+    for d in state_entries:
+        if _read(d / "status") not in TERMINAL_STATUSES:
+            continue
+        raw = _watch_read_cwd_file(d / "cwd")
+        resolved = _worktree_resolve_cwd(raw)
+        if resolved is None:
+            if selected_names is None or d.name in selected_names:
+                skipped.append(f"run {d.name} has an unresolvable cwd")
+            continue
+        if _dir_identity(resolved) is None:
+            if selected_names is None or d.name in selected_names:
+                skipped.append(f"run {d.name} cwd is not a real directory")
+            continue
+        age = _terminal_state_age_seconds(d)
+        key = str(resolved)
+        if key not in by_path:
+            # O_DIRECTORY | O_NOFOLLOW: atomically refuse symlinks and non-dirs.
+            # The open fd pins the inode so its number cannot be recycled while
+            # we hold it; samestat at revalidation then confirms the path still
+            # names the same kernel object.  -1 signals a failed open and is
+            # treated as a refusal in _worktree_candidate_refusal.
+            try:
+                identity_fd = os.open(
+                    str(resolved), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+            except OSError:
+                if selected_names is None or d.name in selected_names:
+                    skipped.append(f"run {d.name} cwd cannot be opened for identity pin")
+                continue
+            by_path[key] = _WorktreeCandidate(
+                resolved, raw, [d.name], age, identity_fd,
+            )
+            continue
+        existing = by_path[key]
+        merged_age = None if age is None or existing.age_seconds is None else min(
+            existing.age_seconds, age
+        )
+        by_path[key] = existing._replace(
+            names=[*existing.names, d.name],
+            age_seconds=merged_age,
+        )
+
+    candidates = [
+        by_path[key]
+        for key in sorted(by_path)
+        if selected_names is None or selected_names.intersection(by_path[key].names)
+    ]
+    return _WorktreeCandidates(candidates, skipped)
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _worktree_candidate_refusal(
+    cand: _WorktreeCandidate,
+    state_entries: List[Path],
+    *,
+    force_dirty: bool,
+    min_age_threshold: float,
+    reconciled_cwds: List[Path],
+    unresolved_cwds: set[str],
+) -> Tuple[Optional[str], Optional[_WorktreeInfo], Optional[float]]:
+    """Run every deletion refusal check against one current filesystem view."""
+    for reconciled in reconciled_cwds:
+        if _path_is_within(reconciled, cand.resolved):
+            return "a sharing run was reconciled in this invocation", None, None
+    if cand.age_seconds is None or cand.age_seconds < min_age_threshold:
+        return "youngest sharing run is below the age threshold", None, None
+    # Every terminal entry that resolves to this candidate must clear the age
+    # threshold independently — including entries whose name is in cand.names.
+    # cand.age_seconds is the frozen minimum from collection time; re-reading
+    # each entry's age here handles two cases:
+    #   • entries absent from cand.names (became terminal after collection);
+    #   • same-name entries where the state directory was replaced between
+    #     collection and this scan (a new run generation with its own fresh
+    #     ended_at that cand.age_seconds does not reflect).
+    # Inode identity is not a reliable generation marker on ext4, which reuses
+    # inodes immediately after directory removal.  Fresh age is always
+    # computable, so it is always checked.
+    for d in state_entries:
+        if _effective_status(d) not in TERMINAL_STATUSES:
+            continue
+        raw = _watch_read_cwd_file(d / "cwd")
+        run_resolved = _worktree_resolve_cwd(raw)
+        if run_resolved is None or not _path_is_within(run_resolved, cand.resolved):
+            continue
+        late_age = _terminal_state_age_seconds(d)
+        if late_age is None:
+            return f"run {d.name} has unparseable age", None, None
+        if late_age < min_age_threshold:
+            return "youngest sharing run is below the age threshold", None, None
+    # Verify the candidate path still names the same directory object opened at
+    # collection.  fstat on the pinned fd and lstat on the path must agree: if
+    # the original directory was removed and another was created at the same
+    # path between collection and this scan, the new directory has a different
+    # inode — guaranteed because the fd holds the original inode's refcount
+    # above zero, preventing its recycling on any filesystem.
+    try:
+        fd_st = os.fstat(cand.identity_fd)
+        path_st = cand.resolved.lstat()
+    except OSError:
+        return "candidate path identity unreadable after collection", None, None
+    if not os.path.samestat(fd_st, path_st):
+        return "candidate path identity changed after collection", None, None
+    symlink_reason = _worktree_symlink_free_reason(cand.raw)
+    if symlink_reason is not None:
+        return symlink_reason, None, None
+
+    info = _worktree_classify(cand.resolved)
+    if info.kind != _WORKTREE_LINKED:
+        return f"not a linked worktree ({info.detail or info.kind})", None, None
+    # Require the candidate to be a registered worktree root in its own repository.
+    # A recursively copied worktree keeps a .git file from the original, so
+    # _worktree_classify returns LINKED, but the copy is not registered and
+    # git worktree remove would refuse it.  Verify by filesystem identity: a
+    # registered root with the same (st_dev, st_ino) as the candidate is
+    # unambiguously this path.
+    registered_roots, reg_error = _worktree_registered_roots(info)
+    if reg_error is not None:
+        return reg_error, None, None
+    assert registered_roots is not None
+    cand_identity = _dir_identity(cand.resolved)
+    if not any(_dir_identity(r) == cand_identity for r in registered_roots):
+        return "not a registered worktree root", None, None
+    nested = _worktree_nested_reason(info, cand.resolved)
+    if nested is not None:
+        return nested, None, None
+    foreign_nested = _worktree_foreign_nested_reason(cand.resolved)
+    if foreign_nested is not None:
+        return foreign_nested, None, None
+    submodule = _worktree_submodule_reason(cand.resolved)
+    if submodule is not None:
+        return submodule, None, None
+
+    live = _worktree_live_run_cwds(state_entries)
+    if live.error is not None:
+        return f"liveness scan failed: {live.error}", None, None
+    assert live.paths is not None
+    unresolved_cwds.update(live.unresolved)
+    for live_cwd in live.paths:
+        if _path_is_within(live_cwd, cand.resolved):
+            return f"a live run is using this directory ({live_cwd})", None, None
+
+    activity_age, activity_error = _worktree_activity_age_seconds(cand.resolved)
+    if activity_error is not None:
+        return activity_error, None, None
+    assert activity_age is not None
+    effective_age = min(cand.age_seconds, activity_age)
+    if effective_age < min_age_threshold:
+        return "worktree filesystem activity is below the age threshold", None, effective_age
+
+    if not force_dirty:
+        content = _worktree_content_reason(cand.resolved)
+        if content is not None:
+            return f"{content} — use --force-dirty to override", None, effective_age
+    unpushed = _worktree_unpushed_reason(cand.resolved)
+    if unpushed is not None:
+        return unpushed, None, effective_age
+    return None, info, effective_age
+
+
+def _worktree_gc_pass(
+    *,
+    collected: Optional[_WorktreeCandidates],
+    scan_error: Optional[str],
+    dry_run: bool,
+    force_dirty: bool,
+    min_age_threshold: float,
+    reconciled_cwds: List[Path],
+    budget_expired,
+) -> Tuple[int, int, int]:
+    """Remove linked worktrees only after an all-state fail-closed scan."""
+    removed = skipped = deferred = 0
+    if scan_error is not None:
+        print(f"  [worktree]: skipped: {scan_error}")
+        return 0, 1, 0
+    assert collected is not None
+    for reason in collected.skipped:
+        print(f"  [worktree]: skipped: {reason}")
+        skipped += 1
+
+    unresolved_cwds: set[str] = set()
+    for cand in collected.candidates:
+        if budget_expired():
+            deferred += 1
+            os.close(cand.identity_fd)
+            continue
+        label = f"  [worktree] {cand.resolved}"
+        shared = f" (runs: {', '.join(cand.names)})" if len(cand.names) > 1 else ""
+
+        try:
+            with _worktree_publication_lock(exclusive=True):
+                final_scan = _worktree_state_scan()
+                if final_scan.error is not None:
+                    print(f"{label}: skipped: {final_scan.error}{shared}")
+                    skipped += 1
+                    continue
+                assert final_scan.entries is not None
+                refusal, info, effective_age = _worktree_candidate_refusal(
+                    cand,
+                    final_scan.entries,
+                    force_dirty=force_dirty,
+                    min_age_threshold=min_age_threshold,
+                    reconciled_cwds=reconciled_cwds,
+                    unresolved_cwds=unresolved_cwds,
+                )
+                if refusal is not None:
+                    print(f"{label}: skipped: {refusal}{shared}")
+                    skipped += 1
+                    continue
+                assert info is not None and effective_age is not None
+                age_h = effective_age / 3600
+                if dry_run:
+                    print(
+                        f"{label}: linked worktree (conservative_age={age_h:.1f}h) "
+                        f"[dry-run]{shared}"
+                    )
+                    removed += 1
+                    continue
+                # Validation is the final step immediately preceding git worktree
+                # remove.  An external process can still create ignored content in
+                # the interval between the last ls-files check (inside
+                # _worktree_candidate_refusal above) and the remove call below; git
+                # removes ignored files without --force, so this window cannot be
+                # fully closed while using git worktree remove.  The exclusive
+                # publication lock prevents concurrent agent-run publication but
+                # does not fence non-agent processes.
+                failure = _worktree_remove(info, cand.resolved, force=force_dirty)
+                if failure is not None:
+                    print(f"{label}: skipped: {failure}")
+                    skipped += 1
+                    continue
+                print(
+                    f"{label}: linked worktree (conservative_age={age_h:.1f}h) "
+                    f"[removing]{shared}"
+                )
+            removed += 1
+        finally:
+            os.close(cand.identity_fd)
+    if unresolved_cwds:
+        names = ", ".join(sorted(unresolved_cwds))
+        print(
+            f"  [worktree]: skipped: {len(unresolved_cwds)} run(s) with no live runner "
+            f"and an unresolvable cwd: {names}"
+        )
+        skipped += 1
+    return removed, skipped, deferred
+
+
 def cmd_reap(args: argparse.Namespace) -> int:
     """Reconcile stale ``running`` state, idle-kill lingering processes, and
     garbage-collect old terminal-state runs, state-less scratch dirs, and
     (with ``--include-logs``) preserved log dirs.
+
+    The opt-in passes — ``--include-logs``, ``--orphan-processes``,
+    ``--include-worktrees`` — can be enabled together with ``--all``, which
+    changes no age threshold and overrides no refusal.
 
     The pass is deliberately split into reconciliation, state-backed GC,
     preserved-log GC, and orphan-scratch GC. Every destructive state-backed
@@ -5117,9 +6110,16 @@ def cmd_reap(args: argparse.Namespace) -> int:
     log_min_age_hours: Optional[float] = getattr(args, "log_min_age_hours", None)
     target_name: Optional[str] = getattr(args, "name", None)
     force_unknown: bool = bool(getattr(args, "force_unknown", False))
-    include_logs: bool = bool(getattr(args, "include_logs", False))
-    orphan_processes: bool = bool(getattr(args, "orphan_processes", False))
+    # --all turns on every opt-in pass and nothing else: force_unknown and
+    # force_dirty override refusals rather than enable a pass, so they stay
+    # exactly as the caller set them.
+    all_passes: bool = bool(getattr(args, "all", False))
+    include_logs: bool = all_passes or bool(getattr(args, "include_logs", False))
+    orphan_processes: bool = all_passes or bool(getattr(args, "orphan_processes", False))
     orphan_min_age_hours: Optional[float] = getattr(args, "orphan_min_age_hours", None)
+    include_worktrees: bool = all_passes or bool(getattr(args, "include_worktrees", False))
+    worktree_min_age_hours: Optional[float] = getattr(args, "worktree_min_age_hours", None)
+    force_dirty: bool = bool(getattr(args, "force_dirty", False))
     if target_name is not None:
         target_name = _validate_run_name(target_name)
 
@@ -5143,6 +6143,14 @@ def cmd_reap(args: argparse.Namespace) -> int:
         orphan_min_age_hours * 3600
         if orphan_min_age_hours is not None
         else _parse_orphan_min_age_seconds()
+    )
+    # Independent of every threshold above: governs destruction of a working
+    # tree, not of bookkeeping. Parsed even when --include-worktrees is
+    # absent so the flag is always validated; see --worktree-min-age-hours help.
+    worktree_min_age_threshold: float = (
+        worktree_min_age_hours * 3600
+        if worktree_min_age_hours is not None
+        else _parse_worktree_min_age_seconds()
     )
     max_seconds_arg: Optional[float] = getattr(args, "max_seconds", None)
     reap_budget: float = (
@@ -5182,9 +6190,21 @@ def cmd_reap(args: argparse.Namespace) -> int:
     gc_skipped_count = 0
     orphan_procs_killed = 0
     orphan_procs_skipped = 0
+    worktrees_removed = 0
+    worktrees_skipped = 0
     deferred_count = 0
     found_target = False
     reconciled_this_pass = set()
+    # Resolved launch directories of runs this invocation moved to a terminal
+    # status, captured while their cwd record is still readable. The worktree
+    # pass refuses any candidate containing one: _mark_terminal preserves a
+    # stale ended_at, so such a run can immediately look old enough to collect.
+    worktree_reconciled_cwds: List[Path] = []
+
+    def _record_reconciled_cwd(state_dir: Path) -> None:
+        resolved = _worktree_resolve_cwd(_watch_read_cwd_file(state_dir / "cwd"))
+        if resolved is not None:
+            worktree_reconciled_cwds.append(resolved)
     # Names whose whole log dir was collected (or reported under --dry-run) by
     # pass 2.5 in this invocation.  Pass 3 skips these to avoid counting the
     # same run's scratch as both a collected log and an orphaned scratch dir.
@@ -5207,6 +6227,20 @@ def cmd_reap(args: argparse.Namespace) -> int:
         state_candidates.append(d)
         found_target = True
 
+    # Capture worktree attribution before routine state GC removes cwd records.
+    worktree_candidates: Optional[_WorktreeCandidates] = None
+    worktree_scan_error: Optional[str] = None
+    worktree_state_names: set[str] = set()
+    if include_worktrees:
+        worktree_scan = _worktree_state_scan()
+        worktree_scan_error = worktree_scan.error
+        if worktree_scan.entries is not None:
+            selected = {target_name} if target_name is not None else None
+            worktree_candidates = _worktree_collect_candidates(worktree_scan.entries, selected)
+            worktree_state_names = {
+                name for candidate in worktree_candidates.candidates for name in candidate.names
+            }
+
     # Pass 1: stale-running reconciliation and identity-verified idle kill.
     for d in state_candidates:
         if time.monotonic() - reap_start > reap_budget:
@@ -5220,6 +6254,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         pid_raw = _read(d / "pid")
         if not pid_raw:
             print(f"  {name}: dead (no pid recorded) [{'dry-run' if dry_run else 'marking died'}]")
+            _record_reconciled_cwd(d)
             if not dry_run:
                 _mark_died(d, "no pid recorded")
                 reconciled_this_pass.add(name)
@@ -5230,6 +6265,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
             pid = int(pid_raw)
         except ValueError:
             print(f"  {name}: dead (invalid pid {pid_raw!r}) [{'dry-run' if dry_run else 'marking died'}]")
+            _record_reconciled_cwd(d)
             if not dry_run:
                 _mark_died(d, f"invalid pid: {pid_raw!r}")
                 reconciled_this_pass.add(name)
@@ -5238,6 +6274,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
 
         if not _pid_alive(pid):
             print(f"  {name}: dead pid={pid} [{'dry-run' if dry_run else 'marking died'}]")
+            _record_reconciled_cwd(d)
             if not dry_run:
                 _mark_died(d, f"pid {pid} no longer alive")
                 reconciled_this_pass.add(name)
@@ -5259,6 +6296,9 @@ def cmd_reap(args: argparse.Namespace) -> int:
         idle_h = idle_secs / 3600
         reason = f"idle>{idle_h:.1f}h"
         print(f"  {name}: idle pid={pid} idle={idle_h:.1f}h [{'dry-run' if dry_run else 'killing'}]")
+        # A run this invocation would reconcile keeps its worktree in both
+        # modes, so --dry-run predicts the same worktree outcome as a real pass.
+        _record_reconciled_cwd(d)
         if dry_run:
             killed_count += 1
             continue
@@ -5311,6 +6351,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
             continue
         name = d.name
         if name in reconciled_this_pass:
+            continue
+        if include_worktrees and name in worktree_state_names:
             continue
         try:
             before = d.lstat()
@@ -5464,7 +6506,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         if _stat_module.S_ISDIR(_ld_st.st_mode):
             validated_logs.append((_ld, _ld_st))
 
-    # Pass 2.5 (--include-logs only): whole-log-dir GC for preserved-log-only
+    # Pass 2.5 (--include-logs): whole-log-dir GC for preserved-log-only
     # runs (state dir gone). Runs after pass 2 so a run whose state dir pass 2
     # just removed in this same invocation can become log-only and eligible
     # here too. Runs before pass 3 (orphan scratch): a log dir removed whole
@@ -5607,7 +6649,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 continue
             orphaned_scratch_count += 1
 
-    # Pass 4 (--orphan-processes only): find and terminate live agent-run runner
+    # Pass 4 (--orphan-processes): find and terminate live agent-run runner
     # processes that have no state dir — invisible to all prior passes because
     # they hold no entry in STATE_ROOT.  Runs last so a state dir removed in
     # pass 2 of this same invocation is correctly seen as absent by discovery.
@@ -5760,6 +6802,22 @@ def cmd_reap(args: argparse.Namespace) -> int:
                     pass
                 orphan_procs_killed += 1
 
+    # Worktree deletion runs last so its long removal timeout cannot starve
+    # routine state, log, scratch, or orphan-process cleanup.
+    if include_worktrees:
+        wt_removed, wt_skipped, wt_deferred = _worktree_gc_pass(
+            collected=worktree_candidates,
+            scan_error=worktree_scan_error,
+            dry_run=dry_run,
+            force_dirty=force_dirty,
+            min_age_threshold=worktree_min_age_threshold,
+            reconciled_cwds=worktree_reconciled_cwds,
+            budget_expired=lambda: time.monotonic() - reap_start > reap_budget,
+        )
+        worktrees_removed += wt_removed
+        worktrees_skipped += wt_skipped
+        deferred_count += wt_deferred
+
     if target_name and not found_target:
         if _known(target_name):
             print(f"reap: '{target_name}' has no ephemeral state (log preserved); nothing to reconcile")
@@ -5779,6 +6837,7 @@ def cmd_reap(args: argparse.Namespace) -> int:
         f"orphaned_scratch={orphaned_scratch_count} gc_skipped={gc_skipped_count} "
         f"resumed={resumed_count} logs_collected={logs_collected_count} "
         f"orphan_procs_killed={orphan_procs_killed} orphan_procs_skipped={orphan_procs_skipped} "
+        f"worktrees_removed={worktrees_removed} worktrees_skipped={worktrees_skipped} "
         f"deferred={deferred_count}"
     )
     return 0
@@ -5801,17 +6860,82 @@ class _DuRow(NamedTuple):
     """One accounting row: a single run (``--by-run``) or an aggregated
     group. ``count`` is the number of runs folded into the row (1 for a
     per-run row). Log bytes exclude the ``tmp/`` scratch subtree — total is
-    state + log + scratch, so nothing is double-counted."""
+    state + log + scratch + worktree, so nothing is double-counted."""
 
     key: str  # run name (--by-run) or group/status label (rollup)
     count: int
     state_bytes: int
     log_bytes: int
     scratch_bytes: int
+    worktree_bytes: int = 0
+    complete: bool = True  # False when any walk encountered a permission error
 
     @property
     def total_bytes(self) -> int:
-        return self.state_bytes + self.log_bytes + self.scratch_bytes
+        return self.state_bytes + self.log_bytes + self.scratch_bytes + self.worktree_bytes
+
+
+def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
+    """Charge each linked worktree once while excluding separately charged roots.
+
+    For deletion, only the worktree's exact top-level path is acceptable (see
+    ``_worktree_classify``).  For accounting, a run launched from a subdirectory
+    of a linked worktree should still contribute the whole worktree's bytes:
+    ``_worktree_du_root`` resolves ``--show-toplevel`` so the correct root is
+    charged regardless of how deep the recorded ``cwd`` is.
+
+    Excluding all of ``STATE_ROOT`` or ``LOG_ROOT`` would drop unrecognized
+    content (e.g. ``.locks``, sentinels, invalid-name entries) from the total,
+    because those bytes appear neither in the STATE/LOG/SCRATCH columns nor in
+    the worktree charge.  Instead, only the per-run directories actually charged
+    to a row are excluded, so any remainder in those roots falls through to the
+    worktree charge and is counted exactly once.
+    """
+    owners: dict[str, int] = {}
+    roots: dict[str, Path] = {}
+    root_cache: dict[str, Optional[Path]] = {}
+    for index, row in enumerate(rows):
+        cwd = _worktree_run_cwd(row.key)
+        if cwd is None:
+            continue
+        cwd_key = str(cwd)
+        if cwd_key not in root_cache:
+            root_cache[cwd_key] = _worktree_du_root(cwd)
+        root = root_cache[cwd_key]
+        if root is None:
+            continue
+        key = str(root)
+        owners.setdefault(key, index)
+        roots[key] = root
+
+    charges = [0] * len(rows)
+    incomplete_owners: set[int] = set()
+    accounted = list(roots.values())
+    for key, owner in owners.items():
+        root = roots[key]
+        nested = [other for other in accounted if other != root and _path_is_within(other, root)]
+        # Exclude only the per-run state and log directories that are already
+        # charged to a row, not the entire configured roots.
+        charged_excludes: List[Path] = []
+        for configured in (STATE_ROOT, LOG_ROOT):
+            if not _path_is_within(configured.resolve(), root):
+                continue
+            for row in rows:
+                for per_run_dir in (_state_dir(row.key), _log_dir(row.key)):
+                    per_run_resolved = per_run_dir.resolve()
+                    if _path_is_within(per_run_resolved, root):
+                        charged_excludes.append(per_run_resolved)
+        size, complete = _dir_size_bytes_complete(root, excludes=[*nested, *charged_excludes])
+        charges[owner] = size
+        if not complete:
+            incomplete_owners.add(owner)
+    return [
+        row._replace(
+            worktree_bytes=charges[index],
+            complete=row.complete and index not in incomplete_owners,
+        )
+        for index, row in enumerate(rows)
+    ]
 
 
 def _du_collect_rows() -> List[_DuRow]:
@@ -5821,6 +6945,10 @@ def _du_collect_rows() -> List[_DuRow]:
     used elsewhere for the same reason (`reap --include-logs`'s report
     line) — labelled explicitly in ``cmd_du``'s own header so the number's
     meaning isn't ambiguous with on-disk block usage.
+
+    Each run's recorded launch ``cwd`` is sized too when it is a linked git
+    worktree; those trees are typically far larger than STATE_ROOT and
+    LOG_ROOT combined and walking them dominates the command's runtime.
     """
     state_names: set = set()
     if STATE_ROOT.is_dir():
@@ -5843,12 +6971,36 @@ def _du_collect_rows() -> List[_DuRow]:
             continue
         has_state = name in state_names
         has_log = name in log_names
-        state_bytes = _dir_size_bytes(_state_dir(name)) if has_state else 0
-        scratch_dir = _log_dir(name) / "tmp"
-        scratch_bytes = _dir_size_bytes(scratch_dir) if has_log else 0
-        log_bytes = _dir_size_bytes(_log_dir(name), exclude=scratch_dir) if has_log else 0
-        rows.append(_DuRow(name, 1, state_bytes, log_bytes, scratch_bytes))
-    return rows
+        state_dir = _state_dir(name) if has_state else None
+        log_dir = _log_dir(name) if has_log else None
+        scratch_dir = log_dir / "tmp" if log_dir is not None else None
+
+        # Assign bytes with deterministic column precedence: state, then log
+        # (excluding scratch), then scratch.  Each real path is charged at most
+        # once; the log column excludes any path already charged as state so
+        # equal or nested roots are not double-counted.  Track completeness
+        # per-column; any walk error marks the whole row incomplete.
+        row_complete = True
+        state_bytes, s_complete = (
+            _dir_size_bytes_complete(state_dir) if state_dir is not None else (0, True)
+        )
+        row_complete = row_complete and s_complete
+        log_excludes: List[Path] = []
+        if scratch_dir is not None:
+            log_excludes.append(scratch_dir)
+        if state_dir is not None and log_dir is not None:
+            log_excludes.append(state_dir)
+        log_bytes, l_complete = (
+            _dir_size_bytes_complete(log_dir, excludes=log_excludes)
+            if log_dir is not None else (0, True)
+        )
+        row_complete = row_complete and l_complete
+        scratch_bytes, sc_complete = (
+            _dir_size_bytes_complete(scratch_dir) if scratch_dir is not None else (0, True)
+        )
+        row_complete = row_complete and sc_complete
+        rows.append(_DuRow(name, 1, state_bytes, log_bytes, scratch_bytes, complete=row_complete))
+    return _du_charge_worktrees(rows)
 
 
 def _du_run_group(name: str) -> str:
@@ -5866,16 +7018,20 @@ def _du_aggregate_groups(run_rows: List[_DuRow]) -> List[_DuRow]:
     totals: dict = {}
     for row in run_rows:
         group = _du_run_group(row.key)
-        state_b, log_b, scratch_b, n = totals.get(group, (0, 0, 0, 0))
+        state_b, log_b, scratch_b, worktree_b, n, complete = totals.get(
+            group, (0, 0, 0, 0, 0, True)
+        )
         totals[group] = (
             state_b + row.state_bytes,
             log_b + row.log_bytes,
             scratch_b + row.scratch_bytes,
+            worktree_b + row.worktree_bytes,
             n + 1,
+            complete and row.complete,
         )
     return [
-        _DuRow(group, n, state_b, log_b, scratch_b)
-        for group, (state_b, log_b, scratch_b, n) in totals.items()
+        _DuRow(group, n, state_b, log_b, scratch_b, worktree_b, complete=complete)
+        for group, (state_b, log_b, scratch_b, worktree_b, n, complete) in totals.items()
     ]
 
 
@@ -5910,47 +7066,47 @@ def _du_print_table(
     count_header = "RUNS"
     shown, omitted = _du_split_top(rows, top)
 
-    columns = [label_header, count_header, "STATE", "LOG", "SCRATCH", "TOTAL"]
+    columns = [label_header, count_header, "STATE", "LOG", "SCRATCH", "WORKTREE", "TOTAL"]
     widths = [max(len(columns[0]), *(len(r.key) for r in shown)) if shown else len(columns[0]), len(columns[1])]
-    print(f"{columns[0]:<{widths[0]}}  {columns[1]:>{widths[1]}}  {columns[2]:>10}  {columns[3]:>10}  {columns[4]:>10}  {columns[5]:>10}")
+
+    def size_fields(r: _DuRow) -> str:
+        sizes = [r.state_bytes, r.log_bytes, r.scratch_bytes, r.worktree_bytes, r.total_bytes]
+        return "  ".join(f"{_du_fmt(b, as_bytes=as_bytes):>10}" for b in sizes)
+
+    header_sizes = "  ".join(f"{c:>10}" for c in columns[2:])
+    print(f"{columns[0]:<{widths[0]}}  {columns[1]:>{widths[1]}}  {header_sizes}")
     for r in shown:
-        print(
-            f"{r.key:<{widths[0]}}  {r.count:>{widths[1]}}  "
-            f"{_du_fmt(r.state_bytes, as_bytes=as_bytes):>10}  "
-            f"{_du_fmt(r.log_bytes, as_bytes=as_bytes):>10}  "
-            f"{_du_fmt(r.scratch_bytes, as_bytes=as_bytes):>10}  "
-            f"{_du_fmt(r.total_bytes, as_bytes=as_bytes):>10}"
-        )
+        print(f"{r.key:<{widths[0]}}  {r.count:>{widths[1]}}  {size_fields(r)}")
     if omitted:
         omitted_total = sum(r.total_bytes for r in omitted)
         print(
             f"... {len(omitted)} more row(s) omitted by --top "
             f"(sum {_du_fmt(omitted_total, as_bytes=as_bytes)}; TOTAL below covers all runs)"
         )
-    print(
-        f"{total.key:<{widths[0]}}  {total.count:>{widths[1]}}  "
-        f"{_du_fmt(total.state_bytes, as_bytes=as_bytes):>10}  "
-        f"{_du_fmt(total.log_bytes, as_bytes=as_bytes):>10}  "
-        f"{_du_fmt(total.scratch_bytes, as_bytes=as_bytes):>10}  "
-        f"{_du_fmt(total.total_bytes, as_bytes=as_bytes):>10}"
-    )
+    print(f"{total.key:<{widths[0]}}  {total.count:>{widths[1]}}  {size_fields(total)}")
 
 
 def _du_row_to_dict(r: _DuRow) -> dict:
-    return {
+    d = {
         "runs": r.count,
         "state_bytes": r.state_bytes,
         "log_bytes": r.log_bytes,
         "scratch_bytes": r.scratch_bytes,
+        "worktree_bytes": r.worktree_bytes,
         "total_bytes": r.total_bytes,
     }
+    if not r.complete:
+        d["complete"] = False
+    return d
 
 
 def cmd_du(args: argparse.Namespace) -> int:
     """Disk usage per effective status (default) or per run (``--by-run``),
     including preserved logs. Strictly read-only: no locks, no
     ``_opportunistic_heal``, no ``_prune_old_logs``, no mutation of any kind
-    — only ``os.scandir``/``stat`` reads via ``_dir_size_bytes``.
+    — only ``os.scandir``/``stat`` reads via ``_dir_size_bytes``, plus the
+    ``git rev-parse`` reads that classify each launch ``cwd``, which neither
+    create nor prune anything in the inspected repository.
     """
     as_bytes: bool = bool(getattr(args, "bytes", False))
     as_json: bool = bool(getattr(args, "json", False))
@@ -5964,12 +7120,15 @@ def cmd_du(args: argparse.Namespace) -> int:
 
     run_rows = _du_collect_rows()
     all_rows = run_rows if by_run else _du_aggregate_groups(run_rows)
+    total_complete = all(r.complete for r in all_rows)
     total = _DuRow(
         "TOTAL",
         sum(r.count for r in all_rows),
         sum(r.state_bytes for r in all_rows),
         sum(r.log_bytes for r in all_rows),
         sum(r.scratch_bytes for r in all_rows),
+        sum(r.worktree_bytes for r in all_rows),
+        complete=total_complete,
     )
 
     if as_json:
@@ -5977,6 +7136,9 @@ def cmd_du(args: argparse.Namespace) -> int:
         payload = {
             "state_root": str(STATE_ROOT),
             "log_root": str(LOG_ROOT),
+            # Names the attribution rule the numbers were produced under, so a
+            # consumer never has to infer it from the values.
+            "worktree_attribution": "charged once to the first run sharing the worktree",
             "total": _du_row_to_dict(total),
         }
         if by_run:
@@ -5995,6 +7157,34 @@ def cmd_du(args: argparse.Namespace) -> int:
     print(
         f"agent-run du: apparent size (st_size), {size_label}, "
         f"STATE_ROOT={STATE_ROOT} LOG_ROOT={LOG_ROOT}"
+    )
+    print(
+        "worktrees: linked git worktrees at each run's recorded cwd, "
+        "deduplicated by realpath and charged once to the first run sharing them"
+    )
+    if not total_complete:
+        incomplete = [r for r in all_rows if not r.complete]
+        print(
+            f"agent-run du: WARNING: {len(incomplete)} row(s) have incomplete walk(s) "
+            "due to permission errors; totals shown are lower bounds"
+        )
+    _du_print_table(
+        all_rows,
+        total,
+        label_header="NAME" if by_run else "STATUS",
+        as_bytes=as_bytes,
+        top=top,
+    )
+    return 0
+
+    size_label = "bytes" if as_bytes else "human-readable (binary, 1024-based)"
+    print(
+        f"agent-run du: apparent size (st_size), {size_label}, "
+        f"STATE_ROOT={STATE_ROOT} LOG_ROOT={LOG_ROOT}"
+    )
+    print(
+        "worktrees: linked git worktrees at each run's recorded cwd, "
+        "deduplicated by realpath and charged once to the first run sharing them"
     )
     _du_print_table(
         all_rows,
@@ -6487,11 +7677,57 @@ def cmd_kill(args: argparse.Namespace) -> int:
 
 def cmd_launch(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
+    # A relative --prompt-file names a file the caller typed, so it is anchored
+    # to the invocation directory before --cwd moves the process; the recorded
+    # <state_dir>/prompt_file is then absolute with or without --cwd.
+    prompt_file: Optional[str] = getattr(args, "prompt_file", None)
+    if prompt_file:
+        args.prompt_file = os.path.abspath(prompt_file)
     # Pruning takes per-name locks itself.  Do it before acquiring this name's
     # lock so a stale log for this same name cannot self-deadlock on flock.
     _prune_old_logs()
-    with _launch_lock(name) as lock_fd:
-        return _cmd_launch_locked(args, name, lock_fd)
+    # The shared publication lock must be acquired before entering the launch
+    # cwd: a concurrent reaper holds the exclusive lock during its final scan,
+    # so any run visible to that scan is protected.  Acquiring shared here
+    # ensures the reaper's exclusive-lock attempt blocks until this run's cwd
+    # and status are both published.
+    with _worktree_publication_lock(exclusive=False):
+        # chdir next: every path below (state, logs, git facts, the launched
+        # command) must observe one single effective working directory.
+        _apply_launch_cwd(args)
+        with _launch_lock(name) as lock_fd:
+            return _cmd_launch_locked(args, name, lock_fd)
+
+
+def _apply_launch_cwd(args: argparse.Namespace) -> None:
+    """Enter the ``--cwd`` directory, before any run state exists.
+
+    ``~`` is expanded (argparse does not).  The chdir is the sole validation:
+    checking exists/is_dir first would judge a path that could be replaced
+    before the chdir landed, and reports nothing the chdir does not report
+    itself.  An unusable DIR exits non-zero here, before the state dir is
+    created, so no run is left at status=starting.
+
+    ``PWD``/``OLDPWD`` are re-pointed afterwards because ``os.chdir`` changes
+    only the kernel cwd, leaving the launched command an environment that
+    disagrees with its real working directory.
+    """
+    requested: Optional[str] = getattr(args, "cwd", None)
+    if not requested:
+        return
+    try:
+        os.chdir(os.path.expanduser(requested))
+    except NotADirectoryError:
+        sys.exit(f"agent-run: --cwd is not a directory: {requested}")
+    except FileNotFoundError:
+        sys.exit(f"agent-run: --cwd directory does not exist: {requested}")
+    except OSError as exc:
+        sys.exit(f"agent-run: cannot enter --cwd {requested}: {exc}")
+    except ValueError as exc:
+        # Embedded NUL: os.chdir rejects the string before issuing a syscall.
+        sys.exit(f"agent-run: invalid --cwd {requested!r}: {exc}")
+    os.environ["PWD"] = os.getcwd()
+    os.environ.pop("OLDPWD", None)
 
 
 def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int:
@@ -6599,7 +7835,9 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
 
     # Written before "starting" is published: Path.cwd() raises if the launch
     # directory is gone, and that must not happen once the run already looks
-    # active with nothing behind it.
+    # active with nothing behind it. _apply_launch_cwd has already entered any
+    # --cwd, so this reads the one effective directory in both cases.
+    cwd: Optional[str]
     try:
         cwd = str(Path.cwd())
     except OSError:
@@ -6645,7 +7883,6 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         managed_prompt = getattr(args, "prompt", None)
         managed_model = getattr(args, "model", None)
         managed_agent_mode: Optional[str] = getattr(args, "agent_mode", None)
-        managed_session_id_arg: Optional[str] = getattr(args, "session_id", None)
         managed_harness_args = getattr(args, "harness_args", [])
         managed_session_id: Optional[str] = None
 
@@ -6660,9 +7897,9 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                 _acquire_log_write(acquire_log, f"could not write prompt file: {exc}")
 
         if harness == "claude":
-            # Push acquisition: caller-supplied UUID4 (validated in
-            # _parse_launch_argv) or a fresh one.
-            managed_session_id = managed_session_id_arg or str(uuid.uuid4())
+            # Push acquisition: agent-run mints the UUID4 and claude is told to
+            # use it, so the id is known before exec.
+            managed_session_id = str(uuid.uuid4())
             _record_session(log_d, acquire_log, "claude", managed_session_id, "pushed", "certain")
 
         elif harness == "opencode":
@@ -6680,7 +7917,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
 
             if opencode_port is not None:
                 managed_session_id = _opencode_prefork_mint(
-                    opencode_port, name, str(Path.cwd()), acquire_log, state_dir=d
+                    opencode_port, name, cwd or str(Path.cwd()), acquire_log, state_dir=d
                 )
                 if managed_session_id:
                     _record_session(log_d, acquire_log, "opencode", managed_session_id,
@@ -8996,6 +10233,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "managed mode (--harness claude|opencode|codex)",
         "agent-run builds the launch command itself; requires --prompt or --prompt-file",
     )
+    # --cwd applies to raw and managed launches alike, so it is registered on the
+    # top-level parser rather than in the managed-mode group.
+    p.add_argument(
+        "--cwd",
+        metavar="DIR",
+        default=argparse.SUPPRESS,
+        help="run the launched command with DIR as its working directory; DIR may be "
+        "relative and may start with '~', is resolved to an absolute path with symlinks "
+        "collapsed, and is entered before any run state is published so <state_dir>/cwd "
+        "records it; available in both managed and raw mode. A relative command path is "
+        "resolved by the command itself and so is relative to DIR, but a relative "
+        "-f/--prompt-file names a file the caller typed and stays relative to the "
+        "invocation directory",
+    )
     mg.add_argument(
         "--harness",
         metavar="claude|opencode|codex",
@@ -9039,25 +10290,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--agent to the harness",
     )
     mg.add_argument(
-        "--session-id",
-        metavar="UUID",
-        default=argparse.SUPPRESS,
-        help="supply a specific session UUID instead of having agent-run generate one "
-        "(claude only; opencode and codex always mint a new session)",
-    )
-    mg.add_argument(
         "--harness-arg",
         metavar="FLAG",
         default=argparse.SUPPRESS,
         help="pass FLAG verbatim to the harness command after agent-run's own constructed "
         "arguments; repeatable escape hatch for flags agent-run does not model",
-    )
-    mg.add_argument(
-        "--cwd",
-        metavar="DIR",
-        default=argparse.SUPPRESS,
-        help="(accepted by the parser but not yet implemented; run from the target directory "
-        "instead)",
     )
 
     sp_status = sub.add_parser("status", help="print one-line status")
@@ -9243,13 +10480,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "reap",
         help="reconcile stale status, idle-kill lingering runs, "
         "garbage-collect old terminal-state run dirs, collect preserved logs "
-        "(--include-logs), and terminate orphan processes (--orphan-processes)",
+        "(--include-logs), terminate orphan processes (--orphan-processes), "
+        "and remove linked worktrees (--include-worktrees); --all enables all "
+        "three opt-in passes without overriding any safety refusal",
     )
     sp_reap.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
         help="report actions without mutating any state",
+    )
+    sp_reap.add_argument(
+        "--all",
+        action="store_true",
+        default=False,
+        help="enable every opt-in pass: --include-logs, --orphan-processes "
+        "and --include-worktrees.  Each pass keeps its own age threshold "
+        "(--min-age-hours, --log-min-age-hours, --orphan-min-age-hours, "
+        "--worktree-min-age-hours) unchanged.  DOES NOT imply --force-dirty "
+        "or --force-unknown: those override safety refusals (unpushed or "
+        "uncommitted work, unclassifiable status) rather than enable a pass, "
+        "and must always be requested explicitly.  Combining --all with an "
+        "individual pass flag is redundant, not an error",
     )
     sp_reap.add_argument(
         "--idle-hours",
@@ -9275,7 +10527,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="also collect old unrecognized/legacy/corrupt statuses; still refuses "
-        "a live or unverifiable recorded runner",
+        "a live or unverifiable recorded runner.  Off by default and never "
+        "implied by --all or any other flag",
     )
     sp_reap.add_argument(
         "--name",
@@ -9289,7 +10542,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="also garbage-collect preserved log directories (state dir "
         "already gone) once older than --log-min-age-hours; without this "
-        "flag preserved logs are never touched by reap",
+        "flag (or --all) preserved logs are never touched by reap",
     )
     sp_reap.add_argument(
         "--log-min-age-hours",
@@ -9314,7 +10567,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "argv parsing; it is opt-in for that reason.  Identity captured at "
         "discovery is re-verified immediately before every signal; any "
         "ambiguity aborts the candidate instead of sending a signal.  Only "
-        "processes older than --orphan-min-age-hours are eligible.",
+        "processes older than --orphan-min-age-hours are eligible.  Also "
+        "enabled by --all.",
     )
     sp_reap.add_argument(
         "--orphan-min-age-hours",
@@ -9325,6 +10579,57 @@ def _build_parser() -> argparse.ArgumentParser:
         "float, must be finite and > 0); independent of --min-age-hours and "
         "--log-min-age-hours; default from AGENT_RUN_ORPHAN_MIN_AGE_HOURS "
         "or 24h.  Parsed and validated even when --orphan-processes is absent.",
+    )
+    sp_reap.add_argument(
+        "--include-worktrees",
+        action="store_true",
+        default=False,
+        help="also remove the launch directory of a terminal run when that "
+        "directory is a LINKED GIT WORKTREE, once older than "
+        "--worktree-min-age-hours. A non-git directory is NEVER removed: a "
+        "run's cwd is frequently a real project checkout or $HOME, so main "
+        "worktrees, bare repos, non-git directories, and anything git cannot "
+        "classify are all refused, as is any path with a symlinked "
+        "component. Removal goes through 'git worktree remove' against the "
+        "owning repository, so the parent's .git/worktrees/<name> admin entry "
+        "is unregistered too. A worktree with modified/deleted tracked files, "
+        "ordinary untracked files, ignored files or directory content, or "
+        "commits not reachable from any local remote-tracking ref is refused. "
+        "NOTE: stale tracking refs (remote branch deleted but not pruned locally) "
+        "are not detected; run 'git fetch --prune' beforehand if current remote "
+        "state matters. --force-dirty overrides only the "
+        "tracked, untracked, and ignored content checks; unpushed commits and "
+        "every structural, liveness, scan, identity, nested-worktree, and git "
+        "failure remain refusals. A worktree still used by a live run is always "
+        "refused, whatever its age. A worktree shared by several terminal runs "
+        "is removed once. Off by "
+        "default; also enabled by --all",
+    )
+    sp_reap.add_argument(
+        "--worktree-min-age-hours",
+        type=_positive_finite_float,
+        default=None,
+        metavar="N",
+        help="override the linked-worktree GC age threshold used by "
+        "--include-worktrees (hours, float, must be finite and > 0), measured "
+        "from the younger of the youngest terminal run and the newest recursive "
+        "filesystem mtime under the worktree. Directory/file mtimes are only a "
+        "conservative activity signal and can be reset externally; independent of "
+        "--min-age-hours, --log-min-age-hours and --orphan-min-age-hours, "
+        "since it governs destruction of a working tree rather than of "
+        "bookkeeping; default from AGENT_RUN_WORKTREE_MIN_AGE_HOURS or 168h "
+        "(7 days).  Parsed and validated even when --include-worktrees is absent",
+    )
+    sp_reap.add_argument(
+        "--force-dirty",
+        action="store_true",
+        default=False,
+        help="with --include-worktrees, override only refusals for modified or "
+        "deleted tracked files, ordinary untracked files, and ignored files or "
+        "directory content. It never overrides unpushed commits, classification, "
+        "live use, nested worktrees, symlink/path identity, state-scan failures, "
+        "or git failures. This destroys local content irreversibly; off by "
+        "default and never implied by --all or any other flag",
     )
     sp_reap.add_argument(
         "--max-seconds",
@@ -9344,7 +10649,20 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_du = sub.add_parser(
         "du",
         help="disk usage per effective status (or per run with --by-run), "
-        "including preserved logs; strictly read-only",
+        "including preserved logs and linked-worktree launch dirs; "
+        "strictly read-only",
+        description="Disk usage per effective status (or per run with "
+        "--by-run), including preserved logs and each run's recorded launch "
+        "cwd when that directory is a linked git worktree (WORKTREE column, "
+        "worktree_bytes under --json). Linked worktrees are usually far "
+        "larger than STATE_ROOT and LOG_ROOT combined, so walking them "
+        "dominates this command's runtime. Main worktrees, bare repos, "
+        "non-git directories, and any directory git cannot classify "
+        "contribute 0. A worktree shared by several runs is deduplicated by "
+        "realpath and charged once, to the first run sharing it (the others "
+        "show 0), so TOTAL counts every byte exactly once. Strictly "
+        "read-only: worktree detection runs git rev-parse only, never gc or "
+        "worktree prune.",
     )
     sp_du.add_argument(
         "--by-run",
@@ -9400,7 +10718,6 @@ class _LaunchArgv(NamedTuple):
       prompt        — inline prompt string (mutually exclusive with prompt_file)
       model         — model string forwarded to the harness
       agent_mode    — harness agent/mode name (opencode --agent)
-      session_id    — caller-supplied session id (--session-id)
       harness_args  — extra raw args forwarded verbatim after harness's own args
     """
     interactive: bool
@@ -9412,12 +10729,13 @@ class _LaunchArgv(NamedTuple):
     name: str
     command: List[str]
     subcommand_tokens: Optional[List[str]]
+    # Working directory for the launched command; None means inherit.
+    cwd: Optional[str] = None
     # Managed-mode fields; all None/empty for raw runs.
     harness: Optional[str] = None
     prompt: Optional[str] = None
     model: Optional[str] = None
     agent_mode: Optional[str] = None
-    session_id: Optional[str] = None
     harness_args: Tuple[str, ...] = ()
     # "bypass" (default) appends --permission-mode bypassPermissions / --auto.
     # "prompt" omits those flags so the harness's own permission UI is used.
@@ -9432,7 +10750,7 @@ _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
 # Managed-mode flags that take a value. Each accepts "--flag value" and
 # "--flag=value"; --harness-arg accumulates, the rest keep the last value.
 _MANAGED_VALUE_FLAGS: Tuple[str, ...] = (
-    "--harness", "--prompt", "--model", "--agent-mode", "--session-id", "--harness-arg",
+    "--harness", "--prompt", "--model", "--agent-mode", "--harness-arg",
     "--permissions",
 )
 
@@ -9451,7 +10769,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
       --submit-mode=cr|crlf
       --idle-timeout N / --idle-timeout=N
       the managed-mode flags in _MANAGED_VALUE_FLAGS
-      --cwd <dir>  (recognised only to reject it; not implemented)
+      --cwd <dir>  (working directory for the launched command)
 
     Preserves the -- separator semantics: name must precede --, everything
     after -- is taken verbatim.  Without --, a leading-dash token immediately
@@ -9476,9 +10794,9 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     prompt: Optional[str] = None
     model: Optional[str] = None
     agent_mode: Optional[str] = None
-    session_id: Optional[str] = None
     harness_args: List[str] = []
     permissions: str = _PERMISSIONS_BYPASS
+    cwd: Optional[str] = None
 
     # Consume flags in any order before the name.
     while tokens:
@@ -9556,8 +10874,6 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                 model = value
             elif managed_flag == "--agent-mode":
                 agent_mode = value
-            elif managed_flag == "--session-id":
-                session_id = value
             elif managed_flag == "--harness-arg":
                 harness_args = harness_args + [value]
             elif managed_flag == "--permissions":
@@ -9568,23 +10884,26 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                     )
                 permissions = value
             continue
-        # --cwd is parsed only to reject it: accepting and ignoring it would
-        # silently run in the wrong directory.
+        # --cwd applies to both managed and raw launches; the value is validated
+        # and entered by cmd_launch, not here (this parser touches no filesystem).
+        # Both spellings share one emptiness check so neither form can accept "".
         if tokens[0] == "--cwd" or tokens[0].startswith("--cwd="):
-            raise _LaunchArgvError(
-                "agent-run: --cwd is not yet implemented; "
-                "run the command from the target directory instead"
-            )
+            if tokens[0] == "--cwd":
+                cwd, tokens = (tokens[1] if len(tokens) > 1 else ""), tokens[2:]
+            else:
+                cwd, tokens = tokens[0].split("=", 1)[1], tokens[1:]
+            if not cwd:
+                raise _LaunchArgvError("agent-run: --cwd requires a directory")
+            continue
         break
 
     # After the flag loop, reject managed-only flags on raw launches.
     if harness is None and (
         prompt is not None or model is not None or agent_mode is not None
-        or session_id is not None or bool(harness_args)
-        or permissions != _PERMISSIONS_BYPASS
+        or bool(harness_args) or permissions != _PERMISSIONS_BYPASS
     ):
         raise _LaunchArgvError(
-            "agent-run: --prompt/--model/--agent-mode/--session-id/--harness-arg/--permissions "
+            "agent-run: --prompt/--model/--agent-mode/--harness-arg/--permissions "
             "require --harness <claude|opencode|codex>"
         )
 
@@ -9601,7 +10920,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     any_launch_flag = (
         interactive or prompt_file or echo or submit_mode is not None
         or idle_timeout is not None or harness is not None or prompt is not None
-        or model is not None or agent_mode is not None or session_id is not None
+        or model is not None or agent_mode is not None or cwd is not None
         or bool(harness_args) or permissions != _PERMISSIONS_BYPASS
     )
     if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
@@ -9617,9 +10936,9 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             interactive=interactive, prompt_file=prompt_file, echo=echo,
             echo_interval=echo_interval, submit_mode=submit_mode,
             idle_timeout=idle_timeout, name="", command=[],
-            subcommand_tokens=None,
+            subcommand_tokens=None, cwd=cwd,
             harness=harness, prompt=prompt, model=model,
-            agent_mode=agent_mode, session_id=session_id, harness_args=harness_args,
+            agent_mode=agent_mode, harness_args=harness_args,
         )
 
     # Managed mode: the name is the only remaining token — agent-run builds the
@@ -9649,25 +10968,15 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         # cannot strand a phantom run at status=starting.
         for ha in harness_args:
             flag = ha.split("=", 1)[0]
-            if flag in {"--session", "-s", "--session-id", "--port", "--prompt"}:
+            if flag == "--prompt":
                 raise _LaunchArgvError(
-                    f"agent-run: --harness-arg {flag!r} is managed internally; "
-                    f"use the corresponding agent-run flag instead"
+                    "agent-run: --harness-arg '--prompt' would collide with the "
+                    "prompt agent-run sends; use agent-run's own --prompt or --prompt-file"
                 )
-        # Only claude can be told which id to use; opencode mints a session and
-        # codex starts a thread, both unconditionally.
-        if session_id is not None and harness in ("opencode", "codex"):
-            raise _LaunchArgvError(
-                f"agent-run: --session-id is not supported for --harness {harness}; "
-                f"it cannot be honoured because {harness} always creates a new session"
-            )
-        if session_id is not None and harness == "claude":
-            try:
-                uuid.UUID(session_id)
-            except ValueError:
+            if flag in {"--session", "-s", "--session-id", "--port"}:
                 raise _LaunchArgvError(
-                    f"agent-run: --session-id {session_id!r} is not a valid UUID; "
-                    "claude requires a UUID4"
+                    f"agent-run: --harness-arg {flag!r} is managed internally by "
+                    f"agent-run and cannot be overridden"
                 )
         # thread/start has no model field, so a forwarded --model would be
         # silently ignored rather than applied.
@@ -9686,11 +10995,11 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             name=name,
             command=[],
             subcommand_tokens=None,
+            cwd=cwd,
             harness=harness,
             prompt=prompt,
             model=model,
             agent_mode=agent_mode,
-            session_id=session_id,
             harness_args=tuple(harness_args),
             permissions=permissions,
         )
@@ -9732,6 +11041,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         name=name,
         command=command,
         subcommand_tokens=None,
+        cwd=cwd,
     )
 
 
@@ -9782,9 +11092,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         prompt=parsed.prompt,
         model=parsed.model,
         agent_mode=parsed.agent_mode,
-        session_id=parsed.session_id,
         harness_args=list(parsed.harness_args),
         permissions=parsed.permissions,
+        cwd=parsed.cwd,
     )
     return cmd_launch(ns)
 
