@@ -2123,8 +2123,9 @@ class TestReapWorktreeFinalRevalidation:
     def test_path_identity_change_after_collection_refuses(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
-        """st_dev/st_ino recorded at collection no longer name the same
-        directory: a different tree now occupies the candidate path."""
+        """An fd opened at collection still refers to the original directory;
+        samestat(fstat(fd), lstat(path)) is False when a different tree now
+        occupies the candidate path."""
         repo = _make_repo(git_root)
         wt = _add_worktree(repo, git_root / "wt", "feature")
         decoy = _add_worktree(repo, git_root / "decoy", "f-decoy")
@@ -2136,6 +2137,60 @@ class TestReapWorktreeFinalRevalidation:
             decoy.rename(wt)
 
         self._mutate_before_removal(monkeypatch, swap)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir()
+        assert (wt / "keep.txt").read_text() == "must survive\n"
+        assert "candidate path identity changed after collection" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    def test_path_identity_inode_reuse_same_inode_refuses(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """_dir_identity returning the same (st_dev, st_ino) for both original
+        and decoy does not defeat the fd-based revalidation check.
+
+        On ext4, inode numbers are recycled immediately after rmdir+mkdir;
+        _dir_identity on the decoy can return the same (st_dev, st_ino) as the
+        original.  The revalidation check uses os.path.samestat on the fd opened
+        at collection rather than _dir_identity, so a same-inode decoy still
+        produces a stat mismatch (fd is pinned to the original kernel object;
+        the decoy is a distinct object despite sharing the inode number on a
+        filesystem without the fd held open).
+
+        The test forces the collision by monkeypatching _dir_identity to return
+        the same tuple for both the original wt and the decoy.  The swap must
+        still be refused because the samestat check compares real stat results.
+
+        Mutation: replacing the samestat(fstat(identity_fd), ...) check with
+        ``_dir_identity(cand.resolved) != cand.identity`` causes this test to
+        fail — the patched _dir_identity makes both sides equal, the check
+        passes, and the decoy is removed."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        decoy = _add_worktree(repo, git_root / "decoy", "f-decoy")
+        (decoy / "keep.txt").write_text("must survive\n")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        # Force same (st_dev, st_ino) for the wt path before and after the swap,
+        # simulating ext4 inode reuse.  The fd-based check does not use this
+        # function and must still refuse the swap.
+        same_identity = (99, 42)
+        real_dir_identity = agent_run._dir_identity
+
+        def patched_dir_identity(path: Path):
+            if path == wt:
+                return same_identity
+            return real_dir_identity(path)
+
+        def swap():
+            wt.rename(git_root / "moved-away")
+            decoy.rename(wt)
+
+        self._mutate_before_removal(monkeypatch, swap)
+        monkeypatch.setattr(agent_run, "_dir_identity", patched_dir_identity)
 
         agent_run.cmd_reap(_reap_args())
 
@@ -2368,14 +2423,14 @@ class TestReapWorktreeFinalRevalidation:
         wt = _add_worktree(repo, git_root / "wt", "feature")
         _make_state_run(isolated_runs_root, isolated_log_root, "old-run", cwd=wt, age_hours=1000)
 
-        # Canonical identity tuple returned for every state directory; forces the
-        # same (dev, ino) for both the original and replacement "old-run" dirs.
+        # Fixed identity tuple returned for every state directory; forces the
+        # same _dir_identity for both the original and replacement "old-run" dirs.
         fixed_state_identity = (99, 42)
         real_dir_identity = agent_run._dir_identity
 
         def patched_dir_identity(path: Path):
             # Return the fixed identity only for paths inside the runs root so
-            # that the worktree's own identity check at cand.identity is unaffected.
+            # that the worktree's fd-based revalidation check is unaffected.
             try:
                 path.relative_to(isolated_runs_root)
                 return fixed_state_identity

@@ -5399,7 +5399,7 @@ class _WorktreeCandidate(NamedTuple):
     raw: str
     names: List[str]
     age_seconds: Optional[float]
-    identity: Tuple[int, int]
+    identity_fd: int
 
 
 class _WorktreeCandidates(NamedTuple):
@@ -5422,16 +5422,28 @@ def _worktree_collect_candidates(
             if selected_names is None or d.name in selected_names:
                 skipped.append(f"run {d.name} has an unresolvable cwd")
             continue
-        identity = _dir_identity(resolved)
-        if identity is None:
+        if _dir_identity(resolved) is None:
             if selected_names is None or d.name in selected_names:
                 skipped.append(f"run {d.name} cwd is not a real directory")
             continue
         age = _terminal_state_age_seconds(d)
         key = str(resolved)
         if key not in by_path:
+            # O_DIRECTORY | O_NOFOLLOW: atomically refuse symlinks and non-dirs.
+            # The open fd pins the inode so its number cannot be recycled while
+            # we hold it; samestat at revalidation then confirms the path still
+            # names the same kernel object.  -1 signals a failed open and is
+            # treated as a refusal in _worktree_candidate_refusal.
+            try:
+                identity_fd = os.open(
+                    str(resolved), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+            except OSError:
+                if selected_names is None or d.name in selected_names:
+                    skipped.append(f"run {d.name} cwd cannot be opened for identity pin")
+                continue
             by_path[key] = _WorktreeCandidate(
-                resolved, raw, [d.name], age, identity,
+                resolved, raw, [d.name], age, identity_fd,
             )
             continue
         existing = by_path[key]
@@ -5497,7 +5509,18 @@ def _worktree_candidate_refusal(
             return f"run {d.name} has unparseable age", None, None
         if late_age < min_age_threshold:
             return "youngest sharing run is below the age threshold", None, None
-    if _dir_identity(cand.resolved) != cand.identity:
+    # Verify the candidate path still names the same directory object opened at
+    # collection.  fstat on the pinned fd and lstat on the path must agree: if
+    # the original directory was removed and another was created at the same
+    # path between collection and this scan, the new directory has a different
+    # inode — guaranteed because the fd holds the original inode's refcount
+    # above zero, preventing its recycling on any filesystem.
+    try:
+        fd_st = os.fstat(cand.identity_fd)
+        path_st = cand.resolved.lstat()
+    except OSError:
+        return "candidate path identity unreadable after collection", None, None
+    if not os.path.samestat(fd_st, path_st):
         return "candidate path identity changed after collection", None, None
     symlink_reason = _worktree_symlink_free_reason(cand.raw)
     if symlink_reason is not None:
@@ -5509,8 +5532,9 @@ def _worktree_candidate_refusal(
     # Require the candidate to be a registered worktree root in its own repository.
     # A recursively copied worktree keeps a .git file from the original, so
     # _worktree_classify returns LINKED, but the copy is not registered and
-    # git worktree remove would refuse it.  Verify by inode: a registered
-    # root with the same inode as the candidate is unambiguously this path.
+    # git worktree remove would refuse it.  Verify by filesystem identity: a
+    # registered root with the same (st_dev, st_ino) as the candidate is
+    # unambiguously this path.
     registered_roots, reg_error = _worktree_registered_roots(info)
     if reg_error is not None:
         return reg_error, None, None
@@ -5579,56 +5603,60 @@ def _worktree_gc_pass(
     for cand in collected.candidates:
         if budget_expired():
             deferred += 1
+            os.close(cand.identity_fd)
             continue
         label = f"  [worktree] {cand.resolved}"
         shared = f" (runs: {', '.join(cand.names)})" if len(cand.names) > 1 else ""
 
-        with _worktree_publication_lock(exclusive=True):
-            final_scan = _worktree_state_scan()
-            if final_scan.error is not None:
-                print(f"{label}: skipped: {final_scan.error}{shared}")
-                skipped += 1
-                continue
-            assert final_scan.entries is not None
-            refusal, info, effective_age = _worktree_candidate_refusal(
-                cand,
-                final_scan.entries,
-                force_dirty=force_dirty,
-                min_age_threshold=min_age_threshold,
-                reconciled_cwds=reconciled_cwds,
-                unresolved_cwds=unresolved_cwds,
-            )
-            if refusal is not None:
-                print(f"{label}: skipped: {refusal}{shared}")
-                skipped += 1
-                continue
-            assert info is not None and effective_age is not None
-            age_h = effective_age / 3600
-            if dry_run:
+        try:
+            with _worktree_publication_lock(exclusive=True):
+                final_scan = _worktree_state_scan()
+                if final_scan.error is not None:
+                    print(f"{label}: skipped: {final_scan.error}{shared}")
+                    skipped += 1
+                    continue
+                assert final_scan.entries is not None
+                refusal, info, effective_age = _worktree_candidate_refusal(
+                    cand,
+                    final_scan.entries,
+                    force_dirty=force_dirty,
+                    min_age_threshold=min_age_threshold,
+                    reconciled_cwds=reconciled_cwds,
+                    unresolved_cwds=unresolved_cwds,
+                )
+                if refusal is not None:
+                    print(f"{label}: skipped: {refusal}{shared}")
+                    skipped += 1
+                    continue
+                assert info is not None and effective_age is not None
+                age_h = effective_age / 3600
+                if dry_run:
+                    print(
+                        f"{label}: linked worktree (conservative_age={age_h:.1f}h) "
+                        f"[dry-run]{shared}"
+                    )
+                    removed += 1
+                    continue
+                # Validation is the final step immediately preceding git worktree
+                # remove.  An external process can still create ignored content in
+                # the interval between the last ls-files check (inside
+                # _worktree_candidate_refusal above) and the remove call below; git
+                # removes ignored files without --force, so this window cannot be
+                # fully closed while using git worktree remove.  The exclusive
+                # publication lock prevents concurrent agent-run publication but
+                # does not fence non-agent processes.
+                failure = _worktree_remove(info, cand.resolved, force=force_dirty)
+                if failure is not None:
+                    print(f"{label}: skipped: {failure}")
+                    skipped += 1
+                    continue
                 print(
                     f"{label}: linked worktree (conservative_age={age_h:.1f}h) "
-                    f"[dry-run]{shared}"
+                    f"[removing]{shared}"
                 )
-                removed += 1
-                continue
-            # Validation is the final step immediately preceding git worktree
-            # remove.  An external process can still create ignored content in
-            # the interval between the last ls-files check (inside
-            # _worktree_candidate_refusal above) and the remove call below; git
-            # removes ignored files without --force, so this window cannot be
-            # fully closed while using git worktree remove.  The exclusive
-            # publication lock prevents concurrent agent-run publication but
-            # does not fence non-agent processes.
-            failure = _worktree_remove(info, cand.resolved, force=force_dirty)
-            if failure is not None:
-                print(f"{label}: skipped: {failure}")
-                skipped += 1
-                continue
-            print(
-                f"{label}: linked worktree (conservative_age={age_h:.1f}h) "
-                f"[removing]{shared}"
-            )
             removed += 1
+        finally:
+            os.close(cand.identity_fd)
     if unresolved_cwds:
         names = ", ".join(sorted(unresolved_cwds))
         print(
