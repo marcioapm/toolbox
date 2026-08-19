@@ -3220,3 +3220,137 @@ class TestReapWorktreeUndefendedGuards:
         assert wt.is_dir()
         assert "youngest sharing run is below the age threshold" in out
         assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    # F8 (a) — reaper lock must be exclusive
+    def test_gc_pass_requests_exclusive_lock(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """_worktree_gc_pass must acquire the publication lock with exclusive=True.
+
+        A shared lock (exclusive=False) would allow a concurrent launcher to
+        publish new state between the final scan and git worktree remove, leaving
+        the race that the exclusive lock is meant to prevent.
+
+        Mutation: changing exclusive=True to exclusive=False in
+        _worktree_gc_pass causes this test to fail because the recorded lock
+        mode is False instead of True."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        lock_modes: list = []
+        real_lock = agent_run._worktree_publication_lock
+        from contextlib import contextmanager
+
+        @contextmanager
+        def recording_lock(*, exclusive):
+            lock_modes.append(exclusive)
+            with real_lock(exclusive=exclusive) as fd:
+                yield fd
+
+        monkeypatch.setattr(agent_run, "_worktree_publication_lock", recording_lock)
+
+        agent_run.cmd_reap(_reap_args(dry_run=True))
+        capsys.readouterr()
+
+        assert lock_modes, "_worktree_gc_pass must acquire the publication lock"
+        assert all(m is True for m in lock_modes), (
+            f"gc_pass lock modes must all be exclusive=True; got {lock_modes}"
+        )
+
+    # F8 (b) — live PID with no process_identity is scan-fatal
+    def test_live_pid_without_process_identity_aborts_scan(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A live PID with no recorded process_identity file must abort the
+        liveness scan and preserve the worktree, not be treated as no runner.
+
+        A missing or empty identity could mean the runner died before writing it
+        or a race; ignoring it would allow a live process to lose its protection.
+
+        Mutation: replacing 'return None, reason' with 'return False, None' for
+        the no-identity branch causes _worktree_state_has_live_runner to report
+        absence rather than ambiguity, letting the worktree be deleted."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        # A run whose PID is our own (live) but has no process_identity file.
+        sd = _make_state_run(
+            isolated_runs_root, isolated_log_root, "a-run", cwd=wt, age_hours=1000
+        )
+        (sd / "pid").write_text(f"{os.getpid()}\n")
+        # Deliberately omit writing process_identity.
+
+        live, err = agent_run._worktree_state_has_live_runner(sd)
+        assert live is None, "live PID with no identity must return ambiguity (None), not False"
+        assert err is not None and "no process identity" in err
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree must not be deleted when liveness is ambiguous"
+        assert "liveness scan failed" in out
+        assert "worktrees_removed=0" in out
+
+    # F8 (c) — initial age_seconds=None is refused
+    def test_candidate_with_unknown_age_is_refused(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A candidate with age_seconds=None (unparseable ended_at, no fallback)
+        must be refused by the age gate, not treated as old enough.
+
+        Mutation: removing the 'cand.age_seconds is None' check in
+        _worktree_candidate_refusal causes the candidate to pass the age gate
+        (None < threshold raises TypeError, or the check is skipped)."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        sd = _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt)
+        # Corrupt ended_at and remove the dir mtime fallback so age returns None.
+        (sd / "ended_at").write_text("not-a-timestamp\n")
+        (sd / "status").write_text("done\n")
+
+        # Confirm that _terminal_state_age_seconds returns None for this entry.
+        age = agent_run._terminal_state_age_seconds(sd)
+        assert age is None or isinstance(age, float), "setup check"
+
+        # Monkeypatch to guarantee None (in case mtime fallback returns a value).
+        real_age = agent_run._terminal_state_age_seconds
+        monkeypatch.setattr(
+            agent_run, "_terminal_state_age_seconds",
+            lambda d: None if d.name == "r1" else real_age(d),
+        )
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree with age=None must not be deleted"
+        assert "worktrees_removed=0" in out
+
+    # F8 (d) — malformed rev-list count is refused
+    def test_malformed_rev_list_count_refuses_removal(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A successful rev-list --count that returns non-integer output must
+        be refused rather than treated as zero (i.e. 'no unpushed commits').
+
+        Mutation: removing the '_safe_int returns None' guard in
+        _worktree_unpushed_reason and treating all non-error output as 0 causes
+        the candidate to pass the unpushed gate with corrupted count data."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_git = agent_run._watch_run_git_checked
+
+        def git_returns_bad_count(path, args, **kw):
+            if list(args[:2]) == ["rev-list", "--count"]:
+                return agent_run._WatchGitOutcome("not-a-number\n", None)
+            return real_git(path, args, **kw)
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", git_returns_bad_count)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree must not be deleted with malformed rev-list count"
+        assert "unparseable unpushed commit count" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
