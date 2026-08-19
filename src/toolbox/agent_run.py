@@ -3209,8 +3209,10 @@ def _hook_encode_line(record: dict) -> bytes:
     The empty-payload, no-message envelope is the proven floor: every other
     field is a short fixed-vocabulary scalar, and `event` is clipped to
     _HOOK_EVENT_MAX_BYTES by _cmd_hook_inner before this call. allow_nan=False
-    rejects NaN/Infinity so emitted lines are valid RFC-8259 JSON; a payload
-    that cannot be serialised cleanly falls back to the next rung.
+    makes NaN/Infinity a ValueError, which falls through to the next rung so
+    emitted lines are valid RFC-8259 JSON. A non-JSON-native value raises
+    TypeError instead, which encode() does not catch; cmd_hook's blanket
+    handler absorbs it, preserving the exit-0 guarantee.
     """
     def encode(rec: dict) -> bytes:
         try:
@@ -3444,6 +3446,20 @@ _HOOK_KIND_TURN_COMPLETE_EVENTS = frozenset(
 )
 _HOOK_KIND_SESSION_START_EVENTS = frozenset({"session-start", "session_start"})
 
+# Only events naming a PENDING request. A resolved permission is not a reason
+# to wake anyone, so it is deliberately absent.
+_HOOK_KIND_PERMISSION_EVENTS = frozenset(
+    {
+        "permission",
+        "permission-request",
+        "permission_request",
+        "permission-asked",
+        "permission_asked",
+        "permission-required",
+        "permission_required",
+    }
+)
+
 
 def _hook_canonical_kind(harness: Optional[str], event: str, payload: Any) -> str:
     """Return one of turn_complete/permission_required/session_start/other.
@@ -3459,7 +3475,9 @@ def _hook_canonical_kind(harness: Optional[str], event: str, payload: Any) -> st
             hook_event_name = payload.get("hook_event_name")
             if hook_event_name == "Stop":
                 return "turn_complete"
-            if hook_event_name in ("PermissionRequest", "Notification"):
+            # Notification is claude's generic attention nag and carries no
+            # evidence a permission is pending, so it is not mapped here.
+            if hook_event_name == "PermissionRequest":
                 return "permission_required"
             if hook_event_name == "SessionStart":
                 return "session_start"
@@ -3477,14 +3495,16 @@ def _hook_canonical_kind(harness: Optional[str], event: str, payload: Any) -> st
             event_type = payload.get("type")
             if event_type == "session.idle":
                 return "turn_complete"
-            if isinstance(event_type, str) and event_type.startswith("permission."):
+            # Exact match, not a "permission." prefix: permission.replied
+            # reports a permission already answered, which is not pending.
+            if event_type == "permission.asked":
                 return "permission_required"
             if event_type == "session.created":
                 return "session_start"
 
     if event in _HOOK_KIND_TURN_COMPLETE_EVENTS:
         return "turn_complete"
-    if "permission" in event:
+    if event in _HOOK_KIND_PERMISSION_EVENTS:
         return "permission_required"
     if event in _HOOK_KIND_SESSION_START_EVENTS:
         return "session_start"

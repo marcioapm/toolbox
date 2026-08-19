@@ -430,7 +430,7 @@ class TestKindDerivation:
         pytest.param("hook_opencode_permission_asked.json", "not-the-real-event-name",
                      "permission_required", id="opencode-permission-asked"),
         pytest.param("hook_opencode_permission_replied.json", "not-the-real-event-name",
-                     "permission_required", id="opencode-permission-replied"),
+                     "other", id="opencode-permission-replied-is-not-pending"),
         pytest.param("hook_opencode_session_created.json", "not-the-real-event-name",
                      "session_start", id="opencode-session-start"),
     ])
@@ -451,6 +451,9 @@ class TestKindDerivation:
         pytest.param("turn-complete", "turn_complete", id="fallback-turn-complete"),
         pytest.param("session-idle", "turn_complete", id="fallback-session-idle"),
         pytest.param("permission-asked", "permission_required", id="fallback-permission"),
+        pytest.param("permission-request", "permission_required", id="fallback-permission-request"),
+        pytest.param("session-start-permission-audit", "other",
+                     id="fallback-permission-substring-is-not-a-request"),
         pytest.param("session-start", "session_start", id="fallback-session-start"),
         pytest.param("something-else-entirely", "other", id="fallback-other"),
     ])
