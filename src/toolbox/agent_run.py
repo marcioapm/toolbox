@@ -4870,6 +4870,58 @@ def _worktree_run_cwd(name: str) -> Optional[Path]:
     return _worktree_resolve_cwd(_watch_read_cwd_file(_state_dir(name) / "cwd"))
 
 
+def _worktree_du_root(cwd: Path) -> Optional[Path]:
+    """Linked-worktree root for disk-accounting of ``cwd``, or ``None``.
+
+    ``_worktree_classify`` returns UNKNOWN for a subdirectory of a linked
+    worktree, because ``git worktree remove`` requires the top-level path.
+    For accounting the top-level root is correct — charging a subdirectory
+    would count part of a tree that another run sharing the same worktree
+    root already covers.  This function resolves the actual top-level so runs
+    launched from a subdirectory still contribute their worktree bytes.
+
+    Returns ``None`` when ``cwd`` is not inside any linked worktree, or when
+    any git query fails (fail-safe: unclassifiable paths contribute 0 bytes
+    rather than blocking the entire ``du`` pass).
+    """
+    probe = _watch_run_git_checked(cwd, [
+        "rev-parse", "--path-format=absolute",
+        "--is-bare-repository", "--is-inside-work-tree",
+        "--git-dir", "--git-common-dir",
+    ])
+    if probe.stdout is None:
+        return None
+    lines = [ln.strip() for ln in probe.stdout.splitlines()]
+    if len(lines) != 4:
+        return None
+    is_bare, inside_work_tree, git_dir, common_dir = lines
+    if is_bare == "true" or inside_work_tree != "true":
+        return None
+    if not git_dir or not common_dir or git_dir == common_dir:
+        return None
+    top_probe = _watch_run_git_checked(
+        cwd, ["rev-parse", "--path-format=absolute", "--show-toplevel"]
+    )
+    if top_probe.stdout is None:
+        return None
+    toplevel_str = top_probe.stdout.strip()
+    if not toplevel_str:
+        return None
+    toplevel = Path(toplevel_str)
+    top_identity = _dir_identity(toplevel)
+    if top_identity is None:
+        return None
+    # Verify the recorded cwd is at or below this toplevel.
+    try:
+        cwd.relative_to(toplevel)
+    except ValueError:
+        return None
+    # Classify the toplevel itself to confirm it is a registered linked worktree.
+    if _worktree_classify(toplevel).kind != _WORKTREE_LINKED:
+        return None
+    return toplevel
+
+
 # `git worktree remove` unlinks the whole checkout, so it needs far more than
 # the plumbing-read budget a rev-parse gets; a multi-gigabyte tree on a slow
 # disk would otherwise time out mid-deletion.
@@ -6346,6 +6398,12 @@ class _DuRow(NamedTuple):
 def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
     """Charge each linked worktree once while excluding separately charged roots.
 
+    For deletion, only the worktree's exact top-level path is acceptable (see
+    ``_worktree_classify``).  For accounting, a run launched from a subdirectory
+    of a linked worktree should still contribute the whole worktree's bytes:
+    ``_worktree_du_root`` resolves ``--show-toplevel`` so the correct root is
+    charged regardless of how deep the recorded ``cwd`` is.
+
     Excluding all of ``STATE_ROOT`` or ``LOG_ROOT`` would drop unrecognized
     content (e.g. ``.locks``, sentinels, invalid-name entries) from the total,
     because those bytes appear neither in the STATE/LOG/SCRATCH columns nor in
@@ -6355,18 +6413,20 @@ def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
     """
     owners: dict[str, int] = {}
     roots: dict[str, Path] = {}
-    linked: dict[str, bool] = {}
+    root_cache: dict[str, Optional[Path]] = {}
     for index, row in enumerate(rows):
         cwd = _worktree_run_cwd(row.key)
         if cwd is None:
             continue
-        key = str(cwd)
-        if key not in linked:
-            linked[key] = _worktree_classify(cwd).kind == _WORKTREE_LINKED
-        if not linked[key]:
+        cwd_key = str(cwd)
+        if cwd_key not in root_cache:
+            root_cache[cwd_key] = _worktree_du_root(cwd)
+        root = root_cache[cwd_key]
+        if root is None:
             continue
+        key = str(root)
         owners.setdefault(key, index)
-        roots[key] = cwd
+        roots[key] = root
 
     charges = [0] * len(rows)
     accounted = list(roots.values())

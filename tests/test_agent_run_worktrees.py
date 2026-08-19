@@ -453,6 +453,68 @@ class TestDuWorktrees:
         assert payload["runs"][0]["worktree_bytes"] == 0
         assert "charged once" in payload["worktree_attribution"]
 
+    def test_du_worktree_bytes_when_cwd_is_subdirectory(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A run launched from a subdirectory of a linked worktree must still
+        contribute the whole worktree's bytes to the WORKTREE column.
+
+        _worktree_classify returns UNKNOWN for a subdirectory (not the top of
+        its worktree), so the previous code reported WORKTREE=0 for such runs.
+        _worktree_du_root resolves --show-toplevel to find and charge the actual
+        linked-worktree root.
+
+        Mutation: replacing _worktree_du_root with _worktree_classify().kind ==
+        _WORKTREE_LINKED causes WORKTREE=0 for subdirectory-launched runs,
+        because _worktree_classify returns UNKNOWN for them."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        (wt / "payload.bin").write_bytes(b"p" * 6000)
+        subdir = wt / "src" / "pkg"
+        subdir.mkdir(parents=True)
+        expected_wt_size = agent_run._dir_size_bytes(wt)
+        # Run whose cwd is a subdirectory of the linked worktree.
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=subdir)
+
+        agent_run.cmd_du(_du_args(by_run=True))
+
+        out = capsys.readouterr().out
+        worktree_col = int(_row(out, "r1")[5])
+        assert worktree_col == expected_wt_size, (
+            f"run launched from subdirectory reported WORKTREE={worktree_col}, "
+            f"expected {expected_wt_size} (the whole worktree)"
+        )
+
+    def test_multiple_subdirectory_runs_share_worktree_charge(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """Multiple runs launched from different subdirectories of one worktree
+        each resolve to the same top-level root and collectively charge it once.
+
+        Mutation: without the _worktree_du_root deduplication, each subdirectory-
+        run resolves to the same toplevel but the owners dict would only charge
+        the root once anyway.  This test verifies the total is not doubled."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        (wt / "payload.bin").write_bytes(b"q" * 4000)
+        sub_a = wt / "a"
+        sub_b = wt / "b"
+        sub_a.mkdir()
+        sub_b.mkdir()
+        expected_wt_size = agent_run._dir_size_bytes(wt)
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=sub_a)
+        _make_state_run(isolated_runs_root, isolated_log_root, "r2", cwd=sub_b)
+
+        agent_run.cmd_du(_du_args(by_run=True))
+
+        out = capsys.readouterr().out
+        wt_r1 = int(_row(out, "r1")[5])
+        wt_r2 = int(_row(out, "r2")[5])
+        assert wt_r1 + wt_r2 == expected_wt_size, (
+            f"two subdirectory runs charged {wt_r1}+{wt_r2}={wt_r1+wt_r2}, "
+            f"expected {expected_wt_size} total (charged once)"
+        )
+
     def test_du_never_mutates_the_worktree(
         self, isolated_runs_root, isolated_log_root, git_root, capsys
     ):
