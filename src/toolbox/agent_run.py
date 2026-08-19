@@ -3356,9 +3356,19 @@ def _hook_append_record(log_dir: Path, record: dict) -> None:
     the atomicity is O_APPEND's offset+write guarantee, not a PIPE_BUF limit.
     Never raises; errors go to stderr.
     """
-    # Every line is at most _HOOK_MAX_LINE_BYTES, so this many bytes holds at
-    # least AGENT_RUN_HOOK_MAX_EVENTS lines — enough to decide the cap.
-    existing = _hooks_read(log_dir, AGENT_RUN_HOOK_MAX_EVENTS * _HOOK_MAX_LINE_BYTES)
+    # One line-length of headroom past the cap's worth of max-size lines. A
+    # window of exactly AGENT_RUN_HOOK_MAX_EVENTS * _HOOK_MAX_LINE_BYTES holds
+    # that many maximal lines with no slack, so crossing it makes
+    # _hooks_read_tail discard the partial leading line and report at most
+    # AGENT_RUN_HOOK_MAX_EVENTS - 1 — below the cap forever, disabling it.
+    existing, truncated = _hooks_read_tail(
+        log_dir, (AGENT_RUN_HOOK_MAX_EVENTS + 1) * _HOOK_MAX_LINE_BYTES
+    )
+    # A truncated read means the file is larger than the cap could ever need,
+    # which is itself proof of being at the cap; counting is only meaningful
+    # when the whole relevant region was read.
+    if truncated:
+        return
     if existing is not None and sum(
         1 for ln in existing.split(b"\n") if ln.strip()
     ) >= AGENT_RUN_HOOK_MAX_EVENTS:
