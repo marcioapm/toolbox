@@ -312,7 +312,7 @@ class TestPayloadParsing:
             "codex", id="codex",
         ),
         pytest.param(
-            {"type": "session.idle", "session": "s1"},
+            {"type": "session.idle", "properties": {"sessionID": "s1"}},
             "opencode", id="opencode",
         ),
         pytest.param({"unrecognised": 1}, None, id="unknown"),
