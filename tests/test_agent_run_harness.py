@@ -622,6 +622,65 @@ class TestOpenCodePolicyConfig:
         assert config["agent"]["test"]["permission"]["question"] == "deny"
 
 
+class TestOpenCodeAgentNameParsing:
+    """Unit tests for _opencode_agent_names_from_harness_args.
+
+    Proves that the agent name extracted from harness_args is the same name
+    that policy targeting uses, so the two cannot drift apart.
+    """
+
+    def test_two_token_form_extracted(self):
+        assert agent_run._opencode_agent_names_from_harness_args(
+            ["--agent", "myagent"]
+        ) == {"myagent"}
+
+    def test_equals_form_extracted(self):
+        assert agent_run._opencode_agent_names_from_harness_args(
+            ["--agent=myagent"]
+        ) == {"myagent"}
+
+    def test_multiple_agent_flags(self):
+        names = agent_run._opencode_agent_names_from_harness_args(
+            ["--agent", "a", "--agent", "b"]
+        )
+        assert names == {"a", "b"}
+
+    def test_no_agent_flag_returns_empty(self):
+        assert agent_run._opencode_agent_names_from_harness_args(
+            ["--auto", "--model", "sonnet"]
+        ) == set()
+
+    def test_empty_harness_args_returns_empty(self):
+        assert agent_run._opencode_agent_names_from_harness_args([]) == set()
+
+    def test_agent_name_drives_policy_target(self):
+        """The name parsed by _opencode_agent_names_from_harness_args is the same
+        name that _opencode_policy_config injects into its target_agents set.
+
+        This test closes the coupling gap: if the parsing function and the policy
+        function ever disagree on the agent name, a per-agent allow would silently
+        escape. Both must agree on the exact same string.
+        """
+        agent_name = "myspecialagent"
+        harness_args = ["--agent", agent_name]
+        extra = agent_run._opencode_agent_names_from_harness_args(harness_args)
+        policy = json.loads(agent_run._opencode_policy_config(
+            None,
+            enable_planning=False,
+            enable_questions=False,
+            extra_agent_names=extra,
+        ))
+        # The agent block for this name must exist and carry deny.
+        agent_block = policy.get("agent", {}).get(agent_name)
+        assert agent_block is not None, (
+            f"_opencode_policy_config did not create a block for agent {agent_name!r}; "
+            f"the parsed name from harness_args did not reach target_agents"
+        )
+        assert agent_block.get("permission", {}).get("question") == "deny", (
+            f"agent block for {agent_name!r} does not carry the deny: {agent_block!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # session.json — write, read, and watch integration
 # ---------------------------------------------------------------------------
@@ -3123,6 +3182,42 @@ class TestOpenCodeRealResolverPolicy:
         env = _oc_policy_env(agent_mode="build")
         data = _oc_debug_agent("build", str(proj), env)
         self._assert_policy_denied(data, "build")
+
+    def test_harness_arg_agent_allow_defeated(self, tmp_path):
+        """A non-default agent selected via --harness-arg --agent must not defeat the deny.
+
+        ARM 3: the project defines a per-agent allow for a non-default agent
+        ("myagent") that is selected at runtime via --harness-arg, not --agent-mode.
+        _opencode_policy_config must be called with enough context to include
+        "myagent" in target_agents.  Without the fix this test fails (question=True).
+        """
+        proj = tmp_path / "proj-harg"
+        proj.mkdir()
+        (proj / "opencode.json").write_text(json.dumps({
+            "agent": {
+                "myagent": {
+                    "permission": {
+                        "question": "allow",
+                        "plan_enter": "allow",
+                        "plan_exit": "allow",
+                    },
+                },
+            },
+        }))
+        # Policy generated with opencode_agent_mode=None (no --agent-mode flag),
+        # but harness_args carries "--agent myagent".  The fix must cover "myagent"
+        # even though it was not passed as opencode_agent_mode.
+        harness_args = ["--agent", "myagent"]
+        policy = agent_run._opencode_policy_config(
+            None,
+            enable_planning=False,
+            enable_questions=False,
+            opencode_agent_mode=None,
+            extra_agent_names=agent_run._opencode_agent_names_from_harness_args(harness_args),
+        )
+        env = {**os.environ, "OPENCODE_CONFIG_CONTENT": policy}
+        data = _oc_debug_agent("myagent", str(proj), env)
+        self._assert_policy_denied(data, "myagent")
 
 
 # ---------------------------------------------------------------------------
