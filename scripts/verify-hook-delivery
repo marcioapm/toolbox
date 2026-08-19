@@ -13,7 +13,8 @@ Each cell exercises one (harness, mode) pair and asserts:
       whose event matches, payload carries harness-specific fields, resolved_by == "env"
   [5] watch --json surfaces it — hooks aggregate non-null, count >= 1, events contains
       the event, last_event_age_s is sane, terminal/status are unaffected
-  [6] latency — seconds between run terminal/first-reply and hook record appearing; fail
+  [6] latency — seconds WAITED after run terminal/first-reply for the hook record;
+      0.00 means the hook was already recorded before that point (harness-dependent); fail
       if beyond HOOK_WAIT_TIMEOUT; reported per cell in --json output
 
 All six cells are real cells; no mode is SKIPped. Probes on this machine confirm:
@@ -75,7 +76,10 @@ HOOK_WAIT_TIMEOUT  = float(os.environ.get("HOOK_WAIT_TIMEOUT",  "30"))
 INTERACTIVE_FIRST_REPLY_TIMEOUT = float(
     os.environ.get("INTERACTIVE_FIRST_REPLY_TIMEOUT", "90")
 )
-STATUS_POLL_INTERVAL = 1.0
+# Bounds the error on the hook-latency zero point. Whether a hook precedes or
+# follows terminal status is harness-dependent: the claude Stop hook is written
+# ~0.02s before agent-run publishes terminal, codex notify ~0.5s after.
+STATUS_POLL_INTERVAL = 0.05
 HOOK_POLL_INTERVAL   = 0.5
 
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
@@ -586,6 +590,11 @@ def _assert_links_2_to_5(
 
     hook_wait_start marks the monotonic time from which hook latency is measured
     (run terminal for oneshot; first-reply for interactive).
+
+    latency_s is therefore the WAIT after that point, not a delivery delay:
+    0.00 means the hook record already existed when the reference point was
+    observed. Hooks that precede terminal cannot produce a negative value and
+    are reported as 0.00.
     """
     log_dir = LOG_ROOT / run_name
 
