@@ -2126,6 +2126,48 @@ class TestReapWorktreeFinalRevalidation:
             f"events: {events}"
         )
 
+    def test_same_name_replacement_applies_fresh_age(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A new run that replaces an old terminal state directory with the same
+        name before the final scan must not inherit the old generation's age.
+
+        Collection freezes the old run's age (1000h).  The final scan finds a
+        directory with the same name but a different inode (new generation) whose
+        ended_at is fresh (age≈0).  The inode mismatch triggers a fresh age
+        check; age≈0 is below the threshold so the worktree is preserved.
+
+        Mutation: reverting to 'd.name in cand.names: continue' (skipping by
+        name alone) causes this test to fail because the frozen 1000h age
+        authorises deletion of a recently-finished worktree."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "old-run", cwd=wt, age_hours=1000)
+
+        real_scan = agent_run._worktree_state_scan
+        calls: dict = {"n": 0}
+
+        def scan_with_replacement():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                import shutil
+                shutil.rmtree(isolated_runs_root / "old-run")
+                # New generation with same name, fresh ended_at (age≈0).
+                _make_state_run(
+                    isolated_runs_root, isolated_log_root, "old-run",
+                    status="done", cwd=wt, age_hours=0,
+                )
+            return real_scan()
+
+        monkeypatch.setattr(agent_run, "_worktree_state_scan", scan_with_replacement)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree must not be deleted when same-name replacement has fresh age"
+        assert "youngest sharing run is below the age threshold" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
 
 class TestReapWorktreePublicationLock:
     """The shared publication lock must be held across cwd entry and state

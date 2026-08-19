@@ -5313,6 +5313,10 @@ class _WorktreeCandidate(NamedTuple):
     names: List[str]
     age_seconds: Optional[float]
     identity: Tuple[int, int]
+    # Device/inode of each contributing state directory, keyed by run name.
+    # Used during final validation to detect a same-name directory replacement
+    # (new generation) that must not inherit the frozen age.
+    state_identities: dict
 
 
 class _WorktreeCandidates(NamedTuple):
@@ -5341,16 +5345,28 @@ def _worktree_collect_candidates(
                 skipped.append(f"run {d.name} cwd is not a real directory")
             continue
         age = _terminal_state_age_seconds(d)
+        # Record the state directory's own inode so final validation can detect
+        # a same-name directory replacement (a new run generation that must not
+        # inherit this candidate's frozen age).
+        state_id = _dir_identity(d)
         key = str(resolved)
         if key not in by_path:
-            by_path[key] = _WorktreeCandidate(resolved, raw, [d.name], age, identity)
+            by_path[key] = _WorktreeCandidate(
+                resolved, raw, [d.name], age, identity,
+                {d.name: state_id} if state_id is not None else {},
+            )
             continue
         existing = by_path[key]
         merged_age = None if age is None or existing.age_seconds is None else min(
             existing.age_seconds, age
         )
+        merged_ids = {**existing.state_identities}
+        if state_id is not None:
+            merged_ids[d.name] = state_id
         by_path[key] = existing._replace(
-            names=[*existing.names, d.name], age_seconds=merged_age
+            names=[*existing.names, d.name],
+            age_seconds=merged_age,
+            state_identities=merged_ids,
         )
 
     candidates = [
@@ -5388,9 +5404,19 @@ def _worktree_candidate_refusal(
     # cand.age_seconds.  A run that finished moments ago would have age≈0;
     # without this check it could bypass the threshold because it never
     # contributed to the frozen cand.age_seconds.
+    #
+    # A same-name replacement must not be skipped: if a new run of the same
+    # name replaced an old terminal state directory before the final scan, its
+    # fresh age must be checked even though the name appears in cand.names.
+    # Compare the current state directory's device/inode against the recorded
+    # identity; a mismatch means a new generation that cand.age_seconds does
+    # not account for.
     for d in state_entries:
         if d.name in cand.names:
-            continue  # already counted in cand.age_seconds
+            recorded_id = cand.state_identities.get(d.name)
+            current_id = _dir_identity(d)
+            if recorded_id is not None and current_id == recorded_id:
+                continue  # same directory, already counted in cand.age_seconds
         if _effective_status(d) not in TERMINAL_STATUSES:
             continue
         raw = _watch_read_cwd_file(d / "cwd")
