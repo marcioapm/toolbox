@@ -2347,6 +2347,69 @@ class TestReapWorktreeFinalRevalidation:
         assert "youngest sharing run is below the age threshold" in out
         assert "worktrees_removed=0 worktrees_skipped=1" in out
 
+    def test_same_name_replacement_same_inode_applies_fresh_age(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """Fresh age is checked for a same-name replacement even when the
+        replacement directory has the same (st_dev, st_ino) as the original.
+
+        On ext4, inode numbers are reused immediately after directory removal,
+        so a same-name replacement can have an identical _dir_identity to the
+        collected entry.  The fix removes the inode-identity generation check
+        entirely and always reads the fresh age; this test verifies that the
+        fix holds regardless of filesystem behaviour by forcing _dir_identity
+        to return a fixed value for state directories.
+
+        Mutation: restoring the 'if d.name in cand.names: continue' skip causes
+        this test to fail because the inode values are identical and the frozen
+        1000h age authorises deletion of a worktree whose replacement run
+        ended seconds ago."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "old-run", cwd=wt, age_hours=1000)
+
+        # Canonical identity tuple returned for every state directory; forces the
+        # same (dev, ino) for both the original and replacement "old-run" dirs.
+        fixed_state_identity = (99, 42)
+        real_dir_identity = agent_run._dir_identity
+
+        def patched_dir_identity(path: Path):
+            # Return the fixed identity only for paths inside the runs root so
+            # that the worktree's own identity check at cand.identity is unaffected.
+            try:
+                path.relative_to(isolated_runs_root)
+                return fixed_state_identity
+            except ValueError:
+                return real_dir_identity(path)
+
+        real_scan = agent_run._worktree_state_scan
+        calls: dict = {"n": 0}
+
+        def scan_with_replacement():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                import shutil
+                shutil.rmtree(isolated_runs_root / "old-run")
+                # New generation with same name and — after the monkeypatch —
+                # the same _dir_identity.  Fresh ended_at is age≈0.
+                _make_state_run(
+                    isolated_runs_root, isolated_log_root, "old-run",
+                    status="done", cwd=wt, age_hours=0,
+                )
+            return real_scan()
+
+        monkeypatch.setattr(agent_run, "_dir_identity", patched_dir_identity)
+        monkeypatch.setattr(agent_run, "_worktree_state_scan", scan_with_replacement)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), (
+            "worktree must not be deleted when replacement has same inode but fresh age"
+        )
+        assert "youngest sharing run is below the age threshold" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
 
 class TestReapWorktreePublicationLock:
     """The shared publication lock must be held across cwd entry and state
@@ -3002,7 +3065,7 @@ class TestReapWorktreeUndefendedGuards:
         _terminal_state_age_seconds returns None produces a refusal and
         leaves the worktree.
 
-        Mutation: deleting the 'if late_age is None' guard at the late-terminal
+        Mutation: deleting the 'if late_age is None' guard at the final-scan
         loop causes it to compare None < threshold and raise TypeError."""
         repo = _make_repo(git_root)
         wt = _add_worktree(repo, git_root / "wt", "feature")
@@ -3030,7 +3093,7 @@ class TestReapWorktreeUndefendedGuards:
 
         out = capsys.readouterr().out
         assert wt.is_dir()
-        assert "newly terminal run r2 has unparseable age" in out
+        assert "run r2 has unparseable age" in out
         assert "worktrees_removed=0 worktrees_skipped=1" in out
 
     # G5 — pid <= 0 is scan-fatal

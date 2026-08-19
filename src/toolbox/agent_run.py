@@ -5400,10 +5400,6 @@ class _WorktreeCandidate(NamedTuple):
     names: List[str]
     age_seconds: Optional[float]
     identity: Tuple[int, int]
-    # Device/inode of each contributing state directory, keyed by run name.
-    # Used during final validation to detect a same-name directory replacement
-    # (new generation) that must not inherit the frozen age.
-    state_identities: dict
 
 
 class _WorktreeCandidates(NamedTuple):
@@ -5432,28 +5428,19 @@ def _worktree_collect_candidates(
                 skipped.append(f"run {d.name} cwd is not a real directory")
             continue
         age = _terminal_state_age_seconds(d)
-        # Record the state directory's own inode so final validation can detect
-        # a same-name directory replacement (a new run generation that must not
-        # inherit this candidate's frozen age).
-        state_id = _dir_identity(d)
         key = str(resolved)
         if key not in by_path:
             by_path[key] = _WorktreeCandidate(
                 resolved, raw, [d.name], age, identity,
-                {d.name: state_id} if state_id is not None else {},
             )
             continue
         existing = by_path[key]
         merged_age = None if age is None or existing.age_seconds is None else min(
             existing.age_seconds, age
         )
-        merged_ids = {**existing.state_identities}
-        if state_id is not None:
-            merged_ids[d.name] = state_id
         by_path[key] = existing._replace(
             names=[*existing.names, d.name],
             age_seconds=merged_age,
-            state_identities=merged_ids,
         )
 
     candidates = [
@@ -5487,23 +5474,18 @@ def _worktree_candidate_refusal(
             return "a sharing run was reconciled in this invocation", None, None
     if cand.age_seconds is None or cand.age_seconds < min_age_threshold:
         return "youngest sharing run is below the age threshold", None, None
-    # Runs that became terminal after candidate collection are absent from
-    # cand.age_seconds.  A run that finished moments ago would have age≈0;
-    # without this check it could bypass the threshold because it never
-    # contributed to the frozen cand.age_seconds.
-    #
-    # A same-name replacement must not be skipped: if a new run of the same
-    # name replaced an old terminal state directory before the final scan, its
-    # fresh age must be checked even though the name appears in cand.names.
-    # Compare the current state directory's device/inode against the recorded
-    # identity; a mismatch means a new generation that cand.age_seconds does
-    # not account for.
+    # Every terminal entry that resolves to this candidate must clear the age
+    # threshold independently — including entries whose name is in cand.names.
+    # cand.age_seconds is the frozen minimum from collection time; re-reading
+    # each entry's age here handles two cases:
+    #   • entries absent from cand.names (became terminal after collection);
+    #   • same-name entries where the state directory was replaced between
+    #     collection and this scan (a new run generation with its own fresh
+    #     ended_at that cand.age_seconds does not reflect).
+    # Inode identity is not a reliable generation marker on ext4, which reuses
+    # inodes immediately after directory removal.  Fresh age is always
+    # computable, so it is always checked.
     for d in state_entries:
-        if d.name in cand.names:
-            recorded_id = cand.state_identities.get(d.name)
-            current_id = _dir_identity(d)
-            if recorded_id is not None and current_id == recorded_id:
-                continue  # same directory, already counted in cand.age_seconds
         if _effective_status(d) not in TERMINAL_STATUSES:
             continue
         raw = _watch_read_cwd_file(d / "cwd")
@@ -5512,7 +5494,7 @@ def _worktree_candidate_refusal(
             continue
         late_age = _terminal_state_age_seconds(d)
         if late_age is None:
-            return f"newly terminal run {d.name} has unparseable age", None, None
+            return f"run {d.name} has unparseable age", None, None
         if late_age < min_age_threshold:
             return "youngest sharing run is below the age threshold", None, None
     if _dir_identity(cand.resolved) != cand.identity:
