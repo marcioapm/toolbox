@@ -6481,10 +6481,25 @@ def _du_collect_rows() -> List[_DuRow]:
             continue
         has_state = name in state_names
         has_log = name in log_names
-        state_bytes = _dir_size_bytes(_state_dir(name)) if has_state else 0
-        scratch_dir = _log_dir(name) / "tmp"
-        scratch_bytes = _dir_size_bytes(scratch_dir) if has_log else 0
-        log_bytes = _dir_size_bytes(_log_dir(name), exclude=scratch_dir) if has_log else 0
+        state_dir = _state_dir(name) if has_state else None
+        log_dir = _log_dir(name) if has_log else None
+        scratch_dir = log_dir / "tmp" if log_dir is not None else None
+
+        # Assign bytes with deterministic column precedence: state, then log
+        # (excluding scratch), then scratch.  Each real path is charged at most
+        # once; the log column excludes any path already charged as state so
+        # equal or nested roots are not double-counted.
+        state_bytes = _dir_size_bytes(state_dir) if state_dir is not None else 0
+        log_excludes: List[Path] = []
+        if scratch_dir is not None:
+            log_excludes.append(scratch_dir)
+        if state_dir is not None and log_dir is not None:
+            log_excludes.append(state_dir)
+        log_bytes = (
+            _dir_size_bytes(log_dir, excludes=log_excludes)
+            if log_dir is not None else 0
+        )
+        scratch_bytes = _dir_size_bytes(scratch_dir) if scratch_dir is not None else 0
         rows.append(_DuRow(name, 1, state_bytes, log_bytes, scratch_bytes))
     return _du_charge_worktrees(rows)
 

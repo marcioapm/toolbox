@@ -2713,6 +2713,44 @@ class TestDuWorktreeArithmetic:
             "unrecognized root content must not be silently excluded"
         )
 
+    def test_equal_state_and_log_roots_do_not_double_count(
+        self, git_root, tmp_path, monkeypatch, capsys
+    ):
+        """When STATE_ROOT == LOG_ROOT the per-run state and log directories are
+        the same path; charging it to both columns would double the byte count.
+
+        The fix in _du_collect_rows excludes the state_dir from the log_dir walk
+        when they are the same path.
+
+        Mutation: removing the log_excludes.append(state_dir) line in
+        _du_collect_rows causes the same directory to be walked twice, inflating
+        the total by the size of the shared per-run directory."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        shared_root = tmp_path / "shared"
+        shared_root.mkdir()
+        monkeypatch.setattr(agent_run, "STATE_ROOT", shared_root)
+        monkeypatch.setattr(agent_run, "LOG_ROOT", shared_root)
+
+        run_dir = shared_root / "r1"
+        run_dir.mkdir()
+        (run_dir / "status").write_text("done\n")
+        (run_dir / "cwd").write_text(f"{wt}\n")
+        (run_dir / "data").write_bytes(b"D" * 300)
+
+        run_dir_size = agent_run._dir_size_bytes(run_dir)
+
+        agent_run.cmd_du(_du_args(by_run=True))
+
+        out = capsys.readouterr().out
+        fields = _row(out, "r1")
+        state_b, log_b, scratch_b = int(fields[2]), int(fields[3]), int(fields[4])
+        # With equal roots, the per-run dir is charged once across state+log columns.
+        assert state_b + log_b + scratch_b == run_dir_size, (
+            f"state={state_b} + log={log_b} + scratch={scratch_b} = "
+            f"{state_b+log_b+scratch_b} but run_dir_size={run_dir_size}: double-counted"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for undefended guards (Part 2)
