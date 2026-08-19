@@ -3564,20 +3564,28 @@ def _hooks_summary(log_dir: Path) -> Optional[dict]:
 
     last = records[-1]
 
-    def _strip_surrogates(s: Any) -> Optional[str]:
+    def _clean(s: Any, max_chars: int) -> Optional[str]:
         # Envelope fields come from a file any process can append to, so a
         # non-string here is data, not a bug: summarise it as None rather
-        # than raising and losing the whole aggregate.
+        # than raising and losing the whole aggregate. The bound applies here
+        # rather than at write time because this dict is the watch contract: a
+        # supervisor polls it on a timer and renders it, so one oversized line
+        # in hooks.jsonl must not become an oversized field in every poll.
         if not isinstance(s, str):
             return None
-        return s.encode("utf-8", "replace").decode("utf-8")
+        return s.encode("utf-8", "replace").decode("utf-8")[:max_chars]
 
+    raw_message = last.get("message")
+    message = _clean(raw_message, _HOOK_MESSAGE_MAX_CHARS)
     last_summary = {
-        "event": _strip_surrogates(last.get("event")),
-        "at": _strip_surrogates(last.get("at")),
-        "harness": _strip_surrogates(last.get("harness")),
-        "kind": _strip_surrogates(last.get("kind")),
-        "message": _strip_surrogates(last.get("message")),
+        "event": _clean(last.get("event"), _HOOK_EVENT_MAX_BYTES),
+        "at": _clean(last.get("at"), _HOOK_EVENT_MAX_BYTES),
+        "harness": _clean(last.get("harness"), _HOOK_EVENT_MAX_BYTES),
+        "kind": _clean(last.get("kind"), _HOOK_EVENT_MAX_BYTES),
+        "message": message,
+        "message_clipped": (
+            isinstance(raw_message, str) and len(message or "") < len(raw_message)
+        ),
     }
 
     last_event_age_s: Optional[float] = None
@@ -3596,13 +3604,13 @@ def _hooks_summary(log_dir: Path) -> Optional[dict]:
     event_counts: dict[str, int] = {}
     kind_counts: dict[str, int] = {}
     for r in records:
-        ev = r.get("event")
-        if isinstance(ev, str):
-            ev = ev.encode("utf-8", "replace").decode("utf-8")
+        # Counter keys are bounded for the same reason as last_summary: they
+        # are attacker-chosen strings that ship in every watch poll.
+        ev = _clean(r.get("event"), _HOOK_EVENT_MAX_BYTES)
+        if ev is not None:
             event_counts[ev] = event_counts.get(ev, 0) + 1
-        kind = r.get("kind")
-        if isinstance(kind, str):
-            kind = kind.encode("utf-8", "replace").decode("utf-8")
+        kind = _clean(r.get("kind"), _HOOK_EVENT_MAX_BYTES)
+        if kind is not None:
             kind_counts[kind] = kind_counts.get(kind, 0) + 1
 
     return {
