@@ -773,8 +773,55 @@ class TestReapWorktrees:
 
         out = capsys.readouterr().out
         assert wt.is_dir()
-        assert "not on any remote" in out
+        assert "not on any remote-tracking ref" in out
         assert "worktrees_skipped=1" in out
+
+    def test_stale_remote_tracking_ref_does_not_block_removal(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A branch deleted on the remote but with an unpruned local tracking
+        ref still shows rev-list count=0 and does NOT block removal.
+
+        This is deliberate: _worktree_unpushed_reason reads refs/remotes/* from
+        the local repository without contacting any remote.  Network calls in a
+        GC path can hang, require authentication, or fail unpredictably.  The
+        documented contract is 'commits not reachable from any local remote-
+        tracking ref'; stale tracking refs (branch deleted remotely but not
+        pruned locally) are not detected.  Callers needing current remote state
+        should run 'git fetch --prune' before reap.
+
+        This test pins the documented behaviour so the gap is deliberate and
+        visible rather than implied.
+
+        Mutation: adding remote-state verification (e.g. checking if the remote
+        branch still exists) would cause a test needing network access or a
+        complex mock, and would make deletion decisions depend on connectivity."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        # Simulate a remote-side deletion without pruning locally: remove the
+        # remote branch ref directly from the bare origin so the push history
+        # record stays intact, while the local tracking ref remains.
+        origin = git_root / "main-origin.git"
+        remote_ref = origin / "refs" / "heads" / "feature"
+        remote_ref.unlink()
+        # Verify the local tracking ref still exists (no prune performed).
+        tracking_exists = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "refs/remotes/origin/feature"],
+            capture_output=True,
+        ).returncode == 0
+        assert tracking_exists, "test setup: local tracking ref must still exist after remote deletion"
+
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args())
+
+        out = capsys.readouterr().out
+        # HEAD is reachable from the stale local tracking ref: count=0, removable.
+        assert not wt.exists(), (
+            "worktree must be removable when HEAD is still on a (stale) local tracking ref"
+        )
+        assert "not on any remote-tracking ref" not in out
+        assert "worktrees_removed=1" in out
 
     def test_force_dirty_removes_dirty_worktree(
         self, isolated_runs_root, isolated_log_root, git_root, capsys
@@ -3102,7 +3149,7 @@ class TestReapWorktreeUndefendedGuards:
 
         out = capsys.readouterr().out
         assert wt.is_dir(), "worktree with unpushed commits deleted under --force-dirty"
-        assert "not on any remote" in out
+        assert "not on any remote-tracking ref" in out
         assert "worktrees_removed=0 worktrees_skipped=1" in out
 
     # G18 (a) — reconciled cwd containment (subdirectory blocks removal)

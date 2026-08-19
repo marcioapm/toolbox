@@ -5100,6 +5100,21 @@ def _worktree_content_reason(path: Path) -> Optional[str]:
 
 
 def _worktree_unpushed_reason(path: Path) -> Optional[str]:
+    """Refusal reason when HEAD is not reachable from any local remote-tracking ref.
+
+    Uses ``git rev-list --count HEAD --not --remotes``, which compares HEAD
+    against ``refs/remotes/*`` in the local repository.  It does NOT contact
+    remote servers and does NOT prune stale tracking refs.  A branch that was
+    deleted on the remote but whose local tracking ref has not been pruned
+    (e.g. via ``git fetch --prune``) still shows count=0, so the commit would
+    not block removal even though it is no longer on any actual remote.
+
+    This is a deliberate gap: any network call in a GC path can hang, require
+    authentication, or fail in ways that make deletion decisions depend on
+    connectivity.  The documented contract is "commits not reachable from any
+    local remote-tracking ref".  Callers that need current remote state should
+    run ``git fetch --prune`` before invoking reap.
+    """
     unpushed = _watch_run_git_checked(path, ["rev-list", "--count", "HEAD", "--not", "--remotes"])
     if unpushed.stdout is None:
         return f"cannot count unpushed commits ({unpushed.error_detail})"
@@ -5107,7 +5122,7 @@ def _worktree_unpushed_reason(path: Path) -> Optional[str]:
     if count is None:
         return "unparseable unpushed commit count"
     if count > 0:
-        return f"{count} commit(s) not on any remote"
+        return f"{count} commit(s) not on any remote-tracking ref"
     return None
 
 
@@ -10030,7 +10045,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "owning repository, so the parent's .git/worktrees/<name> admin entry "
         "is unregistered too. A worktree with modified/deleted tracked files, "
         "ordinary untracked files, ignored files or directory content, or "
-        "commits on no remote is refused. --force-dirty overrides only the "
+        "commits not reachable from any local remote-tracking ref is refused. "
+        "NOTE: stale tracking refs (remote branch deleted but not pruned locally) "
+        "are not detected; run 'git fetch --prune' beforehand if current remote "
+        "state matters. --force-dirty overrides only the "
         "tracked, untracked, and ignored content checks; unpushed commits and "
         "every structural, liveness, scan, identity, nested-worktree, and git "
         "failure remain refusals. A worktree still used by a live run is always "
