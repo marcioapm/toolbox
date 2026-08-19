@@ -26,10 +26,12 @@ from toolbox import agent_run
 
 
 SRC_DIR = str(Path(__file__).parents[1] / "src")
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
-# hooks.jsonl lines are appended with a single os.write to an O_APPEND fd, which
-# only avoids interleaving for writes up to PIPE_BUF (512 on macOS).
-PIPE_BUF = os.pathconf("/", "PC_PIPE_BUF")
+
+def _fixture(name: str) -> dict:
+    """Load a captured real harness hook payload from tests/fixtures/."""
+    return json.loads((FIXTURES_DIR / name).read_text())
 
 
 def _make_run_dirs(
@@ -301,28 +303,22 @@ class TestExitCodeAlways0:
 
 
 class TestPayloadParsing:
-    @pytest.mark.parametrize("payload,expected_harness", [
-        pytest.param(
-            {"session_id": "s1", "hook_event_name": "Stop",
-             "last_assistant_message": "done"},
-            "claude", id="claude",
-        ),
-        pytest.param(
-            {"type": "agent-turn-complete", "thread-id": "t1"},
-            "codex", id="codex",
-        ),
-        pytest.param(
-            {"type": "session.idle", "properties": {"sessionID": "s1"}},
-            "opencode", id="opencode",
-        ),
-        pytest.param({"unrecognised": 1}, None, id="unknown"),
+    @pytest.mark.parametrize("fixture_name,expected_harness", [
+        pytest.param("hook_claude_stop.json", "claude", id="claude"),
+        pytest.param("hook_codex_turn_complete.json", "codex", id="codex"),
+        pytest.param("hook_opencode_session_idle.json", "opencode", id="opencode"),
+        pytest.param(None, None, id="unknown"),
     ])
     def test_harness_detected_from_payload_shape(
         self, isolated_runs_root, isolated_log_root, monkeypatch,
-        payload, expected_harness,
+        fixture_name, expected_harness,
     ):
+        """Driven through captured real per-harness payloads, not hand-built
+        toy shapes — a fixture missing a real field would hide a detection
+        bug the way the phantom opencode "session" key once did."""
         _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "harness")
         monkeypatch.setenv("AGENT_RUN_NAME", "harness")
+        payload = _fixture(fixture_name) if fixture_name else {"unrecognised": 1}
 
         agent_run.cmd_hook(_hook_args("stop", json_payload=json.dumps(payload)))
 
@@ -345,11 +341,7 @@ class TestPayloadParsing:
         """codex notify passes its JSON as argv[1]; source='argv'."""
         _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "argvrun")
         monkeypatch.setenv("AGENT_RUN_NAME", "argvrun")
-        codex_payload = json.dumps({
-            "type": "agent-turn-complete", "thread-id": "t1", "turn-id": "x1",
-            "cwd": "/tmp", "client": "codex", "input-messages": [],
-            "last-assistant-message": "done",
-        })
+        codex_payload = json.dumps(_fixture("hook_codex_turn_complete.json"))
 
         rc = agent_run.cmd_hook(_hook_args("turn-complete", extra=[codex_payload]))
 
@@ -375,12 +367,7 @@ class TestPayloadParsing:
         """claude delivers its Stop payload on stdin; source='stdin'."""
         _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "stdinrun")
         monkeypatch.setenv("AGENT_RUN_NAME", "stdinrun")
-        claude_payload = json.dumps({
-            "session_id": "ses1", "transcript_path": "/tmp/t", "cwd": "/tmp",
-            "prompt_id": "p1", "permission_mode": "bypass",
-            "hook_event_name": "Stop", "stop_hook_active": False,
-            "last_assistant_message": "I am done.",
-        }).encode()
+        claude_payload = json.dumps(_fixture("hook_claude_stop.json")).encode()
 
         rc, _ = _hook_with_stdin(claude_payload, close_writer=True)
 
@@ -419,7 +406,177 @@ class TestPayloadParsing:
         assert _read_hooks(ld)[0]["event"] == recorded
 
 
-class TestStdinBounded:
+class TestKindDerivation:
+    """kind normalises event+payload across harnesses and user-renamed hook
+    argv. Driven through cmd_hook with a misleading event string on every
+    case, so payload evidence winning over the event argv is load-bearing,
+    not incidental."""
+
+    @pytest.mark.parametrize("fixture_name,event,expected_kind", [
+        pytest.param("hook_claude_stop.json", "not-the-real-event-name",
+                     "turn_complete", id="claude-turn-complete"),
+        pytest.param("hook_claude_permission_request.json", "not-the-real-event-name",
+                     "permission_required", id="claude-permission-required"),
+        pytest.param("hook_claude_session_start.json", "not-the-real-event-name",
+                     "session_start", id="claude-session-start"),
+        pytest.param("hook_codex_turn_complete.json", "not-the-real-event-name",
+                     "turn_complete", id="codex-turn-complete"),
+        pytest.param("hook_codex_permission_request.json", "not-the-real-event-name",
+                     "permission_required", id="codex-permission-required"),
+        pytest.param("hook_codex_session_start.json", "not-the-real-event-name",
+                     "session_start", id="codex-session-start"),
+        pytest.param("hook_opencode_session_idle.json", "not-the-real-event-name",
+                     "turn_complete", id="opencode-turn-complete"),
+        pytest.param("hook_opencode_permission_asked.json", "not-the-real-event-name",
+                     "permission_required", id="opencode-permission-asked"),
+        pytest.param("hook_opencode_permission_replied.json", "not-the-real-event-name",
+                     "permission_required", id="opencode-permission-replied"),
+        pytest.param("hook_opencode_session_created.json", "not-the-real-event-name",
+                     "session_start", id="opencode-session-start"),
+    ])
+    def test_kind_from_payload_evidence_beats_misleading_event(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+        fixture_name, event, expected_kind,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "kindrun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "kindrun")
+        payload = _fixture(fixture_name)
+
+        agent_run.cmd_hook(_hook_args(event, json_payload=json.dumps(payload)))
+
+        assert _read_hooks(ld)[0]["kind"] == expected_kind
+
+    @pytest.mark.parametrize("event,expected_kind", [
+        pytest.param("stop", "turn_complete", id="fallback-stop"),
+        pytest.param("turn-complete", "turn_complete", id="fallback-turn-complete"),
+        pytest.param("session-idle", "turn_complete", id="fallback-session-idle"),
+        pytest.param("permission-asked", "permission_required", id="fallback-permission"),
+        pytest.param("session-start", "session_start", id="fallback-session-start"),
+        pytest.param("something-else-entirely", "other", id="fallback-other"),
+    ])
+    def test_kind_falls_back_to_event_string_for_unrecognised_payload(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, event, expected_kind,
+    ):
+        """No payload evidence (unknown harness shape): the normalised event
+        argv string decides."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "kindfallback")
+        monkeypatch.setenv("AGENT_RUN_NAME", "kindfallback")
+
+        agent_run.cmd_hook(_hook_args(event, json_payload='{"unrecognised": 1}'))
+
+        assert _read_hooks(ld)[0]["kind"] == expected_kind
+
+    def test_kind_raw_event_field_kept_unchanged_for_debugging(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """Deriving kind must not mutate the original event field."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "kindraw")
+        monkeypatch.setenv("AGENT_RUN_NAME", "kindraw")
+
+        agent_run.cmd_hook(
+            _hook_args("my-custom-stop-alias",
+                       json_payload=json.dumps(_fixture("hook_claude_stop.json")))
+        )
+
+        record = _read_hooks(ld)[0]
+        assert record["event"] == "my-custom-stop-alias"
+        assert record["kind"] == "turn_complete"
+
+
+class TestMessageExtraction:
+    """The assistant's last turn is promoted into the envelope so a wake is
+    actionable without re-parsing the harness-specific payload shape."""
+
+    def test_claude_message_survives_end_to_end_in_watch_aggregate(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys,
+    ):
+        """A realistic 4096-char claude last_assistant_message survives
+        intact through cmd_hook and appears in watch.hooks.last.message."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "msgrun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "msgrun")
+        payload = dict(_fixture("hook_claude_stop.json"))
+        long_message = "The answer is 42. " * 215  # 4085 chars, under the cap
+        assert len(long_message) <= agent_run._HOOK_MESSAGE_MAX_CHARS
+        payload["last_assistant_message"] = long_message
+
+        agent_run.cmd_hook(_hook_args("stop", json_payload=json.dumps(payload)))
+
+        record = _read_hooks(ld)[0]
+        assert record["message"] == long_message
+        assert "message_truncated" not in record
+
+        agent_run.cmd_watch(_watch_args("msgrun"))
+        watch_payload = json.loads(capsys.readouterr().out)
+        assert watch_payload["hooks"]["last"]["message"] == long_message
+
+    def test_codex_message_key(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "msgcodex")
+        monkeypatch.setenv("AGENT_RUN_NAME", "msgcodex")
+        payload = json.dumps(_fixture("hook_codex_turn_complete.json"))
+
+        agent_run.cmd_hook(_hook_args("turn-complete", extra=[payload]))
+
+        assert _read_hooks(ld)[0]["message"] == "CXPONG"
+
+    def test_opencode_properties_message_key(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "msgoc")
+        monkeypatch.setenv("AGENT_RUN_NAME", "msgoc")
+        payload = {"type": "session.idle",
+                   "properties": {"sessionID": "s1", "message": "done thinking"}}
+
+        agent_run.cmd_hook(_hook_args("session-idle", json_payload=json.dumps(payload)))
+
+        assert _read_hooks(ld)[0]["message"] == "done thinking"
+
+    def test_opencode_properties_text_key(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "msgoctext")
+        monkeypatch.setenv("AGENT_RUN_NAME", "msgoctext")
+        payload = {"type": "session.idle",
+                   "properties": {"sessionID": "s1", "text": "the text form"}}
+
+        agent_run.cmd_hook(_hook_args("session-idle", json_payload=json.dumps(payload)))
+
+        assert _read_hooks(ld)[0]["message"] == "the text form"
+
+    def test_no_message_field_is_null_not_missing(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "nomsg")
+        monkeypatch.setenv("AGENT_RUN_NAME", "nomsg")
+
+        agent_run.cmd_hook(_hook_args("stop", json_payload='{"session_id":"s1"}'))
+
+        record = _read_hooks(ld)[0]
+        assert "message" in record
+        assert record["message"] is None
+
+    @pytest.mark.parametrize("bad_value", [
+        pytest.param(123, id="int"),
+        pytest.param(["a", "b"], id="list"),
+        pytest.param({"nested": True}, id="dict"),
+        pytest.param(None, id="none"),
+        pytest.param(True, id="bool"),
+    ])
+    def test_non_str_message_value_tolerated_not_raised(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, bad_value,
+    ):
+        """A non-str last_assistant_message must not raise; the field is
+        simply absent from the record."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "badmsg")
+        monkeypatch.setenv("AGENT_RUN_NAME", "badmsg")
+        payload = {"session_id": "s1", "hook_event_name": "Stop",
+                   "last_assistant_message": bad_value}
+
+        rc = agent_run.cmd_hook(_hook_args("stop", json_payload=json.dumps(payload)))
+
+        assert rc == 0
+        assert _read_hooks(ld)[0]["message"] is None
     """stdin must never outlast _HOOK_STDIN_TIMEOUT_SECONDS: the harness turn
     does not resume until the hook returns."""
 
@@ -502,9 +659,62 @@ sys.exit(agent_run.cmd_hook(ns))
         for line in lines:
             assert json.loads(line)["event"] == "stop"
 
+    def test_40_writers_near_max_line_bytes_produce_no_torn_lines(
+        self, isolated_runs_root, isolated_log_root,
+    ):
+        """40 concurrent processes each append a record sized close to
+        _HOOK_MAX_LINE_BYTES (8192): the new size where atomicity must still
+        hold on a local regular file's O_APPEND fd, per PIPE_BUF not applying
+        here. Every writer's index is embedded in its payload so a spliced
+        line is detectable by content mismatch, not just by unparseability.
+        """
+        name = "concurrent8k"
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
+        n_writers = 40
+
+        script = f"""\
+import sys
+sys.path.insert(0, {SRC_DIR!r})
+import argparse, json, os
+from pathlib import Path
+from toolbox import agent_run
+agent_run.STATE_ROOT = Path({str(isolated_runs_root)!r})
+agent_run.LOG_ROOT = Path({str(isolated_log_root)!r})
+writer = int(sys.argv[1])
+payload = json.dumps({{
+    "writer": writer,
+    "last_assistant_message": "m" * 6000,
+    "session_id": "writer-%d" % writer,
+}})
+ns = argparse.Namespace(event='stop', name={name!r}, json_payload=payload, extra=[])
+sys.exit(agent_run.cmd_hook(ns))
+"""
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(i)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for i in range(n_writers)
+        ]
+        for p in procs:
+            p.wait(timeout=30)
+
+        lines = _hook_lines(ld)
+        assert len(lines) == n_writers, f"expected {n_writers} lines, got {len(lines)}"
+        seen_writers = set()
+        for line in lines:
+            assert len(line) <= agent_run._HOOK_MAX_LINE_BYTES
+            record = json.loads(line)
+            assert record["event"] == "stop"
+            writer = record["payload"].get("writer")
+            assert writer not in seen_writers, "duplicate writer index: torn/duplicated line"
+            seen_writers.add(writer)
+        assert seen_writers == set(range(n_writers)), "a writer's line was lost or spliced"
+
 
 class TestLineCap:
-    """Every line must fit PIPE_BUF, or a concurrent append can splice it."""
+    """Every line must fit _HOOK_MAX_LINE_BYTES, the atomicity bound for a
+    single os.write to an O_APPEND fd on a local regular file."""
 
     @pytest.mark.parametrize("args,label", [
         pytest.param(
@@ -518,12 +728,20 @@ class TestLineCap:
         ),
         pytest.param(
             {"event": "\U0001F600" * 5000,
-             "json_payload": json.dumps({"type": "session.idle", "session": "s" * 400,
+             "json_payload": json.dumps({"type": "session.idle",
+                                         "properties": {"sessionID": "s" * 400},
                                          "detail": "d" * 400})},
             "huge-event-and-payload", id="huge-event-and-payload",
         ),
+        pytest.param(
+            {"json_payload": json.dumps({
+                "last_assistant_message": "m" * 20000,
+                "transcript_path": "/tmp/" + "p" * 20000,
+            })},
+            "huge-message-and-payload", id="huge-message-and-payload",
+        ),
     ])
-    def test_line_never_exceeds_pipe_buf(
+    def test_line_never_exceeds_max_line_bytes(
         self, isolated_runs_root, isolated_log_root, monkeypatch, args, label,
     ):
         """Sizes are measured on the ensure_ascii encoding, where one astral
@@ -540,8 +758,9 @@ class TestLineCap:
         assert rc == 0
         lines = _hook_lines(ld)
         assert len(lines) == 1
-        assert len(lines[0]) <= agent_run._HOOK_MAX_LINE_BYTES
-        assert len(lines[0]) <= PIPE_BUF, f"{label} line exceeds PIPE_BUF={PIPE_BUF}"
+        assert len(lines[0]) <= agent_run._HOOK_MAX_LINE_BYTES, (
+            f"{label} line exceeds _HOOK_MAX_LINE_BYTES={agent_run._HOOK_MAX_LINE_BYTES}"
+        )
 
     def test_oversized_payload_is_flagged_truncated(
         self, isolated_runs_root, isolated_log_root, monkeypatch,
@@ -568,7 +787,7 @@ class TestLineCap:
         assert "payload_truncated" not in record
         assert record["payload"] == {"k": "v"}
 
-    def test_repeated_writes_all_within_pipe_buf(
+    def test_repeated_writes_all_within_line_cap(
         self, isolated_runs_root, isolated_log_root, monkeypatch,
     ):
         _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "pipebufrun")
@@ -580,7 +799,7 @@ class TestLineCap:
             )
 
         for line in _hook_lines(ld):
-            assert len(line) <= PIPE_BUF
+            assert len(line) <= agent_run._HOOK_MAX_LINE_BYTES
 
     def test_event_cap_stops_appending(
         self, isolated_runs_root, isolated_log_root, monkeypatch,
@@ -594,6 +813,70 @@ class TestLineCap:
             agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
 
         assert len(_read_hooks(ld)) == 3
+
+
+class TestPriorityTruncation:
+    """message is clipped last, after payload has already been shrunk to {},
+    so a huge transcript_path cannot starve the field that makes a wake
+    actionable."""
+
+    def test_huge_payload_field_and_long_message_keeps_message_clips_payload(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "prioritytrunc")
+        monkeypatch.setenv("AGENT_RUN_NAME", "prioritytrunc")
+        message = "The assistant's important final answer. " * 40  # ~1680 chars
+        payload = {
+            "transcript_path": "/very/long/synthetic/path/" + "p" * 10000,
+            "session_id": "s1",
+            "hook_event_name": "Stop",
+            "last_assistant_message": message,
+        }
+
+        rc = agent_run.cmd_hook(_hook_args("stop", json_payload=json.dumps(payload)))
+
+        assert rc == 0
+        record = _read_hooks(ld)[0]
+        assert record["message"] == message
+        assert "message_truncated" not in record
+        assert record["payload_truncated"] is True
+        assert len(record["payload"].get("transcript_path", "")) < 10000
+
+    def test_over_long_message_sets_message_truncated(self):
+        """_hook_extract_message already clips to _HOOK_MESSAGE_MAX_CHARS
+        encoded bytes, so an over-budget message reaching _hook_encode_line
+        can only come from a record built some other way — exercise the
+        ladder rung directly rather than through cmd_hook, which cannot
+        produce this input by construction."""
+        huge_message = "m" * 50000
+        record = {
+            "event": "stop", "at": "2026-08-19T00:00:00Z", "harness": "claude",
+            "kind": "turn_complete", "message": huge_message,
+            "source": "stdin", "pid": 123, "resolved_by": "env",
+            "payload": {},
+        }
+
+        line = agent_run._hook_encode_line(record)
+
+        assert len(line) <= agent_run._HOOK_MAX_LINE_BYTES
+        record_out = json.loads(line)
+        assert record_out["message_truncated"] is True
+        assert huge_message.startswith(record_out["message"])
+        assert 0 < len(record_out["message"]) < len(huge_message)
+
+    def test_message_only_present_when_payload_carries_one(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """A normal-sized record with no message field is never flagged
+        message_truncated."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "nomsgtrunc")
+        monkeypatch.setenv("AGENT_RUN_NAME", "nomsgtrunc")
+
+        agent_run.cmd_hook(_hook_args("stop", json_payload='{"session_id":"s1"}'))
+
+        record = _read_hooks(ld)[0]
+        assert "message_truncated" not in record
+        assert record["message"] is None
 
 
 class TestSymlinkRefused:
@@ -672,6 +955,45 @@ class TestWatchHooks:
         assert hooks["last"]["event"] == "notification"
         assert hooks["last_event_age_s"] >= 0.0
         assert hooks["at_cap"] is False
+
+    def test_hooks_aggregate_kinds_and_last_kind_message(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys,
+    ):
+        """watch.hooks.last gains kind+message, and a top-level kinds counter
+        aggregates alongside the existing events counter — purely additive."""
+        _make_run_dirs(isolated_runs_root, isolated_log_root, "watchkinds")
+        monkeypatch.setenv("AGENT_RUN_NAME", "watchkinds")
+        agent_run.cmd_hook(_hook_args(
+            "stop", json_payload=json.dumps(_fixture("hook_claude_stop.json"))))
+        agent_run.cmd_hook(_hook_args(
+            "turn-complete", extra=[json.dumps(_fixture("hook_codex_turn_complete.json"))]))
+        agent_run.cmd_hook(_hook_args(
+            "permission-asked",
+            json_payload=json.dumps(_fixture("hook_opencode_permission_asked.json"))))
+
+        agent_run.cmd_watch(_watch_args("watchkinds"))
+
+        hooks = json.loads(capsys.readouterr().out)["hooks"]
+        assert hooks["kinds"] == {"turn_complete": 2, "permission_required": 1}
+        assert hooks["last"]["kind"] == "permission_required"
+        assert hooks["last"]["message"] is None  # permission.asked carries no message
+        # count/last/last_event_age_s/events/at_cap/truncated stay as they were.
+        assert hooks["count"] == 3
+        assert set(hooks["events"]) == {"stop", "turn-complete", "permission-asked"}
+
+    def test_hooks_aggregate_last_message_survives(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys,
+    ):
+        _make_run_dirs(isolated_runs_root, isolated_log_root, "watchmsg")
+        monkeypatch.setenv("AGENT_RUN_NAME", "watchmsg")
+        agent_run.cmd_hook(_hook_args(
+            "stop", json_payload=json.dumps(_fixture("hook_claude_stop.json"))))
+
+        agent_run.cmd_watch(_watch_args("watchmsg"))
+
+        hooks = json.loads(capsys.readouterr().out)["hooks"]
+        assert hooks["last"]["message"] == "PONGCAPTURE"
+        assert hooks["last"]["kind"] == "turn_complete"
 
     def test_at_cap_reported_at_cap(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys,
@@ -773,6 +1095,46 @@ class TestReadHooksJsonl:
 
         assert result["count"] == 1
         assert result["events"] == {"stop": 1}
+
+    def test_kinds_aggregated_alongside_events(self, tmp_path):
+        lines = [
+            json.dumps({"event": "stop", "at": "2026-08-18T22:31:00Z",
+                        "harness": "claude", "kind": "turn_complete", "payload": {}}),
+            json.dumps({"event": "turn-complete", "at": "2026-08-18T22:32:00Z",
+                        "harness": "codex", "kind": "turn_complete", "payload": {}}),
+            json.dumps({"event": "notification", "at": "2026-08-18T22:33:00Z",
+                        "harness": None, "kind": "permission_required", "payload": {}}),
+        ]
+        (tmp_path / "hooks.jsonl").write_text("\n".join(lines) + "\n")
+
+        result = agent_run._read_hooks_jsonl(tmp_path)
+
+        assert result["kinds"] == {"turn_complete": 2, "permission_required": 1}
+        assert result["last"]["kind"] == "permission_required"
+
+    @pytest.mark.parametrize("bad_kind,bad_message", [
+        pytest.param("12345", "null", id="int-kind-null-message"),
+        pytest.param("null", "67890", id="null-kind-int-message"),
+        pytest.param("[1,2]", '{"a":1}', id="list-kind-dict-message"),
+        pytest.param("true", "false", id="bool-kind-bool-message"),
+    ])
+    def test_non_string_kind_and_message_do_not_raise(
+        self, tmp_path, bad_kind, bad_message,
+    ):
+        """A non-string kind/message in the file is data from a process that
+        can write anything to hooks.jsonl — summarise as null, never raise."""
+        (tmp_path / "hooks.jsonl").write_text(
+            '{"event":"stop","at":"2026-08-18T22:31:00Z","kind":' + bad_kind
+            + ',"message":' + bad_message + "}\n"
+        )
+
+        result = agent_run._read_hooks_jsonl(tmp_path)
+
+        assert result is not None
+        assert result["last"]["kind"] is None
+        assert result["last"]["message"] is None
+        # A non-string kind contributes nothing countable to the aggregate.
+        assert result["kinds"] == {}
 
     @pytest.mark.parametrize("at_value", [
         pytest.param('"2026-01-01T00:00:00Z"', id="valid"),

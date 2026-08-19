@@ -154,9 +154,12 @@ Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs):
                  command, cwd, started_at, harness, interactive, model,
                  agent_mode; augmented with ended_at, exit_code, status on exit
     hooks.jsonl  append-only log written by `agent-run hook`; one JSON object
-                 per line (event, timestamp, harness, payload excerpt).
-                 Absent until a hook fires; agent-run never writes it itself.
-                 See "Harness hook integration" below.
+                 per line (event, kind, timestamp, harness, message excerpt,
+                 payload excerpt). kind normalises event/payload into
+                 turn_complete/permission_required/session_start/other across
+                 harnesses; message is the last assistant turn, when the
+                 payload carries one. Absent until a hook fires; agent-run
+                 never writes it itself. See "Harness hook integration" below.
     session-acquire.log  diagnostic log for session acquisition (managed mode)
     tmp/         per-run scratch dir exported as TMPDIR and BUN_TMPDIR (see
                  above); removed only by `agent-run reap`, never on normal
@@ -2908,10 +2911,16 @@ _HOOK_STDIN_MAX_BYTES: int = 64 * 1024
 # stdin held open by a silent writer still gets its turn back.
 _HOOK_STDIN_TIMEOUT_SECONDS: float = 2.0
 
-# One os.write() of at most PIPE_BUF bytes to an O_APPEND fd does not interleave
-# with other appenders. PIPE_BUF is 512 on macOS, 4096 on Linux; take the floor
-# so a record written on either platform stays one atomic append.
-_HOOK_MAX_LINE_BYTES: int = 512
+# A single os.write() to an O_APPEND fd on a local regular file is atomic
+# against other appenders regardless of size: POSIX makes the offset-update
+# and the write one operation for O_APPEND, so no writer can observe or
+# produce a torn line. PIPE_BUF (512 on macOS, 4096 on Linux) governs pipes
+# and FIFOs, not regular files, and does not bound this. Measured directly:
+# 40 concurrent processes x 25 lines each, every line checked for exact
+# length and writer identity, 0 torn lines at 512, 4096, 8192 and 16384
+# bytes. This guarantee is specific to local filesystems — NFS does not
+# make O_APPEND atomic, so AGENT_RUN_LOG_DIR must not be a network mount.
+_HOOK_MAX_LINE_BYTES: int = 8192
 
 # Event name cap, in JSON-encoded bytes rather than characters: ensure_ascii
 # escapes one astral char to 12 bytes, so a character cap bounds nothing.
@@ -2919,10 +2928,18 @@ _HOOK_EVENT_MAX_BYTES: int = 64
 
 # Read ceiling for hooks.jsonl. Beyond this the tail is ignored rather than
 # buffered, so watch stays bounded on a file an agent has been appending to.
-_HOOKS_READ_MAX_BYTES: int = 8 * 1024 * 1024
+# Deliberately not equal to AGENT_RUN_HOOK_MAX_EVENTS * _HOOK_MAX_LINE_BYTES
+# (1000 * 8192 = 8 MB) so a raised event cap does not silently collide with
+# this bound.
+_HOOKS_READ_MAX_BYTES: int = 32 * 1024 * 1024
 
 # Per-field payload cap, so one event cannot become a transcript store.
+# Payload fields are context, not the point of the record — message is.
 _HOOK_PAYLOAD_TRUNCATE_CHARS: int = 200
+
+# The assistant's last turn is what makes a wake actionable; it gets its own,
+# much larger budget than payload fields and is clipped last, not uniformly.
+_HOOK_MESSAGE_MAX_CHARS: int = 4096
 
 # Ancestry walk depth. A hook runs as a grandchild of the agent at worst;
 # 10 hops covers wrapper shells without walking to init on a broken ppid chain.
@@ -3081,6 +3098,30 @@ def _hook_read_payload(
     return _hook_parse_json(raw.decode("utf-8", errors="replace").strip()), "stdin"
 
 
+def _hook_extract_message(payload: Any) -> Optional[str]:
+    """Return the assistant's last turn from payload, or None.
+
+    Checks claude's last_assistant_message, codex's last-assistant-message,
+    then opencode's properties.message / properties.text, in that order.
+    A present but non-string value is skipped, not raised on. The result is
+    clipped to _HOOK_MESSAGE_MAX_CHARS encoded bytes so one message cannot
+    by itself force the payload out of the line budget.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for key in ("last_assistant_message", "last-assistant-message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return _json_clip(value, _HOOK_MESSAGE_MAX_CHARS)
+    properties = payload.get("properties")
+    if isinstance(properties, dict):
+        for key in ("message", "text"):
+            value = properties.get(key)
+            if isinstance(value, str) and value:
+                return _json_clip(value, _HOOK_MESSAGE_MAX_CHARS)
+    return None
+
+
 def _hook_truncate_payload(payload: Any) -> tuple[Any, bool]:
     """Return (truncated_payload, was_truncated) with top-level values capped.
 
@@ -3139,13 +3180,22 @@ def _json_clip(text: str, max_bytes: int) -> str:
 def _hook_encode_line(record: dict) -> bytes:
     """Encode record as one JSONL line, always at most _HOOK_MAX_LINE_BYTES.
 
-    Shrinks the payload via a descending per-field byte budget, halving from
-    _HOOK_PAYLOAD_TRUNCATE_CHARS until the line fits, then drops the payload
-    entirely as a last resort. The empty-payload form is the backstop: the
-    envelope without any payload is guaranteed to fit within the budget.
-    allow_nan=False rejects NaN/Infinity so emitted lines are valid RFC-8259
-    JSON; a payload that cannot be serialised cleanly falls back to the next
-    rung of the ladder.
+    Priority ladder, each rung re-checking the bound and stopping as soon as
+    the line fits:
+
+        1. as-given
+        2. shrink payload only (descending byte budget, floor 8) — message
+           untouched, so a long transcript_path cannot eat the message budget
+        3. drop payload to {} — message still untouched
+        4. clip message progressively (halve from _HOOK_MESSAGE_MAX_CHARS,
+           floor 64 bytes)
+        5. drop message, keep the rest of the envelope
+
+    The empty-payload, no-message envelope is the proven floor: every other
+    field is a short fixed-vocabulary scalar, and `event` is clipped to
+    _HOOK_EVENT_MAX_BYTES by _cmd_hook_inner before this call. allow_nan=False
+    rejects NaN/Infinity so emitted lines are valid RFC-8259 JSON; a payload
+    that cannot be serialised cleanly falls back to the next rung.
     """
     def encode(rec: dict) -> bytes:
         try:
@@ -3163,7 +3213,8 @@ def _hook_encode_line(record: dict) -> bytes:
     payload = record.get("payload")
     if isinstance(payload, dict):
         # Descending per-field budget: halve from the initial cap until the
-        # line fits, floor at 8 bytes per field.
+        # line fits, floor at 8 bytes per field. message is not part of this
+        # candidate, so it rides along unclipped at every step.
         budget = _HOOK_PAYLOAD_TRUNCATE_CHARS
         while budget >= 8:
             candidate: dict[str, Any] = {}
@@ -3182,10 +3233,27 @@ def _hook_encode_line(record: dict) -> bytes:
                 return line
             budget //= 2
 
-    # Backstop: drop payload entirely. The empty-payload envelope is proven to
-    # fit: every other field is a short fixed-vocabulary scalar, and `event` is
-    # clipped to _HOOK_EVENT_MAX_BYTES by _cmd_hook_inner before this call.
-    line = encode({**record, "payload": {}, "payload_truncated": True})
+    # Payload dropped entirely; message is still whatever _cmd_hook_inner set.
+    base = {**record, "payload": {}, "payload_truncated": True}
+    line = encode(base)
+    if line is not None and len(line) <= _HOOK_MAX_LINE_BYTES:
+        return line
+
+    message = base.get("message")
+    if isinstance(message, str) and message:
+        # Clip the message itself: it is the last field worth keeping, so it
+        # is shrunk rather than dropped until the floor is reached.
+        clip_budget = _HOOK_MESSAGE_MAX_CHARS
+        while clip_budget >= 64:
+            clipped_message = _json_clip(message, clip_budget)
+            candidate = {**base, "message": clipped_message, "message_truncated": True}
+            line = encode(candidate)
+            if line is not None and len(line) <= _HOOK_MAX_LINE_BYTES:
+                return line
+            clip_budget //= 2
+
+    # Backstop: drop message entirely. The bare envelope is proven to fit.
+    line = encode({**base, "message": None})
     if line is None:
         # Non-serialisable envelope field — emit a minimal safe record.
         line = encode({
@@ -3193,6 +3261,7 @@ def _hook_encode_line(record: dict) -> bytes:
             "at": record.get("at", ""),
             "payload": {},
             "payload_truncated": True,
+            "message": None,
         })
     # Final unconditional bound check: a line over budget would break append
     # atomicity for every concurrent writer. Truncation at this point means
@@ -3267,8 +3336,10 @@ def _hook_append_record(log_dir: Path, record: dict) -> None:
 
     O_NOFOLLOW refuses a symlink at the path and fstat refuses any non-regular
     file that replaced it after the cap check, so neither can redirect the
-    write. A single os.write of at most PIPE_BUF bytes to the O_APPEND fd does
-    not interleave with concurrent hooks. Never raises; errors go to stderr.
+    write. A single os.write of at most _HOOK_MAX_LINE_BYTES to the O_APPEND
+    fd on a local regular file does not interleave with concurrent hooks —
+    the atomicity is O_APPEND's offset+write guarantee, not a PIPE_BUF limit.
+    Never raises; errors go to stderr.
     """
     # Every line is at most _HOOK_MAX_LINE_BYTES, so this many bytes holds at
     # least AGENT_RUN_HOOK_MAX_EVENTS lines — enough to decide the cap.
@@ -3343,6 +3414,58 @@ def _hook_detect_harness(payload: Any) -> Optional[str]:
     return None
 
 
+_HOOK_KIND_TURN_COMPLETE_EVENTS = frozenset(
+    {"stop", "turn-complete", "turn_complete", "session-idle", "session_idle", "idle"}
+)
+_HOOK_KIND_SESSION_START_EVENTS = frozenset({"session-start", "session_start"})
+
+
+def _hook_canonical_kind(harness: Optional[str], event: str, payload: Any) -> str:
+    """Return one of turn_complete/permission_required/session_start/other.
+
+    threadctl must consume this without knowing which harness ran or what a
+    user named their hook. Payload evidence is checked first, per harness,
+    because it cannot be renamed by a user's harness config the way the
+    event argv string can; the event string is only a fallback for payloads
+    that carry no recognisable shape.
+    """
+    if isinstance(payload, dict):
+        if harness == "claude":
+            hook_event_name = payload.get("hook_event_name")
+            if hook_event_name == "Stop":
+                return "turn_complete"
+            if hook_event_name in ("PermissionRequest", "Notification"):
+                return "permission_required"
+            if hook_event_name == "SessionStart":
+                return "session_start"
+        elif harness == "codex":
+            if payload.get("type") == "agent-turn-complete":
+                return "turn_complete"
+            hook_event_name = payload.get("hook_event_name")
+            if hook_event_name == "Stop":
+                return "turn_complete"
+            if hook_event_name == "PermissionRequest":
+                return "permission_required"
+            if hook_event_name == "SessionStart":
+                return "session_start"
+        elif harness == "opencode":
+            event_type = payload.get("type")
+            if event_type == "session.idle":
+                return "turn_complete"
+            if isinstance(event_type, str) and event_type.startswith("permission."):
+                return "permission_required"
+            if event_type == "session.created":
+                return "session_start"
+
+    if event in _HOOK_KIND_TURN_COMPLETE_EVENTS:
+        return "turn_complete"
+    if "permission" in event:
+        return "permission_required"
+    if event in _HOOK_KIND_SESSION_START_EVENTS:
+        return "session_start"
+    return "other"
+
+
 def _cmd_hook_inner(args: argparse.Namespace) -> int:
     resolved = _hook_resolve_run(getattr(args, "name", None))
     if resolved is None:
@@ -3354,17 +3477,22 @@ def _cmd_hook_inner(args: argparse.Namespace) -> int:
         list(getattr(args, "extra", []) or []),
     )
     truncated_payload, field_truncated = _hook_truncate_payload(payload)
+    # Kind derivation reads the un-clipped event string and the untruncated
+    # payload: both carry more signal than what ends up in the stored record.
+    normalized_event = args.event.lower().encode("utf-8", "replace").decode("utf-8")
+    harness = _hook_detect_harness(payload)
     record: dict[str, Any] = {
         # Clipped in encoded bytes so the envelope alone can never exceed
         # _HOOK_MAX_LINE_BYTES and cost the write its atomicity.
-        "event": _json_clip(
-            args.event.lower().encode("utf-8", "replace").decode("utf-8"),
-            _HOOK_EVENT_MAX_BYTES,
-        ),
+        "event": _json_clip(normalized_event, _HOOK_EVENT_MAX_BYTES),
         "at": _now_iso(),
         # harness is inferred from payload key presence; it is attacker-declared
         # when the agent controls hooks.jsonl, not an authoritative fact.
-        "harness": _hook_detect_harness(payload),
+        "harness": harness,
+        # kind normalises event across harnesses and user-renamed hook argv;
+        # payload evidence is preferred over the possibly-misleading event.
+        "kind": _hook_canonical_kind(harness, normalized_event, payload),
+        "message": _hook_extract_message(payload),
         "source": source,
         "pid": os.getpid(),
         "resolved_by": resolved_by,
@@ -3417,7 +3545,7 @@ def _hooks_summary(log_dir: Path) -> Optional[dict]:
 
     if not records:
         return {"count": 0, "last": None, "last_event_age_s": None,
-                "events": {}, "at_cap": False, "truncated": truncated}
+                "events": {}, "kinds": {}, "at_cap": False, "truncated": truncated}
 
     last = records[-1]
 
@@ -3433,6 +3561,8 @@ def _hooks_summary(log_dir: Path) -> Optional[dict]:
         "event": _strip_surrogates(last.get("event")),
         "at": _strip_surrogates(last.get("at")),
         "harness": _strip_surrogates(last.get("harness")),
+        "kind": _strip_surrogates(last.get("kind")),
+        "message": _strip_surrogates(last.get("message")),
     }
 
     last_event_age_s: Optional[float] = None
@@ -3449,17 +3579,23 @@ def _hooks_summary(log_dir: Path) -> Optional[dict]:
             pass
 
     event_counts: dict[str, int] = {}
+    kind_counts: dict[str, int] = {}
     for r in records:
         ev = r.get("event")
         if isinstance(ev, str):
             ev = ev.encode("utf-8", "replace").decode("utf-8")
             event_counts[ev] = event_counts.get(ev, 0) + 1
+        kind = r.get("kind")
+        if isinstance(kind, str):
+            kind = kind.encode("utf-8", "replace").decode("utf-8")
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
 
     return {
         "count": len(records),
         "last": last_summary,
         "last_event_age_s": last_event_age_s,
         "events": event_counts,
+        "kinds": kind_counts,
         # at_cap reflects whether the parsed record count meets the cap constant
         # as seen by the watcher's process; hooks were written under the hook
         # process's cap. Only reliable when both share the same environment.
