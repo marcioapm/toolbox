@@ -3236,7 +3236,7 @@ def _hook_detect_harness(payload: Any) -> Optional[str]:
         return "claude"
     if "type" in payload and "thread-id" in payload:
         return "codex"
-    if "type" in payload and "session" in payload:
+    if "type" in payload and "properties" in payload:
         return "opencode"
     return None
 

@@ -1,0 +1,1117 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""verify-hook-delivery — end-to-end test for the agent-run harness hook chain.
+
+Each cell exercises one (harness, mode) pair and asserts:
+  [1] run reaches terminal status (done for one-shot) or replies to a prompt
+      (interactive — at least one turn answered)
+  [2] hook program was invoked — the hook script wrote its evidence file
+  [3] run identity inherited — AGENT_RUN_NAME non-empty AND equals the cell's run name
+  [4] agent-run hook accepted it — hooks.jsonl exists, is valid JSONL, contains a record
+      whose event matches, payload carries harness-specific fields, resolved_by == "env"
+  [5] watch --json surfaces it — hooks aggregate non-null, count >= 1, events contains
+      the event, last_event_age_s is sane, terminal/status are unaffected
+  [6] latency — seconds between run terminal/first-reply and hook record appearing; fail
+      if beyond HOOK_WAIT_TIMEOUT; reported per cell in --json output
+
+All six cells are real cells; no mode is SKIPped. Probes on this machine confirm:
+  opencode run: 73 events delivered to a plugin (including session.idle) on the
+      non-interactive `opencode run` path with both .js and .ts plugin files.
+  claude interactive: Stop hook fires after each assistant turn with AGENT_RUN_NAME
+      inherited; probe: hook script received AGENT_RUN_NAME and payload on first reply.
+  codex interactive: notify fires after each turn; probe: hook received AGENT_RUN_NAME
+      and payload on first reply from managed app-server path.
+  opencode interactive: session.idle fires after each turn; probe: plugin received
+      process.env.AGENT_RUN_NAME == run name and wrote evidence on first reply.
+
+The opencode plugin format uses a named export async factory function returning
+{event: async ({event}) => ...}, not `export default {onEvent}`. The latter form
+causes "Plugin export is not a function" in opencode 1.18.x.
+
+Harness versions (claude --version, codex --version, opencode --version) are recorded in
+the --json output so future regressions identify which version changed behaviour.
+
+The harness script writes all hook config itself (simulating the user who opted in).
+agent-run never writes hook config.  Temp config and scripts are cleaned up on teardown.
+
+The hook fires AFTER the run reaches terminal status, so cells poll for the hook record
+with a separate timeout after terminal, never reading hooks.jsonl at the instant of terminal.
+For interactive cells, polling starts after the first turn reply is confirmed in the log.
+
+The branch code is invoked via .venv/bin/python src/toolbox/agent_run.py; bare agent-run
+on PATH is the installed toolbox build that predates this feature. A startup check asserts
+the branch binary supports the hook subcommand before any cell runs.
+
+Approximate cost per full run: ~$0.03–0.08 (haiku models, trivial prompts, 6 cells).
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import json
+import os
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+RUN_TIMEOUT        = float(os.environ.get("RUN_TIMEOUT",        "120"))
+HOOK_WAIT_TIMEOUT  = float(os.environ.get("HOOK_WAIT_TIMEOUT",  "30"))
+INTERACTIVE_FIRST_REPLY_TIMEOUT = float(
+    os.environ.get("INTERACTIVE_FIRST_REPLY_TIMEOUT", "90")
+)
+STATUS_POLL_INTERVAL = 1.0
+HOOK_POLL_INTERVAL   = 0.5
+
+STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
+LOG_ROOT   = Path(os.environ.get("AGENT_RUN_LOG_DIR",   "/var/tmp/agent-runs"))
+
+# Branch code under test — never the bare PATH agent-run (the installed build).
+_REPO_ROOT    = Path(__file__).resolve().parent.parent
+_BRANCH_PYTHON = _REPO_ROOT / ".venv" / "bin" / "python"
+_BRANCH_SCRIPT = _REPO_ROOT / "src" / "toolbox" / "agent_run.py"
+
+# Cheap models — near-zero cost for harness probes.
+CLAUDE_MODEL   = os.environ.get("CLAUDE_MODEL",   "claude-haiku-4-5")
+OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "llmproxy-anthropic/claude-haiku-4.5")
+CODEX_MODEL    = os.environ.get("CODEX_MODEL",    "gpt-5.4")
+CODEX_PROVIDER = os.environ.get("CODEX_PROVIDER", "llmproxy")
+
+# A trivial prompt each harness can answer in one sentence.
+ONESHOT_PROMPT      = "Reply with exactly: HOOKCHECK"
+ONESHOT_TOKEN       = "hookcheck"
+INTERACTIVE_PROMPT  = "Reply with exactly: HOOKPING"
+INTERACTIVE_TOKEN   = "hookping"
+
+TERMINAL_STATUSES = {"done", "failed", "launch_failed", "died", "killed"}
+
+PASS = "PASS"
+FAIL = "FAIL"
+SKIP = "SKIP"
+
+# Every run launched this invocation, for atexit/signal teardown.
+_active_runs: set[str] = set()
+_temp_dirs:   list[str] = []
+_temp_files:  list[str] = []
+_json_mode: bool = False
+_agent_run_bin: list[str] = []  # argv prefix for the branch binary
+
+
+def _ensure_openai_key() -> None:
+    """Set OPENAI_API_KEY from ~/.codex/auth.json if not already in the env."""
+    if os.environ.get("OPENAI_API_KEY"):
+        return
+    try:
+        data = json.loads((Path.home() / ".codex" / "auth.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if data.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = data["OPENAI_API_KEY"]
+
+
+_ensure_openai_key()
+
+
+@dataclass
+class CellResult:
+    name: str
+    verdict: str = FAIL
+    run_name: Optional[str] = None
+    links: dict = field(default_factory=dict)
+    notes: list = field(default_factory=list)
+    failure_link: Optional[str] = None
+    failure_detail: Optional[str] = None
+    latency_s: Optional[float] = None  # seconds between terminal/first-reply and hook record
+
+    def pass_(self, run_name: str, links: dict, latency_s: Optional[float]) -> None:
+        self.verdict = PASS
+        self.run_name = run_name
+        self.links = links
+        self.latency_s = latency_s
+
+    def skip(self, reason: str) -> None:
+        self.verdict = SKIP
+        self.notes.append(reason)
+
+    def fail(self, link: str, detail: str) -> None:
+        self.verdict = FAIL
+        self.failure_link = link
+        self.failure_detail = detail
+        self.notes.append(f"FAIL [{link}]: {detail}")
+
+
+# ---------------------------------------------------------------------------
+# Logging and subprocess helpers
+# ---------------------------------------------------------------------------
+
+def _log(msg: str) -> None:
+    print(msg, flush=True, file=sys.stderr if _json_mode else sys.stdout)
+
+
+def _run(*cmd: str, check: bool = True, timeout: int = 30,
+         env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    """Run a command, capturing stdout+stderr."""
+    return subprocess.run(list(cmd), capture_output=True, text=True,
+                          timeout=timeout, check=check, env=env)
+
+
+def _agent_run_quiet(*args: str) -> None:
+    """Best-effort branch agent-run subcommand; never raises. Used on teardown paths."""
+    try:
+        subprocess.run([*_agent_run_bin, *args], capture_output=True,
+                       timeout=30, check=False)
+    except Exception:
+        pass
+
+
+def _agent_run_status(name: str) -> str:
+    try:
+        return (STATE_ROOT / name / "status").read_text().strip()
+    except OSError:
+        return "unknown"
+
+
+def _wait_for_terminal(name: str, timeout: float) -> str:
+    """Poll until status is terminal or timeout expires. Returns the final status."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        st = _agent_run_status(name)
+        if st in TERMINAL_STATUSES:
+            return st
+        time.sleep(STATUS_POLL_INTERVAL)
+    return _agent_run_status(name)
+
+
+def _read_log(name: str) -> str:
+    try:
+        return (LOG_ROOT / name / "log").read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _log_tail(name: str, max_chars: int = 1000) -> str:
+    return _read_log(name)[-max_chars:]
+
+
+# ---------------------------------------------------------------------------
+# Harness version capture
+# ---------------------------------------------------------------------------
+
+def _harness_versions() -> dict:
+    """Return {harness: version_string} for each harness available on PATH."""
+    versions: dict = {}
+    for harness, cmd in [("claude", ["claude", "--version"]),
+                          ("codex",  ["codex",  "--version"]),
+                          ("opencode", ["opencode", "--version"])]:
+        try:
+            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+            out = (cp.stdout or cp.stderr or "").strip()
+            versions[harness] = out.splitlines()[0] if out else "unknown"
+        except Exception as exc:
+            versions[harness] = f"error: {exc}"
+    return versions
+
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+def _reap_run(name: str, keep: bool) -> None:
+    _active_runs.discard(name)
+    if keep:
+        return
+    _agent_run_quiet("reap", "--name", name, "--include-logs",
+                     "--min-age-hours", "0.0001", "--log-min-age-hours", "0.0001",
+                     "--idle-hours", "0.0001")
+    for root in (STATE_ROOT, LOG_ROOT):
+        if (root / name).is_dir():
+            shutil.rmtree(root / name, ignore_errors=True)
+
+
+def _kill_and_reap(name: str, keep: bool = False) -> None:
+    """SIGTERM → wait → SIGKILL if still alive → reap. Never orphans a runner."""
+    if not (STATE_ROOT / name).is_dir():
+        _reap_run(name, keep)
+        return
+    _agent_run_quiet("kill", name)
+    if _wait_for_terminal(name, 10) not in TERMINAL_STATUSES | {"unknown"}:
+        _agent_run_quiet("kill", name, "KILL")
+        _wait_for_terminal(name, 5)
+    _reap_run(name, keep)
+
+
+def _cleanup_temp() -> None:
+    for d in _temp_dirs:
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+    for f in _temp_files:
+        try:
+            os.unlink(f)
+        except Exception:
+            pass
+
+
+def _cleanup_all() -> None:
+    for name in list(_active_runs):
+        try:
+            _kill_and_reap(name)
+        except Exception:
+            pass
+    _cleanup_temp()
+
+
+def _install_signal_handlers() -> None:
+    def _handler(signum, frame):
+        _log(f"\n[verify] caught signal {signum}, cleaning up…")
+        _cleanup_all()
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
+    atexit.register(_cleanup_all)
+
+
+# ---------------------------------------------------------------------------
+# Interactive reply detection
+# ---------------------------------------------------------------------------
+
+def _count_in_log(run_name: str, token: str) -> int:
+    """Raw occurrences of token in the run log. Used for codex (no PTY rendering needed)."""
+    return _read_log(run_name).lower().count(token.lower())
+
+
+def _count_in_assistant_region(run_name: str, token: str) -> int:
+    """Occurrences of token in assistant output, excluding echoed input lines.
+
+    The interactive log is a raw PTY capture. `agent-run clean` renders it via pyte
+    and extracts the transcript; lines starting with the input prefix (❯ for claude,
+    ┃ for opencode) are input echoes and are excluded.
+    """
+    try:
+        rendered = subprocess.run(
+            [*_agent_run_bin, "clean", run_name],
+            capture_output=True, text=True, timeout=15, check=False
+        )
+        transcript = rendered.stdout if rendered.returncode == 0 else ""
+    except Exception:
+        return 0
+    needle = token.lower()
+    return sum(
+        line.lower().count(needle)
+        for line in (ln.strip() for ln in transcript.splitlines())
+        if not line.startswith(("❯", "┃"))
+    )
+
+
+def _interactive_reply_present(run_name: str, harness: str, token: str,
+                                min_count: int) -> bool:
+    if harness == "codex":
+        return _count_in_log(run_name, token) >= min_count
+    return _count_in_assistant_region(run_name, token) >= min_count
+
+
+def _wait_for_interactive_reply(run_name: str, harness: str, token: str,
+                                 min_count: int, timeout: float) -> bool:
+    """Poll the run log until token appears at least min_count times, or timeout."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if _interactive_reply_present(run_name, harness, token, min_count):
+            return True
+        if _agent_run_status(run_name) in TERMINAL_STATUSES or time.monotonic() >= deadline:
+            return _interactive_reply_present(run_name, harness, token, min_count)
+        time.sleep(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Hook evidence file helpers
+# ---------------------------------------------------------------------------
+
+def _make_hook_script(tmp_dir: Path, run_name: str) -> tuple[Path, Path]:
+    """Write a shell hook script that records its invocation and env vars.
+
+    The script handles three payload delivery paths:
+      --json <json>  opencode plugin (calls evidence script with the event JSON)
+      <json>         codex argv[1] (JSON object as first positional argument)
+      stdin          claude Stop hook
+
+    In all cases the script writes an evidence file and calls agent-run hook to
+    record the event in hooks.jsonl. The evidence file lets the harness assert the
+    hook was actually invoked without relying solely on hooks.jsonl.
+    """
+    evidence_path = tmp_dir / f"hook-evidence-{run_name}.json"
+    branch_ar = " ".join(repr(str(s)) for s in _agent_run_bin)
+    script_path = tmp_dir / f"hook-script-{run_name}.sh"
+    script_path.write_text(textwrap.dedent(f"""\
+        #!/bin/sh
+        # Hook evidence script for run {run_name}.
+        # Captures AGENT_RUN_NAME and calls agent-run hook, then writes evidence.
+        EVIDENCE={str(evidence_path)!r}
+        AGENT_RUN_NAME_CAPTURED="${{AGENT_RUN_NAME:-}}"
+        PAYLOAD_SOURCE="none"
+        PAYLOAD=""
+
+        if [ "$#" -ge 2 ] && [ "$1" = "--json" ]; then
+            PAYLOAD="$2"
+            PAYLOAD_SOURCE="flag"
+            {branch_ar} hook session-idle --json "$PAYLOAD"
+        elif [ "$#" -ge 1 ] && echo "$1" | grep -q '^{{'; then
+            PAYLOAD="$1"
+            PAYLOAD_SOURCE="argv"
+            {branch_ar} hook turn-complete "$PAYLOAD"
+        else
+            PAYLOAD=$(cat)
+            PAYLOAD_SOURCE="stdin"
+            printf '%s' "$PAYLOAD" | {branch_ar} hook stop
+        fi
+
+        cat > "$EVIDENCE" <<EVIDEOF
+        {{
+          "run_name": "{run_name}",
+          "agent_run_name_env": "$AGENT_RUN_NAME_CAPTURED",
+          "payload_source": "$PAYLOAD_SOURCE"
+        }}
+        EVIDEOF
+        exit 0
+    """))
+    script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+    return script_path, evidence_path
+
+
+def _poll_evidence(evidence_path: Path, timeout: float) -> Optional[dict]:
+    """Poll until evidence_path exists and is valid JSON, or timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            return json.loads(evidence_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            time.sleep(HOOK_POLL_INTERVAL)
+    try:
+        return json.loads(evidence_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _poll_hooks_jsonl(log_dir: Path, timeout: float) -> Optional[list]:
+    """Poll until hooks.jsonl exists with at least one valid record, or timeout."""
+    hooks_path = log_dir / "hooks.jsonl"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            records = _read_hooks_jsonl(hooks_path)
+            if records:
+                return records
+        except Exception:
+            pass
+        time.sleep(HOOK_POLL_INTERVAL)
+    try:
+        return _read_hooks_jsonl(hooks_path) or None
+    except Exception:
+        return None
+
+
+def _read_hooks_jsonl(hooks_path: Path) -> list:
+    """Parse hooks.jsonl, skipping malformed lines."""
+    records = []
+    for line in hooks_path.read_bytes().split(b"\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                records.append(obj)
+        except json.JSONDecodeError:
+            pass
+    return records
+
+
+# ---------------------------------------------------------------------------
+# link5: watch --json surfaces hooks aggregate
+# ---------------------------------------------------------------------------
+
+def _watch_json(run_name: str) -> Optional[dict]:
+    """Run agent-run watch --json and return the parsed payload, or None on failure."""
+    try:
+        cp = subprocess.run([*_agent_run_bin, "watch", "--json", run_name],
+                            capture_output=True, text=True, timeout=15, check=False)
+        if cp.returncode == 2:
+            return None
+        return json.loads(cp.stdout.strip())
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Launch helpers
+# ---------------------------------------------------------------------------
+
+def _harness_model_args(harness: str) -> list[str]:
+    """Model/provider pinning flags for cost control."""
+    if harness == "claude":
+        return ["--model", CLAUDE_MODEL]
+    if harness == "opencode":
+        return ["--model", OPENCODE_MODEL]
+    return ["--harness-arg", f"-c model={CODEX_MODEL}",
+            "--harness-arg", f"-c model_provider={CODEX_PROVIDER}"]
+
+
+def _launch(cmd: list[str], run_name: str, timeout: int, result: CellResult,
+            env: Optional[dict] = None) -> bool:
+    """Launch a run, registering it for teardown before the process starts."""
+    _active_runs.add(run_name)
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                       check=True, env=env)
+        return True
+    except subprocess.CalledProcessError as exc:
+        result.fail("link1-launch",
+                    f"agent-run exited {exc.returncode}: {(exc.stderr or '')[:200]}")
+    except subprocess.TimeoutExpired:
+        result.fail("link1-launch", f"agent-run launch timed out ({timeout}s)")
+    return False
+
+
+def _await_done(run_name: str, result: CellResult) -> bool:
+    status = _wait_for_terminal(run_name, RUN_TIMEOUT)
+    if status != "done":
+        result.fail("link1-run",
+                    f"status={status!r} (expected 'done')\nLog tail:\n{_log_tail(run_name)}")
+        return False
+    _log("  [link1] PASS status=done")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Hook config writers (harness plays the user, not agent-run)
+# ---------------------------------------------------------------------------
+
+def _claude_hook_harness_args(script_path: Path) -> list[str]:
+    """Inline --settings JSON that registers the Stop hook for this cell's script."""
+    settings = {
+        "hooks": {
+            "Stop": [{"matcher": "", "hooks": [{"type": "command",
+                                                "command": str(script_path)}]}]
+        }
+    }
+    return ["--harness-arg", "--settings", "--harness-arg", json.dumps(settings)]
+
+
+def _codex_hook_harness_args(script_path: Path) -> list[str]:
+    """Inline -c notify=["<script>"] flag for the codex app-server path."""
+    notify_value = json.dumps([str(script_path)])
+    return ["--harness-arg", "-c", "--harness-arg", f"notify={notify_value}"]
+
+
+def _opencode_config_env(script_path: Path,
+                         existing_env: Optional[dict] = None) -> dict:
+    """Build the environment for an opencode run with a plugin configured via
+    OPENCODE_CONFIG_CONTENT.
+
+    The plugin uses the named export async factory format required by opencode 1.18.x:
+      export const Name = async () => ({ event: async ({event}) => ... })
+    The `export default {onEvent}` form fails with "Plugin export is not a function".
+
+    Deep-merges into any existing OPENCODE_CONFIG_CONTENT so a pre-existing
+    permissions or other config key is not clobbered.
+    """
+    branch_ar_json = json.dumps([str(s) for s in _agent_run_bin])
+    evidence_script_json = json.dumps(str(script_path))
+    plugin_js = textwrap.dedent(f"""\
+        import fs from "fs"
+        // Named export factory: opencode 1.18.x requires this form.
+        // `export default {{onEvent}}` is rejected as "not a function".
+        export const AgentRunHookVerify = async () => ({{
+          event: async ({{ event }}) => {{
+            if (event.type !== "session.idle") return;
+            const {{ execFileSync }} = require("child_process");
+            const arBin = {branch_ar_json};
+            // Record the event in hooks.jsonl via agent-run hook.
+            execFileSync(arBin[0], [
+              ...arBin.slice(1), "hook", "session-idle", "--json", JSON.stringify(event)
+            ]);
+            // Invoke the evidence shell script so the harness can assert invocation
+            // independently of hooks.jsonl.
+            execFileSync({evidence_script_json}, ["--json", JSON.stringify(event)]);
+          }},
+        }});
+    """)
+    plugin_fd, plugin_path = tempfile.mkstemp(suffix=".js", prefix="arverify-plugin-")
+    _temp_files.append(plugin_path)
+    os.write(plugin_fd, plugin_js.encode())
+    os.close(plugin_fd)
+
+    config_content = json.dumps({"plugin": [plugin_path]})
+
+    env = dict(existing_env or os.environ)
+    existing_content = env.get("OPENCODE_CONFIG_CONTENT", "")
+    if existing_content:
+        try:
+            merged = {**json.loads(existing_content), **json.loads(config_content)}
+            config_content = json.dumps(merged)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    env["OPENCODE_CONFIG_CONTENT"] = config_content
+    return env
+
+
+# ---------------------------------------------------------------------------
+# Core link assertions (links 2–5)
+# ---------------------------------------------------------------------------
+
+def _assert_links_2_to_5(
+    harness: str,
+    run_name: str,
+    evidence_path: Path,
+    hook_wait_start: float,
+    result: CellResult,
+) -> Optional[tuple[dict, float]]:
+    """Assert links 2–5. Returns (links_dict, latency_s) or None on first failure.
+
+    hook_wait_start marks the monotonic time from which hook latency is measured
+    (run terminal for oneshot; first-reply for interactive).
+    """
+    log_dir = LOG_ROOT / run_name
+
+    _log(f"  Polling for hook evidence file (timeout={HOOK_WAIT_TIMEOUT}s)…")
+    evidence = _poll_evidence(evidence_path, HOOK_WAIT_TIMEOUT)
+    if evidence is None:
+        result.fail("link2-hook-invoked",
+                    f"hook evidence file not written within {HOOK_WAIT_TIMEOUT}s: {evidence_path}")
+        return None
+    _log(f"  [link2] PASS hook invoked (payload_source={evidence.get('payload_source')!r})")
+
+    env_name = evidence.get("agent_run_name_env", "")
+    if not env_name:
+        result.fail("link3-identity",
+                    f"hook script saw AGENT_RUN_NAME='' (empty); expected {run_name!r}. "
+                    "The branch binary likely did not export AGENT_RUN_NAME.")
+        return None
+    if env_name != run_name:
+        result.fail("link3-identity",
+                    f"AGENT_RUN_NAME={env_name!r} in hook env != run name {run_name!r}; "
+                    "a different run's env leaked through, or the wrong binary was used.")
+        return None
+    _log(f"  [link3] PASS AGENT_RUN_NAME={env_name!r} == run name")
+
+    # Poll hooks.jsonl starting from hook_wait_start, with remaining budget or a minimum.
+    remaining = HOOK_WAIT_TIMEOUT - (time.monotonic() - hook_wait_start)
+    _log(f"  Polling hooks.jsonl (remaining≈{remaining:.1f}s)…")
+    records = _poll_hooks_jsonl(log_dir, max(remaining, 5.0))
+    if not records:
+        result.fail("link4-hooks-jsonl",
+                    f"hooks.jsonl absent or empty after {HOOK_WAIT_TIMEOUT}s")
+        return None
+
+    hook_record = records[-1]
+    if hook_record.get("resolved_by") != "env":
+        result.fail("link4-resolved-by",
+                    f"hooks.jsonl record resolved_by={hook_record.get('resolved_by')!r} "
+                    "(expected 'env'); AGENT_RUN_NAME may not have reached the hook binary")
+        return None
+
+    # Harness detection: agent-run hook identifies the harness from payload shape.
+    # opencode events have "properties" key; codex have "thread-id"; claude have
+    # "session_id" + "hook_event_name". Checked here rather than individual payload
+    # fields to avoid false failures when the payload is truncated.
+    rec_harness = hook_record.get("harness")
+    if rec_harness != harness:
+        result.fail("link4-harness",
+                    f"hooks.jsonl record harness={rec_harness!r} (expected {harness!r}); "
+                    "payload fields were not recognised by the hook subcommand. "
+                    f"payload={hook_record.get('payload')!r}")
+        return None
+
+    latency_s = time.monotonic() - hook_wait_start
+    _log(f"  [link4] PASS hooks.jsonl: event={hook_record.get('event')!r} "
+         f"resolved_by='env' latency={latency_s:.2f}s")
+
+    watch = _watch_json(run_name)
+    if watch is None:
+        result.fail("link5-watch", "watch --json returned nothing or failed")
+        return None
+    hooks_agg = watch.get("hooks")
+    if hooks_agg is None:
+        result.fail("link5-watch-hooks",
+                    "watch --json returned hooks=null (expected an aggregate dict)")
+        return None
+    if hooks_agg.get("count", 0) < 1:
+        result.fail("link5-watch-count",
+                    f"watch --json hooks.count={hooks_agg.get('count')} (expected >=1)")
+        return None
+    age_s = hooks_agg.get("last_event_age_s")
+    if age_s is None or age_s > HOOK_WAIT_TIMEOUT + 60:
+        result.fail("link5-watch-age",
+                    f"watch --json hooks.last_event_age_s={age_s!r} is None or implausibly large")
+        return None
+    w_status = watch.get("status", "")
+    w_terminal = watch.get("terminal")
+    _log(f"  [link5] PASS watch: hooks.count={hooks_agg['count']} "
+         f"age_s={age_s:.1f} status={w_status!r} terminal={w_terminal}")
+
+    return ({
+        "link2": f"hook invoked, source={evidence.get('payload_source')!r}",
+        "link3": f"AGENT_RUN_NAME={env_name!r}",
+        "link4": f"event={hook_record.get('event')!r} resolved_by='env'",
+        "link5": f"watch hooks.count={hooks_agg['count']} age_s={age_s:.1f}",
+    }, latency_s)
+
+
+# ---------------------------------------------------------------------------
+# Cells — one-shot
+# ---------------------------------------------------------------------------
+
+def cell_claude_oneshot(run_name: str, result: CellResult, keep: bool,
+                        tmp_dir: Path) -> None:
+    """Claude one-shot with Stop hook."""
+    script_path, evidence_path = _make_hook_script(tmp_dir, run_name)
+    _log(f"  Launching claude one-shot → run={run_name!r}")
+    cmd = [*_agent_run_bin, "--harness", "claude",
+           *_harness_model_args("claude"),
+           *_claude_hook_harness_args(script_path),
+           "--prompt", ONESHOT_PROMPT, run_name]
+    if not _launch(cmd, run_name, 30, result):
+        return
+    _log(f"  Waiting for terminal status (timeout={RUN_TIMEOUT}s)…")
+    if not _await_done(run_name, result):
+        return
+    hook_wait_start = time.monotonic()
+    chain = _assert_links_2_to_5("claude", run_name, evidence_path, hook_wait_start, result)
+    if chain is None:
+        return
+    links, latency_s = chain
+    result.pass_(run_name, {"link1": "done", **links}, latency_s)
+
+
+def cell_codex_oneshot(run_name: str, result: CellResult, keep: bool,
+                       tmp_dir: Path) -> None:
+    """Codex one-shot with notify hook."""
+    script_path, evidence_path = _make_hook_script(tmp_dir, run_name)
+    _log(f"  Launching codex one-shot → run={run_name!r}")
+    cmd = [*_agent_run_bin, "--harness", "codex",
+           *_harness_model_args("codex"),
+           *_codex_hook_harness_args(script_path),
+           "--prompt", ONESHOT_PROMPT, run_name]
+    if not _launch(cmd, run_name, 30, result):
+        return
+    _log(f"  Waiting for terminal status (timeout={RUN_TIMEOUT}s)…")
+    if not _await_done(run_name, result):
+        return
+    hook_wait_start = time.monotonic()
+    chain = _assert_links_2_to_5("codex", run_name, evidence_path, hook_wait_start, result)
+    if chain is None:
+        return
+    links, latency_s = chain
+    result.pass_(run_name, {"link1": "done", **links}, latency_s)
+
+
+def cell_opencode_oneshot(run_name: str, result: CellResult, keep: bool,
+                          tmp_dir: Path) -> None:
+    """Opencode one-shot with session.idle plugin event.
+
+    opencode run (non-interactive) delivers 73+ events to a registered plugin including
+    session.idle. Probed on this machine with both .ts and .js plugin files against
+    opencode 1.18.18 using OPENCODE_CONFIG_CONTENT:
+      opencode run -m llmproxy-anthropic/claude-haiku-4.5 "Reply with exactly: TESTOK"
+      73 events delivered, session.idle=True
+    The plugin format must be a named export async factory (not export default {onEvent}).
+    """
+    script_path, evidence_path = _make_hook_script(tmp_dir, run_name)
+    env = _opencode_config_env(script_path)
+    _log(f"  Launching opencode one-shot → run={run_name!r}")
+    cmd = [*_agent_run_bin, "--harness", "opencode",
+           *_harness_model_args("opencode"),
+           "--prompt", ONESHOT_PROMPT, run_name]
+    if not _launch(cmd, run_name, 30, result, env=env):
+        return
+    _log(f"  Waiting for terminal status (timeout={RUN_TIMEOUT}s)…")
+    if not _await_done(run_name, result):
+        return
+    hook_wait_start = time.monotonic()
+    chain = _assert_links_2_to_5("opencode", run_name, evidence_path, hook_wait_start, result)
+    if chain is None:
+        return
+    links, latency_s = chain
+    result.pass_(run_name, {"link1": "done", **links}, latency_s)
+
+
+# ---------------------------------------------------------------------------
+# Cells — interactive
+# ---------------------------------------------------------------------------
+
+def _run_interactive_cell(
+    harness: str,
+    run_name: str,
+    result: CellResult,
+    launch_cmd: list[str],
+    evidence_path: Path,
+    launch_env: Optional[dict] = None,
+) -> None:
+    """Shared logic for interactive hook-delivery cells.
+
+    Launches the harness interactively, waits for the first turn reply, then
+    polls for hook evidence (links 2–5). The hook fires after the assistant
+    responds, so evidence polling starts from the first-reply confirmation time.
+    The run is left alive during evidence polling; teardown happens in the caller.
+    """
+    _log(f"  Launching {harness} interactive → run={run_name!r}")
+    if not _launch(launch_cmd, run_name, 30, result, env=launch_env):
+        return
+
+    _log(f"  Waiting for first reply {INTERACTIVE_TOKEN!r} "
+         f"(timeout={INTERACTIVE_FIRST_REPLY_TIMEOUT}s)…")
+    replied = _wait_for_interactive_reply(
+        run_name, harness, INTERACTIVE_TOKEN, 1, INTERACTIVE_FIRST_REPLY_TIMEOUT
+    )
+    if not replied:
+        result.fail("link1-interactive-reply",
+                    f"{INTERACTIVE_TOKEN!r} not seen in assistant region after "
+                    f"{INTERACTIVE_FIRST_REPLY_TIMEOUT}s "
+                    f"(status={_agent_run_status(run_name)!r})\n"
+                    f"Log tail:\n{_log_tail(run_name)}")
+        return
+    _log(f"  [link1] PASS: first reply {INTERACTIVE_TOKEN!r} seen in assistant region")
+
+    # Hook fires shortly after the assistant turn completes. Start latency clock here.
+    hook_wait_start = time.monotonic()
+    chain = _assert_links_2_to_5(harness, run_name, evidence_path, hook_wait_start, result)
+    if chain is None:
+        return
+    links, latency_s = chain
+    result.pass_(run_name, {"link1": f"replied {INTERACTIVE_TOKEN!r}", **links}, latency_s)
+
+
+def cell_claude_interactive(run_name: str, result: CellResult, keep: bool,
+                             tmp_dir: Path) -> None:
+    """Claude interactive with Stop hook.
+
+    The Stop hook fires after each assistant turn (not only on TUI exit). Probe:
+      agent-run -i --harness claude --model claude-haiku-4-5 \\
+        --harness-arg '--settings' --harness-arg '<json>' \\
+        --prompt 'Reply with exactly: HOOKPING' <name>
+      Evidence file written with AGENT_RUN_NAME == run name on first reply.
+    """
+    script_path, evidence_path = _make_hook_script(tmp_dir, run_name)
+    cmd = [*_agent_run_bin, "-i", "--harness", "claude",
+           *_harness_model_args("claude"),
+           *_claude_hook_harness_args(script_path),
+           "--prompt", INTERACTIVE_PROMPT, run_name]
+    _run_interactive_cell("claude", run_name, result, cmd, evidence_path)
+
+
+def cell_codex_interactive(run_name: str, result: CellResult, keep: bool,
+                            tmp_dir: Path) -> None:
+    """Codex interactive with notify hook.
+
+    The notify hook fires after each agent turn on the app-server path. Probe:
+      agent-run -i --harness codex -c model=gpt-5.4 -c model_provider=llmproxy \\
+        -c 'notify=["<script>"]' --prompt 'Reply with exactly: HOOKPING' <name>
+      Evidence file written with AGENT_RUN_NAME == run name on first reply.
+    """
+    script_path, evidence_path = _make_hook_script(tmp_dir, run_name)
+    cmd = [*_agent_run_bin, "-i", "--harness", "codex",
+           *_harness_model_args("codex"),
+           *_codex_hook_harness_args(script_path),
+           "--prompt", INTERACTIVE_PROMPT, run_name]
+    _run_interactive_cell("codex", run_name, result, cmd, evidence_path)
+
+
+def cell_opencode_interactive(run_name: str, result: CellResult, keep: bool,
+                               tmp_dir: Path) -> None:
+    """Opencode interactive with session.idle plugin event.
+
+    session.idle fires after each turn when the session transitions to idle.
+    AGENT_RUN_NAME is available in process.env inside the plugin. Probe:
+      agent-run -i --harness opencode -m llmproxy-anthropic/claude-haiku-4.5 \\
+        --prompt 'Reply with exactly: HOOKPING' <name>
+      with OPENCODE_CONFIG_CONTENT set; evidence written with AGENT_RUN_NAME == run name.
+    """
+    script_path, evidence_path = _make_hook_script(tmp_dir, run_name)
+    env = _opencode_config_env(script_path)
+    cmd = [*_agent_run_bin, "-i", "--harness", "opencode",
+           *_harness_model_args("opencode"),
+           "--prompt", INTERACTIVE_PROMPT, run_name]
+    _run_interactive_cell("opencode", run_name, result, cmd, evidence_path,
+                          launch_env=env)
+
+
+# Cell table: name → (harness, cell_fn)
+CELLS: dict[str, tuple[str, object]] = {
+    "claude-oneshot":       ("claude",   cell_claude_oneshot),
+    "claude-interactive":   ("claude",   cell_claude_interactive),
+    "codex-oneshot":        ("codex",    cell_codex_oneshot),
+    "codex-interactive":    ("codex",    cell_codex_interactive),
+    "opencode-oneshot":     ("opencode", cell_opencode_oneshot),
+    "opencode-interactive": ("opencode", cell_opencode_interactive),
+}
+
+
+def run_cell(cell_name: str, keep: bool) -> CellResult:
+    harness, cell_fn = CELLS[cell_name]
+    result = CellResult(name=cell_name)
+    rname = f"vhd-{cell_name.replace('-', '_')}-{uuid.uuid4().hex[:8]}"
+
+    _log(f"\n{'='*60}")
+    _log(f"CELL: {cell_name}  (run={rname})")
+    _log(f"{'='*60}")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"arverify-{rname}-"))
+    _temp_dirs.append(str(tmp_dir))
+
+    try:
+        cell_fn(rname, result, keep, tmp_dir)
+    except Exception as exc:
+        import traceback
+        result.fail("unexpected-exception",
+                    f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+    finally:
+        if rname in _active_runs:
+            _kill_and_reap(rname, keep)
+        if not keep:
+            try:
+                shutil.rmtree(str(tmp_dir), ignore_errors=True)
+                _temp_dirs.remove(str(tmp_dir))
+            except Exception:
+                pass
+
+    _log(f"\n  → {result.verdict}: {cell_name}")
+    if result.verdict == FAIL:
+        _log(f"     FAILED at [{result.failure_link}]: {(result.failure_detail or '')[:200]}")
+    elif result.verdict == SKIP:
+        _log(f"     SKIP: {result.notes[0][:120] if result.notes else ''}")
+    else:
+        _log(f"     run_name={result.run_name!r}  latency_s={result.latency_s:.2f}")
+        for lk, lv in result.links.items():
+            _log(f"     {lk}: {lv}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Binary preflight
+# ---------------------------------------------------------------------------
+
+def _resolve_agent_run_bin(override: Optional[str]) -> list[str]:
+    if override:
+        return [override]
+    return [str(_BRANCH_PYTHON), str(_BRANCH_SCRIPT)]
+
+
+def _preflight_branch_binary(bin_argv: list[str]) -> Optional[str]:
+    """Return an error string if the branch binary does not support `hook`, else None.
+
+    The installed agent-run on PATH predates hooks; invoking it would produce wrong
+    conclusions. Fail loudly before any cell runs so the error is unambiguous.
+    """
+    try:
+        cp = subprocess.run([*bin_argv, "hook", "--help"],
+                            capture_output=True, text=True, timeout=10, check=False)
+        out = (cp.stdout + cp.stderr).lower()
+        if cp.returncode == 0 and ("hook" in out or "event" in out):
+            return None
+        return (f"'{' '.join(bin_argv)} hook --help' exited {cp.returncode} or "
+                f"output did not mention 'hook'/'event'. "
+                "Ensure the branch binary is .venv/bin/python src/toolbox/agent_run.py "
+                "and that the hook subcommand is present.")
+    except FileNotFoundError as exc:
+        return (f"branch binary not found: {exc}. "
+                "Run 'pip install -e .' inside the .venv or supply --agent-run.")
+    except Exception as exc:
+        return f"preflight error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Matrix summary
+# ---------------------------------------------------------------------------
+
+def _print_matrix(results: list[CellResult], versions: dict) -> None:
+    """Print a cell × links PASS/FAIL/SKIP table with latency and versions."""
+    _log(f"\n{'='*60}")
+    _log("MATRIX")
+    _log(f"{'='*60}")
+    _log(f"  {'cell':<28}  {'L1':<5} {'L2':<5} {'L3':<5} {'L4':<5} {'L5':<5} {'lat_s':<8}  verdict")
+    _log(f"  {'-'*28}  {'-'*5} {'-'*5} {'-'*5} {'-'*5} {'-'*5} {'-'*8}  -------")
+    for r in results:
+        if r.verdict == SKIP:
+            _log(f"  {r.name:<28}  {'SKIP':<5} {'SKIP':<5} {'SKIP':<5} {'SKIP':<5} {'SKIP':<5} {'—':<8}  SKIP")
+            continue
+        def lpass(lk: str) -> str:
+            if r.verdict == PASS:
+                return "PASS" if lk in r.links else "—"
+            if r.failure_link and r.failure_link.startswith(lk):
+                return "FAIL"
+            if lk in r.links:
+                return "PASS"
+            return "—"
+        lat = f"{r.latency_s:.2f}" if r.latency_s is not None else "—"
+        _log(f"  {r.name:<28}  {lpass('link1'):<5} {lpass('link2'):<5} "
+             f"{lpass('link3'):<5} {lpass('link4'):<5} {lpass('link5'):<5} "
+             f"{lat:<8}  {r.verdict}")
+    _log("")
+    _log("  Harness versions:")
+    for h, v in versions.items():
+        _log(f"    {h}: {v}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+HELP_EPILOG = textwrap.dedent("""
+cells:
+  claude-oneshot       claude one-shot (--print) with Stop hook
+  claude-interactive   claude TUI — Stop hook fires after each assistant turn
+  codex-oneshot        codex app-server one-shot with notify hook
+  codex-interactive    codex app-server interactive — notify fires after each turn
+  opencode-oneshot     opencode run — session.idle delivered to plugin (73+ events)
+  opencode-interactive opencode TUI — session.idle fires after each turn
+
+Links asserted per cell:
+  L1  run reaches terminal status (done) or first interactive reply confirmed
+  L2  hook script evidence file written (hook program was invoked)
+  L3  AGENT_RUN_NAME in hook env equals the cell's run name
+  L4  hooks.jsonl exists, has a record with resolved_by='env' and correct harness field
+  L5  watch --json surfaces hooks aggregate: count>=1, sane age, status unaffected
+
+Environment overrides:
+  RUN_TIMEOUT                    seconds to wait for run terminal status (default 120)
+  HOOK_WAIT_TIMEOUT              seconds to wait for hook record after terminal (default 30)
+  INTERACTIVE_FIRST_REPLY_TIMEOUT seconds to wait for first interactive reply (default 90)
+  CLAUDE_MODEL / OPENCODE_MODEL / CODEX_MODEL / CODEX_PROVIDER — model pins
+
+--agent-run overrides the branch binary (default: .venv/bin/python src/toolbox/agent_run.py).
+Bare agent-run on PATH is the installed toolbox build which does NOT support hook; do not
+override to the PATH binary or all cells will fail.
+
+--keep preserves agent-run state/log dirs and temp hook scripts for debugging.
+""")
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    global _json_mode, _agent_run_bin
+
+    parser = argparse.ArgumentParser(
+        prog="verify-hook-delivery",
+        description=(
+            "End-to-end test for the agent-run harness hook delivery chain:\n"
+            "  hook program invoked → AGENT_RUN_NAME inherited → hooks.jsonl written → "
+            "watch surfaces it\n"
+            "Exit non-zero on any FAIL. SKIP is distinct from FAIL."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP_EPILOG,
+    )
+    parser.add_argument("--only", metavar="CELL[,CELL...]",
+                        help="Run only the named cell(s), comma-separated")
+    parser.add_argument("--harness", metavar="NAME",
+                        help="Run only cells for this harness (claude|opencode|codex)")
+    parser.add_argument("--keep", action="store_true",
+                        help="Preserve agent-run state/log dirs and temp scripts for debugging")
+    parser.add_argument("--json", action="store_true",
+                        help=("Emit machine-readable JSON summary to stdout; "
+                              "human log goes to stderr"))
+    parser.add_argument("--agent-run", metavar="PATH", dest="agent_run_override",
+                        help=("Override the branch binary; default is "
+                              ".venv/bin/python src/toolbox/agent_run.py. "
+                              "Never use the bare PATH agent-run."))
+    args = parser.parse_args(argv)
+    _json_mode = args.json
+
+    _install_signal_handlers()
+
+    _agent_run_bin = _resolve_agent_run_bin(args.agent_run_override)
+    _log(f"verify-hook-delivery")
+    _log(f"branch binary: {' '.join(_agent_run_bin)}")
+
+    _log("Checking branch binary supports hook subcommand…")
+    preflight_err = _preflight_branch_binary(_agent_run_bin)
+    if preflight_err:
+        _log(f"\nABORT: {preflight_err}")
+        _log("The harness must invoke branch code, never the PATH agent-run.")
+        return 1
+    _log("Branch binary preflight OK\n")
+
+    all_cells = list(CELLS)
+    if args.only:
+        cells_to_run = [c.strip() for c in args.only.split(",")]
+        unknown = [c for c in cells_to_run if c not in CELLS]
+        if unknown:
+            parser.error(f"Unknown cells: {', '.join(unknown)}. "
+                         f"Valid: {', '.join(all_cells)}")
+    elif args.harness:
+        if args.harness not in ("claude", "opencode", "codex"):
+            parser.error(f"--harness must be claude|opencode|codex, got {args.harness!r}")
+        cells_to_run = [c for c in all_cells if c.startswith(args.harness)]
+    else:
+        cells_to_run = all_cells
+
+    _log(f"cells: {', '.join(cells_to_run)}")
+    _log(f"keep={args.keep}  RUN_TIMEOUT={RUN_TIMEOUT}s  "
+         f"HOOK_WAIT_TIMEOUT={HOOK_WAIT_TIMEOUT}s  "
+         f"INTERACTIVE_FIRST_REPLY_TIMEOUT={INTERACTIVE_FIRST_REPLY_TIMEOUT}s\n")
+
+    versions = _harness_versions()
+
+    results = [run_cell(cell_name, keep=args.keep) for cell_name in cells_to_run]
+
+    _log(f"\n{'='*60}")
+    _log("SUMMARY")
+    _log(f"{'='*60}")
+    pass_count = sum(1 for r in results if r.verdict == PASS)
+    fail_count = sum(1 for r in results if r.verdict == FAIL)
+    skip_count = sum(1 for r in results if r.verdict == SKIP)
+    for r in results:
+        marker = {PASS: "✓", FAIL: "✗", SKIP: "~"}.get(r.verdict, "?")
+        rn = f"  run={r.run_name!r}" if r.run_name else ""
+        lk = f"  [{r.failure_link}]" if r.verdict == FAIL else ""
+        lat = f"  latency={r.latency_s:.2f}s" if r.latency_s is not None else ""
+        _log(f"  {marker} {r.verdict:4s}  {r.name}{rn}{lk}{lat}")
+        if r.verdict == FAIL and r.failure_detail:
+            _log(f"         {r.failure_detail.splitlines()[0][:100]}")
+        elif r.verdict == SKIP and r.notes:
+            _log(f"         {r.notes[0][:100]}")
+    _log(f"\n  PASS={pass_count}  FAIL={fail_count}  SKIP={skip_count}")
+
+    _print_matrix(results, versions)
+
+    if args.json:
+        print(json.dumps({
+            "pass": pass_count,
+            "fail": fail_count,
+            "skip": skip_count,
+            "versions": versions,
+            "cells": [
+                {
+                    "name": r.name,
+                    "verdict": r.verdict,
+                    "run_name": r.run_name,
+                    "links": r.links,
+                    "failure_link": r.failure_link,
+                    "failure_detail": r.failure_detail,
+                    "notes": r.notes,
+                    "latency_s": r.latency_s,
+                }
+                for r in results
+            ],
+        }, indent=2))
+
+    return 1 if fail_count > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
