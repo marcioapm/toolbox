@@ -5094,54 +5094,104 @@ def _worktree_nested_reason(info: _WorktreeInfo, path: Path) -> Optional[str]:
     return None
 
 
+def _worktree_bare_repo_check(candidate_dir: Path) -> Optional[str]:
+    """Return a refusal if ``candidate_dir`` is a bare git repository.
+
+    Called for directories that ``ls-files`` descended into (emitting individual
+    files) rather than reporting as a boundary (slash-terminated entry).  Git
+    descends into bare repositories because they have no ``.git`` marker to stop
+    traversal; those files therefore appear as ordinary untracked paths rather
+    than a single ``bare.git/`` entry.
+
+    Uses ``git rev-parse --is-bare-repository`` via the hardened subprocess
+    wrapper to remain consistent with the rest of the classification machinery.
+    A non-zero exit (not a repository) is silently ignored; any other failure
+    or a ``true`` answer is a refusal.
+    """
+    probe = _watch_run_git_checked(candidate_dir, [
+        "rev-parse", "--is-bare-repository",
+    ])
+    if probe.stdout is None:
+        if probe.error == "not_a_repo":
+            return None
+        return f"cannot check bare-repository status of {candidate_dir} ({probe.error_detail})"
+    if probe.stdout.strip() == "true":
+        return f"nested bare git repository at {candidate_dir}"
+    return None
+
+
 def _worktree_foreign_nested_reason(path: Path) -> Optional[str]:
-    """Detect git worktree roots structurally nested inside the candidate directory.
+    """Detect git repository roots structurally nested inside the candidate directory.
 
     ``_worktree_nested_reason`` only queries the candidate's own repository, so
-    a linked worktree of a different repository is invisible to it.  This check
-    uses ``git ls-files --others`` (without ``--directory``) to enumerate
-    untracked and ignored paths: git reports any nested repository as a single
-    directory entry with a trailing ``/`` and does not descend into it, so the
-    nested root is visible at any depth without a bounded filesystem walk.
+    a linked worktree or bare repository of a different repository is invisible
+    to it.  This check uses ``git ls-files --others`` to enumerate untracked and
+    ignored paths, exploiting two complementary mechanisms:
 
-    Two passes cover both cases:
-    - ``--others --exclude-standard``: untracked content, including a nested
-      repo whose intermediate directories are not gitignored.
-    - ``--others --ignored --exclude-standard``: content inside ignored
-      directories; a nested repo buried inside ``node_modules/`` or ``.venv/``
-      appears here as a directory entry, not as individual files.
+    Non-bare repositories: git halts at the repository boundary and emits a
+    single slash-terminated directory entry (e.g. ``nested.git/``); ``lstat``
+    on ``.git`` inside confirms the boundary.
 
-    For every directory entry reported (path ending with ``/``), ``lstat`` on
-    the ``.git`` entry inside it confirms the git-repo boundary.  A missing
-    ``.git`` means the directory is an ordinary untracked folder; any other
-    ``lstat`` error fails closed.  Any git invocation failure also fails closed.
+    Bare repositories: git has no ``.git`` marker to stop traversal and
+    descends into the bare repo, emitting individual files such as
+    ``precious.git/HEAD`` and ``precious.git/config``.  The trailing-``/``
+    filter skips all of these.  The second pass below collects all unique
+    directory prefixes from non-slash entries and calls
+    ``_worktree_bare_repo_check`` on each.  This is bounded because git only
+    descends into directories it cannot identify as repositories (i.e. bare
+    repos and plain untracked dirs); the rev-parse check is fast (one read).
+    Prefixes already confirmed as non-repositories by the slash scan are skipped.
 
-    Called unconditionally, including under ``--force-dirty``: content checks
-    are skipped there, but the structural signature (``.git`` file or directory)
-    is independent of git's index.
+    Two ls-files passes cover both gitignored and non-gitignored content:
+    - ``--others --exclude-standard``: untracked content outside ignored dirs.
+    - ``--others --ignored --exclude-standard``: repos inside ``node_modules/``
+      or ``.venv/`` appear as a directory entry, not as individual files.
+
+    Called unconditionally, including under ``--force-dirty``.
     """
     checks = (
         ["ls-files", "--others", "--exclude-standard", "-z"],
         ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
     )
-    seen: set[str] = set()
+    seen_dirs: set[str] = set()
+    # All unique directory prefixes from non-slash entries, to probe for bare repos.
+    bare_candidates: set[str] = set()
     for git_args in checks:
         outcome = _watch_run_git_checked(path, git_args)
         if outcome.stdout is None:
             return f"cannot enumerate untracked paths ({outcome.error_detail})"
         for entry in outcome.stdout.split("\0"):
-            if not entry or not entry.endswith("/") or entry in seen:
+            if not entry:
                 continue
-            seen.add(entry)
-            # Trailing / marks a git repository boundary; verify via lstat.
-            candidate_git = path / entry.rstrip("/") / ".git"
-            try:
-                candidate_git.lstat()
-                return f"nested git repository at {path / entry.rstrip('/')}"
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                return f"cannot check .git in {path / entry.rstrip('/')}: {exc}"
+            if entry.endswith("/"):
+                if entry in seen_dirs:
+                    continue
+                seen_dirs.add(entry)
+                # Trailing / marks a git repository boundary; verify via lstat.
+                candidate_git = path / entry.rstrip("/") / ".git"
+                try:
+                    candidate_git.lstat()
+                    return f"nested git repository at {path / entry.rstrip('/')}"
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    return f"cannot check .git in {path / entry.rstrip('/')}: {exc}"
+            else:
+                # No slash terminator: git descended into this directory, which
+                # cannot be a non-bare repo (git would have halted there).
+                # Collect every directory prefix of this entry so nested bare
+                # repos at any depth (e.g. vendor/cached.git/HEAD) are found.
+                parts = entry.split("/")
+                for depth in range(1, len(parts)):
+                    prefix = "/".join(parts[:depth])
+                    if prefix and prefix + "/" not in seen_dirs:
+                        bare_candidates.add(prefix)
+
+    for prefix in bare_candidates:
+        candidate_dir = path / prefix
+        reason = _worktree_bare_repo_check(candidate_dir)
+        if reason is not None:
+            return reason
     return None
 
 

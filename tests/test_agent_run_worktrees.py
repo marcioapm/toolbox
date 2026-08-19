@@ -1683,6 +1683,77 @@ class TestReapWorktreeNested:
         assert "worktrees_removed=1" in out
         assert "scan depth limit" not in out
 
+    def test_nested_bare_repository_refused_under_force_dirty(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A bare repository nested inside a candidate is refused under
+        --force-dirty.
+
+        git ls-files descends into bare repositories (they have no .git marker)
+        and emits their individual files rather than a single slash-terminated
+        directory entry.  The trailing-/ filter skips all of those files, so the
+        pre-6a89e5c check was invisible to bare repos.  The fix collects unique
+        immediate-parent directories from non-slash ls-files entries and calls
+        git rev-parse --is-bare-repository on each one.
+
+        Mutation: removing the bare_candidates loop in
+        _worktree_foreign_nested_reason causes this test to fail because the
+        bare repository is no longer detected and the outer worktree is deleted
+        under --force-dirty."""
+        outer_repo = _make_repo(git_root, "outer-repo")
+        outer_wt = _add_worktree(outer_repo, git_root / "outer-wt", "f-outer")
+        # Bare repo nested inside the candidate worktree.
+        bare = outer_wt / "precious.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(bare)], check=True
+        )
+        (bare / "important-note").write_text("do not delete\n")
+
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", cwd=outer_wt, age_hours=1000
+        )
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert outer_wt.is_dir(), "outer worktree must not be deleted"
+        assert bare.is_dir(), "nested bare repository must not be deleted"
+        assert (bare / "important-note").exists()
+        assert "nested bare git repository" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    def test_nested_bare_repo_in_ignored_dir_refused_under_force_dirty(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A bare repo inside a gitignored subdirectory is also refused.
+
+        The --others --ignored pass covers repos buried in vendor/node_modules-
+        style ignored directories.
+
+        Mutation: same as above — removing the bare_candidates loop causes
+        deletion of the outer worktree (and thereby the bare repo)."""
+        outer_repo = _make_repo(git_root, "outer-repo")
+        outer_wt = _add_worktree(outer_repo, git_root / "outer-wt", "f-outer")
+        (outer_repo / ".git" / "info" / "exclude").write_text("vendor/\n")
+        vendor = outer_wt / "vendor"
+        vendor.mkdir()
+        bare = vendor / "cached.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(bare)], check=True
+        )
+
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", cwd=outer_wt, age_hours=1000
+        )
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert outer_wt.is_dir(), "outer worktree must not be deleted"
+        assert bare.is_dir(), "bare repo inside ignored dir must not be deleted"
+        assert "nested bare git repository" in out or "cannot enumerate untracked paths" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
 
 class TestReapWorktreeFinalRevalidation:
     """State captured at collection is re-read under the publication lock
