@@ -341,16 +341,16 @@ def _claude_stream_tool_names(
 
     result text is the final result event's `result` field, or "" if the run
     produced no result event — callers use it as the positive control that
-    claude ran at all.  Callers should also assert that claude produced a result
-    (non-empty text) before treating an empty tool list as policy evidence.
+    claude ran at all. An empty tool list with empty result text is a failed
+    run, not evidence that a tool was denied.
     """
     proc = _claude_run("stream-json", prompt_stdin, list(extra_argv), timeout)
-    tool_names: list[str] = []
-    result_text = ""
     assert proc.returncode == 0, (
         f"claude exited {proc.returncode}; this is a process failure, not policy evidence. "
         f"stderr={proc.stderr!r} stdout={proc.stdout[:300]!r}"
     )
+    tool_names: list[str] = []
+    result_text = ""
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line:

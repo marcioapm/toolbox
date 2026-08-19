@@ -5387,7 +5387,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     managed_prompt: Optional[str] = None
     managed_harness_args: List[str] = []
     managed_agent_mode: Optional[str] = None
-    opencode_extra_agent_names: set = set()
+    opencode_extra_agent_names: set[str] = set()
     if is_managed:
         opencode_port: Optional[int] = None
         managed_prompt = getattr(args, "prompt", None)
@@ -5397,18 +5397,13 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         managed_harness_args = getattr(args, "harness_args", [])
         managed_session_id: Optional[str] = None
 
-        # For opencode, build the complete set of agent names that could carry
-        # a per-agent allow in external config.  This covers both the agent name
-        # extracted from --harness-arg --agent and every agent name found in the
-        # project, user/XDG, and OPENCODE_CONFIG sources.  The union is passed
-        # to _opencode_policy_config so every possible selection gets a deny block.
+        # Every agent name that could be selected at run time and could carry a
+        # per-agent allow in an external config source; passed to
+        # _opencode_policy_config so each one gets an explicit deny block.
         if harness == "opencode":
             opencode_extra_agent_names = (
                 _opencode_agent_names_from_harness_args(managed_harness_args)
-                | _opencode_collect_config_agent_names(
-                    cwd,
-                    env=None,  # current process env; collect reads os.environ directly
-                )
+                | _opencode_collect_config_agent_names(cwd)
             )
 
         # Materialise an inline prompt into a file so every delivery path
@@ -5598,7 +5593,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         enable_planning=enable_planning,
         enable_questions=enable_questions,
         opencode_agent_mode=managed_agent_mode,
-        extra_agent_names=opencode_extra_agent_names or None,
+        extra_agent_names=opencode_extra_agent_names,
     )
     return 0  # never reached
 
@@ -5895,77 +5890,58 @@ def _codex_policy_args(*, enable_questions: bool) -> List[str]:
 
 
 def _opencode_agent_names_from_harness_args(harness_args: Sequence[str]) -> set[str]:
-    """Return agent names selected via --agent in a harness_args sequence.
+    """Return every agent name selected via --agent in a harness_args sequence.
 
-    Handles both ``--agent NAME`` (two-token) and ``--agent=NAME`` (single-token)
-    spellings.  Returns all matched names so a sequence with multiple --agent
-    flags contributes each one — callers add the union to target_agents.
+    Accepts both the ``--agent NAME`` and ``--agent=NAME`` spellings.
     """
     names: set[str] = set()
-    args = list(harness_args)
-    i = 0
-    while i < len(args):
-        token = args[i]
+    for i, token in enumerate(harness_args):
         if token.startswith("--agent="):
             name = token[len("--agent="):]
-            if name:
-                names.add(name)
-        elif token == "--agent" and i + 1 < len(args):
-            name = args[i + 1]
-            if name and not name.startswith("-"):
-                names.add(name)
-                i += 1
-        i += 1
+        elif token == "--agent":
+            following = harness_args[i + 1:i + 2]
+            # A flag-form token after --agent is the next option, not a name.
+            name = following[0] if following and not following[0].startswith("-") else ""
+        else:
+            continue
+        if name:
+            names.add(name)
     return names
 
 
-def _opencode_collect_config_agent_names(
-    cwd: Optional[str],
-    env: Optional[dict],
-) -> set[str]:
-    """Collect agent names defined in external OpenCode config sources.
+def _opencode_collect_config_agent_names(cwd: Optional[str]) -> set[str]:
+    """Return every agent name defined in OpenCode's external config sources.
 
-    Reads the project ``opencode.json`` in ``cwd``, the user/XDG config at
-    ``$XDG_CONFIG_HOME/opencode/opencode.json`` (falling back to
-    ``$HOME/.config/opencode/opencode.json``), and the file pointed to by
-    the ``OPENCODE_CONFIG`` env var.  Each source is parsed independently;
-    a failure in one does not prevent reading the others.
-
-    Returns the union of all agent names found.  Names from this function and
-    from ``_opencode_agent_names_from_harness_args`` are passed together as
-    ``extra_agent_names`` to ``_opencode_policy_config`` so every agent that
-    could carry a per-agent allow gets an explicit deny block.
+    Reads the project ``opencode.json`` in ``cwd``, the user config at
+    ``$XDG_CONFIG_HOME/opencode/opencode.json`` (or ``$HOME/.config/opencode/
+    opencode.json`` when XDG_CONFIG_HOME is unset), and the file named by
+    ``OPENCODE_CONFIG``. Sources are parsed independently, so an unreadable or
+    malformed one does not hide the agents defined in the others.
     """
     names: set[str] = set()
-    env = env or {}
 
     def _agent_names_from_file(path: str) -> set[str]:
         try:
-            raw = Path(path).read_text(encoding="utf-8", errors="replace")
-            data = json.loads(raw)
+            data = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
             if isinstance(data, dict) and isinstance(data.get("agent"), dict):
                 return {k for k in data["agent"] if isinstance(k, str) and k}
         except (OSError, json.JSONDecodeError, ValueError):
             pass
         return set()
 
-    # Project config: opencode.json in the launch working directory.
     if cwd:
         names |= _agent_names_from_file(os.path.join(cwd, "opencode.json"))
 
-    # User/XDG config.
-    xdg_cfg = env.get("XDG_CONFIG_HOME") or os.environ.get("XDG_CONFIG_HOME")
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+    home = os.environ.get("HOME")
     if xdg_cfg:
         names |= _agent_names_from_file(os.path.join(xdg_cfg, "opencode", "opencode.json"))
-    else:
-        home = env.get("HOME") or os.environ.get("HOME")
-        if home:
-            names |= _agent_names_from_file(
-                os.path.join(home, ".config", "opencode", "opencode.json")
-            )
+    elif home:
+        names |= _agent_names_from_file(
+            os.path.join(home, ".config", "opencode", "opencode.json")
+        )
 
-    # Explicit config file via OPENCODE_CONFIG env var.
-    oc_cfg = env.get("OPENCODE_CONFIG") or os.environ.get("OPENCODE_CONFIG")
+    oc_cfg = os.environ.get("OPENCODE_CONFIG")
     if oc_cfg:
         names |= _agent_names_from_file(oc_cfg)
 
@@ -5982,18 +5958,16 @@ def _opencode_policy_config(
 ) -> str:
     """Merge the managed permission policy into an OPENCODE_CONFIG_CONTENT value.
 
-    Sets the three policy keys at global scope and, critically, in a deny block
-    for every agent name that could be selected at runtime.  OpenCode loads
-    config sources in order (user/XDG → project opencode.json → OPENCODE_CONFIG
-    → OPENCODE_CONFIG_CONTENT) and merges per-agent blocks additively with
-    last-match-wins semantics. Because OPENCODE_CONFIG_CONTENT is loaded last,
-    our agent blocks always override per-agent allows from every other source.
+    Sets the three policy keys (question, plan_enter, plan_exit) at global scope
+    and inside a per-agent block for every agent that could be selected at run
+    time. OpenCode loads config sources in order — user/XDG, project
+    opencode.json, OPENCODE_CONFIG, then OPENCODE_CONFIG_CONTENT — and merges
+    per-agent blocks last-match-wins, so a per-agent allow from any other source
+    defeats a global-only deny but not a per-agent deny placed here.
 
-    ``opencode_agent_mode`` names the agent selected via ``--agent-mode``.
-    ``extra_agent_names`` covers agents selected via ``--harness-arg --agent``
-    and agents found in external config sources by ``_opencode_collect_config_agent_names``.
-    Together they ensure every agent that could carry a project/user/env allow
-    gets an explicit deny block in OPENCODE_CONFIG_CONTENT.
+    ``opencode_agent_mode`` is the agent named by ``--agent-mode``;
+    ``extra_agent_names`` covers agents named by ``--harness-arg --agent`` and
+    agents defined in the external config sources.
 
     Any other config the caller already had survives untouched. Unparseable or
     non-object input is replaced rather than raising — the policy must apply even
@@ -6039,48 +6013,36 @@ def _opencode_policy_config(
         config["permission"] = permission
     permission.update(policy_values)
 
-    # Build the set of agent names to receive an explicit deny block.
-    # "build" is always included: it is OpenCode's built-in primary agent and the
-    # default when no --agent flag is given. opencode_agent_mode (--agent-mode flag)
-    # and extra_agent_names (--harness-arg --agent + names from external config files)
-    # extend the set so every agent that could carry a project/user allow is covered.
+    # "build" is OpenCode's built-in primary agent and the default when no
+    # --agent is given, so it always needs a block.
     target_agents: set[str] = {"build"}
     if opencode_agent_mode:
         target_agents.add(opencode_agent_mode)
-    if extra_agent_names:
-        for name in extra_agent_names:
-            if name and isinstance(name, str):
-                target_agents.add(name)
+    for name in extra_agent_names or ():
+        if isinstance(name, str) and name:
+            target_agents.add(name)
 
     agents = config.get("agent")
     if not isinstance(agents, dict):
         agents = {}
         config["agent"] = agents
 
-    # Force the policy into every target agent block. OPENCODE_CONFIG_CONTENT is
-    # loaded after all other sources, so our agent block is last and wins.
-    for agent_name in target_agents:
+    # A target agent gets a block created if it has none; an agent block the
+    # caller already had gets the policy merged into its existing permission
+    # block. Either way OPENCODE_CONFIG_CONTENT is loaded last, so these values
+    # are the last match and win over allows from the other sources.
+    for agent_name in target_agents | set(agents):
+        required = agent_name in target_agents
         agent_cfg = agents.get(agent_name)
         if not isinstance(agent_cfg, dict):
-            agent_cfg = {}
-            agents[agent_name] = agent_cfg
+            if not required:
+                continue
+            agent_cfg = agents[agent_name] = {}
         agent_perm = agent_cfg.get("permission")
         if not isinstance(agent_perm, dict):
-            agent_perm = {}
-            agent_cfg["permission"] = agent_perm
-        agent_perm.update(policy_values)
-
-    # Also update any additional agent blocks already present in the inherited
-    # content so a caller that pre-populated agents for other reasons gets the
-    # policy applied there too.
-    for agent_name, agent_cfg in agents.items():
-        if agent_name in target_agents:
-            continue  # already handled above
-        if not isinstance(agent_cfg, dict):
-            continue
-        agent_perm = agent_cfg.get("permission")
-        if not isinstance(agent_perm, dict):
-            continue
+            if not required:
+                continue
+            agent_perm = agent_cfg["permission"] = {}
         agent_perm.update(policy_values)
 
     return json.dumps(config, separators=(",", ":"))
@@ -6105,7 +6067,7 @@ def _runner(
     enable_planning: bool = False,
     enable_questions: bool = False,
     opencode_agent_mode: Optional[str] = None,
-    extra_agent_names: Optional[set] = None,
+    extra_agent_names: Optional[Iterable[str]] = None,
 ) -> None:
     """Execute in the detached session-leader process.
 
@@ -6913,7 +6875,7 @@ def _opencode_prefork_mint(
     enable_planning: bool = False,
     enable_questions: bool = False,
     opencode_agent_mode: Optional[str] = None,
-    extra_agent_names: Optional[set] = None,
+    extra_agent_names: Optional[Iterable[str]] = None,
 ) -> Optional[str]:
     """Start a temporary opencode process, mint a session, return the session id.
 
@@ -8436,22 +8398,19 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                     f"agent-run: --harness-arg {flag!r} is managed internally; "
                     f"use the corresponding agent-run flag instead"
                 )
-        # Reject --permission-mode plan in claude harness args when planning is
-        # disabled.  Caller args are placed after the managed --permission-mode
-        # bypassPermissions flag, so a later --permission-mode plan starts claude
-        # directly in plan mode and bypasses the EnterPlanMode/ExitPlanMode denies.
-        # Both flag spellings are rejected: "--permission-mode" with a following
-        # "plan" value, and "--permission-mode=plan".
+        # Caller args are appended after the managed --permission-mode
+        # bypassPermissions, so a later --permission-mode plan wins and starts
+        # claude in plan mode without ever hitting the EnterPlanMode/ExitPlanMode
+        # denies. Both spellings are rejected.
         if harness == "claude" and not enable_planning:
-            _args = list(harness_args)
-            for i, token in enumerate(_args):
+            for i, token in enumerate(harness_args):
                 if token == "--permission-mode=plan":
                     raise _LaunchArgvError(
                         "agent-run: --harness-arg --permission-mode=plan selects Claude plan mode "
                         "directly, bypassing the planning deny policy; use --enable-planning to "
                         "relax the policy instead"
                     )
-                if token == "--permission-mode" and i + 1 < len(_args) and _args[i + 1] == "plan":
+                if token == "--permission-mode" and harness_args[i + 1:i + 2] == ["plan"]:
                     raise _LaunchArgvError(
                         "agent-run: --harness-arg --permission-mode --harness-arg plan selects "
                         "Claude plan mode directly, bypassing the planning deny policy; use "
