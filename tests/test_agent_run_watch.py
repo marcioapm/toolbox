@@ -339,7 +339,7 @@ class TestStatusMapping:
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         agent_run.cmd_watch(_watch_args("r4"))
         payload = json.loads(capsys.readouterr().out)
-        assert payload["schema"] == "agent-run.watch.v1"
+        assert payload["schema"] == "agent-run.watch.v2"
         assert set(payload.keys()) == WATCH_CONTRACT_KEYS
         assert set(payload["log"].keys()) == {
             "path", "bytes", "lines", "mtime_age_s", "growing",
