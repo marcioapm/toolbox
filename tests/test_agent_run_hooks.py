@@ -1,19 +1,13 @@
 """Tests for `agent-run hook` — harness hook ingestion.
 
-Covers:
-  - Run resolution: env var hit, env var pointing at nonexistent run, ancestry
-    fallback, nothing resolvable → exit 0 and no file created.
-  - Exit-code contract: always 0 on every failure path.
-  - Payload parsing for all three shapes: stdin JSON, argv JSON, --json flag.
-  - stdin never blocks when it is a tty / empty.
-  - Atomic append: concurrent writers produce exactly N well-formed lines,
-    none interleaved.
-  - Line cap honoured; oversized payload truncated with payload_truncated=true
-    and still <= _HOOK_MAX_LINE_BYTES.
-  - `watch --json` includes hooks: null with no file, correct aggregate with a
-    file, and survives a deliberately corrupt hooks.jsonl.
-  - Env export: a launched run has AGENT_RUN_NAME in the agent's environment.
-  - Regression: every Critical finding and items 7, 8, 9.
+Covers run resolution (--name / AGENT_RUN_NAME / process ancestry), the
+always-exit-0 contract, payload parsing for all three harness shapes, bounded
+stdin reads, atomic appends under concurrency, the line and event caps, the
+`watch` hooks aggregate, and the runner's env export.
+
+The hostile-input cases are load-bearing rather than paranoid: hooks.jsonl sits
+in a directory the agent under observation can write, and `watch` must keep
+reporting a live run as live no matter what is planted there.
 """
 from __future__ import annotations
 
@@ -31,9 +25,12 @@ import pytest
 from toolbox import agent_run
 
 
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
+SRC_DIR = str(Path(__file__).parents[1] / "src")
+
+# hooks.jsonl lines are appended with a single os.write to an O_APPEND fd, which
+# only avoids interleaving for writes up to PIPE_BUF (512 on macOS).
+PIPE_BUF = os.pathconf("/", "PC_PIPE_BUF")
+
 
 def _make_run_dirs(
     state_root: Path,
@@ -46,8 +43,8 @@ def _make_run_dirs(
     sd = state_root / name
     ld = log_root / name
     ld.mkdir(parents=True, exist_ok=True)
+    sd.mkdir(parents=True, exist_ok=True)
     if write_state:
-        sd.mkdir(parents=True, exist_ok=True)
         (sd / "status").write_text("running\n")
         (sd / "pid").write_text(f"{os.getpid()}\n")
         (sd / "pgid").write_text(f"{os.getpgid(0)}\n")
@@ -70,14 +67,13 @@ def _hook_args(
 
 
 def _read_hooks(log_dir: Path) -> list[dict]:
-    """Read hooks.jsonl, returning a list of parsed records (skips bad lines)."""
+    """Parsed hooks.jsonl records, skipping unparseable lines."""
     path = log_dir / "hooks.jsonl"
     if not path.exists():
         return []
     records = []
     for line in path.read_bytes().split(b"\n"):
-        line = line.strip()
-        if not line:
+        if not line.strip():
             continue
         try:
             records.append(json.loads(line))
@@ -86,20 +82,59 @@ def _read_hooks(log_dir: Path) -> list[dict]:
     return records
 
 
+def _hook_lines(log_dir: Path) -> list[bytes]:
+    """Raw non-empty lines of hooks.jsonl, newline stripped."""
+    raw = (log_dir / "hooks.jsonl").read_bytes()
+    return [ln for ln in raw.split(b"\n") if ln.strip()]
+
+
 def _watch_args(name: str, *, as_json: bool = True) -> argparse.Namespace:
     return argparse.Namespace(name=name, json=as_json, repo=None)
 
 
-# ---------------------------------------------------------------------------
-# Resolution tests
-# ---------------------------------------------------------------------------
+def _hook_with_stdin(payload: bytes, *, close_writer: bool) -> tuple[int, float]:
+    """Run cmd_hook with *payload* on a pipe as stdin; return (rc, elapsed).
+
+    When close_writer is False the write end stays open for the duration, which
+    is the case a blocking read would hang on forever.
+    """
+    r_fd, w_fd = os.pipe()
+    if payload:
+        os.write(w_fd, payload)
+    if close_writer:
+        os.close(w_fd)
+    old_stdin = sys.stdin
+    sys.stdin = open(r_fd, "rb", closefd=True)
+    try:
+        start = time.monotonic()
+        rc = agent_run.cmd_hook(_hook_args("stop"))
+        elapsed = time.monotonic() - start
+    finally:
+        sys.stdin.close()
+        if not close_writer:
+            os.close(w_fd)
+        sys.stdin = old_stdin
+    return rc, elapsed
+
+
+def _wait_for_terminal(status_file: Path, timeout: float = 10.0) -> str:
+    """Poll status_file until it holds a terminal status; return it."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if status_file.exists():
+            status = status_file.read_text().strip()
+            if status in {"done", "failed", "launch_failed"}:
+                return status
+        time.sleep(0.1)
+    return status_file.read_text().strip() if status_file.exists() else "unknown"
+
 
 class TestHookResolution:
     def test_env_var_hit_writes_record(
         self, isolated_runs_root, isolated_log_root, monkeypatch,
     ):
-        """AGENT_RUN_NAME env var pointing at a real run resolves and writes."""
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "myrun")
+        """AGENT_RUN_NAME naming a real run resolves and writes one record."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "myrun")
         monkeypatch.setenv("AGENT_RUN_NAME", "myrun")
 
         rc = agent_run.cmd_hook(_hook_args("stop", json_payload='{"a":1}'))
@@ -110,56 +145,54 @@ class TestHookResolution:
         assert records[0]["event"] == "stop"
         assert records[0]["resolved_by"] == "env"
 
-    def test_env_var_nonexistent_run_no_file(
+    def test_env_var_nonexistent_run_writes_nothing(
         self, isolated_runs_root, isolated_log_root, monkeypatch,
     ):
-        """AGENT_RUN_NAME pointing at a nonexistent run: no file, exit 0."""
+        """A stale AGENT_RUN_NAME resolves to nothing rather than to a
+        neighbouring run via the ancestry fallback."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "realrun")
         monkeypatch.setenv("AGENT_RUN_NAME", "ghost")
-        monkeypatch.delenv("AGENT_RUN_STATE_DIR", raising=False)
 
         rc = agent_run.cmd_hook(_hook_args("stop"))
 
         assert rc == 0
         assert not (isolated_log_root / "ghost" / "hooks.jsonl").exists()
+        assert not _read_hooks(ld), "stale env name fell through to another run"
 
     def test_name_override_takes_priority(
         self, isolated_runs_root, isolated_log_root, monkeypatch,
     ):
-        """--name overrides the env var."""
+        """--name overrides AGENT_RUN_NAME."""
         _make_run_dirs(isolated_runs_root, isolated_log_root, "target")
         _make_run_dirs(isolated_runs_root, isolated_log_root, "other")
         monkeypatch.setenv("AGENT_RUN_NAME", "other")
 
-        rc = agent_run.cmd_hook(_hook_args("stop", name="target",
-                                            json_payload='{"x":1}'))
+        rc = agent_run.cmd_hook(
+            _hook_args("stop", name="target", json_payload='{"x":1}')
+        )
 
         assert rc == 0
         assert _read_hooks(isolated_log_root / "target")
         assert not _read_hooks(isolated_log_root / "other")
 
-    def test_nothing_resolvable_exits_0_no_file(
+    def test_nothing_resolvable_writes_nothing(
         self, isolated_runs_root, isolated_log_root, monkeypatch,
     ):
-        """No env var, no ancestry match → exit 0, no hooks.jsonl anywhere."""
+        """No env var and no ancestry match: exit 0, no hooks.jsonl anywhere."""
         monkeypatch.delenv("AGENT_RUN_NAME", raising=False)
 
         rc = agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
 
         assert rc == 0
-        # No run dirs exist, so no hooks.jsonl can have been written.
         for d in isolated_log_root.iterdir():
             assert not (d / "hooks.jsonl").exists()
 
     def test_ancestry_fallback_via_pgid(
         self, isolated_runs_root, isolated_log_root, monkeypatch,
     ):
-        """Ancestry fallback matches when our session id equals the run's pgid."""
-        name = "ancestorrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        # Record the test process's own pgid as the run's pgid — the hook
-        # will see os.getsid(0) and compare against run_pgid.
-        our_pgid = os.getpgid(0)
-        (sd / "pgid").write_text(f"{our_pgid}\n")
+        """With no env var, a run whose pgid equals our sid is attributed."""
+        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "ancestorrun")
+        (sd / "pgid").write_text(f"{os.getpgid(0)}\n")
         monkeypatch.delenv("AGENT_RUN_NAME", raising=False)
 
         rc = agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
@@ -169,946 +202,11 @@ class TestHookResolution:
         assert len(records) == 1
         assert records[0]["resolved_by"] == "ancestry"
 
-    def test_invalid_name_override_exits_0(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """An invalid --name (path separators) exits 0 without crashing."""
-        monkeypatch.delenv("AGENT_RUN_NAME", raising=False)
-        rc = agent_run.cmd_hook(_hook_args("stop", name="../../etc/passwd"))
-        assert rc == 0
-
-
-# ---------------------------------------------------------------------------
-# Exit code contract — always 0
-# ---------------------------------------------------------------------------
-
-class TestExitCodeAlways0:
-    def test_unwritable_log_dir(
-        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path,
-    ):
-        """Unwritable log dir: exit 0, stderr message, no raise."""
-        name = "nowrite"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-        # Make log dir unwritable.
-        ld.chmod(0o555)
-        try:
-            rc = agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
-        finally:
-            ld.chmod(0o755)
-        assert rc == 0
-
-    def test_bad_json_payload_flag(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Bad JSON in --json flag: exit 0, record written with raw fallback."""
-        name = "badjson"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        rc = agent_run.cmd_hook(_hook_args("stop", json_payload="not json {{{"))
-
-        assert rc == 0
-        records = _read_hooks(ld)
-        assert len(records) == 1
-        assert "raw" in records[0]["payload"]
-
-    def test_missing_run_exits_0(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Unresolvable run: exit 0."""
-        monkeypatch.delenv("AGENT_RUN_NAME", raising=False)
-        rc = agent_run.cmd_hook(_hook_args("stop"))
-        assert rc == 0
-
-    def test_oversized_payload_exits_0(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Oversized payload: exit 0, line still <= _HOOK_MAX_LINE_BYTES."""
-        name = "bigpayload"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-        big = {f"k{i}": "x" * 300 for i in range(5)}
-
-        rc = agent_run.cmd_hook(_hook_args("stop", json_payload=json.dumps(big)))
-
-        assert rc == 0
-        records = _read_hooks(ld)
-        assert len(records) == 1
-        raw = (ld / "hooks.jsonl").read_bytes()
-        for line in raw.split(b"\n"):
-            if line.strip():
-                assert len(line) <= agent_run._HOOK_MAX_LINE_BYTES
-
-    def test_exception_in_inner_exits_0(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Even if _cmd_hook_inner raises, cmd_hook exits 0."""
-        monkeypatch.setenv("AGENT_RUN_NAME", "boom")
-        # Patch inner to raise.
-        monkeypatch.setattr(agent_run, "_cmd_hook_inner", lambda _a: (_ for _ in ()).throw(RuntimeError("kaboom")))
-        rc = agent_run.cmd_hook(_hook_args("stop"))
-        assert rc == 0
-
-
-# ---------------------------------------------------------------------------
-# Payload parsing
-# ---------------------------------------------------------------------------
-
-class TestPayloadParsing:
-    def test_json_flag_source(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """--json flag payload is parsed and source='flag'."""
-        name = "flagrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        agent_run.cmd_hook(_hook_args("stop", json_payload='{"session_id":"abc"}'))
-
-        records = _read_hooks(ld)
-        assert records[0]["source"] == "flag"
-        assert records[0]["harness"] is None or isinstance(records[0]["harness"], str)
-
-    def test_argv_json_source(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """JSON as extra positional (codex shape) is parsed; source='argv'."""
-        name = "argvrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-        codex_payload = json.dumps({
-            "type": "agent-turn-complete",
-            "thread-id": "t1",
-            "turn-id": "x1",
-            "cwd": "/tmp",
-            "client": "codex",
-            "input-messages": [],
-            "last-assistant-message": "done",
-        })
-
-        rc = agent_run.cmd_hook(argparse.Namespace(
-            event="turn-complete",
-            name=None,
-            json_payload=None,
-            extra=[codex_payload],
-        ))
-
-        assert rc == 0
-        records = _read_hooks(ld)
-        assert records[0]["source"] == "argv"
-
-    def test_stdin_json_source(
-        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path,
-    ):
-        """JSON on stdin (claude Stop shape) is parsed; source='stdin'."""
-        name = "stdinrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        claude_payload = json.dumps({
-            "session_id": "ses1",
-            "transcript_path": "/tmp/t",
-            "cwd": "/tmp",
-            "prompt_id": "p1",
-            "permission_mode": "bypass",
-            "hook_event_name": "Stop",
-            "stop_hook_active": False,
-            "last_assistant_message": "I am done.",
-        })
-
-        # Write payload to a pipe and use it as stdin.
-        payload_bytes = claude_payload.encode()
-        r_fd, w_fd = os.pipe()
-        os.write(w_fd, payload_bytes)
-        os.close(w_fd)
-
-        old_stdin = sys.stdin
-        sys.stdin = open(r_fd, "rb", closefd=True)  # noqa: WPS515
-        try:
-            # isatty() will return False on a pipe.
-            rc = agent_run.cmd_hook(argparse.Namespace(
-                event="stop",
-                name=None,
-                json_payload=None,
-                extra=[],
-            ))
-        finally:
-            sys.stdin.close()
-            sys.stdin = old_stdin
-
-        assert rc == 0
-        records = _read_hooks(ld)
-        assert records[0]["source"] == "stdin"
-        assert records[0]["harness"] == "claude"
-
-    def test_claude_harness_detected(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Claude Stop shape payload sets harness='claude'."""
-        name = "clauderun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-        payload = json.dumps({
-            "session_id": "s1", "hook_event_name": "Stop",
-            "last_assistant_message": "done",
-        })
-        agent_run.cmd_hook(_hook_args("stop", json_payload=payload))
-
-        records = _read_hooks(ld)
-        assert records[0]["harness"] == "claude"
-
-    def test_codex_harness_detected(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Codex notify shape sets harness='codex'."""
-        name = "codexrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-        payload = json.dumps({
-            "type": "agent-turn-complete", "thread-id": "t1",
-        })
-        agent_run.cmd_hook(_hook_args("stop", json_payload=payload))
-        records = _read_hooks(ld)
-        assert records[0]["harness"] == "codex"
-
-    def test_event_name_lowercased(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Event name is normalised to lowercase regardless of input case."""
-        name = "caserun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-        agent_run.cmd_hook(_hook_args("STOP"))
-
-        records = _read_hooks(ld)
-        assert records[0]["event"] == "stop"
-
-    def test_any_event_name_accepted(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Arbitrary event names (not in a hardcoded list) are accepted."""
-        name = "anyevent"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-        agent_run.cmd_hook(_hook_args("my-custom-event-XYZ"))
-        records = _read_hooks(ld)
-        assert records[0]["event"] == "my-custom-event-xyz"
-
-
-# ---------------------------------------------------------------------------
-# stdin blocking prevention
-# ---------------------------------------------------------------------------
-
-class TestStdinNonBlocking:
-    def test_tty_stdin_produces_no_stdin_read(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """When stdin is a tty, the hook never reads from it (source='none')."""
-        name = "ttyrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        # Mock stdin as a tty by patching isatty.
-        class _FakeTTY:
-            def isatty(self):
-                return True
-            @property
-            def buffer(self):
-                raise AssertionError("should not read from tty stdin")
-
-        old_stdin = sys.stdin
-        sys.stdin = _FakeTTY()
-        try:
-            rc = agent_run.cmd_hook(argparse.Namespace(
-                event="stop", name=None, json_payload=None, extra=[],
-            ))
-        finally:
-            sys.stdin = old_stdin
-
-        assert rc == 0
-        records = _read_hooks(ld)
-        assert records[0]["source"] == "none"
-
-    def test_empty_pipe_stdin_does_not_block(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """A pipe with no data available: hook returns quickly with source='none'."""
-        name = "emptyrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        # Create a pipe where the write end stays open but no data is written.
-        r_fd, w_fd = os.pipe()
-        old_stdin = sys.stdin
-        sys.stdin = open(r_fd, "rb", closefd=True)  # noqa: WPS515
-        try:
-            start = time.monotonic()
-            rc = agent_run.cmd_hook(argparse.Namespace(
-                event="stop", name=None, json_payload=None, extra=[],
-            ))
-            elapsed = time.monotonic() - start
-        finally:
-            sys.stdin.close()
-            os.close(w_fd)
-            sys.stdin = old_stdin
-
-        assert rc == 0
-        # Should return within the 2s timeout plus small overhead.
-        assert elapsed < agent_run._HOOK_STDIN_TIMEOUT_SECONDS + 1.0
-        records = _read_hooks(ld)
-        assert records[0]["source"] == "none"
-
-    def test_closed_stdin_does_not_block(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Closed stdin (EOF immediately): hook returns quickly."""
-        name = "closedstdin"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        r_fd, w_fd = os.pipe()
-        os.close(w_fd)  # immediate EOF
-        old_stdin = sys.stdin
-        sys.stdin = open(r_fd, "rb", closefd=True)  # noqa: WPS515
-        try:
-            rc = agent_run.cmd_hook(argparse.Namespace(
-                event="stop", name=None, json_payload=None, extra=[],
-            ))
-        finally:
-            sys.stdin.close()
-            sys.stdin = old_stdin
-
-        assert rc == 0
-
-
-# ---------------------------------------------------------------------------
-# Atomic append — concurrent writers
-# ---------------------------------------------------------------------------
-
-class TestAtomicAppend:
-    def test_concurrent_writers_produce_complete_lines(
-        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path,
-    ):
-        """20 concurrent processes each write one hook event; exactly 20 valid
-        JSON lines result, none interleaved."""
-        name = "concurrent"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-
-        state_root = str(isolated_runs_root)
-        log_root = str(isolated_log_root)
-        n_writers = 20
-
-        # Script run in each subprocess: resolves via --name so no env inference.
-        script = f"""\
-import sys
-sys.path.insert(0, {str(Path(__file__).parents[1] / 'src')!r})
-import os
-os.environ['AGENT_RUN_STATE_DIR'] = {state_root!r}
-os.environ['AGENT_RUN_LOG_DIR'] = {log_root!r}
-import importlib.util
-import json
-from pathlib import Path
-from toolbox import agent_run
-agent_run.STATE_ROOT = Path({state_root!r})
-agent_run.LOG_ROOT = Path({log_root!r})
-import argparse
-ns = argparse.Namespace(event='stop', name={name!r},
-    json_payload=json.dumps({{'writer': int(sys.argv[1])}}), extra=[])
-rc = agent_run.cmd_hook(ns)
-sys.exit(rc)
-"""
-        procs = []
-        for i in range(n_writers):
-            p = subprocess.Popen(
-                [sys.executable, "-c", script, str(i)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            procs.append(p)
-
-        for p in procs:
-            p.wait(timeout=30)
-
-        hooks_file = ld / "hooks.jsonl"
-        assert hooks_file.exists(), "hooks.jsonl was not created"
-        raw = hooks_file.read_bytes()
-        lines = [l for l in raw.split(b"\n") if l.strip()]
-        assert len(lines) == n_writers, (
-            f"Expected {n_writers} lines, got {len(lines)}: {raw!r}"
-        )
-        for line in lines:
-            obj = json.loads(line)  # raises if line is malformed/interleaved
-            assert obj["event"] == "stop"
-
-
-# ---------------------------------------------------------------------------
-# Line cap and oversized payload
-# ---------------------------------------------------------------------------
-
-class TestLineCap:
-    def test_line_cap_stops_appending(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Once AGENT_RUN_HOOK_MAX_EVENTS lines are written, further writes are dropped."""
-        name = "caprun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-        monkeypatch.setattr(agent_run, "AGENT_RUN_HOOK_MAX_EVENTS", 3)
-
-        for _ in range(5):
-            agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
-
-        records = _read_hooks(ld)
-        assert len(records) == 3
-
-    def test_oversized_payload_truncated_to_line_cap(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """An oversized payload is truncated; line stays <= _HOOK_MAX_LINE_BYTES with
-        payload_truncated=true set."""
-        name = "truncrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-        # 5 keys × 300-char values; well over 512 B even after field-level capping.
-        big = {f"field_{i:02d}": "x" * 300 for i in range(5)}
-
-        agent_run.cmd_hook(_hook_args("stop", json_payload=json.dumps(big)))
-
-        raw = (ld / "hooks.jsonl").read_bytes()
-        lines = [l for l in raw.split(b"\n") if l.strip()]
-        assert len(lines) == 1
-        assert len(lines[0]) <= agent_run._HOOK_MAX_LINE_BYTES
-        obj = json.loads(lines[0])
-        assert obj.get("payload_truncated") is True
-
-    def test_watch_reports_at_cap_true_at_cap(
-        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys,
-    ):
-        """watch --json reports hooks.at_cap=true when line count == cap."""
-        name = "watchcap"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        (sd / "status").write_text("running\n")
-        monkeypatch.setattr(agent_run, "AGENT_RUN_HOOK_MAX_EVENTS", 2)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        for _ in range(2):
-            agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
-
-        agent_run.cmd_watch(_watch_args(name))
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["hooks"]["at_cap"] is True
-
-
-# ---------------------------------------------------------------------------
-# watch --json hooks integration
-# ---------------------------------------------------------------------------
-
-class TestWatchHooks:
-    def test_watch_hooks_null_when_no_file(
-        self, isolated_runs_root, isolated_log_root, capsys,
-    ):
-        """hooks is null when hooks.jsonl is absent."""
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "nofile")
-        (sd / "status").write_text("running\n")
-
-        agent_run.cmd_watch(_watch_args("nofile"))
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["hooks"] is None
-
-    def test_watch_hooks_aggregate(
-        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys,
-    ):
-        """hooks contains correct count, last, events dict when file exists."""
-        name = "watchagg"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        (sd / "status").write_text("running\n")
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
-        agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":2}'))
-        agent_run.cmd_hook(_hook_args("notification", json_payload='{"x":3}'))
-
-        agent_run.cmd_watch(_watch_args(name))
-        payload = json.loads(capsys.readouterr().out)
-        h = payload["hooks"]
-        assert h is not None
-        assert h["count"] == 3
-        assert h["events"] == {"stop": 2, "notification": 1}
-        assert h["last"]["event"] == "notification"
-        assert h["last_event_age_s"] is not None
-        assert h["last_event_age_s"] >= 0.0
-        assert h["at_cap"] is False
-
-    def test_watch_survives_corrupt_hooks_jsonl(
-        self, isolated_runs_root, isolated_log_root, capsys,
-    ):
-        """A corrupt hooks.jsonl never raises or breaks watch output."""
-        name = "corrupt"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        (sd / "status").write_text("running\n")
-        (ld / "hooks.jsonl").write_bytes(b"not json\n{also bad\nmore garbage\n")
-
-        rc = agent_run.cmd_watch(_watch_args(name))
-
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        # hooks is present but has 0 records (all lines were corrupt).
-        assert payload["hooks"] is not None
-        assert payload["hooks"]["count"] == 0
-
-    def test_watch_contract_includes_hooks_key(
-        self, isolated_runs_root, isolated_log_root, capsys,
-    ):
-        """The watch contract always includes the 'hooks' key."""
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "keychk")
-        (sd / "status").write_text("running\n")
-        agent_run.cmd_watch(_watch_args("keychk"))
-        payload = json.loads(capsys.readouterr().out)
-        assert "hooks" in payload
-
-
-# ---------------------------------------------------------------------------
-# Env export: launched run has AGENT_RUN_NAME in the agent's environment
-# ---------------------------------------------------------------------------
-
-class TestEnvExport:
-    def test_launched_run_exports_agent_run_name(
-        self, isolated_runs_root, isolated_log_root,
-    ):
-        """A real launched run writes AGENT_RUN_NAME into the agent's env."""
-        # Launch a one-shot run that prints env var to stdout (captured in log).
-        state_root = str(isolated_runs_root)
-        log_root = str(isolated_log_root)
-        name = "envexport"
-
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "toolbox.agent_run",
-                name, "--",
-                sys.executable, "-c",
-                "import os, sys; sys.exit(0 if os.environ.get('AGENT_RUN_NAME') else 1)",
-            ],
-            capture_output=True,
-            text=True,
-            env={
-                **os.environ,
-                "AGENT_RUN_STATE_DIR": state_root,
-                "AGENT_RUN_LOG_DIR": log_root,
-            },
-            timeout=30,
-        )
-        # agent-run prints start info to stdout; exit 0 means launch succeeded.
-        assert result.returncode == 0, (
-            f"launch failed:\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
-        )
-
-        # Wait for the run to complete.
-        import time as _time
-        deadline = _time.monotonic() + 10
-        status_file = isolated_runs_root / name / "status"
-        while _time.monotonic() < deadline:
-            if status_file.exists():
-                st = status_file.read_text().strip()
-                if st in {"done", "failed", "launch_failed"}:
-                    break
-            _time.sleep(0.1)
-
-        status = status_file.read_text().strip() if status_file.exists() else "unknown"
-        assert status == "done", (
-            f"run ended with status={status!r}\n"
-            f"launch stdout={result.stdout!r}"
-        )
-
-    def test_runner_exports_state_and_log_dir(
-        self, isolated_runs_root, isolated_log_root,
-    ):
-        """Launched run also exports AGENT_RUN_STATE_DIR and AGENT_RUN_LOG_DIR."""
-        state_root = str(isolated_runs_root)
-        log_root = str(isolated_log_root)
-        name = "direxport"
-
-        check_script = (
-            "import os, sys\n"
-            "ok = (\n"
-            "    os.environ.get('AGENT_RUN_STATE_DIR') and\n"
-            "    os.environ.get('AGENT_RUN_LOG_DIR') and\n"
-            "    os.environ.get('AGENT_RUN_NAME') == " + repr(name) + "\n"
-            ")\n"
-            "sys.exit(0 if ok else 1)\n"
-        )
-
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "toolbox.agent_run",
-                name, "--",
-                sys.executable, "-c", check_script,
-            ],
-            capture_output=True,
-            text=True,
-            env={
-                **os.environ,
-                "AGENT_RUN_STATE_DIR": state_root,
-                "AGENT_RUN_LOG_DIR": log_root,
-            },
-            timeout=30,
-        )
-        assert result.returncode == 0, (
-            f"launch failed:\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
-        )
-
-        import time as _time
-        deadline = _time.monotonic() + 10
-        status_file = isolated_runs_root / name / "status"
-        while _time.monotonic() < deadline:
-            if status_file.exists():
-                st = status_file.read_text().strip()
-                if st in {"done", "failed", "launch_failed"}:
-                    break
-            _time.sleep(0.1)
-
-        status = status_file.read_text().strip() if status_file.exists() else "unknown"
-        assert status == "done", f"run ended with status={status!r}"
-
-
-# ---------------------------------------------------------------------------
-# _read_hooks_jsonl unit tests
-# ---------------------------------------------------------------------------
-
-class TestReadHooksJsonl:
-    def test_absent_file_returns_none(self, tmp_path):
-        result = agent_run._read_hooks_jsonl(tmp_path)
-        assert result is None
-
-    def test_empty_file_returns_zero_count(self, tmp_path):
-        (tmp_path / "hooks.jsonl").write_bytes(b"")
-        result = agent_run._read_hooks_jsonl(tmp_path)
-        assert result is not None
-        assert result["count"] == 0
-
-    def test_valid_records_aggregated(self, tmp_path):
-        lines = [
-            json.dumps({"event": "stop", "at": "2026-08-18T22:31:00Z",
-                        "harness": "claude", "source": "stdin", "pid": 1,
-                        "resolved_by": "env", "payload": {}}),
-            json.dumps({"event": "stop", "at": "2026-08-18T22:32:00Z",
-                        "harness": "claude", "source": "stdin", "pid": 2,
-                        "resolved_by": "env", "payload": {}}),
-            json.dumps({"event": "notification", "at": "2026-08-18T22:33:00Z",
-                        "harness": None, "source": "none", "pid": 3,
-                        "resolved_by": "env", "payload": {}}),
-        ]
-        (tmp_path / "hooks.jsonl").write_text("\n".join(lines) + "\n")
-        result = agent_run._read_hooks_jsonl(tmp_path)
-        assert result["count"] == 3
-        assert result["events"] == {"stop": 2, "notification": 1}
-        assert result["last"]["event"] == "notification"
-
-    def test_corrupt_lines_skipped(self, tmp_path):
-        (tmp_path / "hooks.jsonl").write_text(
-            'not json\n{"event":"stop","at":"2026-08-18T22:31:00Z","harness":null,'
-            '"source":"none","pid":1,"resolved_by":"env","payload":{}}\n'
-            "also garbage\n"
-        )
-        result = agent_run._read_hooks_jsonl(tmp_path)
-        assert result["count"] == 1
-        assert result["events"] == {"stop": 1}
-
-    def test_last_event_age_s_nonnegative(self, tmp_path):
-        record = json.dumps({
-            "event": "stop", "at": "2026-01-01T00:00:00Z",
-            "harness": None, "source": "none", "pid": 1,
-            "resolved_by": "env", "payload": {},
-        })
-        (tmp_path / "hooks.jsonl").write_text(record + "\n")
-        result = agent_run._read_hooks_jsonl(tmp_path)
-        assert result["last_event_age_s"] is not None
-        assert result["last_event_age_s"] >= 0.0
-
-
-# ---------------------------------------------------------------------------
-# Regression tests for all Critical items and items 7, 8, 9
-# ---------------------------------------------------------------------------
-
-class TestRegressionCritical1ArgvError:
-    """Critical 1: bad argv must exit 0, never 2 (invariant 1)."""
-
-    def test_main_hook_no_event_exits_0(self):
-        """main(["hook"]) — missing event argument — must exit 0."""
-        assert agent_run.main(["hook"]) == 0
-
-    def test_main_hook_unknown_flag_exits_0(self):
-        """main(["hook", "stop", "--nope"]) — unknown flag — must exit 0."""
-        assert agent_run.main(["hook", "stop", "--nope"]) == 0
-
-    def test_main_hook_missing_name_value_exits_0(self):
-        """main(["hook", "stop", "--name"]) — flag without value — must exit 0."""
-        assert agent_run.main(["hook", "stop", "--name"]) == 0
-
-
-class TestRegressionCritical2StdinDeadline:
-    """Critical 2: stdin with partial data and open writer must return within deadline."""
-
-    def test_partial_stdin_writer_open_returns_within_deadline(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        name = "stdin_deadline"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        r_fd, w_fd = os.pipe()
-        # Write partial data (not a full JSON object) but keep writer open.
-        os.write(w_fd, b'{"partial": "data"')
-
-        old_stdin = sys.stdin
-        sys.stdin = open(r_fd, "rb", closefd=True)  # noqa: WPS515
-        try:
-            start = time.monotonic()
-            rc = agent_run.cmd_hook(argparse.Namespace(
-                event="stop", name=None, json_payload=None, extra=[],
-            ))
-            elapsed = time.monotonic() - start
-        finally:
-            sys.stdin.close()
-            os.close(w_fd)
-            sys.stdin = old_stdin
-
-        assert rc == 0
-        # Must return within deadline + small overhead, not hang.
-        assert elapsed < agent_run._HOOK_STDIN_TIMEOUT_SECONDS + 1.5
-
-
-class TestRegressionCritical3Symlink:
-    """Critical 3: hooks.jsonl symlink must be refused, not followed."""
-
-    def test_symlink_at_hooks_jsonl_refused(
-        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path,
-    ):
-        name = "symlinkrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        target = tmp_path / "precious.txt"
-        target.write_text("original content\n")
-        (ld / "hooks.jsonl").symlink_to(target)
-
-        agent_run.cmd_hook(_hook_args("stop", json_payload='{"a":1}'))
-
-        # The symlink target must be untouched.
-        assert target.read_text() == "original content\n"
-
-
-class TestRegressionCritical4WatchNoHang:
-    """Critical 4: watch must return (not hang) for hostile hooks.jsonl."""
-
-    def test_watch_returns_for_fifo_hooks_jsonl(
-        self, isolated_runs_root, isolated_log_root, capsys,
-    ):
-        name = "fifowatch"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        (sd / "status").write_text("running\n")
-        hooks_path = ld / "hooks.jsonl"
-        # Create a FIFO at the hooks.jsonl path.
-        hooks_path.unlink(missing_ok=True)
-        os.mkfifo(str(hooks_path))
-        try:
-            start = time.monotonic()
-            rc = agent_run.cmd_watch(_watch_args(name))
-            elapsed = time.monotonic() - start
-        finally:
-            hooks_path.unlink(missing_ok=True)
-        assert rc == 0
-        # Must return quickly — FIFO must be detected and skipped.
-        assert elapsed < 5.0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["hooks"] is None
-
-    def test_watch_returns_for_symlink_to_dev_zero(
-        self, isolated_runs_root, isolated_log_root, capsys,
-    ):
-        name = "devzerowatch"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        (sd / "status").write_text("running\n")
-        hooks_path = ld / "hooks.jsonl"
-        hooks_path.symlink_to("/dev/zero")
-        try:
-            start = time.monotonic()
-            rc = agent_run.cmd_watch(_watch_args(name))
-            elapsed = time.monotonic() - start
-        finally:
-            hooks_path.unlink(missing_ok=True)
-        assert rc == 0
-        assert elapsed < 5.0  # must not hang on /dev/zero
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["hooks"] is None
-
-    def test_watch_returns_for_10mb_single_line(
-        self, isolated_runs_root, isolated_log_root, capsys,
-    ):
-        name = "biglinewatch"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        (sd / "status").write_text("running\n")
-        # Write a 10 MB single line (no newline) — read is capped at 8 MiB.
-        (ld / "hooks.jsonl").write_bytes(b"x" * (10 * 1024 * 1024))
-        start = time.monotonic()
-        rc = agent_run.cmd_watch(_watch_args(name))
-        elapsed = time.monotonic() - start
-        assert rc == 0
-        assert elapsed < 10.0
-        _ = capsys.readouterr()  # consume output
-
-
-class TestRegressionCritical5RecursionError:
-    """Critical 5: deeply-nested JSON must not flip a live run to terminal=true."""
-
-    def test_deeply_nested_json_does_not_flip_terminal(
-        self, isolated_runs_root, isolated_log_root, capsys,
-    ):
-        name = "deepnest"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        (sd / "status").write_text("running\n")
-        (sd / "pid").write_text(f"{os.getpid()}\n")
-        # 200 000 levels of nesting exceeds Python's recursion limit.
-        deeply_nested = b"[" * 200000 + b"]" * 200000
-        (ld / "hooks.jsonl").write_bytes(deeply_nested + b"\n")
-
-        rc = agent_run.cmd_watch(_watch_args(name))
-
-        assert rc == 0
-        payload = json.loads(capsys.readouterr().out)
-        # A live run must not become terminal due to a hostile hooks.jsonl.
-        assert payload["terminal"] is False
-        assert payload["status"] != "unknown"
-
-
-class TestRegressionCritical6LineCap:
-    """Critical 6: every emitted hooks.jsonl line must be <= _HOOK_MAX_LINE_BYTES."""
-
-    def test_huge_event_name_line_capped(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        name = "hugevent"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-        huge_event = "e" * 100000
-
-        rc = agent_run.cmd_hook(_hook_args(huge_event))
-
-        assert rc == 0
-        raw = (ld / "hooks.jsonl").read_bytes()
-        for line in raw.split(b"\n"):
-            if line.strip():
-                assert len(line) <= agent_run._HOOK_MAX_LINE_BYTES
-
-    def test_all_lines_within_pipe_buf(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """Every line written must fit within the platform PIPE_BUF."""
-        pipe_buf = os.pathconf("/", "PC_PIPE_BUF") if hasattr(os, "pathconf") else 512
-        name = "pipebufrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        monkeypatch.setenv("AGENT_RUN_NAME", name)
-
-        for _ in range(10):
-            agent_run.cmd_hook(_hook_args("stop", json_payload='{"k":"' + "v" * 200 + '"}'))
-
-        raw = (ld / "hooks.jsonl").read_bytes()
-        for line in raw.split(b"\n"):
-            if line.strip():
-                assert len(line) <= pipe_buf
-
-
-class TestRegressionItem7MaxEvents:
-    """Item 7: malformed AGENT_RUN_HOOK_MAX_EVENTS must not crash the CLI."""
-
-    def test_bad_max_events_falls_back_to_default(self):
-        """_parse_hook_max_events() falls back to 1000 on non-integer value."""
-        orig = os.environ.get("AGENT_RUN_HOOK_MAX_EVENTS")
-        try:
-            os.environ["AGENT_RUN_HOOK_MAX_EVENTS"] = "not_a_number"
-            result = agent_run._parse_hook_max_events()
-            assert result == 1000
-        finally:
-            if orig is None:
-                os.environ.pop("AGENT_RUN_HOOK_MAX_EVENTS", None)
-            else:
-                os.environ["AGENT_RUN_HOOK_MAX_EVENTS"] = orig
-
-    def test_empty_max_events_falls_back_to_default(self):
-        """_parse_hook_max_events() falls back to 1000 when env var is empty."""
-        orig = os.environ.get("AGENT_RUN_HOOK_MAX_EVENTS")
-        try:
-            os.environ["AGENT_RUN_HOOK_MAX_EVENTS"] = ""
-            result = agent_run._parse_hook_max_events()
-            assert result == 1000
-        finally:
-            if orig is None:
-                os.environ.pop("AGENT_RUN_HOOK_MAX_EVENTS", None)
-            else:
-                os.environ["AGENT_RUN_HOOK_MAX_EVENTS"] = orig
-
-    def test_bad_max_events_subprocess_hook_exits_0(
-        self, isolated_runs_root, isolated_log_root,
-    ):
-        """A real subprocess with bad AGENT_RUN_HOOK_MAX_EVENTS must exit 0 for hook."""
-        name = "badmax"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
-        result = subprocess.run(
-            [sys.executable, "-m", "toolbox.agent_run", "hook", "stop", "--name", name],
-            capture_output=True,
-            env={
-                **os.environ,
-                "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
-                "AGENT_RUN_HOOK_MAX_EVENTS": "abc",
-                "AGENT_RUN_STATE_DIR": str(isolated_runs_root),
-                "AGENT_RUN_LOG_DIR": str(isolated_log_root),
-            },
-        )
-        assert result.returncode == 0, (
-            f"Expected exit 0 with bad AGENT_RUN_HOOK_MAX_EVENTS\n"
-            f"stderr={result.stderr!r}"
-        )
-
-
-class TestRegressionItem9AncestryFallback:
-    """Item 9: ancestry fallback must be unambiguous and cross-platform."""
-
-    def test_ancestry_ambiguous_sid_returns_none(
-        self, isolated_runs_root, isolated_log_root, monkeypatch,
-    ):
-        """When two runs have the same pgid and neither is an ancestor, neither is attributed."""
-        # Use a fake pgid that is NOT in the ancestry chain and NOT a real sid.
-        # We use 1 as the fake "my_sid" by patching os.getsid.
-        fake_sid = 888777666  # high enough to not collide with real pids
-        for i in range(2):
-            nm = f"ambig{i}"
-            sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, nm,
-                                    write_state=False)
-            sd.mkdir(parents=True, exist_ok=True)
-            # Record fake_sid as the run pgid — matches via sid==pgid when we
-            # monkeypatch os.getsid to return fake_sid.
-            (sd / "pgid").write_text(f"{fake_sid}\n")
-            (sd / "pid").write_text("999999888\n")  # not a real ancestor
-        monkeypatch.delenv("AGENT_RUN_NAME", raising=False)
-        # Patch os.getsid so the sid==pgid branch sees our fake sid.
-        monkeypatch.setattr(os, "getsid", lambda _: fake_sid)
-
-        # Call the resolver directly.
-        result = agent_run._hook_resolve_run(None)
-
-        # With two sid matches and no direct ancestry, must be None (ambiguous).
-        if result is not None:
-            name, how = result
-            assert name not in ("ambig0", "ambig1"), (
-                f"Ambiguous sid match attributed to {name!r} — expected None"
-            )
-
     def test_ancestry_direct_ppid_match_wins(
         self, isolated_runs_root, isolated_log_root, monkeypatch,
     ):
-        """A run recording our direct ppid is attributed correctly (1-hop ancestry)."""
-        name = "ppidrun"
-        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
+        """A run recording our direct ppid is attributed by 1-hop ancestry."""
+        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "ppidrun")
         (sd / "pid").write_text(f"{os.getppid()}\n")
         monkeypatch.delenv("AGENT_RUN_NAME", raising=False)
 
@@ -1118,3 +216,697 @@ class TestRegressionItem9AncestryFallback:
         records = _read_hooks(ld)
         assert len(records) == 1
         assert records[0]["resolved_by"] == "ancestry"
+
+    def test_ancestry_ambiguous_sid_attributes_to_neither(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """Two runs sharing a session id and neither an ancestor: no match.
+
+        Guessing between them would file another agent's events under this run.
+        """
+        fake_sid = 888777666  # cannot collide with a live pid
+        for i in range(2):
+            sd, _ = _make_run_dirs(
+                isolated_runs_root, isolated_log_root, f"ambig{i}",
+                write_state=False,
+            )
+            (sd / "pgid").write_text(f"{fake_sid}\n")
+            (sd / "pid").write_text("999999888\n")  # not an ancestor
+        monkeypatch.delenv("AGENT_RUN_NAME", raising=False)
+        monkeypatch.setattr(os, "getsid", lambda _: fake_sid)
+
+        result = agent_run._hook_resolve_run(None)
+
+        assert result is None or result[0] not in ("ambig0", "ambig1")
+
+    def test_invalid_name_override_writes_nothing(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """A --name with path separators is rejected, not used to build a path."""
+        monkeypatch.delenv("AGENT_RUN_NAME", raising=False)
+
+        rc = agent_run.cmd_hook(_hook_args("stop", name="../../etc/passwd"))
+
+        assert rc == 0
+        assert not (isolated_log_root.parent / "passwd").exists()
+
+
+class TestExitCodeAlways0:
+    """A claude Stop hook exiting non-zero reads as a decision to block, so
+    every failure path must still return 0."""
+
+    def test_unwritable_log_dir(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "nowrite")
+        monkeypatch.setenv("AGENT_RUN_NAME", "nowrite")
+        ld.chmod(0o555)
+        try:
+            rc = agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
+        finally:
+            ld.chmod(0o755)
+        assert rc == 0
+
+    def test_unresolvable_run(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        monkeypatch.delenv("AGENT_RUN_NAME", raising=False)
+        assert agent_run.cmd_hook(_hook_args("stop")) == 0
+
+    def test_unexpected_exception_is_swallowed(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """An exception escaping the body still leaves the exit code at 0."""
+        monkeypatch.setenv("AGENT_RUN_NAME", "boom")
+        monkeypatch.setattr(
+            agent_run, "_cmd_hook_inner",
+            lambda _a: (_ for _ in ()).throw(RuntimeError("kaboom")),
+        )
+        assert agent_run.cmd_hook(_hook_args("stop")) == 0
+
+    @pytest.mark.parametrize("argv", [
+        pytest.param(["hook"], id="missing-event"),
+        pytest.param(["hook", "stop", "--nope"], id="unknown-flag"),
+        pytest.param(["hook", "stop", "--name"], id="flag-without-value"),
+    ])
+    def test_argv_error_exits_0(self, argv):
+        """argparse exits 2 on bad argv; the hook path converts that to 0."""
+        assert agent_run.main(argv) == 0
+
+    def test_argv_error_keeps_stdout_empty(self, capsys):
+        """argparse usage text must not reach stdout: codex warns on any
+        output from a notify program."""
+        agent_run.main(["hook"])
+        assert capsys.readouterr().out == ""
+
+
+class TestPayloadParsing:
+    @pytest.mark.parametrize("payload,expected_harness", [
+        pytest.param(
+            {"session_id": "s1", "hook_event_name": "Stop",
+             "last_assistant_message": "done"},
+            "claude", id="claude",
+        ),
+        pytest.param(
+            {"type": "agent-turn-complete", "thread-id": "t1"},
+            "codex", id="codex",
+        ),
+        pytest.param(
+            {"type": "session.idle", "session": "s1"},
+            "opencode", id="opencode",
+        ),
+        pytest.param({"unrecognised": 1}, None, id="unknown"),
+    ])
+    def test_harness_detected_from_payload_shape(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+        payload, expected_harness,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "harness")
+        monkeypatch.setenv("AGENT_RUN_NAME", "harness")
+
+        agent_run.cmd_hook(_hook_args("stop", json_payload=json.dumps(payload)))
+
+        assert _read_hooks(ld)[0]["harness"] == expected_harness
+
+    def test_json_flag_source(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """--json is the opencode plugin path; source='flag'."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "flagrun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "flagrun")
+
+        agent_run.cmd_hook(_hook_args("stop", json_payload='{"session_id":"abc"}'))
+
+        assert _read_hooks(ld)[0]["source"] == "flag"
+
+    def test_argv_json_source(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """codex notify passes its JSON as argv[1]; source='argv'."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "argvrun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "argvrun")
+        codex_payload = json.dumps({
+            "type": "agent-turn-complete", "thread-id": "t1", "turn-id": "x1",
+            "cwd": "/tmp", "client": "codex", "input-messages": [],
+            "last-assistant-message": "done",
+        })
+
+        rc = agent_run.cmd_hook(_hook_args("turn-complete", extra=[codex_payload]))
+
+        assert rc == 0
+        records = _read_hooks(ld)
+        assert records[0]["source"] == "argv"
+        assert records[0]["harness"] == "codex"
+
+    def test_non_json_argv_is_not_treated_as_payload(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """A positional that does not open a JSON object or array is ignored."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "plainargv")
+        monkeypatch.setenv("AGENT_RUN_NAME", "plainargv")
+
+        agent_run.cmd_hook(_hook_args("stop", extra=["just a sentence"]))
+
+        assert _read_hooks(ld)[0]["source"] != "argv"
+
+    def test_stdin_json_source(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """claude delivers its Stop payload on stdin; source='stdin'."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "stdinrun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "stdinrun")
+        claude_payload = json.dumps({
+            "session_id": "ses1", "transcript_path": "/tmp/t", "cwd": "/tmp",
+            "prompt_id": "p1", "permission_mode": "bypass",
+            "hook_event_name": "Stop", "stop_hook_active": False,
+            "last_assistant_message": "I am done.",
+        }).encode()
+
+        rc, _ = _hook_with_stdin(claude_payload, close_writer=True)
+
+        assert rc == 0
+        records = _read_hooks(ld)
+        assert records[0]["source"] == "stdin"
+        assert records[0]["harness"] == "claude"
+
+    def test_malformed_json_kept_as_raw_excerpt(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """Unparseable input is recorded as a raw excerpt, not discarded."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "badjson")
+        monkeypatch.setenv("AGENT_RUN_NAME", "badjson")
+
+        rc = agent_run.cmd_hook(_hook_args("stop", json_payload="not json {{{"))
+
+        assert rc == 0
+        records = _read_hooks(ld)
+        assert len(records) == 1
+        assert "raw" in records[0]["payload"]
+
+    @pytest.mark.parametrize("given,recorded", [
+        pytest.param("STOP", "stop", id="uppercase"),
+        pytest.param("my-custom-event-XYZ", "my-custom-event-xyz", id="arbitrary"),
+    ])
+    def test_event_name_lowercased_and_unrestricted(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, given, recorded,
+    ):
+        """Event names are lowercased; there is no allowed-value list."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "eventname")
+        monkeypatch.setenv("AGENT_RUN_NAME", "eventname")
+
+        agent_run.cmd_hook(_hook_args(given))
+
+        assert _read_hooks(ld)[0]["event"] == recorded
+
+
+class TestStdinBounded:
+    """stdin must never outlast _HOOK_STDIN_TIMEOUT_SECONDS: the harness turn
+    does not resume until the hook returns."""
+
+    def test_tty_stdin_is_never_read(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """An interactive stdin has no payload waiting and would block forever."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "ttyrun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "ttyrun")
+
+        class _FakeTTY:
+            def isatty(self):
+                return True
+
+            def fileno(self):
+                raise AssertionError("tty stdin must not be read")
+
+        old_stdin = sys.stdin
+        sys.stdin = _FakeTTY()
+        try:
+            rc = agent_run.cmd_hook(_hook_args("stop"))
+        finally:
+            sys.stdin = old_stdin
+
+        assert rc == 0
+        assert _read_hooks(ld)[0]["source"] == "none"
+
+    @pytest.mark.parametrize("data,close_writer,slack", [
+        pytest.param(b"", True, 1.0, id="eof-immediately"),
+        pytest.param(b"", False, 1.0, id="empty-writer-held-open"),
+        pytest.param(b'{"partial": "data"', False, 1.5, id="partial-writer-held-open"),
+    ])
+    def test_returns_within_deadline(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+        data, close_writer, slack,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "deadline")
+        monkeypatch.setenv("AGENT_RUN_NAME", "deadline")
+
+        rc, elapsed = _hook_with_stdin(data, close_writer=close_writer)
+
+        assert rc == 0
+        assert elapsed < agent_run._HOOK_STDIN_TIMEOUT_SECONDS + slack
+        assert _read_hooks(ld), "a record is written even with no usable payload"
+
+
+class TestAtomicAppend:
+    def test_concurrent_writers_produce_complete_lines(
+        self, isolated_runs_root, isolated_log_root,
+    ):
+        """20 concurrent hooks yield 20 parseable lines, none spliced."""
+        name = "concurrent"
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
+        n_writers = 20
+
+        script = f"""\
+import sys
+sys.path.insert(0, {SRC_DIR!r})
+import argparse, json, os
+from pathlib import Path
+from toolbox import agent_run
+agent_run.STATE_ROOT = Path({str(isolated_runs_root)!r})
+agent_run.LOG_ROOT = Path({str(isolated_log_root)!r})
+ns = argparse.Namespace(event='stop', name={name!r},
+    json_payload=json.dumps({{'writer': int(sys.argv[1])}}), extra=[])
+sys.exit(agent_run.cmd_hook(ns))
+"""
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(i)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for i in range(n_writers)
+        ]
+        for p in procs:
+            p.wait(timeout=30)
+
+        lines = _hook_lines(ld)
+        assert len(lines) == n_writers, f"expected {n_writers} lines, got {len(lines)}"
+        for line in lines:
+            assert json.loads(line)["event"] == "stop"
+
+
+class TestLineCap:
+    """Every line must fit PIPE_BUF, or a concurrent append can splice it."""
+
+    @pytest.mark.parametrize("args,label", [
+        pytest.param(
+            {"json_payload": json.dumps({f"field_{i:02d}": "x" * 300 for i in range(5)})},
+            "oversized-payload", id="oversized-payload",
+        ),
+        pytest.param({"event": "e" * 100000}, "huge-ascii-event", id="huge-ascii-event"),
+        pytest.param({"event": "\u65e5" * 100000}, "huge-bmp-event", id="huge-bmp-event"),
+        pytest.param(
+            {"event": "\U0001F600" * 100000}, "huge-astral-event", id="huge-astral-event",
+        ),
+        pytest.param(
+            {"event": "\U0001F600" * 5000,
+             "json_payload": json.dumps({"type": "session.idle", "session": "s" * 400,
+                                         "detail": "d" * 400})},
+            "huge-event-and-payload", id="huge-event-and-payload",
+        ),
+    ])
+    def test_line_never_exceeds_pipe_buf(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, args, label,
+    ):
+        """Sizes are measured on the ensure_ascii encoding, where one astral
+        character costs 12 bytes — a character-count cap would not bound this.
+        """
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "linecap")
+        monkeypatch.setenv("AGENT_RUN_NAME", "linecap")
+        event = args.get("event", "stop")
+
+        rc = agent_run.cmd_hook(
+            _hook_args(event, json_payload=args.get("json_payload"))
+        )
+
+        assert rc == 0
+        lines = _hook_lines(ld)
+        assert len(lines) == 1
+        assert len(lines[0]) <= agent_run._HOOK_MAX_LINE_BYTES
+        assert len(lines[0]) <= PIPE_BUF, f"{label} line exceeds PIPE_BUF={PIPE_BUF}"
+
+    def test_oversized_payload_is_flagged_truncated(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """A shrunk payload is marked, so a reader can tell a small payload
+        from an elided one."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "truncrun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "truncrun")
+        big = {f"field_{i:02d}": "x" * 300 for i in range(5)}
+
+        agent_run.cmd_hook(_hook_args("stop", json_payload=json.dumps(big)))
+
+        assert json.loads(_hook_lines(ld)[0])["payload_truncated"] is True
+
+    def test_payload_fits_within_budget_is_not_flagged(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "smallrun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "smallrun")
+
+        agent_run.cmd_hook(_hook_args("stop", json_payload='{"k":"v"}'))
+
+        record = _read_hooks(ld)[0]
+        assert "payload_truncated" not in record
+        assert record["payload"] == {"k": "v"}
+
+    def test_repeated_writes_all_within_pipe_buf(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "pipebufrun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "pipebufrun")
+
+        for _ in range(10):
+            agent_run.cmd_hook(
+                _hook_args("stop", json_payload='{"k":"' + "v" * 200 + '"}')
+            )
+
+        for line in _hook_lines(ld):
+            assert len(line) <= PIPE_BUF
+
+    def test_event_cap_stops_appending(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """Past AGENT_RUN_HOOK_MAX_EVENTS records, further events are dropped."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "caprun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "caprun")
+        monkeypatch.setattr(agent_run, "AGENT_RUN_HOOK_MAX_EVENTS", 3)
+
+        for _ in range(5):
+            agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
+
+        assert len(_read_hooks(ld)) == 3
+
+
+class TestSymlinkRefused:
+    def test_symlink_at_hooks_jsonl_is_not_followed(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path,
+    ):
+        """O_NOFOLLOW: a symlink planted at hooks.jsonl must not redirect the
+        write to its target."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "symlinkrun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "symlinkrun")
+        target = tmp_path / "precious.txt"
+        target.write_text("original content\n")
+        (ld / "hooks.jsonl").symlink_to(target)
+
+        rc = agent_run.cmd_hook(_hook_args("stop", json_payload='{"a":1}'))
+
+        assert rc == 0
+        assert target.read_text() == "original content\n"
+
+    def test_symlink_to_absent_path_is_not_created(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path,
+    ):
+        """A dangling symlink must not be followed into creating its target."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "danglerun")
+        monkeypatch.setenv("AGENT_RUN_NAME", "danglerun")
+        target = tmp_path / "should-not-appear.txt"
+        (ld / "hooks.jsonl").symlink_to(target)
+
+        rc = agent_run.cmd_hook(_hook_args("stop", json_payload='{"a":1}'))
+
+        assert rc == 0
+        assert not target.exists()
+
+    def test_fifo_at_hooks_jsonl_does_not_block_write(
+        self, isolated_runs_root, isolated_log_root, monkeypatch,
+    ):
+        """A FIFO with no reader would block an ordinary open forever."""
+        _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, "fifowrite")
+        monkeypatch.setenv("AGENT_RUN_NAME", "fifowrite")
+        os.mkfifo(str(ld / "hooks.jsonl"))
+
+        start = time.monotonic()
+        rc = agent_run.cmd_hook(_hook_args("stop", json_payload='{"a":1}'))
+        elapsed = time.monotonic() - start
+
+        assert rc == 0
+        assert elapsed < 5.0
+
+
+class TestWatchHooks:
+    def test_hooks_null_when_no_file(
+        self, isolated_runs_root, isolated_log_root, capsys,
+    ):
+        _make_run_dirs(isolated_runs_root, isolated_log_root, "nofile")
+
+        agent_run.cmd_watch(_watch_args("nofile"))
+
+        payload = json.loads(capsys.readouterr().out)
+        assert "hooks" in payload, "the watch contract always carries the key"
+        assert payload["hooks"] is None
+
+    def test_hooks_aggregate(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys,
+    ):
+        _make_run_dirs(isolated_runs_root, isolated_log_root, "watchagg")
+        monkeypatch.setenv("AGENT_RUN_NAME", "watchagg")
+        agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
+        agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":2}'))
+        agent_run.cmd_hook(_hook_args("notification", json_payload='{"x":3}'))
+
+        agent_run.cmd_watch(_watch_args("watchagg"))
+
+        hooks = json.loads(capsys.readouterr().out)["hooks"]
+        assert hooks["count"] == 3
+        assert hooks["events"] == {"stop": 2, "notification": 1}
+        assert hooks["last"]["event"] == "notification"
+        assert hooks["last_event_age_s"] >= 0.0
+        assert hooks["at_cap"] is False
+
+    def test_at_cap_reported_at_cap(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys,
+    ):
+        _make_run_dirs(isolated_runs_root, isolated_log_root, "watchcap")
+        monkeypatch.setattr(agent_run, "AGENT_RUN_HOOK_MAX_EVENTS", 2)
+        monkeypatch.setenv("AGENT_RUN_NAME", "watchcap")
+        for _ in range(2):
+            agent_run.cmd_hook(_hook_args("stop", json_payload='{"x":1}'))
+
+        agent_run.cmd_watch(_watch_args("watchcap"))
+
+        assert json.loads(capsys.readouterr().out)["hooks"]["at_cap"] is True
+
+    @pytest.mark.parametrize("plant,expect_hooks_null", [
+        pytest.param(
+            lambda p: p.write_bytes(b"not json\n{also bad\nmore garbage\n"),
+            False, id="corrupt-lines",
+        ),
+        pytest.param(lambda p: os.mkfifo(str(p)), True, id="fifo"),
+        pytest.param(lambda p: p.symlink_to("/dev/zero"), True, id="symlink-dev-zero"),
+        pytest.param(lambda p: p.mkdir(), True, id="directory"),
+        pytest.param(
+            lambda p: p.write_bytes(b"x" * (10 * 1024 * 1024)), False, id="10mb-one-line",
+        ),
+        pytest.param(
+            lambda p: p.write_bytes(b"[" * 200000 + b"]" * 200000 + b"\n"),
+            False, id="deeply-nested-json",
+        ),
+        pytest.param(lambda p: p.write_bytes(b"\xff\xfe\n\x00\x01\n"), False, id="binary"),
+    ])
+    def test_hostile_file_never_reports_live_run_as_terminal(
+        self, isolated_runs_root, isolated_log_root, capsys, plant, expect_hooks_null,
+    ):
+        """watch must return, and must not degrade to status 'unknown' — which
+        _watch_is_terminal treats as terminal, i.e. a live run reported dead.
+
+        The 10 MB line exceeds no read cap by accident: it is capped at
+        _HOOKS_READ_MAX_BYTES. The nested case exhausts the recursion limit
+        inside json.loads.
+        """
+        name = "hostile"
+        sd, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
+        (sd / "pid").write_text(f"{os.getpid()}\n")
+        hooks_path = ld / "hooks.jsonl"
+        try:
+            plant(hooks_path)
+            start = time.monotonic()
+            rc = agent_run.cmd_watch(_watch_args(name))
+            elapsed = time.monotonic() - start
+        finally:
+            if hooks_path.is_dir():
+                hooks_path.rmdir()
+            else:
+                hooks_path.unlink(missing_ok=True)
+
+        assert rc == 0
+        assert elapsed < 10.0, "watch did not return promptly"
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["terminal"] is False
+        assert payload["status"] != "unknown"
+        assert payload["observation_error"] is None
+        if expect_hooks_null:
+            assert payload["hooks"] is None
+
+
+class TestReadHooksJsonl:
+    def test_absent_file_returns_none(self, tmp_path):
+        assert agent_run._read_hooks_jsonl(tmp_path) is None
+
+    def test_empty_file_returns_zero_count(self, tmp_path):
+        (tmp_path / "hooks.jsonl").write_bytes(b"")
+        assert agent_run._read_hooks_jsonl(tmp_path)["count"] == 0
+
+    def test_valid_records_aggregated(self, tmp_path):
+        lines = [
+            json.dumps({"event": "stop", "at": "2026-08-18T22:31:00Z",
+                        "harness": "claude", "payload": {}}),
+            json.dumps({"event": "stop", "at": "2026-08-18T22:32:00Z",
+                        "harness": "claude", "payload": {}}),
+            json.dumps({"event": "notification", "at": "2026-08-18T22:33:00Z",
+                        "harness": None, "payload": {}}),
+        ]
+        (tmp_path / "hooks.jsonl").write_text("\n".join(lines) + "\n")
+
+        result = agent_run._read_hooks_jsonl(tmp_path)
+
+        assert result["count"] == 3
+        assert result["events"] == {"stop": 2, "notification": 1}
+        assert result["last"]["event"] == "notification"
+
+    def test_corrupt_lines_skipped(self, tmp_path):
+        (tmp_path / "hooks.jsonl").write_text(
+            'not json\n{"event":"stop","at":"2026-08-18T22:31:00Z"}\n'
+            "also garbage\n"
+        )
+
+        result = agent_run._read_hooks_jsonl(tmp_path)
+
+        assert result["count"] == 1
+        assert result["events"] == {"stop": 1}
+
+    @pytest.mark.parametrize("at_value", [
+        pytest.param('"2026-01-01T00:00:00Z"', id="valid"),
+        pytest.param('"not-a-date"', id="unparseable"),
+        pytest.param("12345", id="not-a-string"),
+        pytest.param("null", id="null"),
+    ])
+    def test_last_event_age_s_never_negative(self, tmp_path, at_value):
+        """A future or malformed timestamp yields null or >= 0, never a
+        negative age a poller might read as a fresh event."""
+        (tmp_path / "hooks.jsonl").write_text(
+            '{"event":"stop","at":' + at_value + "}\n"
+        )
+
+        age = agent_run._read_hooks_jsonl(tmp_path)["last_event_age_s"]
+
+        assert age is None or age >= 0.0
+
+    def test_summary_failure_returns_none_rather_than_raising(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """The boundary is total even if aggregation itself breaks: a raise
+        here would reach cmd_watch and degrade status to 'unknown'."""
+        (tmp_path / "hooks.jsonl").write_text('{"event":"stop"}\n')
+        monkeypatch.setattr(
+            agent_run, "_hooks_summary",
+            lambda _d: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        assert agent_run._read_hooks_jsonl(tmp_path) is None
+        assert capsys.readouterr().out == ""
+
+
+class TestJsonClip:
+    @pytest.mark.parametrize("text", [
+        pytest.param("plain ascii text " * 50, id="ascii"),
+        pytest.param("\u65e5\u672c\u8a9e" * 100, id="bmp"),
+        pytest.param("\U0001F600" * 100, id="astral"),
+        pytest.param('quotes " and \\ backslashes ' * 30, id="escapes"),
+        pytest.param("\n\t\x00" * 50, id="control-chars"),
+    ])
+    def test_clipped_encoding_fits_budget(self, text):
+        """The budget is in encoded bytes: a clipped prefix must still encode
+        within it, and must never split an escape sequence."""
+        budget = 64
+
+        clipped = agent_run._json_clip(text, budget)
+
+        assert len(json.dumps(clipped, ensure_ascii=True)) - 2 <= budget
+        assert text.startswith(clipped)
+
+    def test_short_text_returned_unchanged(self):
+        assert agent_run._json_clip("short", 64) == "short"
+
+
+class TestMaxEventsEnv:
+    @pytest.mark.parametrize("value", [
+        pytest.param("abc", id="not-a-number"),
+        pytest.param("", id="empty"),
+        pytest.param("0", id="zero"),
+        pytest.param("-5", id="negative"),
+        pytest.param("1e6", id="float-notation"),
+    ])
+    def test_malformed_value_falls_back_to_default(self, value):
+        """AGENT_RUN_HOOK_MAX_EVENTS is read at import time, so a bad value
+        must not stop the module loading. Checked in a subprocess because the
+        constant is resolved during import."""
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "from toolbox import agent_run; print(agent_run.AGENT_RUN_HOOK_MAX_EVENTS)"],
+            capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": SRC_DIR,
+                 "AGENT_RUN_HOOK_MAX_EVENTS": value},
+            timeout=30,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "1000"
+
+    def test_valid_value_is_honoured(self):
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "from toolbox import agent_run; print(agent_run.AGENT_RUN_HOOK_MAX_EVENTS)"],
+            capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": SRC_DIR, "AGENT_RUN_HOOK_MAX_EVENTS": "7"},
+            timeout=30,
+        )
+
+        assert result.stdout.strip() == "7"
+
+    def test_hook_subprocess_exits_0_with_malformed_value(
+        self, isolated_runs_root, isolated_log_root,
+    ):
+        name = "badmax"
+        _make_run_dirs(isolated_runs_root, isolated_log_root, name)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "toolbox.agent_run", "hook", "stop", "--name", name],
+            capture_output=True,
+            env={**os.environ, "PYTHONPATH": SRC_DIR,
+                 "AGENT_RUN_HOOK_MAX_EVENTS": "abc",
+                 "AGENT_RUN_STATE_DIR": str(isolated_runs_root),
+                 "AGENT_RUN_LOG_DIR": str(isolated_log_root)},
+            timeout=30,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == b"", "hook stdout must stay empty"
+
+
+class TestEnvExport:
+    def test_runner_exports_run_identity(
+        self, isolated_runs_root, isolated_log_root,
+    ):
+        """The agent's environment carries AGENT_RUN_NAME plus both roots, so a
+        hook resolves the run it was launched under, not a default root."""
+        name = "envexport"
+        check = (
+            "import os, sys\n"
+            f"assert os.environ['AGENT_RUN_NAME'] == {name!r}\n"
+            f"assert os.environ['AGENT_RUN_STATE_DIR'] == {str(isolated_runs_root)!r}\n"
+            f"assert os.environ['AGENT_RUN_LOG_DIR'] == {str(isolated_log_root)!r}\n"
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-m", "toolbox.agent_run", name, "--",
+             sys.executable, "-c", check],
+            capture_output=True, text=True,
+            env={**os.environ,
+                 "AGENT_RUN_STATE_DIR": str(isolated_runs_root),
+                 "AGENT_RUN_LOG_DIR": str(isolated_log_root)},
+            timeout=30,
+        )
+
+        assert result.returncode == 0, f"launch failed: {result.stderr!r}"
+        status = _wait_for_terminal(isolated_runs_root / name / "status")
+        assert status == "done", f"run ended with status={status!r}"
