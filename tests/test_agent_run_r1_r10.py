@@ -309,6 +309,7 @@ def test_interactive_ready_only_after_pty_and_keeper_setup(tmp_path, monkeypatch
     log_dir.mkdir()
     (log_dir / "log").touch()
     os.mkfifo(state_dir / "stdin")
+    os.mkfifo(state_dir / "resize")
 
     order = []
     real_ready_calls = []
@@ -1155,6 +1156,7 @@ def test_pipe_failure_before_starting_cleans_up_fifo_and_does_not_strand_state(
 
     state = isolated_runs_root / "pipe-fail"
     assert not (state / "stdin").exists()
+    assert not (state / "resize").exists()
     assert not (state / "status").exists() or (
         state / "status"
     ).read_text().strip() != "starting"

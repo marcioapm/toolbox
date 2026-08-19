@@ -13,7 +13,7 @@ A collection of lightweight CLI tools for AI content generation and chat operati
 | `gemini-vision` | Analyze images/videos via Gemini (supports YouTube, Instagram, TikTok) | `GEMINI_API_KEY` |
 | `slackcli` | Lightweight Slack client (channels, messages, search, reactions) | `SLACK_USER_TOKEN` |
 | `llm-usage` | Monitor LLM token usage, costs, and quotas across providers | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` |
-| `agent-run` | Background wrapper for coding agents (Claude Code, Codex…) with PTY steering + live log streaming | — |
+| `agent-run` | Background wrapper for coding agents (Claude Code, OpenCode, Codex) with PTY steering, interactive attach, live log streaming, and managed mode (`--harness`) for deterministic session-id capture | — |
 
 ## Install
 
@@ -508,6 +508,12 @@ agent-run -i chat claude --permission-mode bypassPermissions
 agent-run steer chat 'Also add tests for edge cases.'
 agent-run kill chat                       # TERM the run; runner does its own cleanup
 agent-run reap --dry-run                  # preview idle-kills + terminal-state cleanup
+
+# Managed mode: agent-run builds the command, records the session id
+agent-run --harness claude --prompt 'Refactor X' build
+agent-run --harness opencode --model llmproxy-anthropic/claude-sonnet-4.6 --prompt 'Refactor X' build
+agent-run --harness codex --harness-arg -c --harness-arg model=o4-mini --prompt 'Refactor X' build
+agent-run -i --harness claude --prompt 'Start task' chat   # interactive; steer after launch
 ```
 
 ---
@@ -581,6 +587,157 @@ flag typed after the name without `--` (e.g. `agent-run build --foo`) is
 still rejected, since it would otherwise silently become `argv[0]`; the
 error names the offending token and points at `--`.
 
+### Managed mode
+
+`--harness claude|opencode|codex` switches to managed mode: agent-run builds
+the launch command itself instead of taking a verbatim trailing command. This
+lets it acquire the agent's session id deterministically — before the first
+prompt goes over the wire — because it controls the invocation.
+
+**Raw mode is unchanged and not deprecated.** `--harness` and a trailing
+`-- <command>` are mutually exclusive; supplying both is an argument error.
+All existing raw-mode launch forms keep working.
+
+#### Options
+
+```
+--harness claude|opencode|codex   required; selects the harness
+--prompt TEXT                     inline prompt (mutually exclusive with --prompt-file)
+-f, --prompt-file PATH            read prompt from a file
+-i                                interactive/steerable (stays running; accepts steer)
+--model MODEL                     model string forwarded to the harness
+                                  (not supported for codex; use --harness-arg -c model=<m>)
+--agent-mode NAME                 harness agent/mode name (e.g. opencode --agent build)
+--permissions bypass|prompt       bypass (default): appends --permission-mode bypassPermissions
+                                  or --auto; prompt: omits those flags so the harness's own
+                                  permission UI is used
+--harness-arg FLAG                pass FLAG verbatim after the harness's own args; repeatable
+--session-id UUID                 claude only: use this UUID instead of generating one
+```
+
+#### One-shot examples
+
+```bash
+# claude — sends --print, records session via --session-id (pushed UUID4)
+agent-run --harness claude --prompt 'Refactor X' build
+
+# opencode — mints a session via POST /session before launch
+agent-run --harness opencode --model llmproxy-anthropic/claude-sonnet-4.6 \
+          --prompt 'Refactor X' build
+
+# codex — mints a thread via app-server thread/start
+agent-run --harness codex --harness-arg -c --harness-arg model=o4-mini \
+          --prompt 'Refactor X' build
+
+# prompt from a file (works with any harness)
+agent-run --harness claude --prompt-file brief.md build
+```
+
+#### Interactive examples
+
+```bash
+# claude interactive — stays in TUI, steer after launch
+agent-run -i --harness claude --prompt 'Start the task' chat
+agent-run steer chat 'Also add tests for edge cases.'
+
+# opencode interactive
+agent-run -i --harness opencode \
+          --model llmproxy-anthropic/claude-sonnet-4.6 \
+          --prompt 'Start the task' chat
+
+# codex interactive (uses app-server turn/steer)
+agent-run -i --harness codex --harness-arg -c --harness-arg model=o4-mini \
+          --prompt 'Start the task' chat
+```
+
+`steer` on a one-shot run exits non-zero with a message naming the run;
+it does not silently no-op.
+
+#### Session acquisition per harness
+
+Each harness uses a different mechanism. All are `certain` — never a guess.
+
+| Harness | Mechanism | `acquisition` |
+|---------|-----------|---------------|
+| `claude` | agent-run generates a UUID4, passes `--session-id <uuid>` | `pushed` |
+| `opencode` | launches `opencode --port N --auto`, polls `/global/health`, `POST /session`, then attaches with `--session <id>`; the returned `directory` is verified against the launch cwd so a foreign server that won the port race is rejected | `minted` |
+| `codex` | keeps a `codex app-server` process alive, sends `thread/start` over JSON-RPC to mint the thread id, then sends `turn/start` | `minted` |
+
+Acquisition failure never affects run status, exit code, or log content.
+When acquisition fails, `session.json` is written with `confidence: "missing"` and the run continues normally.
+
+#### Persistent files (managed mode)
+
+These files are written to the persistent log dir (`/var/tmp/agent-runs/<name>/`)
+and survive reboots.
+
+`session.json` — session attribution:
+
+```json
+{
+  "session_id": "ses_ff511aa00ffe5t83A70X8YqR7F",
+  "harness": "opencode",
+  "acquisition": "minted",
+  "confidence": "certain",
+  "observed_at": "2026-08-16T15:20:11Z"
+}
+```
+
+Fields: `session_id` (the harness's own session/thread identifier),
+`harness` (`claude`/`opencode`/`codex`), `acquisition` (`pushed`/`minted`/`reported`/`missing`),
+`confidence` (`certain` or `missing` — never a guess), `observed_at` (ISO-8601 UTC).
+Absent for raw-mode runs.
+
+`run.json` — launch and terminal facts, reboot-durable:
+
+```json
+{
+  "name": "build",
+  "argv": ["agent-run", "--harness", "claude", "--prompt", "Refactor X", "build"],
+  "command": "agent-run --harness claude ...",
+  "cwd": "/Users/you/project",
+  "started_at": "2026-08-16T15:20:10Z",
+  "harness": "claude",
+  "interactive": false,
+  "model": null,
+  "agent_mode": null,
+  "ended_at": "2026-08-16T15:22:04Z",
+  "exit_code": 0,
+  "status": "done"
+}
+```
+
+Written atomically at launch with the fields above, then updated at exit with
+`ended_at`, `exit_code`, and `status`. Present for both raw and managed runs.
+Liveness state (`pid`, `status`, `stdin` FIFO, etc.) remains in the ephemeral
+`/tmp/agent-runs/<name>/` directory only — a missing entry there unambiguously
+means "not running", and that invariant is intact.
+
+#### `watch --json` — additive `session` object
+
+`agent-run watch <name> --json` gained an additive `session` field. Every
+pre-existing key (`status`, `terminal`, `elapsed_s`, `log.*`, `git.*`,
+`signals.*`) is unchanged in name and meaning. When `session.json` exists in
+the run's persistent log dir, `session` is the parsed object; otherwise it is
+`null`.
+
+```json
+{
+  "schema": "agent-run.watch.v1",
+  "name": "build",
+  "status": "done",
+  "terminal": true,
+  "session": {
+    "session_id": "ses_ff511aa00ffe5t83A70X8YqR7F",
+    "harness": "opencode",
+    "acquisition": "minted",
+    "confidence": "certain",
+    "observed_at": "2026-08-16T15:20:11Z"
+  },
+  "..."
+}
+```
+
 ### Inspect / control
 
 ```bash
@@ -593,6 +750,7 @@ agent-run status <name>                   # one-line status
 agent-run logs <name> [--tail N | --head N]    # last/first N lines (default --tail 50)
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
+agent-run attach <name>                   # attach interactively (Ctrl-C detaches)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
                 [--include-logs] [--log-min-age-hours N]
@@ -600,6 +758,24 @@ agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown
                 [--max-seconds N]
 agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage; read-only
 ```
+
+Unlike `tail`, which only streams output, `attach` gives live keyboard and
+terminal-resize passthrough to an interactive run — it adopts the attached
+terminal's size immediately and after every subsequent resize. Ctrl-C
+detaches the attach client locally, exiting 0, without touching the wrapped
+agent, which keeps running. Text pasted with bracketed paste is forwarded
+verbatim: a `0x03` byte or a literal Ctrl-C escape sequence inside a paste
+is content, not a detach keystroke. Multiple simultaneous attaches are
+allowed and all of them see the output, but only one should type at a time
+— each write is atomic up to `PIPE_BUF`, but a longer burst is split across
+several writes that another client can interleave between, so an escape
+sequence can still tear mid-sequence. The PTY size tracks whichever client
+resized most recently.
+
+Attaching from inside another attach session shares one terminal between
+two raw-mode owners: the inner session restores the outer session's raw
+mode when it exits, so exit them in reverse order or the terminal is left
+raw (`reset` fixes it).
 
 `kill` sends TERM/INT/HUP straight to the identity-verified runner, which
 catches it and runs its own teardown (kill/reap the workload, publish
@@ -908,6 +1084,7 @@ Ephemeral, under `$AGENT_RUN_STATE_DIR/<name>/` (default `/tmp/agent-runs`):
 | `argv` | JSON-encoded argv (authoritative form for replay) |
 | `started_at`, `ended_at` | ISO-8601 UTC timestamps |
 | `stdin` | FIFO for `steer` (only when launched with `-i`) |
+| `resize` | FIFO for terminal-resize records used by `attach` (only when launched with `-i`) |
 | `pty_pid` | PID of the PTY child (interactive only) |
 | `keeper_pid` | PID of the FIFO keeper (interactive only) |
 | `interactive` | `1` if launched with `-i`, else `0` |
@@ -921,6 +1098,8 @@ Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
 | `log` | combined stdout+stderr (PTY-captured in interactive mode) |
 | `log.clean` | rendered transcript (only when launched with `--echo`) |
 | `prompt` | copy of the `-f`/`--prompt-file` input, if one was given |
+| `session.json` | session attribution (managed mode only): `session_id`, `harness`, `acquisition`, `confidence`, `observed_at`; absent for raw runs |
+| `run.json` | launch and terminal facts (all modes): `name`, `argv`, `command`, `cwd`, `started_at`, `harness`, `interactive`, `model`, `agent_mode`; augmented with `ended_at`, `exit_code`, `status` at exit |
 | `tmp/` | per-run scratch dir exported as `TMPDIR` and `BUN_TMPDIR`; removed only by `agent-run reap`, never on normal run exit |
 
 ### Design notes

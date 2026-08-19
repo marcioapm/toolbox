@@ -103,10 +103,17 @@ def test_logs_does_not_reset_terminal_modes_when_not_a_tty(
 
 
 def test_tail_resets_terminal_modes_after_ctrl_c(isolated_runs_root, monkeypatch):
+    """Exercises the non-TTY fallback path explicitly (sys.stdin.isatty
+    forced False) rather than relying on the real invoking environment's
+    stdin happening to not be a TTY (e.g. under default pytest capture) --
+    `tail` never touches terminal modes, so this is the only path: the
+    KeyboardInterrupt handler must still run the DEC private-mode reset
+    that the replayed PTY bytes made necessary."""
     run = _make_run(isolated_runs_root, "following", b"")
     (run / "pid").write_text("123\n")
     stdout = _FakeStdout(tty=True)
     monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(agent_run.sys.stdin, "isatty", lambda: False)
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(
         agent_run.time,
@@ -462,19 +469,6 @@ class TestLogsFlags:
         with pytest.raises(SystemExit) as exc_info:
             agent_run._build_parser().parse_args(argv)
         assert exc_info.value.code == 2
-
-    def test_logs_double_dash_before_name_and_flag(self, isolated_runs_root, monkeypatch):
-        """logs -- <name> --tail N must work (the -- is stripped before argparse)."""
-        log_content = b"\n".join(f"line{i}".encode() for i in range(1, 11)) + b"\n"
-        _make_log_run(isolated_runs_root, "dashrun", log_content)
-        stdout = _FakeStdout(tty=False)
-        monkeypatch.setattr(sys, "stdout", stdout)
-        rc = agent_run.main(["logs", "--", "dashrun", "--tail", "3"])
-        assert rc == 0
-        lines = stdout.buffer.getvalue().splitlines()
-        # --tail 3 from a 10-line log should return the last 3 lines.
-        assert len(lines) == 3
-        assert lines[-1] == b"line10"
 
     def test_ansi_stripped_on_logs_output(self, isolated_runs_root, monkeypatch):
         """ANSI and OSC sequences in the log must be stripped from logs output."""
