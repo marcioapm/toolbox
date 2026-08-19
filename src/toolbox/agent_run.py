@@ -2676,7 +2676,7 @@ def _watch_run_git_checked(
         return _WatchGitOutcome(None, "git_failed", stderr)
     except (OSError, subprocess.SubprocessError) as exc:
         return _WatchGitOutcome(None, "git_failed", str(exc))
-    return _WatchGitOutcome(result.stdout.decode("utf-8", errors="replace"), None)
+    return _WatchGitOutcome(result.stdout.decode("utf-8", errors="surrogateescape"), None)
 
 
 _WATCH_SHORTSTAT_RES = (
@@ -5094,6 +5094,19 @@ def _worktree_nested_reason(info: _WorktreeInfo, path: Path) -> Optional[str]:
     return None
 
 
+def _has_surrogate(s: str) -> bool:
+    """True if ``s`` contains any UTF-16 surrogate code point (U+D800–U+DFFF).
+
+    ``_watch_run_git_checked`` decodes git output with ``errors="surrogateescape"``,
+    which maps each non-UTF-8 byte to a private surrogate (U+DC80–U+DCFF).
+    A surrogate in a path component means the original byte sequence was not
+    valid UTF-8: the path cannot be safely round-tripped through Python's str
+    layer without re-encoding via ``os.fsencode``.  Any such path must be
+    treated as unresolvable to avoid acting on a mangled name.
+    """
+    return any("\ud800" <= c <= "\udfff" for c in s)
+
+
 def _worktree_submodule_reason(path: Path) -> Optional[str]:
     """Return a refusal if any initialized submodule exists in the worktree.
 
@@ -5113,7 +5126,9 @@ def _worktree_submodule_reason(path: Path) -> Optional[str]:
 
     Uses NUL-delimited output for path safety.  Fails closed on command
     failure or malformed output.  A `.git` lstat error other than
-    ``FileNotFoundError`` also fails closed.
+    ``FileNotFoundError`` also fails closed.  A non-UTF-8 submodule path
+    (surrogate in the decoded string) is treated as unresolvable and fails
+    closed rather than acting on a mangled name.
     """
     outcome = _watch_run_git_checked(path, ["ls-files", "--stage", "-z"])
     if outcome.stdout is None:
@@ -5131,6 +5146,8 @@ def _worktree_submodule_reason(path: Path) -> Optional[str]:
         if meta[0] != "160000":
             continue
         submodule_path = fields[1]
+        if _has_surrogate(submodule_path):
+            return f"submodule path contains non-UTF-8 bytes: {submodule_path!r}"
         checkout = path / submodule_path
         git_entry = checkout / ".git"
         try:
@@ -5198,6 +5215,10 @@ def _worktree_foreign_nested_reason(path: Path) -> Optional[str]:
     - ``--others --ignored --exclude-standard``: repos inside ``node_modules/``
       or ``.venv/`` appear as a directory entry, not as individual files.
 
+    A path entry containing non-UTF-8 bytes is decoded with surrogate escapes
+    by ``_watch_run_git_checked``; ``_has_surrogate`` detects such entries and
+    fails closed rather than acting on a mangled name.
+
     Called unconditionally, including under ``--force-dirty``.
     """
     checks = (
@@ -5214,6 +5235,9 @@ def _worktree_foreign_nested_reason(path: Path) -> Optional[str]:
         for entry in outcome.stdout.split("\0"):
             if not entry:
                 continue
+            if _has_surrogate(entry):
+                # Non-UTF-8 byte in path: cannot safely resolve the name.
+                return f"untracked path contains non-UTF-8 bytes: {entry!r}"
             if entry.endswith("/"):
                 if entry in seen_dirs:
                     continue

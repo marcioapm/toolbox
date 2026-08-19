@@ -1754,8 +1754,50 @@ class TestReapWorktreeNested:
         assert "nested bare git repository" in out or "cannot enumerate untracked paths" in out
         assert "worktrees_removed=0 worktrees_skipped=1" in out
 
+    def test_non_utf8_ls_files_entry_fails_closed(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """An ls-files entry containing non-UTF-8 bytes fails closed rather
+        than silently mangling the path to a different name.
 
-class TestReapWorktreeSubmodule:
+        On byte-preserving filesystems (Linux), git path output may contain
+        arbitrary non-NUL bytes.  _watch_run_git_checked decodes with
+        errors='surrogateescape', preserving non-UTF-8 bytes as surrogate code
+        points (U+DC80–U+DCFF).  _worktree_foreign_nested_reason detects these
+        surrogates and refuses rather than passing the mangled path to lstat.
+
+        APFS rejects filenames with invalid UTF-8 (EILSEQ), so this fixture
+        injects the surrogate-escaped output directly.
+
+        Mutation: changing errors='surrogateescape' to errors='replace' in
+        _watch_run_git_checked, or removing the _has_surrogate check in
+        _worktree_foreign_nested_reason, causes the worktree to be deleted
+        (FileNotFoundError on the mangled path is misread as 'ordinary dir')."""
+        repo = _make_repo(git_root, "outer-repo")
+        wt = _add_worktree(repo, git_root / "wt", "f-outer")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        real_git = agent_run._watch_run_git_checked
+
+        def git_with_nonutf8_ls_files(path, args, **kw):
+            if list(args[:2]) == ["ls-files", "--others"] and "--exclude-standard" in args:
+                # Simulate a bare repo at precious\xff.git/ emitting its files.
+                # The byte \xff is not valid UTF-8; surrogateescape maps it to \udcff.
+                mangled = "precious\udcff.git/HEAD\x00precious\udcff.git/config\x00"
+                return agent_run._WatchGitOutcome(mangled, None)
+            return real_git(path, args, **kw)
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", git_with_nonutf8_ls_files)
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree must not be deleted when ls-files returns non-UTF-8 path"
+        assert "non-UTF-8" in out or "non_UTF" in out.replace("-", "_")
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+
+
     """Initialized submodules must block removal; deinitialized must not."""
 
     _ENV = {
