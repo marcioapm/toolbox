@@ -54,6 +54,44 @@ from pathlib import Path
 from typing import Optional
 
 # ---------------------------------------------------------------------------
+# Repo-local import — must happen before any 'toolbox' import
+# ---------------------------------------------------------------------------
+# Resolve the repo root from this script's own path so the import works from
+# any cwd, with any PYTHONPATH, regardless of which editable packages the
+# calling environment has installed.  Prepending to sys.path[0] guarantees
+# our src/ wins over any site-packages entry that might point at a different
+# checkout of the same package.
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REPO_SRC  = _REPO_ROOT / "src"
+
+if str(_REPO_SRC) != sys.path[0] if sys.path else True:
+    sys.path.insert(0, str(_REPO_SRC))
+
+import toolbox.agent_run as _ar  # noqa: E402  (must follow sys.path setup)
+
+# Hard assertion: if the resolved module file is not inside this repo, the
+# sys.path insertion did not win (e.g. a .pth file or PYTHONPATH entry took
+# precedence).  A mismatch must abort, not degrade to a skip — a verifier
+# that silently validates the wrong source is worse than no verifier.
+_EXPECTED_AR = (_REPO_SRC / "toolbox" / "agent_run.py").resolve()
+_ACTUAL_AR   = Path(_ar.__file__).resolve()
+if _ACTUAL_AR != _EXPECTED_AR:
+    print(
+        f"ABORT: toolbox.agent_run resolved to the wrong file.\n"
+        f"  expected: {_EXPECTED_AR}\n"
+        f"  got:      {_ACTUAL_AR}\n"
+        f"A sys.path entry or .pth file is overriding the repo-local src/.\n"
+        f"This verifier must only run against its own repository's source.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+# Canonical string used in header output and --json so every PASS record names
+# the exact source file that was validated.
+_AR_FILE: str = str(_ACTUAL_AR)
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -456,8 +494,6 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
     if not _require_binary("opencode", result):
         return
 
-    import toolbox.agent_run as ar
-
     version = _binary_version("opencode") or "unknown"
     result.version_info["opencode"] = version
     _log(f"  opencode version: {version}")
@@ -517,7 +553,7 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
     }
     with open(os.path.join(project_dir_s1, "opencode.json"), "w") as f:
         json.dump(build_allow_cfg, f)
-    policy_env1 = ar._opencode_policy_config(
+    policy_env1 = _ar._opencode_policy_config(
         None,
         enable_planning=False,
         enable_questions=False,
@@ -533,7 +569,7 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
 
     # 2. --agent-mode agent: production passes opencode_agent_mode to the policy builder.
     agent_mode_name = "myagent_mode_test"
-    policy_env2 = ar._opencode_policy_config(
+    policy_env2 = _ar._opencode_policy_config(
         None,
         enable_planning=False,
         enable_questions=False,
@@ -554,10 +590,10 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
     #    as extra_agent_names. Exercising that extraction path here catches regressions
     #    in _opencode_agent_names_from_harness_args itself.
     harness_arg_name = "myharness_arg_agent"
-    extra_from_harness_args = ar._opencode_agent_names_from_harness_args(
+    extra_from_harness_args = _ar._opencode_agent_names_from_harness_args(
         ["--agent", harness_arg_name]
     )
-    policy_env3 = ar._opencode_policy_config(
+    policy_env3 = _ar._opencode_policy_config(
         None,
         enable_planning=False,
         enable_questions=False,
@@ -592,8 +628,8 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
     with open(os.path.join(project_dir, "opencode.json"), "w") as f:
         json.dump(project_cfg, f)
     # Mirror production: collect agent names from config sources, then build policy.
-    config_agent_names = ar._opencode_collect_config_agent_names(project_dir)
-    policy_env4 = ar._opencode_policy_config(
+    config_agent_names = _ar._opencode_collect_config_agent_names(project_dir)
+    policy_env4 = _ar._opencode_policy_config(
         None,
         enable_planning=False,
         enable_questions=False,
@@ -617,13 +653,12 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
         json.dump(project_cfg, f)  # same project_cfg: grants allow for build
     # _opencode_collect_config_agent_names reads OPENCODE_CONFIG from the environment;
     # pass it explicitly here so the cell is self-contained.
-    env_for_collect = {**os.environ, "OPENCODE_CONFIG": cfg_file, "XDG_CONFIG_HOME": empty_xdg}
-    config_agent_names5 = ar._opencode_collect_config_agent_names(project_dir)
+    config_agent_names5 = _ar._opencode_collect_config_agent_names(project_dir)
     # Also pick up any agents named in the OPENCODE_CONFIG file.
     oc_cfg_data = json.loads(Path(cfg_file).read_text())
     for name in (oc_cfg_data.get("agent") or {}):
         config_agent_names5.add(name)
-    policy_env5 = ar._opencode_policy_config(
+    policy_env5 = _ar._opencode_policy_config(
         None,
         enable_planning=False,
         enable_questions=False,
@@ -641,7 +676,7 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
     _log("  [5] OPENCODE_CONFIG env override: deny wins")
 
     # 6. Enabled arm: both flags set → last rule must be 'allow' for all three keys.
-    policy_env6 = ar._opencode_policy_config(
+    policy_env6 = _ar._opencode_policy_config(
         None,
         enable_planning=True,
         enable_questions=True,
@@ -670,7 +705,13 @@ def cell_c6_opencode_resolver(result: CellResult, tmp_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _import_live_helpers():
-    """Import helpers from test_agent_run_live_acceptance without executing it."""
+    """Import helpers from test_agent_run_live_acceptance without executing it.
+
+    Loading by explicit file path (spec_from_file_location) prevents falling back
+    to an installed copy of the test module. The loaded module's own 'from toolbox
+    import agent_run' resolves via sys.path, which already has our repo's src/ at
+    position 0 (set at module startup), so it also imports the right agent_run.
+    """
     import importlib.util, pathlib
     test_file = pathlib.Path(__file__).parent.parent / "tests" / "test_agent_run_live_acceptance.py"
     spec = importlib.util.spec_from_file_location("_live_acceptance", str(test_file))
@@ -703,11 +744,10 @@ def cell_a1_codex_questions_differential(result: CellResult, tmp_dir: str) -> No
     log_root.mkdir(parents=True, exist_ok=True)
 
     # Temporarily redirect agent-run roots to our temp dirs.
-    import toolbox.agent_run as ar
-    orig_state = ar.STATE_ROOT
-    orig_log   = ar.LOG_ROOT
-    ar.STATE_ROOT = state_root
-    ar.LOG_ROOT   = log_root
+    orig_state = _ar.STATE_ROOT
+    orig_log   = _ar.LOG_ROOT
+    _ar.STATE_ROOT = state_root
+    _ar.LOG_ROOT   = log_root
 
     repeats   = live._A1_REPEATS
     sentinel  = live._A1_SENTINEL
@@ -749,8 +789,8 @@ def cell_a1_codex_questions_differential(result: CellResult, tmp_dir: str) -> No
                     f"tools={d['tools']}"
                 )
     finally:
-        ar.STATE_ROOT = orig_state
-        ar.LOG_ROOT   = orig_log
+        _ar.STATE_ROOT = orig_state
+        _ar.LOG_ROOT   = orig_log
 
     summary = (
         f"enabled {enabled_passes}/{repeats} passes, disabled {disabled_passes}/{repeats} passes"
@@ -932,21 +972,18 @@ def cell_a5_enabled_arms(result: CellResult, tmp_dir: str) -> None:
         result.fail(f"could not import live-acceptance helpers: {exc}")
         return
 
-    import toolbox.agent_run as ar
-    from pathlib import Path
-
     # — codex —
     _log("  A5 codex: functions.request_user_input when enable_questions=True…")
     state_root = Path(tmp_dir) / "a5_state"
     log_root   = Path(tmp_dir) / "a5_logs"
     state_root.mkdir(parents=True, exist_ok=True)
     log_root.mkdir(parents=True, exist_ok=True)
-    orig_state, orig_log = ar.STATE_ROOT, ar.LOG_ROOT
-    ar.STATE_ROOT, ar.LOG_ROOT = state_root, log_root
+    orig_state, orig_log = _ar.STATE_ROOT, _ar.LOG_ROOT
+    _ar.STATE_ROOT, _ar.LOG_ROOT = state_root, log_root
     try:
         obs = live._a1_run_arm(True, "vhp-a5-codex", state_root, log_root)
     finally:
-        ar.STATE_ROOT, ar.LOG_ROOT = orig_state, orig_log
+        _ar.STATE_ROOT, _ar.LOG_ROOT = orig_state, orig_log
 
     if not obs["has_sentinel"]:
         result.fail(
@@ -967,7 +1004,7 @@ def cell_a5_enabled_arms(result: CellResult, tmp_dir: str) -> None:
     project = Path(tmp_dir) / "a5_oc_project"
     project.mkdir(parents=True, exist_ok=True)
     (project / "opencode.json").write_text(json.dumps({"permission": {"bash": "allow"}}))
-    enable_q_cfg = ar._opencode_policy_config(None, enable_planning=False, enable_questions=True)
+    enable_q_cfg = _ar._opencode_policy_config(None, enable_planning=False, enable_questions=True)
     oc_tools, _, oc_proc = live._opencode_subprocess(
         "Run: echo SENTINEL_OUTPUT_XYZ", project,
         extra_env={"OPENCODE_CONFIG_CONTENT": enable_q_cfg},
@@ -988,7 +1025,7 @@ def cell_a5_enabled_arms(result: CellResult, tmp_dir: str) -> None:
 
     # — claude —
     _log("  A5 claude: enabled argv has no --disallowedTools…")
-    argv = ar._build_managed_argv(
+    argv = _ar._build_managed_argv(
         "claude",
         interactive=False,
         prompt="placeholder",
@@ -1183,6 +1220,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     _log("verify-harness-policy")
     _log(f"cells: {', '.join(names_selected)}")
     _log(f"keep={args.keep}")
+    _log(f"agent_run: {_AR_FILE}")
     _log("")
 
     # Single shared temp dir for all cells; cells create sub-dirs inside it.
@@ -1221,6 +1259,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "pass": pass_count,
             "fail": fail_count,
             "skip": skip_count,
+            "agent_run_file": _AR_FILE,
             "cells": [
                 {
                     "name":           r.name,

@@ -76,6 +76,9 @@ C6 (and the Tier-2 cells) are the ones that catch our own regressions.
 
 ## How to run
 
+The script resolves `toolbox.agent_run` from its own repository unconditionally — no
+`PYTHONPATH` or `uv run` required. It can be invoked from any working directory:
+
 ```sh
 # Tier 1 only — free, takes ~5 s
 python3 scripts/verify-harness-policy --free-only
@@ -97,9 +100,26 @@ python3 scripts/verify-harness-policy --free-only --json
 
 # Keep temp dirs for debugging
 python3 scripts/verify-harness-policy --keep --only C6-opencode-resolver
+
+# From any working directory by absolute path
+python3 /path/to/toolbox-harness/scripts/verify-harness-policy --free-only
 ```
 
-Exit code is **0** when all cells are PASS or SKIP, **1** on any FAIL.
+Exit code is **0** when all cells are PASS or SKIP, **1** on any FAIL, **2** on import
+assertion failure (wrong `agent_run.py` resolved despite the `sys.path` setup).
+
+The header line `agent_run: /path/to/toolbox-harness/src/toolbox/agent_run.py` names
+the exact source file validated. The `--json` output includes it as `"agent_run_file"`.
+When this script reports PASS, the record shows which source it ran against.
+
+Sample header:
+
+```
+verify-harness-policy
+cells: C1-codex-key-exists, ...
+keep=False
+agent_run: /Users/marcio/git/toolbox-harness/src/toolbox/agent_run.py
+```
 
 ## Claude tool-name check — why it's free
 
