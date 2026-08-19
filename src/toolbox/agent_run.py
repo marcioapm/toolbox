@@ -169,23 +169,38 @@ Harness hook integration. Configure these yourself; agent-run never edits a
 harness config file:
 
     claude (~/.claude/settings.json):
-        {"hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command",
-          "command": "agent-run hook stop"}]}]}}
+        {"hooks": {
+          "Stop": [{"matcher": "", "hooks": [{"type": "command",
+            "command": "agent-run hook stop"}]}],
+          "PermissionRequest": [{"matcher": "", "hooks": [{"type": "command",
+            "command": "agent-run hook permission-request"}]}]}}
 
     codex (~/.codex/config.toml):
         notify = ["agent-run", "hook", "turn-complete"]
 
-    opencode (plugin; opencode hooks are JavaScript, so it shells out):
-        export default {
-          name: "agent-run-hook",
-          onEvent(event) {
-            if (event.type !== "session.idle") return;
-            const { execFileSync } = require("child_process");
-            // Array argv: no shell, so no injection from event contents.
-            execFileSync("agent-run", ["hook", "session-idle", "--json",
-              JSON.stringify(event)]);
+        codex reports only turn completion this way: notify emits a single
+        agent-turn-complete event. Its richer hook engine, which does have a
+        PermissionRequest event, requires --dangerously-bypass-hook-trust,
+        which `codex app-server` -- the binary managed mode drives -- does not
+        accept, so permission_required is unavailable for managed codex runs.
+
+    opencode (~/.config/opencode/plugin/agent-run-hook.js; opencode plugins
+    are JavaScript, so the plugin shells out. The export must be a named
+    factory returning an object of handlers -- `export default {onEvent}` is
+    silently never invoked):
+        import { execFileSync } from "child_process"
+
+        export const AgentRunHook = async () => ({
+          event: async ({ event }) => {
+            const kind = event.type === "session.idle" ? "session-idle"
+              : event.type.startsWith("permission.") ? "permission-request"
+              : null
+            if (!kind) return
+            // Array argv: no shell, so event contents cannot inject.
+            execFileSync("agent-run", ["hook", kind, "--json",
+              JSON.stringify(event)])
           },
-        };
+        })
 
 The runner exports AGENT_RUN_NAME, AGENT_RUN_STATE_DIR, and AGENT_RUN_LOG_DIR
 into the agent's environment, so a hook need not know how the run was
