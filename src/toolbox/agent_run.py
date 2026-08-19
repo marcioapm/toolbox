@@ -3206,6 +3206,11 @@ def _hook_encode_line(record: dict) -> bytes:
            floor 64 bytes)
         5. drop message, keep the rest of the envelope
 
+    Rungs 4-5 are unreachable from cmd_hook: _cmd_hook_inner clips event to
+    _HOOK_EVENT_MAX_BYTES and message to _HOOK_MESSAGE_MAX_CHARS first, so the
+    worst-case rung-3 envelope is 4414 bytes against an 8192 budget. They bound
+    a caller that bypasses that clipping, and are kept for that reason.
+
     The empty-payload, no-message envelope is the proven floor: every other
     field is a short fixed-vocabulary scalar, and `event` is clipped to
     _HOOK_EVENT_MAX_BYTES by _cmd_hook_inner before this call. allow_nan=False
@@ -3272,7 +3277,9 @@ def _hook_encode_line(record: dict) -> bytes:
     # Backstop: drop message entirely. The bare envelope is proven to fit.
     line = encode({**base, "message": None})
     if line is None:
-        # Non-serialisable envelope field — emit a minimal safe record.
+        # Reached when a non-message envelope field is non-finite: NaN/Inf in
+        # payload is resolved at rung 3, but in an envelope field it survives
+        # to here and makes encode() return None. Emit a minimal safe record.
         line = encode({
             "event": _json_clip(str(record.get("event", "")), _HOOK_EVENT_MAX_BYTES),
             "at": record.get("at", ""),
@@ -3332,20 +3339,6 @@ def _hooks_read_tail(log_dir: Path, max_bytes: int) -> tuple[Optional[bytes], bo
         except OSError:
             pass
         return None, False
-
-
-def _hooks_read(log_dir: Path, max_bytes: int) -> Optional[bytes]:
-    """First max_bytes of log_dir/hooks.jsonl, or None if it is not a readable
-    regular file.
-
-    Opens the directory with O_NOFOLLOW then opens hooks.jsonl relative to that
-    dir_fd with O_NOFOLLOW|O_NONBLOCK. fstat on the opened fd confirms it is a
-    regular file before any read, closing the TOCTOU that an lstat-then-open
-    pair leaves open. O_NONBLOCK ensures a FIFO planted at the path returns
-    ENXIO rather than blocking.
-    """
-    data, _ = _hooks_read_tail(log_dir, max_bytes)
-    return data
 
 
 def _hook_append_record(log_dir: Path, record: dict) -> None:
