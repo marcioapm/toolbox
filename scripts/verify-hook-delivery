@@ -17,15 +17,7 @@ Each cell exercises one (harness, mode) pair and asserts:
       0.00 means the hook was already recorded before that point (harness-dependent); fail
       if beyond HOOK_WAIT_TIMEOUT; reported per cell in --json output
 
-All six cells are real cells; no mode is SKIPped. Probes on this machine confirm:
-  opencode run: 73 events delivered to a plugin (including session.idle) on the
-      non-interactive `opencode run` path with both .js and .ts plugin files.
-  claude interactive: Stop hook fires after each assistant turn with AGENT_RUN_NAME
-      inherited; probe: hook script received AGENT_RUN_NAME and payload on first reply.
-  codex interactive: notify fires after each turn; probe: hook received AGENT_RUN_NAME
-      and payload on first reply from managed app-server path.
-  opencode interactive: session.idle fires after each turn; probe: plugin received
-      process.env.AGENT_RUN_NAME == run name and wrote evidence on first reply.
+All six cells are real cells; no mode is SKIPped.
 
 The opencode plugin format uses a named export async factory function returning
 {event: async ({event}) => ...}, not `export default {onEvent}`. The latter form
@@ -54,6 +46,7 @@ import argparse
 import atexit
 import json
 import os
+import shlex
 import shutil
 import signal
 import stat
@@ -360,14 +353,12 @@ def _make_hook_script(tmp_dir: Path, run_name: str) -> tuple[Path, Path]:
     hook was actually invoked without relying solely on hooks.jsonl.
     """
     evidence_path = tmp_dir / f"hook-evidence-{run_name}.json"
-    branch_ar = " ".join(repr(str(s)) for s in _agent_run_bin)
+    branch_ar = " ".join(shlex.quote(str(s)) for s in _agent_run_bin)
     script_path = tmp_dir / f"hook-script-{run_name}.sh"
     script_path.write_text(textwrap.dedent(f"""\
         #!/bin/sh
         # Hook evidence script for run {run_name}.
         # Captures AGENT_RUN_NAME and calls agent-run hook, then writes evidence.
-        EVIDENCE={str(evidence_path)!r}
-        AGENT_RUN_NAME_CAPTURED="${{AGENT_RUN_NAME:-}}"
         PAYLOAD_SOURCE="none"
         PAYLOAD=""
 
@@ -385,16 +376,20 @@ def _make_hook_script(tmp_dir: Path, run_name: str) -> tuple[Path, Path]:
             printf '%s' "$PAYLOAD" | {branch_ar} hook stop
         fi
 
-        cat > "$EVIDENCE" <<EVIDEOF
-        {{
-          "run_name": "{run_name}",
-          "agent_run_name_env": "$AGENT_RUN_NAME_CAPTURED",
-          "payload_source": "$PAYLOAD_SOURCE"
-        }}
-        EVIDEOF
+        python3 - "$PAYLOAD_SOURCE" "${{AGENT_RUN_NAME:-}}" <<'PYEOF'
+import json, sys
+payload_source = sys.argv[1] if len(sys.argv) > 1 else "none"
+agent_run_name_env = sys.argv[2] if len(sys.argv) > 2 else ""
+data = {{
+  "run_name": {run_name!r},
+  "agent_run_name_env": agent_run_name_env,
+  "payload_source": payload_source,
+}}
+open({str(evidence_path)!r}, "w").write(json.dumps(data))
+PYEOF
         exit 0
     """))
-    script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+    script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR)
     return script_path, evidence_path
 
 
@@ -917,8 +912,14 @@ def run_cell(cell_name: str, keep: bool) -> CellResult:
 
 def _resolve_agent_run_bin(override: Optional[str]) -> list[str]:
     if override:
-        return [override]
-    return [str(_BRANCH_PYTHON), str(_BRANCH_SCRIPT)]
+        # Accept a multi-token override so callers can supply "python script.py".
+        parts = shlex.split(override)
+        return parts if parts else [override]
+    if _BRANCH_PYTHON.exists():
+        return [str(_BRANCH_PYTHON), str(_BRANCH_SCRIPT)]
+    # Fall back to the current interpreter with the branch script. This works
+    # in worktrees that share a venv via PYTHONPATH rather than installing.
+    return [sys.executable, str(_BRANCH_SCRIPT)]
 
 
 def _preflight_branch_binary(bin_argv: list[str]) -> Optional[str]:
@@ -939,7 +940,8 @@ def _preflight_branch_binary(bin_argv: list[str]) -> Optional[str]:
                 "and that the hook subcommand is present.")
     except FileNotFoundError as exc:
         return (f"branch binary not found: {exc}. "
-                "Run 'pip install -e .' inside the .venv or supply --agent-run.")
+                "Supply --agent-run 'python /path/to/agent_run.py' or "
+                "ensure .venv/bin/python exists in the repo root.")
     except Exception as exc:
         return f"preflight error: {exc}"
 

@@ -3081,19 +3081,37 @@ def _hook_read_payload(
     return _hook_parse_json(raw.decode("utf-8", errors="replace").strip()), "stdin"
 
 
-def _hook_truncate_payload(payload: Any) -> Any:
-    """Return a copy of payload with top-level string values capped.
+def _hook_truncate_payload(payload: Any) -> tuple[Any, bool]:
+    """Return (truncated_payload, was_truncated) with top-level values capped.
 
-    Caps each top-level string to _HOOK_PAYLOAD_TRUNCATE_CHARS characters.
-    Nested content is not traversed; bulk nesting is caught by the byte budget
-    in _hook_encode_record. Non-dict payloads are returned unchanged.
+    Caps each top-level string to _HOOK_PAYLOAD_TRUNCATE_CHARS characters and
+    clips strings inside top-level lists by the same limit. Nested content
+    beyond one level deep is not traversed; bulk nesting is caught by the byte
+    budget in _hook_encode_line. Non-dict payloads are returned unchanged.
     """
     if not isinstance(payload, dict):
-        return payload
-    return {
-        k: v[:_HOOK_PAYLOAD_TRUNCATE_CHARS] if isinstance(v, str) else v
-        for k, v in payload.items()
-    }
+        return payload, False
+    result = {}
+    changed = False
+    for k, v in payload.items():
+        if isinstance(v, str) and len(v) > _HOOK_PAYLOAD_TRUNCATE_CHARS:
+            result[k] = v[:_HOOK_PAYLOAD_TRUNCATE_CHARS]
+            changed = True
+        elif isinstance(v, list):
+            clipped = []
+            list_changed = False
+            for item in v:
+                if isinstance(item, str) and len(item) > _HOOK_PAYLOAD_TRUNCATE_CHARS:
+                    clipped.append(item[:_HOOK_PAYLOAD_TRUNCATE_CHARS])
+                    list_changed = True
+                else:
+                    clipped.append(item)
+            result[k] = clipped
+            if list_changed:
+                changed = True
+        else:
+            result[k] = v
+    return result, changed
 
 
 def _json_clip(text: str, max_bytes: int) -> str:
@@ -3121,52 +3139,127 @@ def _json_clip(text: str, max_bytes: int) -> str:
 def _hook_encode_line(record: dict) -> bytes:
     """Encode record as one JSONL line, always at most _HOOK_MAX_LINE_BYTES.
 
-    Shrinks the payload in three steps — as given, string fields clipped to a
-    quarter budget, then dropped entirely — and sets payload_truncated once it
-    has to shrink anything. The empty-payload form is guaranteed to fit: every
-    envelope field is a short fixed-vocabulary scalar except `event`, which
-    callers clip to _HOOK_EVENT_MAX_BYTES.
+    Shrinks the payload via a descending per-field byte budget, halving from
+    _HOOK_PAYLOAD_TRUNCATE_CHARS until the line fits, then drops the payload
+    entirely as a last resort. The empty-payload form is the backstop: the
+    envelope without any payload is guaranteed to fit within the budget.
+    allow_nan=False rejects NaN/Infinity so emitted lines are valid RFC-8259
+    JSON; a payload that cannot be serialised cleanly falls back to the next
+    rung of the ladder.
     """
     def encode(rec: dict) -> bytes:
-        return (json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+        try:
+            return (
+                json.dumps(rec, ensure_ascii=True, separators=(",", ":"),
+                           allow_nan=False) + "\n"
+            ).encode()
+        except (ValueError, OverflowError):
+            return None  # type: ignore[return-value]
 
     line = encode(record)
-    if len(line) <= _HOOK_MAX_LINE_BYTES:
+    if line is not None and len(line) <= _HOOK_MAX_LINE_BYTES:
         return line
 
     payload = record.get("payload")
-    quarter = _HOOK_PAYLOAD_TRUNCATE_CHARS // 4
-    smaller: list[Any] = []
     if isinstance(payload, dict):
-        smaller.append({
-            k: _json_clip(v, quarter) if isinstance(v, str) else v
-            for k, v in payload.items()
-        })
-    smaller.append({})
+        # Descending per-field budget: halve from the initial cap until the
+        # line fits, floor at 8 bytes per field.
+        budget = _HOOK_PAYLOAD_TRUNCATE_CHARS
+        while budget >= 8:
+            candidate: dict[str, Any] = {}
+            for k, v in payload.items():
+                if isinstance(v, str):
+                    candidate[k] = _json_clip(v, budget)
+                elif isinstance(v, list):
+                    candidate[k] = [
+                        _json_clip(item, budget) if isinstance(item, str) else item
+                        for item in v
+                    ]
+                else:
+                    candidate[k] = v
+            line = encode({**record, "payload": candidate, "payload_truncated": True})
+            if line is not None and len(line) <= _HOOK_MAX_LINE_BYTES:
+                return line
+            budget //= 2
 
-    for candidate in smaller:
-        line = encode({**record, "payload": candidate, "payload_truncated": True})
-        if len(line) <= _HOOK_MAX_LINE_BYTES:
-            break
+    # Backstop: drop payload entirely. The empty-payload envelope is proven to
+    # fit: every other field is a short fixed-vocabulary scalar, and `event` is
+    # clipped to _HOOK_EVENT_MAX_BYTES by _cmd_hook_inner before this call.
+    line = encode({**record, "payload": {}, "payload_truncated": True})
+    if line is None:
+        # Non-serialisable envelope field — emit a minimal safe record.
+        line = encode({
+            "event": _json_clip(str(record.get("event", "")), _HOOK_EVENT_MAX_BYTES),
+            "at": record.get("at", ""),
+            "payload": {},
+            "payload_truncated": True,
+        })
+    # Final unconditional bound check: a line over budget would break append
+    # atomicity for every concurrent writer. Truncation at this point means
+    # the caller passed an un-clipped event; drop rather than corrupt the log.
+    if line is None or len(line) > _HOOK_MAX_LINE_BYTES:
+        return b""
     return line
+
+
+def _hooks_read_tail(log_dir: Path, max_bytes: int) -> tuple[Optional[bytes], bool]:
+    """Read at most max_bytes from the tail of log_dir/hooks.jsonl.
+
+    Returns (data, truncated). truncated is True when the file exceeds max_bytes
+    and only the tail was read. The first partial line in a truncated read is
+    discarded so all returned lines are complete records.
+    """
+    try:
+        dir_fd = os.open(str(log_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None, False
+    try:
+        fd = os.open(
+            "hooks.jsonl",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=dir_fd,
+        )
+    except OSError:
+        return None, False
+    finally:
+        os.close(dir_fd)
+    try:
+        if not _stat_module.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None, False
+        os.set_blocking(fd, True)
+        with open(fd, "rb", closefd=True) as fh:
+            size = fh.seek(0, 2)  # seek to end to get file size
+            if size <= max_bytes:
+                fh.seek(0)
+                return fh.read(max_bytes), False
+            # Tail read: seek back max_bytes from end, drop the first partial line.
+            fh.seek(size - max_bytes)
+            raw = fh.read(max_bytes)
+            newline = raw.find(b"\n")
+            if newline >= 0:
+                raw = raw[newline + 1:]
+            return raw, True
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None, False
 
 
 def _hooks_read(log_dir: Path, max_bytes: int) -> Optional[bytes]:
     """First max_bytes of log_dir/hooks.jsonl, or None if it is not a readable
     regular file.
 
-    lstat gates the open so a symlink, FIFO, or device planted at the path is
-    never opened: reading a FIFO blocks until a writer appears and /dev/zero
-    never ends, either of which would stop `watch` returning.
+    Opens the directory with O_NOFOLLOW then opens hooks.jsonl relative to that
+    dir_fd with O_NOFOLLOW|O_NONBLOCK. fstat on the opened fd confirms it is a
+    regular file before any read, closing the TOCTOU that an lstat-then-open
+    pair leaves open. O_NONBLOCK ensures a FIFO planted at the path returns
+    ENXIO rather than blocking.
     """
-    path = log_dir / "hooks.jsonl"
-    try:
-        if not _stat_module.S_ISREG(os.lstat(path).st_mode):
-            return None
-        with open(path, "rb") as fh:
-            return fh.read(max_bytes)
-    except OSError:
-        return None
+    data, _ = _hooks_read_tail(log_dir, max_bytes)
+    return data
 
 
 def _hook_append_record(log_dir: Path, record: dict) -> None:
@@ -3180,7 +3273,9 @@ def _hook_append_record(log_dir: Path, record: dict) -> None:
     # Every line is at most _HOOK_MAX_LINE_BYTES, so this many bytes holds at
     # least AGENT_RUN_HOOK_MAX_EVENTS lines — enough to decide the cap.
     existing = _hooks_read(log_dir, AGENT_RUN_HOOK_MAX_EVENTS * _HOOK_MAX_LINE_BYTES)
-    if existing is not None and existing.count(b"\n") >= AGENT_RUN_HOOK_MAX_EVENTS:
+    if existing is not None and sum(
+        1 for ln in existing.split(b"\n") if ln.strip()
+    ) >= AGENT_RUN_HOOK_MAX_EVENTS:
         return
 
     line = _hook_encode_line(record)
@@ -3229,7 +3324,14 @@ def cmd_hook(args: argparse.Namespace) -> int:
 
 
 def _hook_detect_harness(payload: Any) -> Optional[str]:
-    """Identify the harness from its payload's distinguishing key pair."""
+    """Infer harness from payload key presence; returns None when unrecognised.
+
+    Detection is best-effort key presence, not authoritative: an agent that
+    controls hooks.jsonl can forge this field by adding keys from another
+    harness's shape. Use the `source` field (flag/argv/stdin) as a
+    cross-check when attribution matters — it reflects the delivery mechanism
+    the hook binary observed, which the agent cannot choose independently.
+    """
     if not isinstance(payload, dict):
         return None
     if "session_id" in payload and "hook_event_name" in payload:
@@ -3251,17 +3353,25 @@ def _cmd_hook_inner(args: argparse.Namespace) -> int:
         getattr(args, "json_payload", None),
         list(getattr(args, "extra", []) or []),
     )
-    record = {
+    truncated_payload, field_truncated = _hook_truncate_payload(payload)
+    record: dict[str, Any] = {
         # Clipped in encoded bytes so the envelope alone can never exceed
         # _HOOK_MAX_LINE_BYTES and cost the write its atomicity.
-        "event": _json_clip(args.event.lower(), _HOOK_EVENT_MAX_BYTES),
+        "event": _json_clip(
+            args.event.lower().encode("utf-8", "replace").decode("utf-8"),
+            _HOOK_EVENT_MAX_BYTES,
+        ),
         "at": _now_iso(),
+        # harness is inferred from payload key presence; it is attacker-declared
+        # when the agent controls hooks.jsonl, not an authoritative fact.
         "harness": _hook_detect_harness(payload),
         "source": source,
         "pid": os.getpid(),
         "resolved_by": resolved_by,
-        "payload": _hook_truncate_payload(payload),
+        "payload": truncated_payload,
     }
+    if field_truncated:
+        record["payload_truncated"] = True
     _hook_append_record(_log_dir(name), record)
     return 0
 
@@ -3283,8 +3393,14 @@ def _read_hooks_jsonl(log_dir: Path) -> Optional[dict]:
 
 def _hooks_summary(log_dir: Path) -> Optional[dict]:
     """Count and aggregate hooks.jsonl records; skip lines that are not JSON
-    objects. None when the file is absent or not a readable regular file."""
-    raw = _hooks_read(log_dir, _HOOKS_READ_MAX_BYTES)
+    objects. None when the file is absent or not a readable regular file.
+
+    Reads the tail of the file so `last` and `last_event_age_s` describe the
+    newest records even when the file exceeds _HOOKS_READ_MAX_BYTES. truncated
+    is True when the file was larger than the read cap and only the tail was
+    parsed; a consumer can use it to tell a complete aggregate from a partial one.
+    """
+    raw, truncated = _hooks_read_tail(log_dir, _HOOKS_READ_MAX_BYTES)
     if raw is None:
         return None
 
@@ -3301,18 +3417,27 @@ def _hooks_summary(log_dir: Path) -> Optional[dict]:
 
     if not records:
         return {"count": 0, "last": None, "last_event_age_s": None,
-                "events": {}, "at_cap": False}
+                "events": {}, "at_cap": False, "truncated": truncated}
 
     last = records[-1]
+
+    def _strip_surrogates(s: Any) -> Optional[str]:
+        # Envelope fields come from a file any process can append to, so a
+        # non-string here is data, not a bug: summarise it as None rather
+        # than raising and losing the whole aggregate.
+        if not isinstance(s, str):
+            return None
+        return s.encode("utf-8", "replace").decode("utf-8")
+
     last_summary = {
-        "event": last.get("event"),
-        "at": last.get("at"),
-        "harness": last.get("harness"),
+        "event": _strip_surrogates(last.get("event")),
+        "at": _strip_surrogates(last.get("at")),
+        "harness": _strip_surrogates(last.get("harness")),
     }
 
     last_event_age_s: Optional[float] = None
     at_str = last.get("at")
-    if at_str:
+    if isinstance(at_str, str) and at_str:
         try:
             at_dt = datetime.strptime(at_str, "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=timezone.utc
@@ -3327,6 +3452,7 @@ def _hooks_summary(log_dir: Path) -> Optional[dict]:
     for r in records:
         ev = r.get("event")
         if isinstance(ev, str):
+            ev = ev.encode("utf-8", "replace").decode("utf-8")
             event_counts[ev] = event_counts.get(ev, 0) + 1
 
     return {
@@ -3334,7 +3460,11 @@ def _hooks_summary(log_dir: Path) -> Optional[dict]:
         "last": last_summary,
         "last_event_age_s": last_event_age_s,
         "events": event_counts,
+        # at_cap reflects whether the parsed record count meets the cap constant
+        # as seen by the watcher's process; hooks were written under the hook
+        # process's cap. Only reliable when both share the same environment.
         "at_cap": len(records) >= AGENT_RUN_HOOK_MAX_EVENTS,
+        "truncated": truncated,
     }
 
 
