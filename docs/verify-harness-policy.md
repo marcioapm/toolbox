@@ -66,9 +66,9 @@ Two failure modes matter:
 | C5 | No | **Yes** | Calls `claude --disallowedTools` directly. |
 | C6 | **Yes** | **Yes** | Calls `ar._opencode_policy_config()` (our code) then `opencode debug agent` (harness). A gutted policy builder (`target_agents = set()`) is detected at scenario 1: the project per-agent allow wins instead of the policy deny. |
 | A1 | **Yes** | **Yes** | Calls `agent_run.cmd_launch` through the full managed path; result observed in the model's tool list. |
-| A2 | **Yes** | **Yes** | Calls `opencode run` via `_opencode_subprocess`; result observed in `tool_use` records. |
+| A2 | **Partial** | **Yes** | Calls `opencode run` via `_opencode_subprocess`. The deny config is built by `_opencode_policy_config()` with an inherited `bash` deny, so a builder that drops inherited keys is caught; regressions confined to the three policy keys are not, because `bash` is the observable proxy. |
 | A3 | No | **Yes** | Calls `claude --disallowedTools` directly; result observed in `tool_use` records. |
-| A5 | **Yes** | **Yes** | Exercises `_opencode_policy_config()` and `_build_managed_argv()` output. |
+| A5 | **Yes** | **Partial** | Exercises `_opencode_policy_config()` and `_build_managed_argv()` output. The codex and opencode arms call their harnesses; the claude arm is argv-only and makes no claude call, so it cannot detect claude drift. |
 
 **Key point**: C1–C5 are harness-drift detectors only. A bug introduced into
 `_opencode_policy_config()` or `_build_managed_argv()` would not be caught by any of them.
@@ -219,6 +219,11 @@ the policy was verified against.
 | A5 | "bash not invoked when question=allow" | Policy merge corrupted the bash allow |
 
 ## Limitations
+
+- **Codex contract cells redirect `CODEX_HOME`** to a scratch directory so they never write to
+  the real `~/.codex/`. Codex initialises sqlite state on every invocation, so a writable state
+  root is required; the scratch root is created per run.
+
 
 Known gaps that are NOT fixed here (see commit message):
 

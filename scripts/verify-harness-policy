@@ -150,6 +150,16 @@ def _log(msg: str) -> None:
     print(msg, flush=True, file=sys.stderr if _json_mode else sys.stdout)
 
 
+# Exit code and message emitted by `claude --print` when no prompt is supplied. Used as a
+# positive control: reaching this error proves claude parsed its options and validated tool
+# names, so an absent "matches no known tool" warning is meaningful.
+CLAUDE_NO_PROMPT_RC = 1
+CLAUDE_NO_PROMPT_ERROR = "Input must be provided"
+
+# Exit code codex returns when --strict-config rejects a configuration value.
+CODEX_CONFIG_ERROR_RC = 1
+
+
 def _run(
     *cmd: str,
     timeout: int = CONTRACT_TIMEOUT,
@@ -203,6 +213,19 @@ def _require_binary(name: str, result: CellResult) -> Optional[str]:
 # Tier 1 — contract cells
 # ---------------------------------------------------------------------------
 
+# Codex writes sqlite state under its state root on every invocation. Point that
+# root at a scratch directory so contract cells never touch the real ~/.codex.
+_CODEX_STATE_ROOT: Optional[str] = None
+
+
+def _codex_env() -> dict:
+    """Environment for codex invocations with CODEX_HOME redirected to scratch."""
+    global _CODEX_STATE_ROOT
+    if _CODEX_STATE_ROOT is None:
+        _CODEX_STATE_ROOT = tempfile.mkdtemp(prefix="vhp-codex-home-")
+    return {**os.environ, "CODEX_HOME": _CODEX_STATE_ROOT}
+
+
 def cell_c1_codex_key_exists(result: CellResult) -> None:
     """C1: tools.experimental_request_user_input accepted; a nonsense key is not.
 
@@ -220,6 +243,7 @@ def cell_c1_codex_key_exists(result: CellResult) -> None:
     pos = _run(
         "codex", "app-server", "--strict-config",
         "-c", "tools.experimental_request_user_input={enabled=false}",
+        env=_codex_env(),
     )
     if pos.returncode != 0:
         result.fail(
@@ -232,7 +256,8 @@ def cell_c1_codex_key_exists(result: CellResult) -> None:
 
     # Negative: a generated nonsense key must exit non-zero with 'unknown configuration field'.
     bogus = "tools.BOGUS_VERIFIER_KEY_NEVER_EXISTS_XYZ"
-    neg = _run("codex", "app-server", "--strict-config", "-c", f"{bogus}=false")
+    neg = _run("codex", "app-server", "--strict-config", "-c", f"{bogus}=false",
+               env=_codex_env())
     if neg.returncode == 0:
         result.fail(
             f"codex app-server --strict-config -c {bogus}=false exited 0; "
@@ -265,25 +290,49 @@ def cell_c2_codex_value_shape(result: CellResult) -> None:
     version = _binary_version("codex") or "unknown"
     result.version_info["codex"] = version
 
+    # Positive control: the struct literal must be ACCEPTED (exit 0). Without this a
+    # binary that fails every invocation would satisfy the rejection arm below.
+    ok = _run(
+        "codex", "app-server", "--strict-config",
+        "-c", "tools.experimental_request_user_input={enabled=false}",
+        env=_codex_env(),
+    )
+    if ok.returncode != 0:
+        result.fail(
+            f"positive control failed: the struct literal exited {ok.returncode}, expected 0. "
+            "codex is not behaving as a working binary, so the rejection arm below proves "
+            f"nothing.\nstderr: {ok.stderr[:300]}"
+        )
+        return
+    _log("  [positive control] struct literal accepted: exit 0")
+
     r = _run(
         "codex", "app-server", "--strict-config",
         "-c", "tools.experimental_request_user_input=false",
+        env=_codex_env(),
     )
-    if r.returncode == 0:
+    if r.returncode != CODEX_CONFIG_ERROR_RC:
         result.fail(
-            "bare boolean 'false' was accepted for tools.experimental_request_user_input; "
-            "expected rejection with struct-type error. If codex now accepts a boolean, "
-            "_codex_policy_args() can simplify to a boolean value — but verify first."
+            f"bare boolean 'false' exited {r.returncode}, expected {CODEX_CONFIG_ERROR_RC} "
+            "(config rejection). If codex now accepts a boolean, _codex_policy_args() can "
+            f"simplify — but verify first.\nstderr: {r.stderr[:300]}"
         )
         return
-    if "expected struct" not in r.stderr:
+    # Match the full codex diagnostic: 'expected struct' alone also appears in unrelated
+    # startup failures, which would let a broken binary satisfy this arm.
+    if not (
+        "invalid type: boolean" in r.stderr
+        and "expected struct ExperimentalRequestUserInput" in r.stderr
+    ):
         result.fail(
-            f"bare boolean rejected (exit {r.returncode}) but stderr lacks 'expected struct'.\n"
-            f"stderr: {r.stderr[:300]}"
+            f"bare boolean exited {r.returncode} but stderr lacks the codex struct-type "
+            f"diagnostic.\nstderr: {r.stderr[:300]}"
         )
         return
-    _log(f"  bare boolean rejected: exit {r.returncode}, 'expected struct' in stderr")
-    result.pass_(f"bare boolean rejected with struct-type error (codex {version})")
+    _log(f"  bare boolean rejected: exit {r.returncode}, struct-type diagnostic present")
+    result.pass_(
+        f"struct literal accepted; bare boolean rejected with struct-type error (codex {version})"
+    )
 
 
 def cell_c3_codex_last_wins(result: CellResult) -> None:
@@ -308,12 +357,14 @@ def cell_c3_codex_last_wins(result: CellResult) -> None:
         "codex", "app-server", "--strict-config",
         "-c", invalid,
         "-c", valid,
+        env=_codex_env(),
     )
     # valid-first / invalid-last → last occurrence is invalid → should exit non-zero.
     first_then_invalid = _run(
         "codex", "app-server", "--strict-config",
         "-c", valid,
         "-c", invalid,
+        env=_codex_env(),
     )
 
     if first_then_valid.returncode != 0:
@@ -322,9 +373,11 @@ def cell_c3_codex_last_wins(result: CellResult) -> None:
             f"stderr: {first_then_valid.stderr[:300]}"
         )
         return
-    if first_then_invalid.returncode == 0:
+    if first_then_invalid.returncode != CODEX_CONFIG_ERROR_RC:
         result.fail(
-            "valid-first/invalid-last exited 0; expected non-zero (last-wins not honoured)."
+            f"valid-first/invalid-last exited {first_then_invalid.returncode}, expected "
+            f"{CODEX_CONFIG_ERROR_RC} (config rejection). Either last-wins is not honoured or "
+            f"codex failed for an unrelated reason.\nstderr: {first_then_invalid.stderr[:300]}"
         )
         return
 
@@ -370,6 +423,16 @@ def cell_c4_claude_tool_names(result: CellResult) -> None:
         "claude", "--print", "--permission-mode", "bypassPermissions",
         "--disallowedTools", real_tools,
     )
+    # Positive control: claude must reach prompt validation, proving it parsed the
+    # --disallowedTools option. Absence of a warning from a binary that never got that
+    # far would otherwise read as "all names recognised".
+    if pos.returncode != CLAUDE_NO_PROMPT_RC or CLAUDE_NO_PROMPT_ERROR not in pos.stderr:
+        result.fail(
+            f"positive control failed: expected exit {CLAUDE_NO_PROMPT_RC} with "
+            f"{CLAUDE_NO_PROMPT_ERROR!r}, got exit {pos.returncode}. claude did not reach "
+            f"tool-name validation, so this cell proves nothing.\nstderr: {pos.stderr[:400]}"
+        )
+        return
     if "matches no known tool" in pos.stderr:
         result.fail(
             "One or more of EnterPlanMode/ExitPlanMode/AskUserQuestion produced "
@@ -378,13 +441,19 @@ def cell_c4_claude_tool_names(result: CellResult) -> None:
             f"stderr: {pos.stderr[:400]}"
         )
         return
+    _log(f"  [positive control] claude reached prompt validation: rc={pos.returncode}")
     _log(f"  [positive] real policy tools: no 'matches no known tool' in stderr")
-    _log(f"    elapsed check: rc={pos.returncode} (expected 1 — no prompt supplied)")
 
     neg = _run(
         "claude", "--print", "--permission-mode", "bypassPermissions",
         "--disallowedTools", bogus_tool,
     )
+    if neg.returncode != CLAUDE_NO_PROMPT_RC or CLAUDE_NO_PROMPT_ERROR not in neg.stderr:
+        result.fail(
+            f"negative-control invocation did not reach prompt validation: expected exit "
+            f"{CLAUDE_NO_PROMPT_RC}, got {neg.returncode}.\nstderr: {neg.stderr[:400]}"
+        )
+        return
     if "matches no known tool" not in neg.stderr:
         result.fail(
             f"Bogus tool names {bogus_tool!r} did NOT produce 'matches no known tool' warning. "
@@ -425,6 +494,17 @@ def cell_c5_claude_variadic_additive(result: CellResult) -> None:
         "claude", "--print", "--permission-mode", "bypassPermissions",
         "--disallowedTools", "EnterPlanMode ExitPlanMode AskUserQuestion",
     )
+    if (
+        variadic_check.returncode != CLAUDE_NO_PROMPT_RC
+        or CLAUDE_NO_PROMPT_ERROR not in variadic_check.stderr
+    ):
+        result.fail(
+            f"positive control failed: expected exit {CLAUDE_NO_PROMPT_RC} with "
+            f"{CLAUDE_NO_PROMPT_ERROR!r}, got exit {variadic_check.returncode}. claude did not "
+            f"parse the option, so split semantics are unproven.\n"
+            f"stderr: {variadic_check.stderr[:400]}"
+        )
+        return
     if "matches no known tool" in variadic_check.stderr:
         result.fail(
             "Variadic split check: one or more of EnterPlanMode/ExitPlanMode/AskUserQuestion "
@@ -442,6 +522,16 @@ def cell_c5_claude_variadic_additive(result: CellResult) -> None:
         "--disallowedTools", "BOGUSADDA BOGUSADDB",
         "--disallowedTools", "BOGUSADDC BOGUSADDD",
     )
+    if (
+        additive_check.returncode != CLAUDE_NO_PROMPT_RC
+        or CLAUDE_NO_PROMPT_ERROR not in additive_check.stderr
+    ):
+        result.fail(
+            f"additive-check invocation did not reach prompt validation: expected exit "
+            f"{CLAUDE_NO_PROMPT_RC}, got {additive_check.returncode}. Token presence in stderr "
+            f"would not prove option semantics.\nstderr: {additive_check.stderr[:400]}"
+        )
+        return
     for token in ("BOGUSADDA", "BOGUSADDB", "BOGUSADDC", "BOGUSADDD"):
         if token not in additive_check.stderr:
             result.fail(
@@ -808,7 +898,14 @@ def cell_a1_codex_questions_differential(result: CellResult, tmp_dir: str) -> No
 def cell_a2_opencode_deny_beats_allow(result: CellResult, tmp_dir: str) -> None:
     """A2: OPENCODE_CONFIG_CONTENT deny overrides project opencode.json allow.
 
-    Reuses _opencode_subprocess from test_agent_run_live_acceptance.
+    Uses ``bash`` as the observable capability because the three policy keys
+    (question, plan_enter, plan_exit) cannot be driven on demand from a prompt.
+
+    The deny config is produced by ``_opencode_policy_config()`` with the bash deny
+    supplied as inherited content, so this cell also exercises that function's
+    documented contract that unrelated caller keys survive the merge. A builder that
+    dropped or clobbered inherited permission keys would let the project allow win
+    and fail this cell.
     """
     if not _require_binary("opencode", result):
         return
@@ -822,6 +919,7 @@ def cell_a2_opencode_deny_beats_allow(result: CellResult, tmp_dir: str) -> None:
         result.fail(f"could not import live-acceptance helpers: {exc}")
         return
 
+    import toolbox.agent_run as ar
     from pathlib import Path
 
     project = Path(tmp_dir) / "a2_project"
@@ -849,8 +947,19 @@ def cell_a2_opencode_deny_beats_allow(result: CellResult, tmp_dir: str) -> None:
         return
     _log("  [control] bash invoked (allow confirmed)")
 
-    # Deny arm: OPENCODE_CONFIG_CONTENT deny → bash absent.
-    deny_cfg = json.dumps({"permission": {"bash": "deny"}})
+    # Deny arm: the bash deny is routed through the production builder as inherited
+    # content, so the merge must preserve it alongside the injected policy keys.
+    deny_cfg = ar._opencode_policy_config(
+        json.dumps({"permission": {"bash": "deny"}}),
+        enable_planning=False,
+        enable_questions=False,
+    )
+    if json.loads(deny_cfg).get("permission", {}).get("bash") != "deny":
+        result.fail(
+            "_opencode_policy_config() dropped the inherited 'bash' permission; the merge "
+            f"contract is broken.\nproduced: {deny_cfg[:300]}"
+        )
+        return
     _log("  A2 deny arm (bash denied by OPENCODE_CONFIG_CONTENT)…")
     deny_tools, deny_text, deny_proc = live._opencode_subprocess(
         prompt, project,
