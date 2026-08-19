@@ -5524,6 +5524,18 @@ def _worktree_candidate_refusal(
     info = _worktree_classify(cand.resolved)
     if info.kind != _WORKTREE_LINKED:
         return f"not a linked worktree ({info.detail or info.kind})", None, None
+    # Require the candidate to be a registered worktree root in its own repository.
+    # A recursively copied worktree keeps a .git file from the original, so
+    # _worktree_classify returns LINKED, but the copy is not registered and
+    # git worktree remove would refuse it.  Verify by inode: a registered
+    # root with the same inode as the candidate is unambiguously this path.
+    registered_roots, reg_error = _worktree_registered_roots(info)
+    if reg_error is not None:
+        return reg_error, None, None
+    assert registered_roots is not None
+    cand_identity = _dir_identity(cand.resolved)
+    if not any(_dir_identity(r) == cand_identity for r in registered_roots):
+        return "not a registered worktree root", None, None
     nested = _worktree_nested_reason(info, cand.resolved)
     if nested is not None:
         return nested, None, None

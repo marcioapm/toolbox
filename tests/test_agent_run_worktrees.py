@@ -1175,6 +1175,76 @@ class TestReapWorktreeLivenessEvidence:
         assert "worktrees_removed=0" in out
 
 
+class TestReapWorktreeCopiedForged:
+    """Copied or forged linked-worktree metadata must not reach the destructive path."""
+
+    def test_copied_worktree_refused(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A recursively copied linked worktree keeps its .git file pointing at
+        the original admin dir, so _worktree_classify returns LINKED.  But the
+        copy is not registered in git worktree list; git worktree remove would
+        refuse it.  The fix requires the candidate's inode to match a registered
+        root before accepting it for deletion.
+
+        Mutation: removing the registered-root inode check in
+        _worktree_candidate_refusal allows the copied path to advance to
+        git worktree remove --force, which then fails (preventing actual
+        deletion in this case), but the guard must be there before the
+        destructive command rather than relying on git's own refusal."""
+        import shutil
+
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        (wt / "important.txt").write_text("must survive\n")
+
+        # Recursively copy the worktree; the .git file now points at wt's admin.
+        wt_copy = git_root / "wt-copy"
+        shutil.copytree(wt, wt_copy, symlinks=True)
+        assert (wt_copy / ".git").exists(), "copy must have a .git file"
+
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", cwd=wt_copy, age_hours=1000
+        )
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert wt_copy.is_dir(), "copied worktree directory must not be deleted"
+        assert "not a registered worktree root" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    def test_forged_git_file_refused(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A plain directory with a crafted .git file pointing at a real worktree's
+        admin dir is classified as LINKED but is not registered.
+
+        This verifies that the registration check catches forged metadata."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+
+        # Read the .git file from the real worktree.
+        git_file_content = (wt / ".git").read_text()
+
+        # Create a plain directory with a forged .git file.
+        forged = git_root / "forged"
+        forged.mkdir()
+        (forged / ".git").write_text(git_file_content)
+        (forged / "data.bin").write_bytes(b"x" * 200)
+
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", cwd=forged, age_hours=1000
+        )
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert forged.is_dir(), "forged worktree directory must not be deleted"
+        assert "not a registered worktree root" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+
 class TestReapWorktreesDryRun:
     def _run_both(self, args_kw, capsys):
         dry = capsys
