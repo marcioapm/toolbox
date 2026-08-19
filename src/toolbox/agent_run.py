@@ -1901,7 +1901,7 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None,
     ``d``, in bytes, excluding anything at or below ``exclude`` or ``excludes``.
     The singular argument keeps log/scratch callers concise; the sequence is
     used when several separately charged roots are nested in one worktree.
-    symlinks (``entry.stat(follow_symlinks=False)``), so neither the walk
+    Uses lstat (``entry.stat(follow_symlinks=False)``), so neither the walk
     interior nor ``d`` itself can be a symlink that redirects the count
     outside ``d``. Tolerates races (a file vanishing between scan and stat)
     by skipping the entry rather than raising; an unreadable or non-real-
@@ -1909,15 +1909,33 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None,
 
     Shared by `reap --include-logs` (per-candidate size in its report line)
     and `du` (per-group/per-run totals), so both report the same notion of
-    "size" for a log directory.
+    "size" for a log directory.  Callers that need completeness information
+    should use ``_dir_size_bytes_complete``.
+    """
+    size, _ = _dir_size_bytes_complete(d, exclude=exclude, excludes=excludes)
+    return size
+
+
+def _dir_size_bytes_complete(d: Path, *, exclude: Optional[Path] = None,
+                             excludes: Sequence[Path] = ()) -> Tuple[int, bool]:
+    """Like ``_dir_size_bytes`` but also returns whether the walk was complete.
+
+    Returns ``(size, complete)`` where ``complete`` is ``True`` when every
+    entry was successfully read.  A permission error on the root directory
+    returns ``(0, False)``; a permission error on a subtree directory returns
+    ``(partial, False)``.  Both cases mean the reported size is a lower bound.
     """
     try:
         top_st = d.lstat()
+    except FileNotFoundError:
+        # Missing directory is not an error: a run may have no scratch dir.
+        return 0, True
     except OSError:
-        return 0
+        return 0, False
     if not _stat_module.S_ISDIR(top_st.st_mode):
-        return 0
+        return 0, True
     total = 0
+    complete = True
     excluded = {p.resolve() for p in excludes}
     if exclude is not None:
         excluded.add(exclude.resolve())
@@ -1929,6 +1947,7 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None,
         try:
             entries = list(os.scandir(current))
         except OSError:
+            complete = False
             continue
         for entry in entries:
             try:
@@ -1938,8 +1957,9 @@ def _dir_size_bytes(d: Path, *, exclude: Optional[Path] = None,
                     st = entry.stat(follow_symlinks=False)
                     total += st.st_size
             except OSError:
+                complete = False
                 continue
-    return total
+    return total, complete
 
 
 _SIZE_UNITS = ("B", "K", "M", "G", "T", "P")
@@ -6404,6 +6424,7 @@ class _DuRow(NamedTuple):
     log_bytes: int
     scratch_bytes: int
     worktree_bytes: int = 0
+    complete: bool = True  # False when any walk encountered a permission error
 
     @property
     def total_bytes(self) -> int:
@@ -6444,6 +6465,7 @@ def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
         roots[key] = root
 
     charges = [0] * len(rows)
+    incomplete_owners: set[int] = set()
     accounted = list(roots.values())
     for key, owner in owners.items():
         root = roots[key]
@@ -6459,8 +6481,17 @@ def _du_charge_worktrees(rows: List[_DuRow]) -> List[_DuRow]:
                     per_run_resolved = per_run_dir.resolve()
                     if _path_is_within(per_run_resolved, root):
                         charged_excludes.append(per_run_resolved)
-        charges[owner] = _dir_size_bytes(root, excludes=[*nested, *charged_excludes])
-    return [row._replace(worktree_bytes=charges[index]) for index, row in enumerate(rows)]
+        size, complete = _dir_size_bytes_complete(root, excludes=[*nested, *charged_excludes])
+        charges[owner] = size
+        if not complete:
+            incomplete_owners.add(owner)
+    return [
+        row._replace(
+            worktree_bytes=charges[index],
+            complete=row.complete and index not in incomplete_owners,
+        )
+        for index, row in enumerate(rows)
+    ]
 
 
 def _du_collect_rows() -> List[_DuRow]:
@@ -6503,19 +6534,28 @@ def _du_collect_rows() -> List[_DuRow]:
         # Assign bytes with deterministic column precedence: state, then log
         # (excluding scratch), then scratch.  Each real path is charged at most
         # once; the log column excludes any path already charged as state so
-        # equal or nested roots are not double-counted.
-        state_bytes = _dir_size_bytes(state_dir) if state_dir is not None else 0
+        # equal or nested roots are not double-counted.  Track completeness
+        # per-column; any walk error marks the whole row incomplete.
+        row_complete = True
+        state_bytes, s_complete = (
+            _dir_size_bytes_complete(state_dir) if state_dir is not None else (0, True)
+        )
+        row_complete = row_complete and s_complete
         log_excludes: List[Path] = []
         if scratch_dir is not None:
             log_excludes.append(scratch_dir)
         if state_dir is not None and log_dir is not None:
             log_excludes.append(state_dir)
-        log_bytes = (
-            _dir_size_bytes(log_dir, excludes=log_excludes)
-            if log_dir is not None else 0
+        log_bytes, l_complete = (
+            _dir_size_bytes_complete(log_dir, excludes=log_excludes)
+            if log_dir is not None else (0, True)
         )
-        scratch_bytes = _dir_size_bytes(scratch_dir) if scratch_dir is not None else 0
-        rows.append(_DuRow(name, 1, state_bytes, log_bytes, scratch_bytes))
+        row_complete = row_complete and l_complete
+        scratch_bytes, sc_complete = (
+            _dir_size_bytes_complete(scratch_dir) if scratch_dir is not None else (0, True)
+        )
+        row_complete = row_complete and sc_complete
+        rows.append(_DuRow(name, 1, state_bytes, log_bytes, scratch_bytes, complete=row_complete))
     return _du_charge_worktrees(rows)
 
 
@@ -6534,17 +6574,20 @@ def _du_aggregate_groups(run_rows: List[_DuRow]) -> List[_DuRow]:
     totals: dict = {}
     for row in run_rows:
         group = _du_run_group(row.key)
-        state_b, log_b, scratch_b, worktree_b, n = totals.get(group, (0, 0, 0, 0, 0))
+        state_b, log_b, scratch_b, worktree_b, n, complete = totals.get(
+            group, (0, 0, 0, 0, 0, True)
+        )
         totals[group] = (
             state_b + row.state_bytes,
             log_b + row.log_bytes,
             scratch_b + row.scratch_bytes,
             worktree_b + row.worktree_bytes,
             n + 1,
+            complete and row.complete,
         )
     return [
-        _DuRow(group, n, state_b, log_b, scratch_b, worktree_b)
-        for group, (state_b, log_b, scratch_b, worktree_b, n) in totals.items()
+        _DuRow(group, n, state_b, log_b, scratch_b, worktree_b, complete=complete)
+        for group, (state_b, log_b, scratch_b, worktree_b, n, complete) in totals.items()
     ]
 
 
@@ -6600,7 +6643,7 @@ def _du_print_table(
 
 
 def _du_row_to_dict(r: _DuRow) -> dict:
-    return {
+    d = {
         "runs": r.count,
         "state_bytes": r.state_bytes,
         "log_bytes": r.log_bytes,
@@ -6608,6 +6651,9 @@ def _du_row_to_dict(r: _DuRow) -> dict:
         "worktree_bytes": r.worktree_bytes,
         "total_bytes": r.total_bytes,
     }
+    if not r.complete:
+        d["complete"] = False
+    return d
 
 
 def cmd_du(args: argparse.Namespace) -> int:
@@ -6630,6 +6676,7 @@ def cmd_du(args: argparse.Namespace) -> int:
 
     run_rows = _du_collect_rows()
     all_rows = run_rows if by_run else _du_aggregate_groups(run_rows)
+    total_complete = all(r.complete for r in all_rows)
     total = _DuRow(
         "TOTAL",
         sum(r.count for r in all_rows),
@@ -6637,6 +6684,7 @@ def cmd_du(args: argparse.Namespace) -> int:
         sum(r.log_bytes for r in all_rows),
         sum(r.scratch_bytes for r in all_rows),
         sum(r.worktree_bytes for r in all_rows),
+        complete=total_complete,
     )
 
     if as_json:
@@ -6660,6 +6708,30 @@ def cmd_du(args: argparse.Namespace) -> int:
             }
         print(json.dumps(payload))
         return 0
+
+    size_label = "bytes" if as_bytes else "human-readable (binary, 1024-based)"
+    print(
+        f"agent-run du: apparent size (st_size), {size_label}, "
+        f"STATE_ROOT={STATE_ROOT} LOG_ROOT={LOG_ROOT}"
+    )
+    print(
+        "worktrees: linked git worktrees at each run's recorded cwd, "
+        "deduplicated by realpath and charged once to the first run sharing them"
+    )
+    if not total_complete:
+        incomplete = [r for r in all_rows if not r.complete]
+        print(
+            f"agent-run du: WARNING: {len(incomplete)} row(s) have incomplete walk(s) "
+            "due to permission errors; totals shown are lower bounds"
+        )
+    _du_print_table(
+        all_rows,
+        total,
+        label_header="NAME" if by_run else "STATUS",
+        as_bytes=as_bytes,
+        top=top,
+    )
+    return 0
 
     size_label = "bytes" if as_bytes else "human-readable (binary, 1024-based)"
     print(

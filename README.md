@@ -1138,6 +1138,10 @@ emits a machine-readable object and always uses exact integers, so combining
 it with `--bytes` is rejected. `du` never mutates anything — no locks, no
 `_opportunistic_heal`, no `_prune_old_logs` — and tolerates races
 (`FileNotFoundError`/`PermissionError`) by skipping the affected entry.
+When a permission error is encountered during a walk, the affected row is
+marked incomplete: the table prints a WARNING line and `--json` adds
+`"complete": false` to the row.  Totals for incomplete rows are lower
+bounds, not exact byte counts.
 
 #### Linked worktrees
 
@@ -1154,8 +1158,9 @@ Attribution: launch directories are deduplicated by realpath, and each
 worktree is charged in full to the **first run** (by run name) that recorded
 it; every other run sharing it shows 0. Without that, one 900 MB worktree
 shared by four runs would be reported as 3.6 GB. `TOTAL` therefore counts
-every byte exactly once, and `TOTAL` == `STATE` + `LOG` + `SCRATCH` +
-`WORKTREE` in both `--by-run` and rollup mode.
+every readable byte exactly once, and `TOTAL` == `STATE` + `LOG` + `SCRATCH` +
+`WORKTREE` in both `--by-run` and rollup mode, subject to any incomplete
+walks noted above.
 
 Walking those trees dominates the command's runtime: worktrees are large,
 and sizing them costs several times a `STATE_ROOT`-plus-`LOG_ROOT`-only

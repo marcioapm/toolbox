@@ -2664,8 +2664,122 @@ class TestReapWorktreePassOrdering:
         assert "worktrees_removed=3" in capsys.readouterr().out
 
 
+class TestDuCompleteness:
+    """Incomplete walks are marked and presented as lower bounds, not exact totals."""
+
+    def test_top_level_permission_error_marks_row_incomplete(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """When os.scandir raises PermissionError on the top-level state dir,
+        the row is marked incomplete and a WARNING line is printed.
+
+        Mutation: not tracking completeness in _dir_size_bytes_complete causes
+        the row to report complete=True even when bytes were missed, and the
+        WARNING is not printed."""
+        repo = _make_repo(git_root)
+        _make_state_run(
+            isolated_runs_root, isolated_log_root, "r1", log_bytes=1000
+        )
+
+        real_scandir = os.scandir
+
+        def scandir_fails_for_state(path):
+            if str(path) == str(isolated_log_root / "r1"):
+                raise PermissionError("no permission")
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", scandir_fails_for_state)
+
+        agent_run.cmd_du(_du_args(by_run=True, bytes=False, json=True))
+        out = capsys.readouterr().out
+
+        payload = json.loads(out)
+        runs = {r["name"]: r for r in payload["runs"]}
+        assert "complete" in runs["r1"] and runs["r1"]["complete"] is False, (
+            "row with permission-denied scandir must have complete=False in JSON"
+        )
+        assert "complete" in payload["total"] and payload["total"]["complete"] is False
+
+    def test_nested_permission_error_marks_row_incomplete(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A PermissionError on a nested subtree also marks the row incomplete.
+
+        Mutation: catching OSError and silently continuing (the old behaviour)
+        hides the partial result; complete=True is returned even with missing bytes."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        (wt / "readable.txt").write_bytes(b"r" * 100)
+        secret_dir = wt / "secret"
+        secret_dir.mkdir()
+        (secret_dir / "hidden.bin").write_bytes(b"h" * 500)
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt)
+
+        real_scandir = os.scandir
+
+        def scandir_fails_for_secret(path):
+            if str(path) == str(secret_dir):
+                raise PermissionError("no permission")
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", scandir_fails_for_secret)
+
+        agent_run.cmd_du(_du_args(by_run=True, bytes=False, json=True))
+        out = capsys.readouterr().out
+
+        payload = json.loads(out)
+        runs = {r["name"]: r for r in payload["runs"]}
+        assert "complete" in runs["r1"] and runs["r1"]["complete"] is False, (
+            "row with permission-denied subtree must have complete=False"
+        )
+        assert runs["r1"]["worktree_bytes"] < 600, (
+            "partial worktree bytes (secret dir omitted) must be less than full size"
+        )
+
+    def test_complete_walk_has_no_complete_key_in_json(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """When all walks succeed, complete is not present in JSON output
+        (omitting the key keeps the common case terse)."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt)
+
+        agent_run.cmd_du(_du_args(by_run=True, bytes=False, json=True))
+        out = capsys.readouterr().out
+
+        payload = json.loads(out)
+        runs = {r["name"]: r for r in payload["runs"]}
+        assert "complete" not in runs["r1"], (
+            "complete key must be absent from JSON when walk is complete"
+        )
+        assert "complete" not in payload["total"]
+
+    def test_incomplete_walk_prints_warning_in_table_mode(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A permission error during a state dir walk prints a WARNING line."""
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", log_bytes=200)
+
+        real_scandir = os.scandir
+
+        def scandir_fails_for_log(path):
+            if str(path) == str(isolated_log_root / "r1"):
+                raise PermissionError("no permission")
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", scandir_fails_for_log)
+
+        agent_run.cmd_du(_du_args(by_run=True))
+        out = capsys.readouterr().out
+
+        assert "WARNING" in out and ("incomplete" in out or "lower bound" in out), (
+            "table output must warn about incomplete walks"
+        )
+
+
 class TestDuWorktreeArithmetic:
-    """TOTAL counts every byte exactly once, whatever nests inside what."""
+    """TOTAL counts every readable byte exactly once, whatever nests inside what."""
 
     def test_nested_worktrees_counted_once_each(
         self, isolated_runs_root, isolated_log_root, git_root, capsys
