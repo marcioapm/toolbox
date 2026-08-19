@@ -1755,6 +1755,133 @@ class TestReapWorktreeNested:
         assert "worktrees_removed=0 worktrees_skipped=1" in out
 
 
+class TestReapWorktreeSubmodule:
+    """Initialized submodules must block removal; deinitialized must not."""
+
+    _ENV = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    }
+
+    def _add_submodule(self, repo: Path, sub_src: Path, name: str = "tracked-sub") -> Path:
+        """Add and initialize a submodule in ``repo`` from ``sub_src``."""
+        subprocess.run(
+            ["git", "-c", "protocol.file.allow=always",
+             "-C", str(repo), "submodule", "add", "-q", str(sub_src), name],
+            check=True, env=self._ENV,
+        )
+        _git(repo, "commit", "-qm", f"add submodule {name}")
+        return repo / name
+
+    def test_initialized_submodule_refused_under_force_dirty(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """An initialized submodule inside the candidate is refused under
+        --force-dirty.
+
+        A gitlink (mode 160000) is absent from both ls-files --others queries,
+        so _worktree_foreign_nested_reason cannot see it.  --force-dirty skips
+        content checks, leaving _worktree_submodule_reason as the only guard.
+
+        Mutation: removing the _worktree_submodule_reason call in
+        _worktree_candidate_refusal causes the worktree (and its initialized
+        submodule checkout) to be deleted under --force-dirty."""
+        repo = _make_repo(git_root, "outer-repo")
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        sub_src = _make_repo(git_root, "sub-src")
+        sub_checkout = self._add_submodule(wt, sub_src)
+        (sub_checkout / "precious.txt").write_text("local only work\n")
+
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "candidate worktree must not be deleted"
+        assert sub_checkout.is_dir(), "submodule checkout must not be deleted"
+        assert (sub_checkout / "precious.txt").exists()
+        assert "initialized submodule" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    def test_dirty_submodule_refused_under_force_dirty(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """An initialized submodule with dirty content is refused even when
+        --force-dirty overrides the outer worktree's content checks."""
+        repo = _make_repo(git_root, "outer-repo")
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        sub_src = _make_repo(git_root, "sub-src")
+        sub_checkout = self._add_submodule(wt, sub_src)
+        (sub_checkout / "untracked.txt").write_text("untracked inside submodule\n")
+
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree must not be deleted"
+        assert sub_checkout.is_dir(), "dirty submodule must not be deleted"
+        assert "initialized submodule" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    def test_locally_committed_submodule_refused_under_force_dirty(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A submodule with local-only commits is refused under --force-dirty.
+        Local commits inside a submodule may be the only copy of that work."""
+        repo = _make_repo(git_root, "outer-repo")
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        sub_src = _make_repo(git_root, "sub-src")
+        sub_checkout = self._add_submodule(wt, sub_src)
+        (sub_checkout / "tracked.txt").write_text("local commit in sub\n")
+        _git(sub_checkout, "commit", "-qam", "local-only commit in submodule")
+
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert wt.is_dir(), "worktree must not be deleted"
+        assert sub_checkout.is_dir(), "submodule with local commits must not be deleted"
+        assert "initialized submodule" in out
+        assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+    def test_deinitialized_submodule_does_not_block_removal(
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
+    ):
+        """A deinitialized submodule (empty checkout directory, nothing to lose)
+        does not block removal.
+
+        Mutation: refusing on any mode-160000 index entry regardless of
+        initialization state causes this test to fail because the worktree is
+        skipped instead of removed."""
+        repo = _make_repo(git_root, "outer-repo")
+        wt = _add_worktree(repo, git_root / "wt", "feature")
+        sub_src = _make_repo(git_root, "sub-src")
+        sub_checkout = self._add_submodule(wt, sub_src)
+        # Push so the submodule commit is on the remote (no unpushed blocker).
+        _git(wt, "push", "-q", "origin", "feature")
+        # Deinitialize: empties the checkout directory.
+        subprocess.run(
+            ["git", "-C", str(wt), "submodule", "deinit", "-f", "tracked-sub"],
+            check=True, env=self._ENV,
+        )
+        assert not any(sub_checkout.iterdir()), "checkout must be empty after deinit"
+
+        _make_state_run(isolated_runs_root, isolated_log_root, "r1", cwd=wt, age_hours=1000)
+
+        agent_run.cmd_reap(_reap_args(force_dirty=True))
+
+        out = capsys.readouterr().out
+        assert not wt.exists(), "worktree with only a deinitialized submodule must be removable"
+        assert "worktrees_removed=1" in out
+
+
 class TestReapWorktreeFinalRevalidation:
     """State captured at collection is re-read under the publication lock
     immediately before `git worktree remove`."""

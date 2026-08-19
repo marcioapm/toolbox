@@ -5094,6 +5094,57 @@ def _worktree_nested_reason(info: _WorktreeInfo, path: Path) -> Optional[str]:
     return None
 
 
+def _worktree_submodule_reason(path: Path) -> Optional[str]:
+    """Return a refusal if any initialized submodule exists in the worktree.
+
+    An initialized submodule is a mode-160000 gitlink in the index whose
+    checkout directory contains a `.git` file pointing into the parent
+    repository's modules store.  It is absent from both ``ls-files --others``
+    queries (gitlinks are tracked, not untracked) and invisible to
+    ``_worktree_foreign_nested_reason``.  Under ``--force-dirty`` the content
+    checks are skipped entirely; this check runs unconditionally so neither
+    code path reaches ``git worktree remove --force`` with an initialized
+    submodule checkout present.
+
+    A deinitialized submodule has a mode-160000 index entry but an empty
+    checkout directory (no `.git` file or directory); removing it loses nothing
+    irreplaceable and is permitted.  The test is whether the checkout directory
+    has a `.git` entry, not merely whether the index entry exists.
+
+    Uses NUL-delimited output for path safety.  Fails closed on command
+    failure or malformed output.  A `.git` lstat error other than
+    ``FileNotFoundError`` also fails closed.
+    """
+    outcome = _watch_run_git_checked(path, ["ls-files", "--stage", "-z"])
+    if outcome.stdout is None:
+        return f"cannot enumerate index entries ({outcome.error_detail})"
+    for entry in outcome.stdout.split("\0"):
+        if not entry:
+            continue
+        # Stage output format: "<mode> <object> <stage>\t<path>"
+        fields = entry.split("\t", 1)
+        if len(fields) != 2:
+            return f"malformed ls-files --stage output: {entry!r}"
+        meta = fields[0].split()
+        if not meta:
+            return f"malformed ls-files --stage output: {entry!r}"
+        if meta[0] != "160000":
+            continue
+        submodule_path = fields[1]
+        checkout = path / submodule_path
+        git_entry = checkout / ".git"
+        try:
+            git_entry.lstat()
+            # .git present: initialized checkout with submodule data.
+            return f"initialized submodule at {submodule_path}"
+        except FileNotFoundError:
+            # No .git entry: deinitialized (empty directory), safe to remove.
+            continue
+        except OSError as exc:
+            return f"cannot check submodule at {submodule_path}: {exc}"
+    return None
+
+
 def _worktree_bare_repo_check(candidate_dir: Path) -> Optional[str]:
     """Return a refusal if ``candidate_dir`` is a bare git repository.
 
@@ -5342,6 +5393,9 @@ def _worktree_candidate_refusal(
     foreign_nested = _worktree_foreign_nested_reason(cand.resolved)
     if foreign_nested is not None:
         return foreign_nested, None, None
+    submodule = _worktree_submodule_reason(cand.resolved)
+    if submodule is not None:
+        return submodule, None, None
 
     live = _worktree_live_run_cwds(state_entries)
     if live.error is not None:
