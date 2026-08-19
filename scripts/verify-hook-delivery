@@ -377,16 +377,16 @@ def _make_hook_script(tmp_dir: Path, run_name: str) -> tuple[Path, Path]:
         fi
 
         python3 - "$PAYLOAD_SOURCE" "${{AGENT_RUN_NAME:-}}" <<'PYEOF'
-import json, sys
-payload_source = sys.argv[1] if len(sys.argv) > 1 else "none"
-agent_run_name_env = sys.argv[2] if len(sys.argv) > 2 else ""
-data = {{
-  "run_name": {run_name!r},
-  "agent_run_name_env": agent_run_name_env,
-  "payload_source": payload_source,
-}}
-open({str(evidence_path)!r}, "w").write(json.dumps(data))
-PYEOF
+        import json, sys
+        payload_source = sys.argv[1] if len(sys.argv) > 1 else "none"
+        agent_run_name_env = sys.argv[2] if len(sys.argv) > 2 else ""
+        data = {{
+          "run_name": {run_name!r},
+          "agent_run_name_env": agent_run_name_env,
+          "payload_source": payload_source,
+        }}
+        open({str(evidence_path)!r}, "w").write(json.dumps(data))
+        PYEOF
         exit 0
     """))
     script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR)
