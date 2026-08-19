@@ -222,8 +222,12 @@ class TestA1CodexQuestionsDifferential:
 # ---------------------------------------------------------------------------
 
 def _opencode_subprocess(prompt: str, project_dir: Path, extra_env: Optional[dict] = None,
-                          timeout: int = 90) -> tuple[list[str], str]:
-    """Run opencode run --format json. Returns (tools_used, full_output_text)."""
+                          timeout: int = 90) -> tuple[list[str], str, subprocess.CompletedProcess]:
+    """Run opencode run --format json. Returns (tools_used, full_output_text, completed_process).
+
+    Callers must check the completed process return code before asserting policy;
+    a non-zero exit may indicate a configuration failure rather than a policy result.
+    """
     env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
@@ -243,7 +247,7 @@ def _opencode_subprocess(prompt: str, project_dir: Path, extra_env: Optional[dic
                 text_parts.append(ev.get("part", {}).get("text", ""))
         except json.JSONDecodeError:
             pass
-    return tools_used, " ".join(text_parts)
+    return tools_used, " ".join(text_parts), result
 
 
 @live_only
@@ -263,7 +267,11 @@ class TestA2OpenCodeDenyBeatsProjectAllow:
         project.mkdir()
         (project / "opencode.json").write_text(json.dumps({"permission": {"bash": "allow"}}))
 
-        tools_used, text = _opencode_subprocess(self._PROMPT, project)
+        tools_used, text, proc = _opencode_subprocess(self._PROMPT, project)
+        assert proc.returncode == 0, (
+            f"Control arm: opencode exited {proc.returncode}; this is a process failure. "
+            f"stderr={proc.stderr!r} tools={tools_used!r}"
+        )
         assert "bash" in tools_used, (
             f"Control arm: bash not invoked despite project allow. "
             f"tools={tools_used!r} text={text[:200]!r}"
@@ -276,14 +284,18 @@ class TestA2OpenCodeDenyBeatsProjectAllow:
         (project / "opencode.json").write_text(json.dumps({"permission": {"bash": "allow"}}))
 
         deny_cfg = json.dumps({"permission": {"bash": "deny"}})
-        tools_used, text = _opencode_subprocess(
+        tools_used, text, proc = _opencode_subprocess(
             self._PROMPT, project,
             extra_env={"OPENCODE_CONFIG_CONTENT": deny_cfg},
+        )
+        assert proc.returncode == 0, (
+            f"Deny arm: opencode exited {proc.returncode}; this is a process failure, "
+            f"not policy evidence. stderr={proc.stderr!r}"
         )
         # Positive control: OpenCode ran and produced non-empty text.
         assert text.strip(), (
             "Deny arm positive control failed: OpenCode produced no text output. "
-            f"tools={tools_used!r}"
+            f"tools={tools_used!r} stderr={proc.stderr!r}"
         )
         # Actual assertion.
         assert "bash" not in tools_used, (
@@ -295,11 +307,15 @@ class TestA2OpenCodeDenyBeatsProjectAllow:
 # A3: Claude deny beats a genuinely honoured allow
 # ---------------------------------------------------------------------------
 
-def _claude_run(output_format: str, prompt_stdin: str, extra_argv: list[str], timeout: int) -> str:
-    """Run claude --print in the given output format and return its stdout."""
+def _claude_run(output_format: str, prompt_stdin: str, extra_argv: list[str], timeout: int) -> subprocess.CompletedProcess:
+    """Run claude --print in the given output format and return the completed process.
+
+    Callers must check the return code before treating stdout as policy evidence;
+    a non-zero exit may indicate a launch failure rather than a policy result.
+    """
     model_args = ["--model", _CLAUDE_MODEL] if _CLAUDE_MODEL else []
     verbose = ["--verbose"] if output_format == "stream-json" else []
-    proc = subprocess.run(
+    return subprocess.run(
         [
             "claude",
             *model_args,
@@ -314,7 +330,6 @@ def _claude_run(output_format: str, prompt_stdin: str, extra_argv: list[str], ti
         text=True,
         timeout=timeout,
     )
-    return proc.stdout
 
 
 def _claude_stream_tool_names(
@@ -326,11 +341,17 @@ def _claude_stream_tool_names(
 
     result text is the final result event's `result` field, or "" if the run
     produced no result event — callers use it as the positive control that
-    claude ran at all.
+    claude ran at all.  Callers should also assert that claude produced a result
+    (non-empty text) before treating an empty tool list as policy evidence.
     """
+    proc = _claude_run("stream-json", prompt_stdin, list(extra_argv), timeout)
     tool_names: list[str] = []
     result_text = ""
-    for line in _claude_run("stream-json", prompt_stdin, list(extra_argv), timeout).splitlines():
+    assert proc.returncode == 0, (
+        f"claude exited {proc.returncode}; this is a process failure, not policy evidence. "
+        f"stderr={proc.stderr!r} stdout={proc.stdout[:300]!r}"
+    )
+    for line in proc.stdout.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -351,7 +372,12 @@ def _claude_stream_tool_names(
 
 def _claude_json(prompt_stdin: str, extra_argv: list[str] = (), timeout: int = 60) -> dict:
     """Run claude --print --output-format json and return the parsed result object."""
-    return json.loads(_claude_run("json", prompt_stdin, list(extra_argv), timeout))
+    proc = _claude_run("json", prompt_stdin, list(extra_argv), timeout)
+    assert proc.returncode == 0, (
+        f"claude exited {proc.returncode}; this is a process failure, not policy evidence. "
+        f"stderr={proc.stderr!r} stdout={proc.stdout[:300]!r}"
+    )
+    return json.loads(proc.stdout)
 
 
 @live_only
@@ -493,10 +519,14 @@ class TestA5EnabledArmsObservablyEnable:
         enable_q_cfg = agent_run._opencode_policy_config(
             None, enable_planning=False, enable_questions=True,
         )
-        tools_used, _ = _opencode_subprocess(
+        tools_used, _, proc = _opencode_subprocess(
             "Run: echo SENTINEL_OUTPUT_XYZ",
             project,
             extra_env={"OPENCODE_CONFIG_CONTENT": enable_q_cfg},
+        )
+        assert proc.returncode == 0, (
+            f"A5 opencode: opencode exited {proc.returncode}; this is a process failure. "
+            f"stderr={proc.stderr!r}"
         )
         assert "bash" in tools_used, (
             f"A5 opencode: bash not invoked when question=allow. tools={tools_used!r}"

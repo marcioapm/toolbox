@@ -5386,11 +5386,12 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     acquire_log = log_d / "session-acquire.log"
     managed_prompt: Optional[str] = None
     managed_harness_args: List[str] = []
+    managed_agent_mode: Optional[str] = None
     if is_managed:
         opencode_port: Optional[int] = None
         managed_prompt = getattr(args, "prompt", None)
         managed_model = getattr(args, "model", None)
-        managed_agent_mode: Optional[str] = getattr(args, "agent_mode", None)
+        managed_agent_mode = getattr(args, "agent_mode", None)
         managed_session_id_arg: Optional[str] = getattr(args, "session_id", None)
         managed_harness_args = getattr(args, "harness_args", [])
         managed_session_id: Optional[str] = None
@@ -5429,6 +5430,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                     opencode_port, name, str(Path.cwd()), acquire_log, state_dir=d,
                     enable_planning=enable_planning,
                     enable_questions=enable_questions,
+                    opencode_agent_mode=managed_agent_mode,
                 )
                 if managed_session_id:
                     _record_session(log_d, acquire_log, "opencode", managed_session_id,
@@ -5579,6 +5581,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         managed_prompt=managed_prompt if is_managed else None,
         enable_planning=enable_planning,
         enable_questions=enable_questions,
+        opencode_agent_mode=managed_agent_mode,
     )
     return 0  # never reached
 
@@ -5874,15 +5877,30 @@ def _codex_policy_args(*, enable_questions: bool) -> List[str]:
     return ["-c", f"tools.experimental_request_user_input={{enabled={enabled}}}"]
 
 
-def _opencode_policy_config(existing: Optional[str], *, enable_planning: bool, enable_questions: bool) -> str:
+def _opencode_policy_config(
+    existing: Optional[str],
+    *,
+    enable_planning: bool,
+    enable_questions: bool,
+    opencode_agent_mode: Optional[str] = None,
+) -> str:
     """Merge the managed permission policy into an OPENCODE_CONFIG_CONTENT value.
 
-    Sets the three policy keys at global scope and in every per-agent permission
-    block, because OpenCode merges per-agent config after global config and the
-    last matching rule wins — an agent-level allow would otherwise defeat a
-    global deny. Any other config the caller already had survives untouched.
-    Unparseable or non-object input is replaced rather than raising — the policy
-    must apply even if the inherited value is junk.
+    Sets the three policy keys at global scope and, critically, in the selected
+    agent's permission block inside OPENCODE_CONFIG_CONTENT. OpenCode loads
+    config sources in order (user/XDG → project opencode.json → OPENCODE_CONFIG
+    → OPENCODE_CONFIG_CONTENT) and merges per-agent blocks additively with
+    last-match-wins semantics. Because OPENCODE_CONFIG_CONTENT is loaded last,
+    our agent block overrides any per-agent allow from every other source.
+
+    The agent block is always written for ``opencode_agent_mode`` (or "build",
+    OpenCode's default primary agent, when none is specified). This guarantees
+    final precedence even when the user or project defines per-agent allows for
+    the selected agent in their own config files.
+
+    Any other config the caller already had survives untouched. Unparseable or
+    non-object input is replaced rather than raising — the policy must apply even
+    if the inherited value is junk.
 
     Ordering asymmetry vs claude/codex: opencode policy is delivered via env,
     not argv, so --harness-arg has no effect on the three policy keys
@@ -5924,18 +5942,44 @@ def _opencode_policy_config(existing: Optional[str], *, enable_planning: bool, e
         config["permission"] = permission
     permission.update(policy_values)
 
-    # Force the same values in every per-agent block so an agent-level allow
-    # cannot override the global deny. Absent keys fall through to the global
-    # value in OpenCode's ruleset, but present keys win regardless of order.
+    # Build the set of agent names to receive an explicit policy block.
+    # "build" is always included because it is OpenCode's built-in primary agent
+    # (the default when no --agent flag is given). The caller-selected agent is
+    # included so a named agent's own project/user allow cannot win.
+    target_agents: set[str] = {"build"}
+    if opencode_agent_mode:
+        target_agents.add(opencode_agent_mode)
+
     agents = config.get("agent")
-    if isinstance(agents, dict):
-        for agent_cfg in agents.values():
-            if not isinstance(agent_cfg, dict):
-                continue
-            agent_perm = agent_cfg.get("permission")
-            if not isinstance(agent_perm, dict):
-                continue
-            agent_perm.update(policy_values)
+    if not isinstance(agents, dict):
+        agents = {}
+        config["agent"] = agents
+
+    # Force the policy into every target agent block. OPENCODE_CONFIG_CONTENT is
+    # loaded after all other sources, so our agent block is last and wins.
+    for agent_name in target_agents:
+        agent_cfg = agents.get(agent_name)
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+            agents[agent_name] = agent_cfg
+        agent_perm = agent_cfg.get("permission")
+        if not isinstance(agent_perm, dict):
+            agent_perm = {}
+            agent_cfg["permission"] = agent_perm
+        agent_perm.update(policy_values)
+
+    # Also update any additional agent blocks already present in the inherited
+    # content so a caller that pre-populated agents for other reasons gets the
+    # policy applied there too.
+    for agent_name, agent_cfg in agents.items():
+        if agent_name in target_agents:
+            continue  # already handled above
+        if not isinstance(agent_cfg, dict):
+            continue
+        agent_perm = agent_cfg.get("permission")
+        if not isinstance(agent_perm, dict):
+            continue
+        agent_perm.update(policy_values)
 
     return json.dumps(config, separators=(",", ":"))
 
@@ -5958,6 +6002,7 @@ def _runner(
     managed_prompt: Optional[str] = None,
     enable_planning: bool = False,
     enable_questions: bool = False,
+    opencode_agent_mode: Optional[str] = None,
 ) -> None:
     """Execute in the detached session-leader process.
 
@@ -6093,6 +6138,7 @@ def _runner(
                 os.environ.get("OPENCODE_CONFIG_CONTENT"),
                 enable_planning=enable_planning,
                 enable_questions=enable_questions,
+                opencode_agent_mode=opencode_agent_mode,
             )
 
         runner_pgid = os.getpgid(my_pid)
@@ -6762,6 +6808,7 @@ def _opencode_prefork_mint(
     state_dir: Optional[Path] = None,
     enable_planning: bool = False,
     enable_questions: bool = False,
+    opencode_agent_mode: Optional[str] = None,
 ) -> Optional[str]:
     """Start a temporary opencode process, mint a session, return the session id.
 
@@ -6779,6 +6826,7 @@ def _opencode_prefork_mint(
         mint_env.get("OPENCODE_CONFIG_CONTENT"),
         enable_planning=enable_planning,
         enable_questions=enable_questions,
+        opencode_agent_mode=opencode_agent_mode,
     )
     try:
         proc = subprocess.Popen(
@@ -8282,6 +8330,27 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                     f"agent-run: --harness-arg {flag!r} is managed internally; "
                     f"use the corresponding agent-run flag instead"
                 )
+        # Reject --permission-mode plan in claude harness args when planning is
+        # disabled.  Caller args are placed after the managed --permission-mode
+        # bypassPermissions flag, so a later --permission-mode plan starts claude
+        # directly in plan mode and bypasses the EnterPlanMode/ExitPlanMode denies.
+        # Both flag spellings are rejected: "--permission-mode" with a following
+        # "plan" value, and "--permission-mode=plan".
+        if harness == "claude" and not enable_planning:
+            _args = list(harness_args)
+            for i, token in enumerate(_args):
+                if token == "--permission-mode=plan":
+                    raise _LaunchArgvError(
+                        "agent-run: --harness-arg --permission-mode=plan selects Claude plan mode "
+                        "directly, bypassing the planning deny policy; use --enable-planning to "
+                        "relax the policy instead"
+                    )
+                if token == "--permission-mode" and i + 1 < len(_args) and _args[i + 1] == "plan":
+                    raise _LaunchArgvError(
+                        "agent-run: --harness-arg --permission-mode --harness-arg plan selects "
+                        "Claude plan mode directly, bypassing the planning deny policy; use "
+                        "--enable-planning to relax the policy instead"
+                    )
         # Only claude can be told which id to use; opencode mints a session and
         # codex starts a thread, both unconditionally.
         if session_id is not None and harness in ("opencode", "codex"):

@@ -648,6 +648,12 @@ flags to the opencode process but cannot override the three managed policy keys
 (`question`, `plan_enter`, `plan_exit`) — use `--enable-planning` or
 `--enable-questions` instead.
 
+**`--harness-arg --permission-mode` for claude:** passing `--permission-mode plan`
+via `--harness-arg` is rejected when planning is disabled, because it would start
+Claude directly in plan mode, bypassing the `EnterPlanMode`/`ExitPlanMode` tool
+denies. Use `--enable-planning` to enable plan mode through the supported policy
+path.
+
 #### One-shot examples
 
 ```bash
