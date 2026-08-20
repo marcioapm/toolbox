@@ -3341,6 +3341,33 @@ def _hooks_read_tail(log_dir: Path, max_bytes: int) -> tuple[Optional[bytes], bo
         return None, False
 
 
+_HOOK_OPEN_ENOENT_ATTEMPTS: int = 5
+
+
+def _hook_open_append(dir_fd: int) -> int:
+    """Open hooks.jsonl for atomic append relative to dir_fd.
+
+    Concurrent creators racing O_CREAT can each get ENOENT even though the
+    directory exists and the flags ask for creation: measured at ~5% of 40
+    simultaneous writers, with an immediate retry always succeeding and
+    pre-creating the file eliminating it entirely. Since cmd_hook must return 0
+    on every path, an unretried failure here silently drops the record it was
+    called to persist.
+
+    Retries ENOENT only. Every other errno propagates on the first attempt, and
+    O_NOFOLLOW/O_NONBLOCK apply to each attempt, so a symlink or FIFO planted
+    between retries is refused exactly as on the first open.
+    """
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    for attempt in range(_HOOK_OPEN_ENOENT_ATTEMPTS):
+        try:
+            return os.open("hooks.jsonl", flags, 0o600, dir_fd=dir_fd)
+        except FileNotFoundError:
+            if attempt == _HOOK_OPEN_ENOENT_ATTEMPTS - 1:
+                raise
+    raise AssertionError("unreachable: loop returns or raises")
+
+
 def _hook_append_record(log_dir: Path, record: dict) -> None:
     """Append one record to log_dir/hooks.jsonl, or drop it at the event cap.
 
@@ -3373,12 +3400,7 @@ def _hook_append_record(log_dir: Path, record: dict) -> None:
     try:
         dir_fd = os.open(str(log_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            fd = os.open(
-                "hooks.jsonl",
-                os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                0o600,
-                dir_fd=dir_fd,
-            )
+            fd = _hook_open_append(dir_fd)
             try:
                 if not _stat_module.S_ISREG(os.fstat(fd).st_mode):
                     return

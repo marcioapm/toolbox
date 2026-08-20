@@ -626,6 +626,48 @@ class TestMessageExtraction:
         assert _read_hooks(ld), "a record is written even with no usable payload"
 
 
+def _fork_concurrent_hooks(n_writers, run_name, payload_for):
+    """Drive n_writers concurrent cmd_hook appends from forked children.
+
+    Forking inherits the imported module and its patched STATE_ROOT/LOG_ROOT
+    through copy-on-write, so a writer costs a page table rather than a fresh
+    interpreter: spawning N subprocesses cost ~38 MB each on a cold bytecode
+    cache and got pytest OOM-killed on hosted CI at N=40.
+
+    Children block on a pipe until the parent releases them, so all writers
+    reach os.write at once instead of being staggered by process startup.
+    """
+    read_fd, write_fd = os.pipe()
+    pids = []
+    for i in range(n_writers):
+        pid = os.fork()
+        if pid == 0:
+            # Child: never return into pytest, never flush its buffers.
+            try:
+                os.close(write_fd)
+                while not os.read(read_fd, 1):
+                    pass
+                ns = argparse.Namespace(
+                    event="stop", name=run_name,
+                    json_payload=json.dumps(payload_for(i)), extra=[],
+                )
+                agent_run.cmd_hook(ns)
+            except BaseException:
+                os._exit(1)
+            os._exit(0)
+        pids.append(pid)
+
+    os.close(read_fd)
+    os.write(write_fd, b"x" * n_writers)
+    os.close(write_fd)
+
+    for pid in pids:
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, (
+            "writer %d exited abnormally: %s" % (pid, status)
+        )
+
+
 class TestAtomicAppend:
     def test_concurrent_writers_produce_complete_lines(
         self, isolated_runs_root, isolated_log_root,
@@ -635,27 +677,9 @@ class TestAtomicAppend:
         _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
         n_writers = 20
 
-        script = f"""\
-import sys
-sys.path.insert(0, {SRC_DIR!r})
-import argparse, json, os
-from pathlib import Path
-from toolbox import agent_run
-agent_run.STATE_ROOT = Path({str(isolated_runs_root)!r})
-agent_run.LOG_ROOT = Path({str(isolated_log_root)!r})
-ns = argparse.Namespace(event='stop', name={name!r},
-    json_payload=json.dumps({{'writer': int(sys.argv[1])}}), extra=[])
-sys.exit(agent_run.cmd_hook(ns))
-"""
-        procs = [
-            subprocess.Popen(
-                [sys.executable, "-c", script, str(i)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-            for i in range(n_writers)
-        ]
-        for p in procs:
-            p.wait(timeout=30)
+        _fork_concurrent_hooks(
+            n_writers, name, lambda i: {"writer": i},
+        )
 
         lines = _hook_lines(ld)
         assert len(lines) == n_writers, f"expected {n_writers} lines, got {len(lines)}"
@@ -675,32 +699,15 @@ sys.exit(agent_run.cmd_hook(ns))
         _, ld = _make_run_dirs(isolated_runs_root, isolated_log_root, name)
         n_writers = 40
 
-        script = f"""\
-import sys
-sys.path.insert(0, {SRC_DIR!r})
-import argparse, json, os
-from pathlib import Path
-from toolbox import agent_run
-agent_run.STATE_ROOT = Path({str(isolated_runs_root)!r})
-agent_run.LOG_ROOT = Path({str(isolated_log_root)!r})
-writer = int(sys.argv[1])
-payload = json.dumps({{
-    "writer": writer,
-    "last_assistant_message": "m" * 6000,
-    "session_id": "writer-%d" % writer,
-}})
-ns = argparse.Namespace(event='stop', name={name!r}, json_payload=payload, extra=[])
-sys.exit(agent_run.cmd_hook(ns))
-"""
-        procs = [
-            subprocess.Popen(
-                [sys.executable, "-c", script, str(i)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-            for i in range(n_writers)
-        ]
-        for p in procs:
-            p.wait(timeout=30)
+        _fork_concurrent_hooks(
+            n_writers,
+            name,
+            lambda i: {
+                "writer": i,
+                "last_assistant_message": "m" * 6000,
+                "session_id": "writer-%d" % i,
+            },
+        )
 
         lines = _hook_lines(ld)
         assert len(lines) == n_writers, f"expected {n_writers} lines, got {len(lines)}"
