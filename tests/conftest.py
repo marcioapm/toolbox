@@ -13,13 +13,8 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _ancestor_pids() -> set:
-    """Every pid between this process and init.
-
-    Walked once at fixture setup: the chain cannot change while the test
-    process lives, and every pid in it is alive by definition, so there is no
-    pid-reuse hazard in caching it. Bounded by a seen-set so a malformed ppid
-    cycle terminates.
-    """
+    """This process's ancestor pids, stopping at init, a lookup failure, or a
+    cycle."""
     from toolbox import agent_run
 
     seen = set()
@@ -106,11 +101,8 @@ def isolated_runs_root(request, tmp_path, monkeypatch) -> Path:
                 pid = int(pid_file.read_text().strip())
             except (ValueError, OSError):
                 continue
-            # Never signal the test runner or anything it descends from.
-            # A test may legitimately record an ancestor pid (ancestry
-            # resolution is a real feature), and under CI the immediate parent
-            # is the step's shell: killing it ends the whole job while pytest
-            # itself keeps running, reparented to init.
+            # An ancestry-resolution test may legitimately record an ancestor
+            # pid, and under CI the immediate parent is the step's shell.
             if pid <= 0 or pid == own_pid or pid in own_ancestors:
                 continue
             for sig in (signal.SIGTERM, signal.SIGKILL):

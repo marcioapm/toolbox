@@ -629,13 +629,8 @@ class TestMessageExtraction:
 def _fork_concurrent_hooks(n_writers, run_name, payload_for):
     """Drive n_writers concurrent cmd_hook appends from forked children.
 
-    Forking inherits the imported module and its patched STATE_ROOT/LOG_ROOT
-    through copy-on-write, so a writer costs a page table rather than a fresh
-    interpreter: spawning N subprocesses cost ~38 MB each on a cold bytecode
-    cache and got pytest OOM-killed on hosted CI at N=40.
-
-    Children block on a pipe until the parent releases them, so all writers
-    reach os.write at once instead of being staggered by process startup.
+    Children block on a pipe until the parent releases them, so every writer
+    reaches os.write at once instead of being staggered by process startup.
     """
     read_fd, write_fd = os.pipe()
     pids = []
