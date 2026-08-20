@@ -5747,10 +5747,11 @@ def _validate_resize_timeline(
     in-bounds ``(offset, cols, rows)`` tuples, in the input's order.
 
     Each record is validated independently: a malformed shape, a
-    non-integer field, a dimension outside ``1..MAX_TERMINAL_DIMENSION``,
-    an offset not strictly greater than the last accepted one, or an offset
-    past the end of ``raw`` is dropped rather than raised, so a corrupt
-    timeline degrades to fewer resize points instead of an exception.
+    non-integer field, a dimension outside ``1..MAX_TERMINAL_DIMENSION``, an
+    offset before the last accepted one, or an offset past the end of ``raw``
+    is dropped rather than raised, so a corrupt timeline degrades to fewer
+    resize points instead of an exception. Records sharing an offset coalesce
+    to the last valid one.
     """
     if not resizes:
         return []
@@ -5772,11 +5773,43 @@ def _validate_resize_timeline(
             continue
         if not (1 <= cols <= MAX_TERMINAL_DIMENSION and 1 <= rows <= MAX_TERMINAL_DIMENSION):
             continue
-        if offset <= last_offset or offset > raw_len:
+        if offset < last_offset or offset > raw_len:
+            continue
+        if accepted and offset == last_offset:
+            # Several resizes can be applied with no log output between them
+            # (attach startup then detach restore, two clients, a drag burst).
+            # TIOCSWINSZ is last-writer-wins, so the final geometry at an
+            # offset is the one that was in effect for the bytes after it.
+            accepted[-1] = (offset, cols, rows)
             continue
         accepted.append((offset, cols, rows))
         last_offset = offset
     return accepted
+
+
+def _resize_screen(screen, cols: int, rows: int) -> None:
+    """Resize ``screen`` to ``cols`` x ``rows`` and clamp the cursor into it.
+
+    ``pyte.Screen.resize`` clips cells at the right and rows at the top but
+    leaves the cursor where it was, so a cursor beyond the new bounds keeps
+    drawing into cells outside ``screen.columns``/``screen.lines`` that
+    ``_serialize_screen`` never reads: on a 10-column screen resized to 5, the
+    next character lands at column 10 and disappears.
+
+    ``cursor.x == columns`` is not out of bounds -- it is the DECAWM
+    pending-wrap state that ``draw`` tests for -- so x clamps to ``columns``
+    rather than ``columns - 1``, preserving a pending wrap across the resize.
+    ``savepoints`` need no clamping: ``restore_cursor`` bounds the restored
+    position itself.
+
+    Rows clipped by a height reduction are dropped rather than scrolled into
+    ``history.top``, so a shrink still loses the lines above the new viewport.
+    That is pyte's model of a resize, not a terminal's; replay across a height
+    reduction is approximate.
+    """
+    screen.resize(rows, cols)
+    screen.cursor.x = min(screen.cursor.x, screen.columns)
+    screen.cursor.y = min(screen.cursor.y, screen.lines - 1)
 
 
 def _render_log(
@@ -5821,7 +5854,7 @@ def _render_log(
         start = 0
         for offset, cols, rows in timeline:
             _feed_pyte(stream, raw[start:offset])
-            screen.resize(rows, cols)
+            _resize_screen(screen, cols, rows)
             start = offset
         _feed_pyte(stream, raw[start:])
     except Exception:

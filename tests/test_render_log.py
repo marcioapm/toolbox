@@ -283,15 +283,13 @@ class TestRenderLogResizeTimeline:
         out = _render_log(raw, resizes=[bad_record])
         assert out == _render_log(raw)
 
-    def test_non_monotonic_offset_is_skipped(self):
+    def test_backwards_offset_is_skipped(self):
         raw = b"a" * 20 + b"\r\n" + b"b" * 20 + b"\r\n"
         first_split = len(b"a" * 20 + b"\r\n")
         resizes = [
             {"offset": first_split, "cols": 40, "rows": 20},
-            # Same offset again: not strictly greater than the last accepted
-            # one, so this second record must be dropped.
-            {"offset": first_split, "cols": 10, "rows": 5},
-            # Offset going backwards must also be dropped.
+            # An offset before the last accepted one cannot describe a segment
+            # boundary in a forward replay.
             {"offset": 1, "cols": 10, "rows": 5},
         ]
         out = _render_log(raw, resizes=resizes)
@@ -696,3 +694,84 @@ class TestRenderLogRecursionHardening:
         out = _render_log(blob)
         assert isinstance(out, str)
         assert "survived" in out
+
+
+class TestResizeCursorClamping:
+    """pyte's Screen.resize clips cells but leaves the cursor where it was, so
+    a resize during replay must clamp it back into the new screen."""
+
+    @staticmethod
+    def _render_at(width, height, payload):
+        return agent_run._render_log(payload, width=width, height=height)
+
+    def test_cursor_past_new_right_edge_keeps_drawing_on_screen(self):
+        """A cursor left beyond the new width would otherwise write into
+        columns _serialize_screen never emits, silently dropping output."""
+        rendered = agent_run._render_log(
+            b"1234567890X\r\n", width=10, height=4,
+            resizes=[{"offset": 10, "cols": 5, "rows": 4}],
+        )
+        assert rendered == self._render_at(5, 4, b"12345\r\nX\r\n")
+
+    def test_cursor_below_new_bottom_keeps_drawing_on_screen(self):
+        head = b"".join(f"line{i}\r\n".encode() for i in range(8))
+        rendered = agent_run._render_log(
+            head + b"AFTER\r\n", width=20, height=10,
+            resizes=[{"offset": len(head), "cols": 20, "rows": 3}],
+        )
+        assert "AFTER" in rendered
+
+    def test_growing_does_not_move_a_cursor_already_in_range(self):
+        rendered = agent_run._render_log(
+            b"abcDEF\r\n", width=10, height=4,
+            resizes=[{"offset": 3, "cols": 40, "rows": 12}],
+        )
+        assert rendered == "abcDEF\n"
+
+    def test_pending_wrap_survives_a_resize(self):
+        """cursor.x == columns is DECAWM's pending-wrap state, not an
+        out-of-range cursor, so clamping must not pull it back a column."""
+        pyte = pytest.importorskip("pyte")
+        screen = agent_run._new_pyte_screen(pyte, 5, 4, 2048)
+        agent_run._feed_pyte(pyte.ByteStream(screen), b"12345")
+        assert screen.cursor.x == screen.columns
+        agent_run._resize_screen(screen, 5, 4)
+        assert screen.cursor.x == screen.columns
+
+    def test_height_shrink_drops_clipped_rows_rather_than_scrolling_them(self):
+        """Documents pyte's model, which a terminal does not share: rows
+        clipped by a height reduction are deleted, not moved into
+        history.top, so replay across a shrink loses them."""
+        head = b"".join(f"line{i}\r\n".encode() for i in range(8))
+        rendered = agent_run._render_log(
+            head + b"AFTER\r\n", width=20, height=10,
+            resizes=[{"offset": len(head), "cols": 20, "rows": 3}],
+        )
+        assert "line0" not in rendered
+        assert rendered != self._render_at(20, 3, head + b"AFTER\r\n")
+
+
+class TestResizeTimelineCoalescing:
+    def test_records_sharing_an_offset_coalesce_to_the_last(self):
+        """TIOCSWINSZ is last-writer-wins, and several resizes can be applied
+        with no log output between them (attach startup then detach restore,
+        two clients, a drag burst)."""
+        timeline = agent_run._validate_resize_timeline(
+            [{"offset": 0, "cols": 5, "rows": 5},
+             {"offset": 0, "cols": 20, "rows": 5}], 30,
+        )
+        assert timeline == [(0, 20, 5)]
+
+    def test_a_coalesced_record_still_rejects_an_earlier_offset(self):
+        timeline = agent_run._validate_resize_timeline(
+            [{"offset": 10, "cols": 5, "rows": 5},
+             {"offset": 3, "cols": 20, "rows": 5}], 30,
+        )
+        assert timeline == [(10, 5, 5)]
+
+    def test_an_invalid_record_does_not_replace_a_valid_one_at_the_offset(self):
+        timeline = agent_run._validate_resize_timeline(
+            [{"offset": 4, "cols": 8, "rows": 6},
+             {"offset": 4, "cols": 0, "rows": 6}], 30,
+        )
+        assert timeline == [(4, 8, 6)]
