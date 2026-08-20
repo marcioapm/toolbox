@@ -14,6 +14,7 @@ import contextlib
 import errno
 import fcntl
 import io
+import json
 import os
 import pty
 import random
@@ -300,6 +301,75 @@ def test_drain_resize_records_discards_a_batch_with_no_record_boundary(monkeypat
 
     assert agent_run._drain_resize_records(7, b"\x00\x01\x02\x03") == b""
     assert applied == []
+
+
+def test_drain_resize_records_invokes_on_applied_callback(monkeypatch):
+    """_run_interactive passes a callback that records the resize timeline;
+    it must fire exactly once per applied record, with that record's
+    dimensions, and only after _apply_resize itself succeeds."""
+    monkeypatch.setattr(agent_run, "_apply_resize", lambda master_fd, cols, rows: None)
+    record = agent_run._pack_resize(120, 42)
+    applied = []
+
+    suffix = agent_run._drain_resize_records(
+        7, record, on_applied=lambda cols, rows: applied.append((cols, rows))
+    )
+
+    assert suffix == b""
+    assert applied == [(120, 42)]
+
+
+def test_run_interactive_appends_one_resize_record_at_the_log_offset(tmp_path):
+    """A resize applied while the run is live must append exactly one
+    well-formed line to resizes.jsonl, carrying the byte offset the log had
+    already reached -- resizes leave no trace in the byte stream itself
+    (TIOCSWINSZ + SIGWINCH), so this is the only record of where a replay
+    must switch geometry."""
+    state_dir = tmp_path / "state"
+    log_dir = tmp_path / "log"
+    state_dir.mkdir()
+    log_dir.mkdir()
+    log_path = log_dir / "log"
+    log_path.touch()
+    os.mkfifo(state_dir / "stdin")
+    os.mkfifo(state_dir / "resize")
+
+    script = "import sys, time; sys.stdout.write('READY'); sys.stdout.flush(); time.sleep(30)"
+
+    pid = os.fork()
+    if pid == 0:
+        log_fd = os.open(str(log_path), os.O_WRONLY | os.O_TRUNC)
+        try:
+            agent_run._run_interactive(
+                state_dir,
+                [sys.executable, "-c", script],
+                log_fd,
+                lambda: None,
+                log_dir=log_dir,
+            )
+        finally:
+            os._exit(0)
+
+    try:
+        assert _wait_until(lambda: log_path.stat().st_size == len("READY"))
+        resize_fd = os.open(str(state_dir / "resize"), os.O_WRONLY)
+        try:
+            os.write(resize_fd, agent_run._pack_resize(101, 32))
+        finally:
+            os.close(resize_fd)
+
+        records_path = log_dir / "resizes.jsonl"
+        assert _wait_until(lambda: records_path.exists() and records_path.read_text().strip())
+        lines = records_path.read_text().strip().splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0]) == {"offset": len("READY"), "cols": 101, "rows": 32}
+    finally:
+        pty_pid = int((state_dir / "pty_pid").read_text().strip())
+        try:
+            os.kill(pty_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
 
 
 def test_interactive_launch_creates_stdin_and_resize_fifos(isolated_runs_root):

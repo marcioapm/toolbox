@@ -10061,7 +10061,9 @@ def _runner(
             # Managed claude/opencode use the same PTY path as raw runs: the
             # session id is already in argv, and the prompt is delivered through
             # the FIFO after the TUI comes up.
-            exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
+            exit_code = _run_interactive(
+                state_dir, argv, log_fd, _ready, prompt_file, submit_mode, log_dir
+            )
         else:
             exit_code = _run_oneshot(state_dir, argv, log_fd, _ready, prompt_file)
         agent_exited_naturally = True
@@ -10258,7 +10260,9 @@ def _apply_resize(master_fd: int, cols: int, rows: int) -> None:
             raise
 
 
-def _drain_resize_records(master_fd: int, buffered: bytes, warn=None) -> bytes:
+def _drain_resize_records(
+    master_fd: int, buffered: bytes, warn=None, on_applied=None
+) -> bytes:
     """Apply the LAST complete resize record found in ``buffered``,
     discarding earlier complete records in the same batch, and return any
     trailing partial record for the next call.
@@ -10282,7 +10286,11 @@ def _drain_resize_records(master_fd: int, buffered: bytes, warn=None) -> bytes:
     build's is reported through ``warn`` and skipped rather than decoded:
     an attach client from another release writes a different layout, and
     reading its bytes as dimensions drives the agent's terminal to a
-    garbage size."""
+    garbage size.
+
+    ``on_applied(cols, rows)``, when given, runs after ``_apply_resize``
+    succeeds, so a caller can record the resize timeline without this
+    function knowing anything about logs or offsets."""
     last_record = None
     foreign_version = None
     while len(buffered) >= RESIZE_RECORD_SIZE:
@@ -10319,6 +10327,8 @@ def _drain_resize_records(master_fd: int, buffered: bytes, warn=None) -> bytes:
             RESIZE_RECORD_FORMAT, last_record
         )
         _apply_resize(master_fd, cols, rows)
+        if on_applied is not None:
+            on_applied(cols, rows)
     return buffered
 
 
@@ -10478,6 +10488,7 @@ def _run_interactive(
     ready: callable,
     prompt_file: Optional[str] = None,
     submit_mode: str = SUBMIT_MODE_CR,
+    log_dir: Optional[Path] = None,
 ) -> int:
     stdin_path = state_dir / "stdin"
     resize_path = state_dir / "resize"
@@ -10578,6 +10589,24 @@ def _run_interactive(
         except OSError:
             pass
 
+    log_bytes_written = 0
+
+    def record_resize(cols: int, rows: int) -> None:
+        # Resizes are out-of-band (TIOCSWINSZ + SIGWINCH): no byte of the
+        # ioctl reaches the log, so the offset it took effect at has to be
+        # recorded here, not recovered from the stream later. Bytes at or
+        # after log_bytes_written are the first the new geometry applies to.
+        if log_dir is None:
+            return
+        record = json.dumps(
+            {"offset": log_bytes_written, "cols": cols, "rows": rows}
+        )
+        try:
+            with (log_dir / "resizes.jsonl").open("a", encoding="utf-8") as f:
+                f.write(record + "\n")
+        except OSError:
+            pass
+
     exit_code: Optional[int] = None
     buf_in = b""
     buf_resize = b""
@@ -10615,9 +10644,10 @@ def _run_interactive(
                 # master closed but child still alive? unusual — loop again.
             else:
                 try:
-                    os.write(log_fd, data)
+                    written = os.write(log_fd, data)
                 except OSError:
-                    pass
+                    written = 0
+                log_bytes_written += written
 
         if fifo_fd in r:
             try:
@@ -10642,7 +10672,9 @@ def _run_interactive(
                 chunk = b""
             if chunk:
                 buf_resize += chunk
-            buf_resize = _drain_resize_records(master_fd, buf_resize, warn_resize)
+            buf_resize = _drain_resize_records(
+                master_fd, buf_resize, warn_resize, record_resize
+            )
 
         if master_fd in w and buf_in:
             buf_in = _drain_pty_input(master_fd, buf_in)
