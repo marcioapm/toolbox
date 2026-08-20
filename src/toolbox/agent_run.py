@@ -328,9 +328,11 @@ than STATE_ROOT and LOG_ROOT combined. See its own `--help` for `--top`,
 from __future__ import annotations
 
 import argparse
+import codecs
 from contextlib import contextmanager
 import errno
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -5691,6 +5693,352 @@ def _render_log(
     return _serialize_screen(screen)
 
 
+
+# ---------------------------------------------------------------------------
+# grounded offsets and screen checkpoints for incremental clean rendering
+# ---------------------------------------------------------------------------
+
+# A checkpoint may only be published where a fresh ByteStream would start in the
+# same state the original stream was in. Two kinds of parser state live in the
+# stream rather than the screen and are lost by restarting it: the escape
+# sequence FSM, and the incremental UTF-8 decoder. An offset is "grounded" when
+# neither is pending, so resuming there needs no parser state at all.
+
+_GROUND_ESC = 0x1B
+# CSI final bytes per ECMA-48 (0x40-0x7E), preceded by parameter bytes
+# (0x30-0x3F) then intermediate bytes (0x20-0x2F).
+_GROUND_CSI_FINAL = (0x40, 0x7E)
+_GROUND_CSI_PARAM = (0x30, 0x3F)
+_GROUND_CSI_INTER = (0x20, 0x2F)
+
+
+def _escape_pending_from(data: bytes) -> int:
+    """Offset of the earliest byte beginning an escape sequence left
+    unterminated at the end of ``data``, or ``len(data)`` when all are complete.
+
+    Scans forward rather than searching backward for the last ESC: an ESC byte
+    occurs inside an OSC payload as the first half of a String Terminator, so
+    the last ESC in a buffer need not be the one that is still pending.
+    """
+    i = 0
+    n = len(data)
+    while i < n:
+        if data[i] != _GROUND_ESC:
+            i += 1
+            continue
+        if i + 1 >= n:
+            return i  # lone trailing ESC
+        kind = data[i + 1]
+        if kind == 0x5B:  # CSI
+            j = i + 2
+            while j < n and _GROUND_CSI_PARAM[0] <= data[j] <= _GROUND_CSI_PARAM[1]:
+                j += 1
+            while j < n and _GROUND_CSI_INTER[0] <= data[j] <= _GROUND_CSI_INTER[1]:
+                j += 1
+            if j < n and _GROUND_CSI_FINAL[0] <= data[j] <= _GROUND_CSI_FINAL[1]:
+                i = j + 1
+                continue
+            return i
+        if kind == 0x5D:  # OSC, terminated by BEL or ST
+            j = i + 2
+            terminated = False
+            while j < n:
+                if data[j] == 0x07:
+                    j += 1
+                    terminated = True
+                    break
+                if data[j] == _GROUND_ESC and j + 1 < n and data[j + 1] == 0x5C:
+                    j += 2
+                    terminated = True
+                    break
+                j += 1
+            if not terminated:
+                return i
+            i = j
+            continue
+        i += 2  # any other two-byte escape is complete once both bytes are present
+    return n
+
+
+def _utf8_boundary(data: bytes, limit: int) -> int:
+    """Largest offset <= ``limit`` lying on a UTF-8 character boundary.
+
+    ``utf_8_decode`` with ``final=False`` reports how many bytes form whole
+    characters; bytes past that are a partial sequence a fresh decoder would
+    mis-decode as separate code points.
+    """
+    if limit <= 0:
+        return 0
+    try:
+        _text, consumed = codecs.utf_8_decode(data[:limit], "strict", False)
+    except UnicodeDecodeError as exc:
+        return exc.start  # malformed input: ground at the last clean byte
+    return consumed
+
+
+def _grounded_offset(data: bytes) -> int:
+    """Last offset in ``data`` at which a fresh ByteStream may resume."""
+    return _utf8_boundary(data, _escape_pending_from(data))
+
+
+# Screen attributes carrying state a fresh ByteStream cannot rebuild. Anything
+# pyte exposes outside this set and _CKPT_EXCLUDED is unaccounted for; the
+# surface test fails rather than let a resumed render silently drop state.
+_CKPT_ATTRS = frozenset({
+    "buffer", "cursor", "charset", "g0_charset", "g1_charset", "tabstops",
+    "savepoints", "margins", "mode", "saved_columns", "title", "icon_name",
+    "history",
+})
+# Excluded, with reasons: geometry is carried in cache metadata and compared
+# before a checkpoint is loaded; dirty is repaint bookkeeping that load rebuilds.
+_CKPT_EXCLUDED = frozenset({"columns", "lines", "dirty"})
+
+_CKPT_VERSION = 1
+
+
+def _ckpt_charset_tags(pyte):
+    """Map short tag -> charset table. g0/g1 hold the mapping table itself
+    rather than a name, so a stable tag is needed to round-trip them."""
+    from pyte import charsets as cs
+    return {"B": cs.LAT1_MAP, "0": cs.VT100_MAP, "U": cs.IBMPC_MAP, "V": cs.VAX42_MAP}
+
+
+def _ckpt_tag_for_charset(pyte, table) -> str:
+    for tag, known in _ckpt_charset_tags(pyte).items():
+        if known is table:
+            return tag
+    return "B"  # an unknown table cannot be restored; Latin-1 is pyte's default
+
+
+def _ckpt_charset_for_tag(pyte, tag: str):
+    return _ckpt_charset_tags(pyte).get(tag, _ckpt_charset_tags(pyte)["B"])
+
+
+def _ckpt_dump_row(row) -> dict:
+    """One sparse row as {column: char}; unwritten cells stay implicit."""
+    return {str(x): list(char) for x, char in row.items()}
+
+
+def _ckpt_load_row(pyte, data: dict, default):
+    row = pyte.screens.StaticDefaultDict(default)
+    for x, values in data.items():
+        row[int(x)] = pyte.screens.Char(*values)
+    return row
+
+
+def _ckpt_dump_savepoint(pyte, sp) -> dict:
+    return {
+        "cursor": [sp.cursor.x, sp.cursor.y, sp.cursor.hidden, list(sp.cursor.attrs)],
+        "g0": _ckpt_tag_for_charset(pyte, sp.g0_charset),
+        "g1": _ckpt_tag_for_charset(pyte, sp.g1_charset),
+        "charset": sp.charset,
+        "origin": sp.origin,
+        "wrap": sp.wrap,
+    }
+
+
+def _ckpt_load_savepoint(pyte, data: dict):
+    x, y, hidden, attrs = data["cursor"]
+    cursor = pyte.screens.Cursor(x, y, pyte.screens.Char(*attrs))
+    cursor.hidden = hidden
+    return pyte.screens.Savepoint(
+        cursor,
+        _ckpt_charset_for_tag(pyte, data["g0"]),
+        _ckpt_charset_for_tag(pyte, data["g1"]),
+        data["charset"],
+        data["origin"],
+        data["wrap"],
+    )
+
+
+def _ckpt_surface_fingerprint(pyte) -> str:
+    """Hash of pyte's screen attribute surface and Char layout. Recorded in the
+    checkpoint so a pyte upgrade that reshapes either invalidates stale caches
+    instead of having them loaded into a screen they no longer describe."""
+    probe = pyte.HistoryScreen(
+        _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT,
+        history=_RENDER_LOG_DEFAULT_HISTORY, ratio=0.5,
+    )
+    parts = sorted(k for k in vars(probe) if not k.startswith("__"))
+    parts += list(pyte.screens.Char._fields)
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _ckpt_dump_state(pyte, screen) -> dict:
+    """Serializable screen state, excluding ``history.top``.
+
+    ``history.top`` is published separately as an append-only file: a line that
+    has scrolled off the viewport never changes, so rewriting the whole of it on
+    every tick costs bytes proportional to run length for no new information.
+    """
+    return {
+        "version": _CKPT_VERSION,
+        "fingerprint": _ckpt_surface_fingerprint(pyte),
+        "columns": screen.columns,
+        "lines": screen.lines,
+        "buffer": {str(y): _ckpt_dump_row(row) for y, row in screen.buffer.items()},
+        "cursor": {
+            "x": screen.cursor.x,
+            "y": screen.cursor.y,
+            "hidden": screen.cursor.hidden,
+            "attrs": list(screen.cursor.attrs),
+        },
+        "charset": screen.charset,
+        "g0": _ckpt_tag_for_charset(pyte, screen.g0_charset),
+        "g1": _ckpt_tag_for_charset(pyte, screen.g1_charset),
+        "tabstops": sorted(screen.tabstops),
+        "savepoints": [_ckpt_dump_savepoint(pyte, sp) for sp in screen.savepoints],
+        "margins": None if screen.margins is None else list(screen.margins),
+        "mode": sorted(screen.mode),
+        "saved_columns": screen.saved_columns,
+        "title": screen.title,
+        "icon_name": screen.icon_name,
+        "history": {
+            "bottom": [_ckpt_dump_row(row) for row in screen.history.bottom],
+            "ratio": screen.history.ratio,
+            "size": screen.history.size,
+            "position": screen.history.position,
+        },
+    }
+
+
+def _ckpt_load_state(pyte, screen, state: dict, history_top) -> None:
+    """Restore ``state`` and ``history_top`` into ``screen`` in place.
+
+    Raises ValueError when the checkpoint does not describe this screen; callers
+    treat any failure as a cache miss and replay the log in full.
+    """
+    if state.get("version") != _CKPT_VERSION:
+        raise ValueError(f"unsupported checkpoint version {state.get('version')!r}")
+    if state.get("fingerprint") != _ckpt_surface_fingerprint(pyte):
+        raise ValueError("checkpoint was written against a different pyte surface")
+    if state["columns"] != screen.columns or state["lines"] != screen.lines:
+        raise ValueError("checkpoint geometry does not match screen geometry")
+
+    default = screen.default_char
+    screen.buffer.clear()
+    for y, row in state["buffer"].items():
+        screen.buffer[int(y)] = _ckpt_load_row(pyte, row, default)
+
+    cursor = state["cursor"]
+    screen.cursor.x = cursor["x"]
+    screen.cursor.y = cursor["y"]
+    screen.cursor.hidden = cursor["hidden"]
+    screen.cursor.attrs = pyte.screens.Char(*cursor["attrs"])
+
+    screen.charset = state["charset"]
+    screen.g0_charset = _ckpt_charset_for_tag(pyte, state["g0"])
+    screen.g1_charset = _ckpt_charset_for_tag(pyte, state["g1"])
+    screen.tabstops = set(state["tabstops"])
+    screen.savepoints = [_ckpt_load_savepoint(pyte, sp) for sp in state["savepoints"]]
+    screen.margins = None if state["margins"] is None else pyte.screens.Margins(*state["margins"])
+    screen.mode = set(state["mode"])
+    screen.saved_columns = state["saved_columns"]
+    screen.title = state["title"]
+    screen.icon_name = state["icon_name"]
+
+    history = state["history"]
+    # history.top is a bounded deque: replaying every recorded line in order
+    # leaves exactly the window pyte itself would hold, even when the file has
+    # outgrown that window.
+    screen.history.top.clear()
+    for row in history_top:
+        screen.history.top.append(_ckpt_load_row(pyte, row, default))
+    screen.history.bottom.clear()
+    for row in history["bottom"]:
+        screen.history.bottom.append(_ckpt_load_row(pyte, row, default))
+    screen.history = screen.history._replace(
+        ratio=history["ratio"], size=history["size"], position=history["position"]
+    )
+
+    screen.dirty.clear()
+    screen.dirty.update(range(screen.lines))
+
+
+def _ckpt_state_path(clean: Path) -> Path:
+    return clean.with_name(f"{clean.name}.state.json")
+
+
+def _ckpt_history_path(clean: Path) -> Path:
+    return clean.with_name(f"{clean.name}.history.jsonl")
+
+
+def _ckpt_publish(clean: Path, pyte, screen, *, history_written: int, offset: int) -> int:
+    """Write the screen checkpoint and append newly scrolled-off history lines.
+
+    Returns the new count of history lines on disk. History is appended, never
+    rewritten; the state file is replaced atomically each time.
+
+    The state records the raw-log ``offset`` it covers and the number of history
+    lines belonging to it. Publication is not atomic across the two files, so a
+    reader that finds a state naming a different offset than the metadata, or a
+    history file shorter than the state claims, must treat the checkpoint as
+    absent rather than load a prefix of one tick against another.
+    """
+    rows = [_ckpt_dump_row(row) for row in screen.history.top]
+    if len(rows) > history_written:
+        with _ckpt_history_path(clean).open("a", encoding="utf-8") as handle:
+            for row in rows[history_written:]:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        history_written = len(rows)
+    state = _ckpt_dump_state(pyte, screen)
+    state["offset"] = offset
+    state["history_lines"] = history_written
+    _atomic_write_text(
+        _ckpt_state_path(clean), json.dumps(state, sort_keys=True), suffix="state",
+    )
+    return history_written
+
+
+def _ckpt_discard(clean: Path) -> None:
+    """Remove the checkpoint. Readers fall back to a full replay, which is
+    always correct; a checkpoint that cannot be trusted must not survive."""
+    for path in (_ckpt_state_path(clean), _ckpt_history_path(clean)):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _ckpt_load(clean: Path, pyte, screen, *, offset: int) -> bool:
+    """Restore the checkpoint covering ``offset`` into ``screen``.
+
+    Returns False when no checkpoint applies, for any reason: absent, malformed,
+    written by a different pyte, or naming another offset. The caller then
+    replays the log in full.
+    """
+    try:
+        with _watch_open_validated_log(_ckpt_state_path(clean)) as handle:
+            if handle is None:
+                return False
+            state = json.loads(handle.read().decode("utf-8"))
+        if state.get("offset") != offset:
+            return False
+        history_lines = state.get("history_lines")
+        if not isinstance(history_lines, int) or history_lines < 0:
+            return False
+        history_top = _ckpt_read_history(clean)
+        if len(history_top) < history_lines:
+            return False
+        # A longer file is a later tick's append landing before its state; the
+        # extra lines are not part of this checkpoint.
+        _ckpt_load_state(pyte, screen, state, history_top[:history_lines])
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return False
+    return True
+
+
+def _ckpt_read_history(clean: Path) -> list:
+    path = _ckpt_history_path(clean)
+    with _watch_open_validated_log(path) as handle:
+        if handle is None:
+            return []
+        text = handle.read().decode("utf-8")
+    return [json.loads(line) for line in text.splitlines() if line]
+
+
 def _cache_metadata_path(clean: Path) -> Path:
     return clean.with_name(f"{clean.name}.meta.json")
 
@@ -5830,6 +6178,12 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
     published cache always identifies the exact (dev, ino, offset) prefix it
     covers via ``log.clean.meta.json``. Any parse or publication failure leaves
     that contract unpublished and is retried after discarding mutated pyte state.
+
+    Bytes are fed only up to a grounded offset -- outside any escape sequence and
+    on a UTF-8 character boundary -- and the published offset is always grounded.
+    A reader resuming there starts a fresh ByteStream in the state this one was
+    in, so no parser state is carried in the checkpoint. A trailing partial
+    sequence is left unfed and re-read on the next tick once its remainder lands.
     """
     log = log_dir / "log"
     clean = log_dir / "log.clean"
@@ -5849,6 +6203,7 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
     offset = 0
     log_ino = -1
     log_dev = -1
+    history_written = 0
     # (rendered-or-None, source stat, offset) awaiting publication; retried on a
     # publish failure. rendered None means the text is unchanged (metadata only).
     pending: Optional[tuple[Optional[str], Any, int]] = None
@@ -5873,6 +6228,8 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
                     log_dev = current.st_dev
                     pending = None
                     failures = 0
+                    history_written = 0
+                    _ckpt_discard(clean)
                 if current.st_size > offset:
                     read_size = min(current.st_size - offset, ECHO_LOOP_MAX_RENDER_BYTES)
                     f.seek(offset)
@@ -5889,6 +6246,13 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
             if blocked == identity:
                 time.sleep(interval)
                 continue
+            ground = _grounded_offset(chunk)
+            if ground == 0:
+                # The whole chunk is one unterminated sequence. Nothing can be
+                # published at a grounded offset yet; wait for its remainder.
+                time.sleep(interval)
+                continue
+            chunk = chunk[:ground]
             try:
                 _feed_pyte(stream, chunk)
                 rendered = _serialize_screen(screen)
@@ -5899,6 +6263,8 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
                 offset = 0
                 pending = None
                 failures += 1
+                history_written = 0
+                _ckpt_discard(clean)
                 if failures >= 2:
                     blocked = identity
                     try:
@@ -5928,6 +6294,16 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
             except OSError:
                 time.sleep(interval)
                 continue
+            try:
+                history_written = _ckpt_publish(
+                    clean, pyte, screen,
+                    history_written=history_written, offset=published_offset,
+                )
+            except (OSError, ValueError, TypeError):
+                # The transcript stands on its own; a missing checkpoint only
+                # costs the next reader a full replay.
+                _ckpt_discard(clean)
+                history_written = 0
             pending = None
         time.sleep(interval)
 
@@ -5938,7 +6314,13 @@ def _read_clean_cache(
     height: int,
     history: int,
 ) -> "Optional[str]":
-    """Return a compatible cache only when metadata proves it covers the raw log."""
+    """Return a rendered transcript from cache, or None to render in full.
+
+    An exact cache -- metadata covering the whole raw log -- is returned as-is.
+    Otherwise a checkpoint covering a grounded prefix is resumed: the recorded
+    screen state is restored and only the bytes appended since that offset are
+    fed. Any failure returns None; a resumed render is never a guess.
+    """
     if (
         width != _RENDER_LOG_DEFAULT_WIDTH
         or height != _RENDER_LOG_DEFAULT_HEIGHT
@@ -5964,18 +6346,68 @@ def _read_clean_cache(
             and metadata.get("complete") is True
             and metadata.get("dev") == raw_stat.st_dev
             and metadata.get("ino") == raw_stat.st_ino
-            and metadata.get("offset") == raw_stat.st_size
-            and metadata.get("size") == raw_stat.st_size
             and metadata.get("width") == width
             and metadata.get("height") == height
             and metadata.get("history") == history
         ):
             return None
-        with _watch_open_validated_log(clean) as clean_file:
-            if clean_file is None:
-                return None
-            return clean_file.read().decode("utf-8", errors="replace")
+        published = metadata.get("offset")
+        if published != metadata.get("size") or not isinstance(published, int):
+            return None
+        if published == raw_stat.st_size:
+            with _watch_open_validated_log(clean) as clean_file:
+                if clean_file is None:
+                    return None
+                return clean_file.read().decode("utf-8", errors="replace")
+        if published > raw_stat.st_size:
+            # The log shrank since publication: the cache describes a file that
+            # no longer exists.
+            return None
+        return _resume_clean_cache(
+            log_path, clean, published, raw_stat, width, height, history
+        )
     except (OSError, ValueError, TypeError):
+        return None
+
+
+def _resume_clean_cache(
+    log_path: Path,
+    clean: Path,
+    published: int,
+    raw_stat,
+    width: int,
+    height: int,
+    history: int,
+) -> "Optional[str]":
+    """Render by restoring the checkpoint at ``published`` and feeding the tail.
+
+    Returns None when the checkpoint cannot be used, when the log changed
+    identity mid-read, or when pyte raises. Every such case is a cache miss.
+    """
+    try:
+        import pyte  # type: ignore
+    except ImportError:
+        return None
+    screen = _new_pyte_screen(pyte, width, height, history)
+    if not _ckpt_load(clean, pyte, screen, offset=published):
+        return None
+    with _watch_open_validated_log(log_path) as log_file:
+        if log_file is None:
+            return None
+        try:
+            reread = os.fstat(log_file.fileno())
+            if (reread.st_dev, reread.st_ino) != (raw_stat.st_dev, raw_stat.st_ino):
+                return None
+            log_file.seek(published)
+            tail = log_file.read(raw_stat.st_size - published)
+        except OSError:
+            return None
+    if len(tail) != raw_stat.st_size - published:
+        return None
+    try:
+        _feed_pyte(pyte.ByteStream(screen), tail)
+        return _serialize_screen(screen)
+    except Exception:
         return None
 
 
