@@ -9,6 +9,10 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     strategy:
+      # Report both jobs independently: with the default fail-fast, one job's
+      # failure cancels the other and its cancellation looks like a second,
+      # unrelated failure.
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
@@ -21,6 +25,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: Run pytest
+        env:
+          # -v block-buffers through a pipe, so the last PASSED line lags real
+          # execution and misreports where the run died.
+          PYTHONUNBUFFERED: "1"
         run: |
           echo "pytest-start-epoch=$(date +%s)" >> "$GITHUB_ENV"
           pytest -v -p no:cacheprovider
