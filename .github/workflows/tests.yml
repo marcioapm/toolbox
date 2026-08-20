@@ -22,22 +22,28 @@ jobs:
           pip install -e ".[dev]"
       - name: Run pytest
         run: |
-          set +e
+          echo "pytest-start-epoch=$(date +%s)" >> "$GITHUB_ENV"
           pytest -v -p no:cacheprovider
-          rc=$?
-          echo "::group::post-run diagnostics (pytest rc=$rc)"
-          echo "--- cgroup memory.events ---"
-          cat /sys/fs/cgroup/memory.events 2>/dev/null || echo "(unavailable)"
-          echo "--- cgroup memory.peak / max ---"
-          cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo "(unavailable)"
-          cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "(unavailable)"
+
+      # Runs during cancellation teardown, which the pytest step itself does
+      # not survive: an external cancel tears down that step's process group
+      # before any trailing command executes.
+      - name: Runner state
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "elapsed_in_pytest_step=$(( $(date +%s) - ${pytest_start_epoch:-$(date +%s)} ))s"
+          echo "--- cgroup memory.events / peak / max ---"
+          cat /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.max 2>/dev/null || echo "(unavailable)"
           echo "--- free -m ---"
           free -m || true
-          echo "--- nproc / loadavg ---"
-          nproc; cat /proc/loadavg
+          echo "--- disk ---"
+          df -h / /home/runner /tmp 2>/dev/null || true
+          echo "--- nproc / loadavg / uptime ---"
+          nproc; cat /proc/loadavg; uptime
           echo "--- surviving python/pytest processes ---"
-          ps -eo pid,ppid,pgid,stat,rss,etime,comm,args | grep -E "pytest|python" | head -40 || true
-          echo "--- dmesg tail (oom/kill lines) ---"
-          sudo dmesg 2>/dev/null | tail -60 | grep -iE "oom|kill|memory" || echo "(none or unavailable)"
-          echo "::endgroup::"
-          exit $rc
+          ps -eo pid,ppid,pgid,stat,rss,etime,comm | grep -E "pytest|python" | head -40 || true
+          echo "--- dmesg (oom/kill/memory) ---"
+          sudo dmesg 2>/dev/null | tail -80 | grep -iE "oom|kill|memory" || echo "(none or unavailable)"
+        env:
+          pytest_start_epoch: ${{ env.pytest-start-epoch }}
