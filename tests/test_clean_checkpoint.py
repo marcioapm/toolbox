@@ -228,3 +228,197 @@ def test_ckpt_discard_removes_the_checkpoint(tmp_path):
     assert ar._ckpt_state_path(clean).exists()
     ar._ckpt_discard(clean)
     assert not ar._ckpt_state_path(clean).exists()
+
+
+# ---------------------------------------------------------------------------
+# run.json terminal geometry + resizes.jsonl wiring, and the cache-invalidation
+# it drives through log.clean.meta.json's resize identity.
+# ---------------------------------------------------------------------------
+
+def _write_run_json(log_dir: Path, terminal) -> None:
+    (log_dir / "run.json").write_text(json.dumps({"terminal": terminal}))
+
+
+def _write_resizes_jsonl(log_dir: Path, records) -> None:
+    lines = [json.dumps(r) for r in records]
+    (log_dir / "resizes.jsonl").write_text("\n".join(lines) + ("\n" if lines else ""))
+
+
+class TestRunJsonAndResizeTimelineWiring:
+    def test_absent_terminal_and_timeline_reproduce_current_render(self, tmp_path):
+        """No run.json, no resizes.jsonl -- every existing log -- must render
+        byte-identical to _render_log with the module defaults."""
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(20))
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(raw)
+
+        ar._render_log_to_clean(log_dir)
+
+        assert (log_dir / "log.clean").read_text() == _render(raw)
+
+    def test_run_json_terminal_and_timeline_are_applied(self, tmp_path):
+        raw = b"x" * 60 + b"\r\n" + b"after resize\r\n"
+        split = len(b"x" * 60 + b"\r\n")
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(raw)
+        _write_run_json(log_dir, {"cols": 80, "rows": 24})
+        _write_resizes_jsonl(log_dir, [{"offset": split, "cols": 10, "rows": 40}])
+
+        ar._render_log_to_clean(log_dir)
+
+        expected = ar._render_log(
+            raw, width=80, height=24,
+            resizes=[{"offset": split, "cols": 10, "rows": 40}],
+        )
+        assert (log_dir / "log.clean").read_text() == expected
+        # Sanity: the resize actually narrowed the second line.
+        assert "after resize" not in expected
+
+    def test_meta_json_records_resize_identity(self, tmp_path):
+        raw = b"a" * 20 + b"\r\n" + b"b" * 20 + b"\r\n"
+        split = len(b"a" * 20 + b"\r\n")
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(raw)
+        _write_resizes_jsonl(log_dir, [{"offset": split, "cols": 40, "rows": 20}])
+
+        ar._render_log_to_clean(log_dir)
+
+        metadata = json.loads((log_dir / "log.clean.meta.json").read_text())
+        assert metadata["resize_count"] == 1
+        assert metadata["resize_last_offset"] == split
+
+    def test_no_timeline_records_zero_resize_identity(self, tmp_path):
+        raw = b"plain\r\n"
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(raw)
+
+        ar._render_log_to_clean(log_dir)
+
+        metadata = json.loads((log_dir / "log.clean.meta.json").read_text())
+        assert metadata["resize_count"] == 0
+        assert metadata["resize_last_offset"] == 0
+
+    def test_cache_is_a_miss_when_resize_timeline_identity_differs(self, tmp_path):
+        raw = b"a" * 20 + b"\r\n" + b"b" * 20 + b"\r\n"
+        split = len(b"a" * 20 + b"\r\n")
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log = log_dir / "log"
+        log.write_bytes(raw)
+
+        # Cache published with no resizes at all.
+        ar._render_log_to_clean(log_dir)
+        cached_before = (log_dir / "log.clean").read_text()
+        assert ar._read_clean_cache(log, W, H, HIST) == cached_before
+
+        # A resize is now recorded after the cache was published; the same
+        # (dev, ino, offset, size) cache must become a miss because its
+        # resize identity no longer matches the current timeline.
+        _write_resizes_jsonl(log_dir, [{"offset": split, "cols": 40, "rows": 20}])
+        assert ar._read_clean_cache(log, W, H, HIST) is None
+
+    def test_cache_hit_when_resize_timeline_identity_matches(self, tmp_path):
+        raw = b"a" * 20 + b"\r\n" + b"b" * 20 + b"\r\n"
+        split = len(b"a" * 20 + b"\r\n")
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log = log_dir / "log"
+        log.write_bytes(raw)
+        _write_resizes_jsonl(log_dir, [{"offset": split, "cols": 40, "rows": 20}])
+
+        ar._render_log_to_clean(log_dir)
+        cached = (log_dir / "log.clean").read_text()
+
+        assert ar._read_clean_cache(log, W, H, HIST) == cached
+
+    def test_pre_existing_metadata_without_resize_fields_is_a_hit_when_log_has_no_resizes(
+        self, tmp_path
+    ):
+        """Metadata written before this feature has no resize_count/
+        resize_last_offset fields; it must still be treated as a hit when
+        the log genuinely has no resize timeline (the (0, 0) default on
+        both sides)."""
+        raw = b"legacy content\r\n"
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log = log_dir / "log"
+        log.write_bytes(raw)
+        clean = log_dir / "log.clean"
+        rendered = _render(raw)
+        clean.write_text(rendered, encoding="utf-8")
+        log_stat = log.stat()
+        (log_dir / "log.clean.meta.json").write_text(json.dumps({
+            "version": 1, "dev": log_stat.st_dev, "ino": log_stat.st_ino,
+            "offset": log_stat.st_size, "size": log_stat.st_size, "complete": True,
+            "width": W, "height": H, "history": HIST, "updated_at": 0,
+        }))
+
+        assert ar._read_clean_cache(log, W, H, HIST) == rendered
+
+    def test_corrupt_run_json_falls_back_without_raising(self, tmp_path):
+        raw = b"hello\r\n"
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(raw)
+        (log_dir / "run.json").write_text("{not json")
+
+        ar._render_log_to_clean(log_dir)
+
+        assert (log_dir / "log.clean").read_text() == _render(raw)
+
+    def test_corrupt_resizes_jsonl_falls_back_without_raising(self, tmp_path):
+        raw = b"hello\r\n"
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(raw)
+        (log_dir / "resizes.jsonl").write_text("not json at all\n{also not json\n")
+
+        ar._render_log_to_clean(log_dir)
+
+        assert (log_dir / "log.clean").read_text() == _render(raw)
+
+    def test_read_run_terminal_geometry_rejects_malformed_shapes(self, tmp_path):
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+
+        assert ar._read_run_terminal_geometry(log_dir) is None  # no run.json
+
+        (log_dir / "run.json").write_text("not json")
+        assert ar._read_run_terminal_geometry(log_dir) is None
+
+        (log_dir / "run.json").write_text(json.dumps({"terminal": "not-a-dict"}))
+        assert ar._read_run_terminal_geometry(log_dir) is None
+
+        (log_dir / "run.json").write_text(
+            json.dumps({"terminal": {"cols": True, "rows": 24}})
+        )
+        assert ar._read_run_terminal_geometry(log_dir) is None
+
+        (log_dir / "run.json").write_text(
+            json.dumps({"terminal": {"cols": 3000, "rows": 24}})
+        )
+        assert ar._read_run_terminal_geometry(log_dir) is None
+
+        (log_dir / "run.json").write_text(
+            json.dumps({"terminal": {"cols": 80, "rows": 24}})
+        )
+        assert ar._read_run_terminal_geometry(log_dir) == (80, 24)
+
+    def test_read_resize_timeline_skips_malformed_lines_individually(self, tmp_path):
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "resizes.jsonl").write_text(
+            "not json\n"
+            '{"offset": 3, "cols": 80, "rows": 24}\n'
+            "\n"
+            '"just a string"\n'
+            '{"offset": 10, "cols": 40, "rows": 20}\n'
+        )
+        assert ar._read_resize_timeline(log_dir) == [
+            {"offset": 3, "cols": 80, "rows": 24},
+            {"offset": 10, "cols": 40, "rows": 20},
+        ]

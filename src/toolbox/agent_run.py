@@ -6061,14 +6061,24 @@ def _atomic_write_text(path: Path, text: str, *, suffix: str) -> None:
             pass
 
 
-def _publish_clean(clean: Path, rendered: str, *, stat_result, offset: int, complete: bool) -> None:
+def _publish_clean(
+    clean: Path, rendered: str, *, stat_result, offset: int, complete: bool,
+    resize_identity: Tuple[int, int] = (0, 0),
+) -> None:
     """Publish transcript then metadata identifying the raw prefix it covers."""
     _atomic_write_text(clean, rendered, suffix="clean")
-    _publish_clean_metadata(clean, stat_result=stat_result, offset=offset, complete=complete)
+    _publish_clean_metadata(
+        clean, stat_result=stat_result, offset=offset, complete=complete,
+        resize_identity=resize_identity,
+    )
 
 
-def _publish_clean_metadata(clean: Path, *, stat_result, offset: int, complete: bool) -> None:
+def _publish_clean_metadata(
+    clean: Path, *, stat_result, offset: int, complete: bool,
+    resize_identity: Tuple[int, int] = (0, 0),
+) -> None:
     """Publish cache health metadata without treating diagnostic state as text."""
+    resize_count, resize_last_offset = resize_identity
     metadata = {
         "version": 1,
         "dev": stat_result.st_dev,
@@ -6079,22 +6089,130 @@ def _publish_clean_metadata(clean: Path, *, stat_result, offset: int, complete: 
         "width": _RENDER_LOG_DEFAULT_WIDTH,
         "height": _RENDER_LOG_DEFAULT_HEIGHT,
         "history": _RENDER_LOG_DEFAULT_HISTORY,
+        # Identifies the resize timeline this render applied -- count plus
+        # last offset is enough to detect a timeline that has since grown
+        # or changed, without storing the whole thing twice.
+        "resize_count": resize_count,
+        "resize_last_offset": resize_last_offset,
         "updated_at": time.time(),
     }
     _atomic_write_text(_cache_metadata_path(clean), json.dumps(metadata, sort_keys=True), suffix="meta")
 
 
+def _read_run_terminal_geometry(log_dir: Path) -> Optional[Tuple[int, int]]:
+    """Read the launch-time PTY geometry from run.json's ``terminal`` field.
+
+    Returns ``None`` -- meaning "use the render defaults" -- when run.json
+    is absent, unreadable, not valid JSON, or ``terminal`` is malformed;
+    every log from before this field existed falls back the same way.
+    """
+    try:
+        data = json.loads((log_dir / "run.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    terminal = data.get("terminal")
+    if not isinstance(terminal, dict):
+        return None
+    cols = terminal.get("cols")
+    rows = terminal.get("rows")
+    if (
+        not isinstance(cols, int) or isinstance(cols, bool)
+        or not isinstance(rows, int) or isinstance(rows, bool)
+        or not (1 <= cols <= MAX_TERMINAL_DIMENSION and 1 <= rows <= MAX_TERMINAL_DIMENSION)
+    ):
+        return None
+    return (cols, rows)
+
+
+def _read_resize_timeline(log_dir: Path) -> List[dict]:
+    """Read ``resizes.jsonl`` into a list of raw JSON-object records.
+
+    A line that fails to parse, or does not decode as a JSON object, is
+    skipped individually; a missing or unreadable file yields an empty
+    timeline. Never raises -- ``_validate_resize_timeline`` still screens
+    every field of every returned record before it is trusted.
+    """
+    try:
+        text = (log_dir / "resizes.jsonl").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    records: List[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _current_resize_identity(log_dir: Path, raw_len: int) -> Tuple[int, int]:
+    """(count, last offset) of the resize timeline that currently applies to
+    ``raw_len`` bytes of ``log_dir``'s raw log.
+
+    Compared against a cached render's own recorded identity by
+    ``_read_clean_cache`` to detect a cache published before a resize (or a
+    further resize) was recorded.
+    """
+    validated = _validate_resize_timeline(_read_resize_timeline(log_dir), raw_len)
+    return (len(validated), validated[-1][0] if validated else 0)
+
+
+def _render_log_dir(
+    log_dir: Path, raw: bytes, *, width: int, height: int, history: int
+) -> str:
+    """Render ``raw`` for ``log_dir``, applying its recorded launch geometry
+    and resize timeline only when the caller asked for the render defaults.
+
+    A caller requesting a specific width/height (``clean --width``) wants a
+    render at that exact size; the recorded timeline describes a different
+    geometry (the run's own PTY) and does not apply. At the defaults, the
+    initial geometry comes from run.json's ``terminal`` field and the
+    timeline from resizes.jsonl; either absent or malformed falls back to
+    the defaults with no resizes, reproducing every pre-existing log byte
+    for byte.
+    """
+    if width != _RENDER_LOG_DEFAULT_WIDTH or height != _RENDER_LOG_DEFAULT_HEIGHT:
+        return _render_log(raw, width=width, height=height, history=history)
+    geometry = _read_run_terminal_geometry(log_dir)
+    base_width, base_height = geometry or (width, height)
+    resize_records = _read_resize_timeline(log_dir)
+    return _render_log(
+        raw, width=base_width, height=base_height, history=history,
+        resizes=resize_records,
+    )
+
+
 def _render_log_to_clean(log_dir: Path) -> None:
-    """Atomically render ``log`` to ``log.clean`` in ``log_dir``."""
+    """Atomically render ``log`` to ``log.clean`` in ``log_dir``.
+
+    Initial geometry comes from run.json's ``terminal`` field and the
+    resize timeline from resizes.jsonl; either absent or malformed falls
+    back to the render defaults, reproducing every pre-existing log byte
+    for byte.
+    """
     log = log_dir / "log"
     clean = log_dir / "log.clean"
     raw = log.read_bytes()
-    rendered = _render_log(raw)
+    rendered = _render_log_dir(
+        log_dir, raw, width=_RENDER_LOG_DEFAULT_WIDTH,
+        height=_RENDER_LOG_DEFAULT_HEIGHT, history=_RENDER_LOG_DEFAULT_HISTORY,
+    )
     with _watch_open_validated_log(log) as f:
         if f is None:
             raise OSError("log is not a regular file")
         stat_result = os.fstat(f.fileno())
-    _publish_clean(clean, rendered, stat_result=stat_result, offset=stat_result.st_size, complete=True)
+    resize_identity = _current_resize_identity(log_dir, len(raw))
+    _publish_clean(
+        clean, rendered, stat_result=stat_result, offset=stat_result.st_size,
+        complete=True, resize_identity=resize_identity,
+    )
 
 
 def _bounded_final_render(
@@ -6355,6 +6473,16 @@ def _read_clean_cache(
         published = metadata.get("offset")
         if published != metadata.get("size") or not isinstance(published, int):
             return None
+        # A resize recorded (or further extended) after this cache was
+        # published changes what the render should have looked like; the
+        # checkpoint in log.clean.state.json shares this same gate, since a
+        # resize-identity mismatch here already forces a full re-render.
+        # Metadata predating this field defaults to (0, 0) -- "no resizes"
+        # -- so an old cache is a hit exactly when the log still has none.
+        if _current_resize_identity(log_path.parent, raw_stat.st_size) != (
+            metadata.get("resize_count", 0), metadata.get("resize_last_offset", 0)
+        ):
+            return None
         if published == raw_stat.st_size:
             with _watch_open_validated_log(clean) as clean_file:
                 if clean_file is None:
@@ -6423,8 +6551,8 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
             raw = f.read()
         try:
-            rendered = _render_log(
-                raw,
+            rendered = _render_log_dir(
+                log.parent, raw,
                 width=args.width,
                 height=args.height,
                 history=args.history,
