@@ -5208,6 +5208,69 @@ def _drain_fifo_write(fd: int, data: bytes) -> bytes:
     return data
 
 
+def _register_attach_presence(state_dir: Path) -> Path:
+    """Create ``<state_dir>/attached/<pid>``, creating the directory if
+    needed, and return the marker path.
+
+    Never raises: a failure here only means this client won't be counted
+    toward "who is still attached" -- degrading, at worst, to a skipped
+    detach-restore later (see ``_deregister_attach_presence_and_restore``),
+    not a failure to attach.
+    """
+    marker = state_dir / "attached" / str(os.getpid())
+    try:
+        marker.parent.mkdir(exist_ok=True)
+        marker.touch()
+    except OSError:
+        pass
+    return marker
+
+
+def _deregister_attach_presence_and_restore(
+    name: str, marker: Path, resize_fd: Optional[int]
+) -> None:
+    """Remove this client's presence entry and, if it was the last one
+    attached, restore the run's PTY to its launch-time geometry.
+
+    A resize is last-writer-wins and out-of-band (TIOCSWINSZ + SIGWINCH):
+    once every attach client has detached, the PTY otherwise stays at
+    whatever size the last one left it, and every byte the wrapped agent
+    writes afterward is at a geometry nobody recorded. Sending one final
+    resize record carrying run.json's launch-time ``terminal`` geometry
+    closes that gap; if run.json has no ``terminal`` field (a run launched
+    by an older build), nothing is sent.
+
+    A leftover presence entry from a killed client is tolerated: it just
+    means this client cannot tell it is the last one, so the restore is
+    skipped -- today's behaviour before this feature existed. No liveness
+    check, no reaping of stale entries.
+    """
+    try:
+        marker.unlink()
+    except OSError:
+        return
+    if resize_fd is None:
+        return
+    try:
+        remaining = list(marker.parent.iterdir())
+    except OSError:
+        return
+    if remaining:
+        return
+    geometry = _read_run_terminal_geometry(_log_dir(name))
+    if geometry is None:
+        return
+    cols, rows = geometry
+    try:
+        record = _pack_resize(cols, rows)
+    except ValueError:
+        return
+    try:
+        _drain_fifo_write(resize_fd, record)
+    except OSError:
+        pass
+
+
 def cmd_attach(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     state_dir, pid = _require_live_interactive_run(name)
@@ -5255,6 +5318,11 @@ def cmd_attach(args: argparse.Namespace) -> int:
         except OSError as exc:
             os.close(stdin_fd)
             sys.exit(f"agent-run: failed to open resize FIFO at {resize_path}: {exc}")
+    # Presence registration: once every attach client has detached, the last
+    # one restores the run's PTY to its launch geometry (see
+    # _deregister_attach_presence_and_restore). try/finally below guarantees
+    # the entry is removed on Ctrl-C, an error, and normal exit alike.
+    attach_marker = _register_attach_presence(state_dir)
     pending_input = b""
     pending_resize = b""
     resize_requested = True
@@ -5497,6 +5565,9 @@ def cmd_attach(args: argparse.Namespace) -> int:
                 previous_winch if previous_winch is not None else signal.SIG_DFL,
             )
         os.close(stdin_fd)
+        # Deregister before closing resize_fd: restoring the launch geometry
+        # (when this is the last attached client) writes through it.
+        _deregister_attach_presence_and_restore(name, attach_marker, resize_fd)
         if resize_fd is not None:
             os.close(resize_fd)
         restore_terminal()
