@@ -129,7 +129,7 @@ def _stop_run(state: Path) -> None:
 
 
 def _detach(process: subprocess.Popen, master_fd: int, timeout: float = 5.0) -> None:
-    """Send Ctrl-C and wait for `attach` to exit, draining its PTY master
+    """Send Ctrl-D and wait for `attach` to exit, draining its PTY master
     the whole time.
 
     `attach`'s cleanup calls `termios.tcsetattr(..., TCSADRAIN, ...)`, which
@@ -143,7 +143,7 @@ def _detach(process: subprocess.Popen, master_fd: int, timeout: float = 5.0) -> 
     """
     try:
         if process.poll() is None:
-            os.write(master_fd, b"\x03")
+            os.write(master_fd, b"\x04")
             deadline = time.monotonic() + timeout
             while process.poll() is None and time.monotonic() < deadline:
                 readable, _, _ = select.select([master_fd], [], [], 0.1)
@@ -432,7 +432,7 @@ def test_attach_requires_tty_stdin(isolated_runs_root, isolated_log_root, monkey
 def test_attach_falls_back_when_resize_fifo_missing(isolated_runs_root, isolated_log_root, capsys):
     """Coverage for a run launched before this branch's resize-FIFO support:
     a state dir with a `stdin` FIFO but no `resize` FIFO must not block
-    attach entirely. Keyboard passthrough and Ctrl-C detach still work;
+    attach entirely. Keyboard passthrough and Ctrl-D detach still work;
     only resize forwarding is skipped, with a warning on stderr. (The
     subsequent SystemExit here is the unrelated no-tty check firing --
     confirms the resize check didn't sys.exit first.)"""
@@ -452,7 +452,7 @@ def test_attach_falls_back_when_resize_fifo_missing(isolated_runs_root, isolated
 def test_attach_end_to_end_without_resize_fifo(isolated_runs_root, isolated_log_root):
     """End-to-end: a session launched before resize-FIFO support (simulated
     by deleting the FIFO a real `-i` launch created) must still be
-    attachable -- input relays through and Ctrl-C detaches cleanly -- just
+    attachable -- input relays through and Ctrl-D detaches cleanly -- just
     without resize forwarding."""
     env = _environment(isolated_runs_root, isolated_log_root)
     script = """\
@@ -472,7 +472,7 @@ time.sleep(30)
         _read_until(master_fd, b"READY")
         os.write(master_fd, b"x")
         _read_until(master_fd, b"GOT:78")
-        os.write(master_fd, b"\x03")
+        os.write(master_fd, b"\x04")
         assert process.wait(timeout=5) == 0
         assert (state / "status").read_text().strip() == "running"
         assert agent_run._pid_alive(int((state / "pid").read_text()))
@@ -579,7 +579,7 @@ def test_attach_resets_terminal_modes_on_external_sigint(
         os.close(resize_reader)
 
 
-def test_attach_relays_input_detaches_on_ctrl_c_and_restores_terminal(
+def test_attach_relays_input_detaches_on_ctrl_d_and_restores_terminal(
     isolated_runs_root, isolated_log_root
 ):
     env = _environment(isolated_runs_root, isolated_log_root)
@@ -600,7 +600,7 @@ time.sleep(30)
         _read_until(master_fd, b"READY")
         os.write(master_fd, b"x")
         _read_until(master_fd, b"GOT:78")
-        os.write(master_fd, b"\x03")
+        os.write(master_fd, b"\x04")
         assert process.wait(timeout=5) == 0
         assert termios.tcgetattr(master_fd) == original
         assert (state / "status").read_text().strip() == "running"
@@ -610,33 +610,33 @@ time.sleep(30)
         _stop_run(state)
 
 
-def test_attach_ctrl_c_forwards_only_bytes_before_marker_within_one_chunk(
+def test_attach_ctrl_d_forwards_only_bytes_before_marker_within_one_chunk(
     isolated_runs_root, isolated_log_root
 ):
     """Direct coverage for the Task 2 byte-preservation fix.
 
-    `test_attach_relays_input_detaches_on_ctrl_c_and_restores_terminal` only
-    catches a leaked `\\x03` *indirectly*: its wrapped Python script happens
+    `test_attach_relays_input_detaches_on_ctrl_d_and_restores_terminal` only
+    catches a leaked `\\x04` *indirectly*: its wrapped Python script happens
     to raise `KeyboardInterrupt` if a stray `\\x03` reaches it, flipping
-    status to `failed`. A wrapped agent that ignores SIGINT (or doesn't run
-    Python) would leak the same byte with nothing catching it. This test
-    proves delivery directly: the wrapped agent logs every byte it reads, a
-    single write of `b"ab\\x03cd"` is sent as one chunk (matching
-    `cmd_attach`'s "scan each raw read chunk for `\\x03`" behavior), and the
-    test asserts (1) the bytes before `\\x03` (0x61 'a', 0x62 'b') were
-    delivered, (2) `\\x03` itself was not, (3) nothing after it in the same
-    chunk (0x63 'c', 0x64 'd') was either, and (4) the wrapped run stayed
-    alive/running throughout — only `attach` detaches, never the run.
+    status to `failed` -- but that mechanism cannot catch a stray `\\x04`
+    (EOF does not raise), so this test proves delivery directly. The
+    wrapped agent logs every byte it reads, a single write of
+    `b"ab\\x04cd"` is sent as one chunk (matching `cmd_attach`'s "scan each
+    raw read chunk for `\\x04`" behavior), and the test asserts (1) the
+    bytes before `\\x04` (0x61 'a', 0x62 'b') were delivered, (2) `\\x04`
+    itself was not, (3) nothing after it in the same chunk (0x63 'c', 0x64
+    'd') was either, and (4) the wrapped run stayed alive/running
+    throughout — only `attach` detaches, never the run.
 
     Reads the persistent log file directly rather than `attach`'s own PTY
     output: `cmd_attach` returns immediately after forwarding the
-    pre-`\\x03` bytes and detecting the detach marker, in the same loop
+    pre-`\\x04` bytes and detecting the detach marker, in the same loop
     iteration, without looping back to drain the log growth the wrapped
     agent's own `BYTE:..` writes produce — so by the time `attach` exits,
     those log lines have not necessarily been replayed onto its stdout yet.
     """
     env = _environment(isolated_runs_root, isolated_log_root)
-    name = "attach-ctrlc-truncate"
+    name = "attach-ctrld-truncate"
     script = """\
 import os, sys, termios, tty
 fd = sys.stdin.fileno()
@@ -654,7 +654,7 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
     process, master_fd = _spawn_attach(name, env, rows=24, cols=80)
     try:
         _read_until(master_fd, b"READY")
-        os.write(master_fd, b"ab\x03cd")
+        os.write(master_fd, b"ab\x04cd")
         assert process.wait(timeout=5) == 0
 
         log_path = isolated_log_root / name / "log"
@@ -662,9 +662,9 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         log = log_path.read_bytes()
         assert b"BYTE:61" in log  # 'a' delivered
         assert b"BYTE:62" in log  # 'b' delivered
-        assert b"BYTE:03" not in log  # '\x03' itself never delivered
-        assert b"BYTE:63" not in log  # 'c' (after \x03 in the chunk) dropped
-        assert b"BYTE:64" not in log  # 'd' (after \x03 in the chunk) dropped
+        assert b"BYTE:04" not in log  # '\x04' itself never delivered
+        assert b"BYTE:63" not in log  # 'c' (after \x04 in the chunk) dropped
+        assert b"BYTE:64" not in log  # 'd' (after \x04 in the chunk) dropped
 
         assert (state / "status").read_text().strip() == "running"
         assert agent_run._pid_alive(int((state / "pid").read_text()))
@@ -673,24 +673,77 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         _stop_run(state)
 
 
-def test_find_ctrl_c_trigger_recognizes_raw_byte():
-    assert agent_run._find_ctrl_c_trigger(b"ab\x03cd") == (2, 3)
+@pytest.mark.parametrize(
+    "ctrl_c_bytes",
+    [
+        b"ab\x03cd",  # raw Ctrl-C byte
+        b"ab\x1b[27;5;99~cd",  # CSI modifyOtherKeys form
+        b"ab\x1b[99;5ucd",  # kitty CSI-u form
+    ],
+    ids=["raw", "csi-modify-other-keys", "csi-kitty"],
+)
+def test_attach_forwards_ctrl_c_to_the_wrapped_agent_without_detaching(
+    isolated_runs_root, isolated_log_root, ctrl_c_bytes
+):
+    """Ctrl-C is no longer the detach trigger: every byte, including a raw
+    `\\x03` or a CSI-encoded Ctrl-C sequence, must reach the wrapped agent
+    unmodified, and `attach` itself must stay attached (not exit) -- the
+    mirror image of the Ctrl-D truncation test above."""
+    env = _environment(isolated_runs_root, isolated_log_root)
+    name = f"attach-ctrlc-passthrough-{ctrl_c_bytes.hex()}"
+    script = """\
+import os, sys, termios, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+print("READY", flush=True)
+while True:
+    b = os.read(fd, 1)
+    if not b:
+        break
+    print(f"BYTE:{b.hex()}", flush=True)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+"""
+    state = _launch_interactive(name, script, env)
+    process, master_fd = _spawn_attach(name, env, rows=24, cols=80)
+    try:
+        _read_until(master_fd, b"READY")
+        os.write(master_fd, ctrl_c_bytes)
+
+        log_path = isolated_log_root / name / "log"
+        assert _wait_until(lambda: b"BYTE:64" in log_path.read_bytes(), timeout=5)
+        log = log_path.read_bytes()
+        for byte in ctrl_c_bytes:
+            assert f"BYTE:{byte:02x}".encode() in log, (
+                f"byte {byte:#04x} from {ctrl_c_bytes!r} was not forwarded"
+            )
+
+        assert process.poll() is None, "attach detached on Ctrl-C"
+        assert (state / "status").read_text().strip() == "running"
+        assert agent_run._pid_alive(int((state / "pid").read_text()))
+    finally:
+        _detach(process, master_fd)
+        _stop_run(state)
 
 
-def test_find_ctrl_c_trigger_recognizes_iterm_csi_form():
-    # What iTerm2 actually sends for Ctrl-C once Claude Code's TUI has
+def test_find_ctrl_d_trigger_recognizes_raw_byte():
+    assert agent_run._find_ctrl_d_trigger(b"ab\x04cd") == (2, 3)
+
+
+def test_find_ctrl_d_trigger_recognizes_iterm_csi_form():
+    # What iTerm2 actually sends for Ctrl-D once Claude Code's TUI has
     # negotiated the "disambiguate escape codes" keyboard protocol: the
     # legacy xterm modifyOtherKeys form, ESC[27;<mod>;<codepoint>~, with
-    # mod=5 (1 + Ctrl's bit 4) and codepoint=99 ('c').
-    data = b"ab\x1b[27;5;99~cd"
-    start, end = agent_run._find_ctrl_c_trigger(data)
+    # mod=5 (1 + Ctrl's bit 4) and codepoint=100 ('d').
+    data = b"ab\x1b[27;5;100~cd"
+    start, end = agent_run._find_ctrl_d_trigger(data)
     assert data[:start] == b"ab"
     assert data[end:] == b"cd"
 
 
-def test_find_ctrl_c_trigger_recognizes_kitty_csi_u_form():
-    data = b"ab\x1b[99;5ucd"
-    start, end = agent_run._find_ctrl_c_trigger(data)
+def test_find_ctrl_d_trigger_recognizes_kitty_csi_u_form():
+    data = b"ab\x1b[100;5ucd"
+    start, end = agent_run._find_ctrl_d_trigger(data)
     assert data[:start] == b"ab"
     assert data[end:] == b"cd"
 
@@ -698,17 +751,17 @@ def test_find_ctrl_c_trigger_recognizes_kitty_csi_u_form():
 @pytest.mark.parametrize(
     "trigger",
     [
-        b"\x1b[99;5:1u",  # explicit press event type
-        b"\x1b[99;5:2u",  # repeat event type -- a held-down Ctrl-C
-        b"\x1b[99;5:3u",  # release event type
-        b"\x1b[99:65:67;5u",  # shifted + base-layout alt-key-codes
-        b"\x1b[99:65;5u",  # a single alt-key-code
-        b"\x1b[99;5;99u",  # "report associated text" field, one codepoint
-        b"\x1b[99;5;99:100u",  # associated text, multiple codepoints
-        b"\x1b[99:65:67;5:1;99u",  # alt-codes + event type + associated text together
+        b"\x1b[100;5:1u",  # explicit press event type
+        b"\x1b[100;5:2u",  # repeat event type -- a held-down Ctrl-D
+        b"\x1b[100;5:3u",  # release event type
+        b"\x1b[100:65:67;5u",  # shifted + base-layout alt-key-codes
+        b"\x1b[100:65;5u",  # a single alt-key-code
+        b"\x1b[100;5;100u",  # "report associated text" field, one codepoint
+        b"\x1b[100;5;100:100u",  # associated text, multiple codepoints
+        b"\x1b[100:65:67;5:1;100u",  # alt-codes + event type + associated text together
     ],
 )
-def test_find_ctrl_c_trigger_recognizes_kitty_optional_subparameters(trigger):
+def test_find_ctrl_d_trigger_recognizes_kitty_optional_subparameters(trigger):
     # Terminals implementing the kitty keyboard protocol may include these
     # optional colon-separated subparameters even when the client (Claude
     # Code) only requested the base "disambiguate escape codes" flag --
@@ -716,7 +769,7 @@ def test_find_ctrl_c_trigger_recognizes_kitty_optional_subparameters(trigger):
     # was requested. Detection must not depend on the client's requested
     # flags matching the terminal's actual behavior.
     data = b"ab" + trigger + b"cd"
-    start, end = agent_run._find_ctrl_c_trigger(data)
+    start, end = agent_run._find_ctrl_d_trigger(data)
     assert data[:start] == b"ab"
     assert data[end:] == b"cd"
     assert data[start:end] == trigger
@@ -725,12 +778,12 @@ def test_find_ctrl_c_trigger_recognizes_kitty_optional_subparameters(trigger):
 @pytest.mark.parametrize(
     "trigger",
     [
-        b"\x1b[99;5;u",  # empty "associated text" field
-        b"\x1b[99;5:u",  # empty event-type subparameter
-        b"\x1b[99;5:1;u",  # explicit event type, empty associated text
+        b"\x1b[100;5;u",  # empty "associated text" field
+        b"\x1b[100;5:u",  # empty event-type subparameter
+        b"\x1b[100;5:1;u",  # explicit event type, empty associated text
     ],
 )
-def test_find_ctrl_c_trigger_recognizes_kitty_forms_with_empty_subparameters(trigger):
+def test_find_ctrl_d_trigger_recognizes_kitty_forms_with_empty_subparameters(trigger):
     # Per ECMA-48/kitty-protocol grammar, an EMPTY parameter between two
     # separators means "use the default value" and is legal on the wire --
     # a terminal sending it is spec-compliant. Requiring at least one
@@ -738,47 +791,47 @@ def test_find_ctrl_c_trigger_recognizes_kitty_forms_with_empty_subparameters(tri
     # reintroducing the exact leak-through-to-the-wrapped-agent bug this
     # detector exists to fix.
     data = b"ab" + trigger + b"cd"
-    start, end = agent_run._find_ctrl_c_trigger(data)
+    start, end = agent_run._find_ctrl_d_trigger(data)
     assert data[:start] == b"ab"
     assert data[end:] == b"cd"
     assert data[start:end] == trigger
 
 
-def test_find_ctrl_c_trigger_returns_the_earliest_match_not_the_last():
-    # A CSI Ctrl-C at an earlier offset, followed later in the SAME chunk
-    # by a stray raw 0x03, must win -- picking the later trigger would
-    # forward the earlier, intact CSI Ctrl-C sequence into the wrapped
+def test_find_ctrl_d_trigger_returns_the_earliest_match_not_the_last():
+    # A CSI Ctrl-D at an earlier offset, followed later in the SAME chunk
+    # by a stray raw 0x04, must win -- picking the later trigger would
+    # forward the earlier, intact CSI Ctrl-D sequence into the wrapped
     # agent's stdin as an unintended side effect of detaching.
-    csi = b"\x1b[99;5u"
-    data = b"ab" + csi + b"some intervening text" + b"\x03" + b"more"
-    start, end = agent_run._find_ctrl_c_trigger(data)
+    csi = b"\x1b[100;5u"
+    data = b"ab" + csi + b"some intervening text" + b"\x04" + b"more"
+    start, end = agent_run._find_ctrl_d_trigger(data)
     assert data[start:end] == csi
     assert start == 2
 
 
-def test_find_ctrl_c_trigger_raw_byte_wins_when_it_is_earliest():
-    # The inverse of the above: when the raw 0x03 genuinely comes first,
+def test_find_ctrl_d_trigger_raw_byte_wins_when_it_is_earliest():
+    # The inverse of the above: when the raw 0x04 genuinely comes first,
     # it must still be the one detected.
-    data = b"ab\x03cd\x1b[99;5u"
-    start, end = agent_run._find_ctrl_c_trigger(data)
-    assert data[start:end] == b"\x03"
+    data = b"ab\x04cd\x1b[100;5u"
+    start, end = agent_run._find_ctrl_d_trigger(data)
+    assert data[start:end] == b"\x04"
     assert start == 2
 
 
 @pytest.mark.parametrize(
     "data",
     [
-        b"\x1b[27;1;99~",  # mod=1 -> no modifiers held at all, not Ctrl-C
-        b"\x1b[27;2;99~",  # mod=2 -> Shift only
-        b"\x1b[27;3;99~",  # mod=3 -> Shift+Alt, still no Ctrl bit
-        b"\x1b[99;1u",
-        b"\x1b[99:65;1u",  # alt-key-code present, but still no Ctrl modifier
-        b"\x1b[27;5;100~",  # codepoint 100 = 'd', not 'c'
-        b"\x1b[100;5u",  # kitty form, wrong codepoint
+        b"\x1b[27;1;100~",  # mod=1 -> no modifiers held at all, not Ctrl-D
+        b"\x1b[27;2;100~",  # mod=2 -> Shift only
+        b"\x1b[27;3;100~",  # mod=3 -> Shift+Alt, still no Ctrl bit
+        b"\x1b[100;1u",
+        b"\x1b[100:65;1u",  # alt-key-code present, but still no Ctrl modifier
+        b"\x1b[27;5;99~",  # codepoint 99 = 'c', not 'd'
+        b"\x1b[99;5u",  # kitty form, wrong codepoint
     ],
 )
-def test_find_ctrl_c_trigger_ignores_non_ctrl_csi_forms(data):
-    assert agent_run._find_ctrl_c_trigger(data) == (-1, -1)
+def test_find_ctrl_d_trigger_ignores_non_ctrl_csi_forms(data):
+    assert agent_run._find_ctrl_d_trigger(data) == (-1, -1)
 
 
 def test_split_trailing_incomplete_escape_holds_back_in_flight_csi():
@@ -788,7 +841,7 @@ def test_split_trailing_incomplete_escape_holds_back_in_flight_csi():
 
 
 def test_split_trailing_incomplete_escape_releases_terminated_sequence():
-    data = b"ab\x1b[27;5;99~"
+    data = b"ab\x1b[27;5;100~"
     forwardable, held = agent_run._split_trailing_incomplete_escape(data)
     assert forwardable == data
     assert held == b""
@@ -856,11 +909,11 @@ def test_scan_local_input_forwards_a_whole_bracketed_paste_intact():
     assert not in_paste
 
 
-def test_scan_local_input_does_not_detach_on_ctrl_c_inside_a_paste():
-    """A 0x03 byte in pasted content is data, not a keypress. Detaching on
+def test_scan_local_input_does_not_detach_on_ctrl_d_inside_a_paste():
+    """A 0x04 byte in pasted content is data, not a keypress. Detaching on
     it drops the session mid-paste and forwards only the fragment before
     the byte."""
-    data = b"\x1b[200~before\x03after\x1b[201~tail"
+    data = b"\x1b[200~before\x04after\x1b[201~tail"
 
     forwardable, held, detached, in_paste, _pb, _ps, _st = agent_run._scan_local_input_for_detach(data)
 
@@ -870,8 +923,8 @@ def test_scan_local_input_does_not_detach_on_ctrl_c_inside_a_paste():
     assert held == b""
 
 
-def test_scan_local_input_does_not_detach_on_literal_csi_ctrl_c_inside_a_paste():
-    data = b"\x1b[200~see \x1b[99;5u here\x1b[201~"
+def test_scan_local_input_does_not_detach_on_literal_csi_ctrl_d_inside_a_paste():
+    data = b"\x1b[200~see \x1b[100;5u here\x1b[201~"
 
     forwardable, _held, detached, in_paste, _pb, _ps, _st = agent_run._scan_local_input_for_detach(data)
 
@@ -882,14 +935,14 @@ def test_scan_local_input_does_not_detach_on_literal_csi_ctrl_c_inside_a_paste()
 
 def test_scan_local_input_carries_paste_state_across_reads():
     """A paste larger than one 4096-byte read spans several calls; the
-    in-paste flag has to persist or a 0x03 in a later chunk detaches."""
+    in-paste flag has to persist or a 0x04 in a later chunk detaches."""
     first = b"\x1b[200~" + b"x" * 20
     forwardable, _held, detached, in_paste, _pb, _ps, _st = agent_run._scan_local_input_for_detach(first)
     assert forwardable == first
     assert not detached
     assert in_paste
 
-    second = b"y\x03z\x1b[201~"
+    second = b"y\x04z\x1b[201~"
     forwardable, _held, detached, in_paste, _pb, _ps, _st = agent_run._scan_local_input_for_detach(
         second, in_paste
     )
@@ -899,7 +952,7 @@ def test_scan_local_input_carries_paste_state_across_reads():
 
 
 def test_scan_local_input_detaches_again_once_the_paste_has_ended():
-    data = b"\x1b[200~pasted\x1b[201~typed\x03rest"
+    data = b"\x1b[200~pasted\x1b[201~typed\x04rest"
 
     forwardable, _held, detached, in_paste, _pb, _ps, _st = agent_run._scan_local_input_for_detach(data)
 
@@ -908,8 +961,8 @@ def test_scan_local_input_detaches_again_once_the_paste_has_ended():
     assert not in_paste
 
 
-def test_scan_local_input_detaches_on_ctrl_c_before_a_paste_starts():
-    data = b"typed\x03\x1b[200~pasted\x1b[201~"
+def test_scan_local_input_detaches_on_ctrl_d_before_a_paste_starts():
+    data = b"typed\x04\x1b[200~pasted\x1b[201~"
 
     forwardable, _held, detached, _in_paste, _pb, _ps, _st = agent_run._scan_local_input_for_detach(data)
 
@@ -920,31 +973,31 @@ def test_scan_local_input_detaches_on_ctrl_c_before_a_paste_starts():
 @pytest.mark.parametrize(
     "trigger",
     [
-        b"\x1b[27;1000;99~",  # modifier value past three digits
-        b"\x1b[27;5;99:100~",  # subparameters on the codepoint
-        b"\x1b[27:1;5;99~",  # subparameters on the leading 27
+        b"\x1b[27;1000;100~",  # modifier value past three digits
+        b"\x1b[27;5;100:100~",  # subparameters on the codepoint
+        b"\x1b[27:1;5;100~",  # subparameters on the leading 27
     ],
 )
-def test_find_ctrl_c_trigger_recognizes_wide_modifiers_and_subparameters(trigger):
+def test_find_ctrl_d_trigger_recognizes_wide_modifiers_and_subparameters(trigger):
     """Conforming encodings the detector must not miss: a modifier bitmask
     above 999 (many modifiers held at once) and colon subparameters on the
     modifyOtherKeys form's own parameters."""
     data = b"ab" + trigger + b"cd"
-    start, end = agent_run._find_ctrl_c_trigger(data)
+    start, end = agent_run._find_ctrl_d_trigger(data)
     assert data[start:end] == trigger
 
 
-def test_attach_ctrl_c_via_csi_sequence_detaches_without_leaking(
+def test_attach_ctrl_d_via_csi_sequence_detaches_without_leaking(
     isolated_runs_root, isolated_log_root
 ):
     """Reproduces the real-world bug: iTerm2 (and any terminal honoring the
     kitty/CSI-u "disambiguate escape codes" keyboard protocol Claude Code's
-    TUI requests) sends Ctrl-C as `ESC[27;5;99~`, not a raw `\\x03` byte. A
-    detector that only looks for `\\x03` never fires, and the whole escape
+    TUI requests) sends Ctrl-D as `ESC[27;5;100~`, not a raw `\\x04` byte. A
+    detector that only looks for `\\x04` never fires, and the whole escape
     sequence leaks straight into the wrapped agent's stdin instead of
     detaching `attach` locally."""
     env = _environment(isolated_runs_root, isolated_log_root)
-    name = "attach-ctrlc-csi"
+    name = "attach-ctrld-csi"
     script = """\
 import os, sys, termios, tty
 fd = sys.stdin.fileno()
@@ -962,7 +1015,7 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
     process, master_fd = _spawn_attach(name, env, rows=24, cols=80)
     try:
         _read_until(master_fd, b"READY")
-        os.write(master_fd, b"ab\x1b[27;5;99~cd")
+        os.write(master_fd, b"ab\x1b[27;5;100~cd")
         assert process.wait(timeout=5) == 0
 
         log_path = isolated_log_root / name / "log"
@@ -981,7 +1034,7 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         _stop_run(state)
 
 
-def test_attach_ctrl_c_via_kitty_extended_csi_form_detaches_without_leaking(
+def test_attach_ctrl_d_via_kitty_extended_csi_form_detaches_without_leaking(
     isolated_runs_root, isolated_log_root
 ):
     """Terminals implementing the kitty keyboard protocol can send the
@@ -989,9 +1042,9 @@ def test_attach_ctrl_c_via_kitty_extended_csi_form_detaches_without_leaking(
     when Claude Code only requested the base disambiguation flag -- proves
     the whole attach pipeline (not just the unit-level regex) still
     detaches on one of those extended forms rather than only the minimal
-    `ESC[99;5u`."""
+    `ESC[100;5u`."""
     env = _environment(isolated_runs_root, isolated_log_root)
-    name = "attach-ctrlc-kitty-ext"
+    name = "attach-ctrld-kitty-ext"
     script = """\
 import os, sys, termios, tty
 fd = sys.stdin.fileno()
@@ -1010,7 +1063,7 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
     try:
         _read_until(master_fd, b"READY")
         # Alt-key-codes (65:67) + explicit press event type (:1) together.
-        os.write(master_fd, b"ab\x1b[99:65:67;5:1ucd")
+        os.write(master_fd, b"ab\x1b[100:65:67;5:1ucd")
         assert process.wait(timeout=5) == 0
 
         log_path = isolated_log_root / name / "log"
@@ -1029,15 +1082,15 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         _stop_run(state)
 
 
-def test_attach_ctrl_c_via_csi_split_across_two_reads_still_detaches(
+def test_attach_ctrl_d_via_csi_split_across_two_reads_still_detaches(
     isolated_runs_root, isolated_log_root
 ):
-    """The CSI-u Ctrl-C trigger can legitimately arrive split across two
+    """The CSI-u Ctrl-D trigger can legitimately arrive split across two
     local-terminal reads (e.g. a slow pty writer, or scheduler jitter). The
     held-back-prefix logic must reassemble it rather than either missing
     the detach or corrupting/duplicating forwarded bytes."""
     env = _environment(isolated_runs_root, isolated_log_root)
-    name = "attach-ctrlc-csi-split"
+    name = "attach-ctrld-csi-split"
     script = """\
 import os, sys, termios, tty
 fd = sys.stdin.fileno()
@@ -1057,7 +1110,7 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         _read_until(master_fd, b"READY")
         os.write(master_fd, b"ab\x1b[27;5")
         time.sleep(0.01)
-        os.write(master_fd, b";99~cd")
+        os.write(master_fd, b";100~cd")
         assert process.wait(timeout=5) == 0
 
         log_path = isolated_log_root / name / "log"
@@ -1282,7 +1335,7 @@ _BURST_SECONDS = 20.0
 # The starvation bug defers input servicing until the whole log backlog has
 # been replayed. At the client's 8192-byte-per-iteration read this backlog
 # takes over ten seconds, against a detach budget measured from t0 = the
-# instant \x03 is written.
+# instant \x04 is written.
 _DETACH_BUDGET_SECONDS = 1.5
 _BACKLOG_BYTES = 8 * 1024 * 1024
 # Rate at which the test consumes the client's output, standing in for a
@@ -1374,10 +1427,10 @@ def test_attach_detaches_promptly_during_a_continuous_output_burst(
     """Regression test for the log-drain starvation bug: attach's loop used
     to `continue` straight back to another log read whenever output was
     pending, so a wrapped agent that never lets up starved keystroke
-    forwarding, resize delivery, and Ctrl-C detection until the entire
+    forwarding, resize delivery, and Ctrl-D detection until the entire
     backlog had been replayed -- over ten seconds with the backlog here."""
     env = _environment(isolated_runs_root, isolated_log_root)
-    name = "attach-burst-ctrlc"
+    name = "attach-burst-ctrld"
     state = _launch_interactive(name, _BURST_SCRIPT, env)
     log = isolated_log_root / name / "log"
     _await_backlog(log)
@@ -1385,12 +1438,12 @@ def test_attach_detaches_promptly_during_a_continuous_output_burst(
     try:
         # tty.setraw uses TCSAFLUSH, which discards anything already queued
         # on stdin. Wait for raw mode to actually be established (ECHO off)
-        # before writing \x03, or the byte is silently dropped.
+        # before writing \x04, or the byte is silently dropped.
         _await_raw_mode(process, master_fd)
-        assert process.poll() is None, "attach exited before Ctrl-C was sent"
+        assert process.poll() is None, "attach exited before Ctrl-D was sent"
 
         t0 = time.monotonic()
-        os.write(master_fd, b"\x03")
+        os.write(master_fd, b"\x04")
         _drain_until_exit(process, master_fd, t0 + _DETACH_BUDGET_SECONDS)
         # _drain_until_exit returns early on EIO, which the kernel raises as
         # soon as attach closes the PTY slave -- before the child is reaped,
@@ -1697,7 +1750,7 @@ def test_flush_fifo_write_reports_zero_when_the_reader_is_backpressured():
 
 
 def test_drain_fifo_write_completes_a_short_write():
-    """Bytes typed before Ctrl-C are already committed to the agent, so the
+    """Bytes typed before Ctrl-D are already committed to the agent, so the
     detach path must keep writing past the first PIPE_BUF-sized chunk
     instead of dropping the remainder."""
     read_fd, write_fd = os.pipe()
@@ -1744,14 +1797,14 @@ def test_attach_forwards_a_large_paste_without_losing_bytes(
 ):
     """End-to-end guard against the two paste bugs together: a bracketed
     paste bigger than one 4096-byte read must reach the agent byte-for-byte,
-    with the paste markers intact and no spurious detach on the 0x03 byte
+    with the paste markers intact and no spurious detach on the 0x04 byte
     embedded in the payload."""
     env = _environment(isolated_runs_root, isolated_log_root)
     name = "attach-large-paste"
-    payload = ("line-%04d\n" % 0).join(f"seg{i:04d}\x03" for i in range(400))
+    payload = ("line-%04d\n" % 0).join(f"seg{i:04d}\x04" for i in range(400))
     pasted = "\x1b[200~" + payload + "\x1b[201~"
-    # Raw mode on the agent's own PTY: without it the kernel turns the 0x03
-    # bytes inside the paste into SIGINT and ICRNL rewrites the newlines,
+    # Raw mode on the agent's own PTY: without it the kernel treats the 0x04
+    # bytes inside the paste as EOF (VEOF) and ICRNL rewrites the newlines,
     # so the comparison would measure the tty discipline, not the forwarding.
     script = """\
 import os, sys, termios, tty
@@ -1781,7 +1834,7 @@ import time; time.sleep(30)
         report = output.split(b"GOT ")[-1].split(b"\n")[0].split()
         assert int(report[0]) == len(pasted.encode()), "paste was truncated"
         assert int(report[1]) == 1, "paste-start marker was lost"
-        assert process.poll() is None, "attach detached on a 0x03 inside the paste"
+        assert process.poll() is None, "attach detached on a 0x04 inside the paste"
     finally:
         _detach(process, master_fd)
         _stop_run(state)
@@ -1856,7 +1909,7 @@ def test_attach_restores_terminal_modes_on_signal_death(
 
 
 def test_escape_hold_timeout_tolerates_ssh_latency():
-    """A CSI Ctrl-C split across two reads is only reassembled if the first
+    """A CSI Ctrl-D split across two reads is only reassembled if the first
     fragment is still held when the second arrives. At 50ms the hold
     expired under real SSH round-trip latency, releasing the fragment as
     literal input -- the exact leak-through the detector prevents."""
@@ -1905,7 +1958,7 @@ def test_drain_resize_records_recovers_from_a_replaced_partial_record(monkeypatc
 def test_detach_flushes_typed_input_through_to_the_agent(
     isolated_runs_root, isolated_log_root
 ):
-    """Bytes typed before Ctrl-C are already committed to the agent, and a
+    """Bytes typed before Ctrl-D are already committed to the agent, and a
     single PIPE_BUF-sized write is not enough for a large pending buffer.
     Drives the real attach loop and has the wrapped agent report how much of
     a >PIPE_BUF burst actually arrived."""
@@ -1933,10 +1986,10 @@ import time; time.sleep(30)
     try:
         _read_until(master_fd, b"READY")
         # Type a burst, then detach in the same breath: everything before
-        # the \x03 must still reach the agent.
+        # the \x04 must still reach the agent.
         os.write(master_fd, typed)
         time.sleep(0.3)
-        os.write(master_fd, b"\x03")
+        os.write(master_fd, b"\x04")
 
         output = _read_until(master_fd, b"GOT ", timeout=15.0)
         got = int(output.split(b"GOT ")[-1].split(b"\n")[0])
@@ -2054,7 +2107,7 @@ def test_detach_warns_about_input_it_could_not_deliver(
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
 
     typed = b"q" * 4096
-    reads = [typed + b"\x03"]
+    reads = [typed + b"\x04"]
 
     def fake_read(fd, _n):
         return reads.pop(0) if reads else b""
@@ -2200,9 +2253,9 @@ def test_attach_returns_zero_when_its_terminal_peer_goes_away(
 def test_scan_local_input_gives_up_on_a_paste_that_never_closes():
     """An ESC[201~ that never arrives (paste aborted mid-flight, terminal
     reset, an emulator that drops the closer) must not latch the in-paste
-    state on forever. Ctrl-C is the only documented way out of attach, so a
+    state on forever. Ctrl-D is the only documented way out of attach, so a
     stuck latch strands the user in a raw-mode terminal with no in-band
-    escape and silently feeds the \\x03 to the agent instead."""
+    escape and silently feeds the \\x04 to the agent instead."""
     _f, _h, detached, in_paste, paste_bytes, _ps, _st = agent_run._scan_local_input_for_detach(
         b"\x1b[200~" + b"x" * 64
     )
@@ -2215,14 +2268,14 @@ def test_scan_local_input_gives_up_on_a_paste_that_never_closes():
     assert not in_paste, "in-paste latch never released without ESC[201~"
 
     _f, _h, detached, _ip, _pb, _ps, _st = agent_run._scan_local_input_for_detach(
-        b"\x03", in_paste, paste_bytes
+        b"\x04", in_paste, paste_bytes
     )
-    assert detached, "Ctrl-C detach permanently wedged by an unclosed paste"
+    assert detached, "Ctrl-D detach permanently wedged by an unclosed paste"
 
 
 def test_scan_local_input_keeps_a_genuine_large_paste_bracketed():
     """The latch budget must not cut a real paste short: a payload well
-    under the bound stays in-paste, so an embedded 0x03 is still content."""
+    under the bound stays in-paste, so an embedded 0x04 is still content."""
     payload = b"z" * (agent_run._MAX_PASTE_BYTES // 2)
     _f, _h, _d, in_paste, paste_bytes, _ps, _st = agent_run._scan_local_input_for_detach(
         b"\x1b[200~" + payload
@@ -2230,7 +2283,7 @@ def test_scan_local_input_keeps_a_genuine_large_paste_bracketed():
     assert in_paste
 
     _f, _h, detached, in_paste, _pb, _ps, _st = agent_run._scan_local_input_for_detach(
-        b"\x03still pasting", in_paste, paste_bytes
+        b"\x04still pasting", in_paste, paste_bytes
     )
     assert not detached, "a genuine large paste was cut short by the latch"
     assert in_paste
@@ -2240,7 +2293,7 @@ def test_scan_local_input_keeps_a_genuine_large_paste_bracketed():
 def test_release_or_resync_preserves_a_split_paste_start_marker(split):
     """ESC[200~ split across the hold deadline must still be recognized.
     Releasing the prefix as literal input destroys the marker: the next
-    read starts mid-sequence, in_paste stays False, and any 0x03 in the
+    read starts mid-sequence, in_paste stays False, and any 0x04 in the
     payload detaches mid-paste -- reproducing round 1's Critical #2.
 
     Two mechanisms cover this between them: distinctive prefixes (ESC[2 and
@@ -2249,7 +2302,7 @@ def test_release_or_resync_preserves_a_split_paste_start_marker(split):
     """
     marker = agent_run._PASTE_START
     prefix, rest = marker[:split], marker[split:]
-    payload = rest + b"pasted\x03text"
+    payload = rest + b"pasted\x04text"
 
     held, _deadline, released = agent_run._release_expired_held_escape(
         prefix, time.monotonic() - 0.001
@@ -2576,8 +2629,8 @@ def test_tail_discards_unflushable_stdout_instead_of_exiting_120(
 
 def test_scan_local_input_gives_up_on_a_stalled_paste_after_a_timeout():
     """The byte budget alone does not recover the common abort, which sends
-    almost no data: Ctrl-C mid-paste, a terminal reset, tmux forwarding the
-    opener but dropping the closer. An idle bound does, and Ctrl-C is
+    almost no data: Ctrl-D mid-paste, a terminal reset, tmux forwarding the
+    opener but dropping the closer. An idle bound does, and Ctrl-D is
     the only documented way out of attach."""
     _f, _h, _d, in_paste, paste_bytes, idle_since, started = (
         agent_run._scan_local_input_for_detach(b"\x1b[200~orphaned")
@@ -2587,7 +2640,7 @@ def test_scan_local_input_gives_up_on_a_stalled_paste_after_a_timeout():
     # Still inside the window: the paste is genuinely mid-flight.
     _f, _h, detached, in_paste, paste_bytes, idle_since, started = (
         agent_run._scan_local_input_for_detach(
-            b"\x03more", in_paste, paste_bytes, idle_since, started
+            b"\x04more", in_paste, paste_bytes, idle_since, started
         )
     )
     assert not detached, "gave up on a paste that was still in flight"
@@ -2595,9 +2648,9 @@ def test_scan_local_input_gives_up_on_a_stalled_paste_after_a_timeout():
     # Past the window with no closing marker.
     stale = idle_since - (agent_run._MAX_PASTE_IDLE_SECONDS + 1.0)
     _f, _h, detached, in_paste, _pb, _ps, _st = agent_run._scan_local_input_for_detach(
-        b"\x03", in_paste, paste_bytes, stale, started
+        b"\x04", in_paste, paste_bytes, stale, started
     )
-    assert detached, "Ctrl-C still wedged after a stalled paste timed out"
+    assert detached, "Ctrl-D still wedged after a stalled paste timed out"
     assert not in_paste
 
 
@@ -2605,7 +2658,7 @@ def test_scan_local_input_paste_timeout_measures_idleness_not_duration():
     """A large paste over a slow link trickles in for far longer than the
     idle bound. Timing from the opening marker expires the latch mid-stream,
     so the rest of the payload is rescanned as typed input and an embedded
-    0x03 truncates it -- destroying a legitimate paste, which is the very
+    0x04 truncates it -- destroying a legitimate paste, which is the very
     failure the bracketing exists to prevent. Each arriving chunk must
     restart the idle window (the separate total-duration ceiling, which is
     not renewable, is what still bounds the latch overall)."""
@@ -2620,7 +2673,7 @@ def test_scan_local_input_paste_timeout_measures_idleness_not_duration():
         aged = idle_since - (agent_run._MAX_PASTE_IDLE_SECONDS * 0.5)
         _f, _h, detached, in_paste, paste_bytes, idle_since, started = (
             agent_run._scan_local_input_for_detach(
-                b"payload\x03payload", in_paste, paste_bytes, aged, started
+                b"payload\x04payload", in_paste, paste_bytes, aged, started
             )
         )
         assert not detached, "a slow but live paste was interrupted"
@@ -2629,16 +2682,16 @@ def test_scan_local_input_paste_timeout_measures_idleness_not_duration():
     # Only an actually idle gap releases it.
     stalled = idle_since - (agent_run._MAX_PASTE_IDLE_SECONDS + 1.0)
     _f, _h, detached, in_paste, _pb, _ps, _st = agent_run._scan_local_input_for_detach(
-        b"\x03", in_paste, paste_bytes, stalled, started
+        b"\x04", in_paste, paste_bytes, stalled, started
     )
-    assert detached, "Ctrl-C wedged after the paste genuinely stalled"
+    assert detached, "Ctrl-D wedged after the paste genuinely stalled"
 
 
-def test_attach_recovers_ctrl_c_after_an_aborted_paste(
+def test_attach_recovers_ctrl_d_after_an_aborted_paste(
     isolated_runs_root, isolated_log_root, monkeypatch
 ):
     """End-to-end: an ESC[200~ with no closing marker must not strand the
-    user. The wrapped agent ignores SIGINT here so a forwarded \\x03 cannot
+    user. The wrapped agent ignores SIGINT here so a forwarded \\x04 cannot
     kill it -- otherwise attach exits because the agent died, which looks
     like a working detach but is not one."""
     env = _environment(isolated_runs_root, isolated_log_root)
@@ -2654,14 +2707,14 @@ def test_attach_recovers_ctrl_c_after_an_aborted_paste(
         _await_raw_mode(process, master_fd)
         os.write(master_fd, b"\x1b[200~orphaned text")
 
-        # Inside the paste window Ctrl-C is content, so attach stays put.
-        os.write(master_fd, b"\x03")
+        # Inside the paste window Ctrl-D is content, so attach stays put.
+        os.write(master_fd, b"\x04")
         time.sleep(0.5)
         assert process.poll() is None, "detached while a paste was in flight"
 
-        # Past the window the latch releases and Ctrl-C works again.
+        # Past the window the latch releases and Ctrl-D works again.
         time.sleep(agent_run._MAX_PASTE_IDLE_SECONDS + 1.0)
-        os.write(master_fd, b"\x03")
+        os.write(master_fd, b"\x04")
         deadline = time.monotonic() + 10.0
         while process.poll() is None and time.monotonic() < deadline:
             readable, _, _ = select.select([master_fd], [], [], 0.05)
@@ -2670,7 +2723,7 @@ def test_attach_recovers_ctrl_c_after_an_aborted_paste(
                     os.read(master_fd, 65536)
                 except OSError:
                     break
-        assert process.wait(timeout=5) == 0, "Ctrl-C never detached after the abort"
+        assert process.wait(timeout=5) == 0, "Ctrl-D never detached after the abort"
         assert (state / "status").read_text().strip() == "running", (
             "the agent died instead of attach detaching"
         )
@@ -2687,9 +2740,9 @@ def test_attach_does_not_detach_on_a_paste_whose_start_marker_was_split(
     """End-to-end mirror of the aborted-paste Critical. When ESC[200~ is
     split across a gap longer than the escape hold, the lone ESC is
     released as an ordinary keystroke; if the bytes that follow are not
-    rejoined to it, the payload is scanned as typed input and any 0x03
+    rejoined to it, the payload is scanned as typed input and any 0x04
     inside it detaches mid-paste. The agent ignores SIGINT so a forwarded
-    \\x03 cannot end the session by killing it instead."""
+    \\x04 cannot end the session by killing it instead."""
     env = _environment(isolated_runs_root, isolated_log_root)
     name = "attach-split-start"
     script = (
@@ -2709,11 +2762,11 @@ def test_attach_does_not_detach_on_a_paste_whose_start_marker_was_split(
         # Split the marker across a gap longer than _ESCAPE_HOLD_TIMEOUT_SECONDS.
         os.write(master_fd, b"\x1b")
         time.sleep(agent_run._ESCAPE_HOLD_TIMEOUT_SECONDS + 0.15)
-        os.write(master_fd, b"[200~payload\x03embedded\x1b[201~")
+        os.write(master_fd, b"[200~payload\x04embedded\x1b[201~")
         time.sleep(1.0)
 
         assert process.poll() is None, (
-            "attach detached on a 0x03 inside a paste whose start marker was split"
+            "attach detached on a 0x04 inside a paste whose start marker was split"
         )
     finally:
         if process.poll() is None:
@@ -2957,7 +3010,7 @@ def test_attach_warns_and_keeps_going_when_the_runner_speaks_another_version(
     isolated_runs_root, isolated_log_root, capsys
 ):
     """A session launched by a build with a different resize format must
-    still be attachable: keyboard passthrough and Ctrl-C detach are what
+    still be attachable: keyboard passthrough and Ctrl-D detach are what
     matter, and forwarding records the runner cannot read would move its
     terminal to a garbage size. (The SystemExit is the unrelated no-tty
     check firing, which confirms the version check did not exit first.)"""
@@ -3103,12 +3156,12 @@ def test_attach_does_not_interrupt_a_paste_that_trickles_in_slowly(
     link (a loaded SSH session, a terminal trickling the payload) takes
     longer end to end than the latch budget while never actually going
     idle. Timing from the opening marker expires the latch mid-stream, so
-    the rest of the payload is rescanned as typed input and the 0x03 bytes
+    the rest of the payload is rescanned as typed input and the 0x04 bytes
     in it detach -- truncating a legitimate paste. The agent ignores SIGINT
-    so a forwarded 0x03 cannot end the session by killing it instead."""
+    so a forwarded 0x04 cannot end the session by killing it instead."""
     env = _environment(isolated_runs_root, isolated_log_root)
     name = "attach-slow-paste"
-    chunks = [f"chunk{i:03d}\x03".encode() for i in range(8)]
+    chunks = [f"chunk{i:03d}\x04".encode() for i in range(8)]
     pasted = b"\x1b[200~" + b"".join(chunks) + b"\x1b[201~"
     state = _launch_interactive(name, _byte_accounting_script(len(pasted)), env)
     process, master_fd = _spawn_attach(name, env, rows=24, cols=80)
@@ -3184,11 +3237,11 @@ def test_attach_does_not_detach_on_a_paste_marker_split_by_a_long_gap(
         _read_until(master_fd, b"READY")
         os.write(master_fd, b"\x1b[2")
         time.sleep(agent_run._PASTE_MARKER_HOLD_SECONDS - 0.5)
-        os.write(master_fd, b"00~payload\x03embedded\x1b[201~")
+        os.write(master_fd, b"00~payload\x04embedded\x1b[201~")
         time.sleep(1.0)
 
         assert process.poll() is None, (
-            "detached on a 0x03 inside a paste whose marker was split by a long gap"
+            "detached on a 0x04 inside a paste whose marker was split by a long gap"
         )
     finally:
         if process.poll() is None:
@@ -3228,7 +3281,7 @@ def test_attach_reports_input_it_could_not_deliver_when_the_agent_dies(
     # A bare ESC, then nothing: the hold expires, the prefix is released and
     # forwarded, and the detach that follows must account for it.
     typed = b"\x1b"
-    reads = [typed, b"\x03"]
+    reads = [typed, b"\x04"]
 
     def fake_read(_fd, _n):
         return reads.pop(0) if reads else b""
@@ -3330,7 +3383,7 @@ def test_attach_does_not_duplicate_a_prefix_rejoined_across_three_reads(
 
 def test_scan_local_input_paste_latch_cannot_be_pinned_open_by_input():
     """The idle bound alone cannot end a paste that never stops receiving
-    bytes, and inside a paste every byte is payload -- so the Ctrl-C a user
+    bytes, and inside a paste every byte is payload -- so the Ctrl-D a user
     presses to escape a stuck paste is itself what renews the window. With
     only an idle bound, input arriving more often than once per idle period
     pins the latch open for the rest of the session: pressing the escape
@@ -3361,14 +3414,14 @@ def test_scan_local_input_paste_latch_cannot_be_pinned_open_by_input():
                 elapsed += interval
                 _f, _h, detached, in_paste, pb, idle, started = (
                     agent_run._scan_local_input_for_detach(
-                        b"\x03", in_paste, pb, idle, started
+                        b"\x04", in_paste, pb, idle, started
                     )
                 )
                 if detached:
                     break
 
             assert detached, (
-                f"Ctrl-C never reachable with input every {interval:.2f}s -- "
+                f"Ctrl-D never reachable with input every {interval:.2f}s -- "
                 f"the latch is pinned open by the user's own keypresses"
             )
             assert elapsed <= ceiling + interval + 1.0, (
@@ -3449,7 +3502,7 @@ def test_attach_survives_a_terminal_wider_than_the_record_range(
         "get_terminal_size",
         lambda _fd: os.terminal_size((oversized, oversized)),
     )
-    reads = [b"\x03"]
+    reads = [b"\x04"]
     monkeypatch.setattr(
         agent_run.os, "read", lambda _fd, _n: reads.pop(0) if reads else b""
     )
@@ -3566,7 +3619,7 @@ def test_drain_resize_records_accepts_a_record_carrying_a_magic_byte_payload(
 def test_resync_paste_marker_rejoins_a_split_paste_end_marker():
     """ESC[201~ splits across the hold exactly as ESC[200~ does. If the
     closer is not rejoined, in_paste never clears: the latch stays on and
-    every subsequent Ctrl-C is treated as paste content instead of a
+    every subsequent Ctrl-D is treated as paste content instead of a
     detach."""
     marker = agent_run._PASTE_END
     for split in (1, 2):
@@ -3578,7 +3631,7 @@ def test_resync_paste_marker_rejoins_a_split_paste_end_marker():
 
 def test_split_paste_end_marker_still_closes_the_paste():
     """End to end through the scanner: a paste whose closer was split must
-    leave in_paste False, so the next Ctrl-C detaches rather than being
+    leave in_paste False, so the next Ctrl-D detaches rather than being
     swallowed as payload."""
     marker = agent_run._PASTE_END
     for split in (1, 2):
@@ -3599,10 +3652,10 @@ def test_split_paste_end_marker_still_closes_the_paste():
 
         _f, _h, detached, _ip, _pb, _idle, _st = (
             agent_run._scan_local_input_for_detach(
-                b"\x03", in_paste, pb, idle, started
+                b"\x04", in_paste, pb, idle, started
             )
         )
-        assert detached, f"Ctrl-C swallowed after a closer split at {split}"
+        assert detached, f"Ctrl-D swallowed after a closer split at {split}"
 
 
 def test_attach_releases_the_already_sent_carry_after_the_rescan(

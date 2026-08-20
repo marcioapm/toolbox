@@ -777,7 +777,7 @@ agent-run status <name>                   # one-line status
 agent-run logs <name> [--tail N | --head N]    # last/first N lines (default --tail 50)
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
-agent-run attach <name>                   # attach interactively (Ctrl-C detaches)
+agent-run attach <name>                   # attach interactively (Ctrl-D detaches)
 agent-run kill <name> [SIGNAL]            # default TERM; KILL force-terminates
 agent-run reap [--dry-run] [--idle-hours N] [--min-age-hours N] [--force-unknown] [--name NAME]
                 [--all]
@@ -790,10 +790,11 @@ agent-run du [--by-run] [--top N] [--bytes|--json]  # disk usage; read-only
 
 Unlike `tail`, which only streams output, `attach` gives live keyboard and
 terminal-resize passthrough to an interactive run — it adopts the attached
-terminal's size immediately and after every subsequent resize. Ctrl-C
+terminal's size immediately and after every subsequent resize. Ctrl-D
 detaches the attach client locally, exiting 0, without touching the wrapped
-agent, which keeps running. Text pasted with bracketed paste is forwarded
-verbatim: a `0x03` byte or a literal Ctrl-C escape sequence inside a paste
+agent, which keeps running. Ctrl-C is forwarded to the wrapped agent like
+any other keystroke. Text pasted with bracketed paste is forwarded
+verbatim: a `0x04` byte or a literal Ctrl-D escape sequence inside a paste
 is content, not a detach keystroke. Multiple simultaneous attaches are
 allowed and all of them see the output, but only one should type at a time
 — each write is atomic up to `PIPE_BUF`, but a longer burst is split across
