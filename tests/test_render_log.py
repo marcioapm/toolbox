@@ -200,6 +200,123 @@ class TestRenderLogSizing:
 
 
 # ---------------------------------------------------------------------------
+# Geometry-aware replay — resizes are out-of-band (TIOCSWINSZ + SIGWINCH) and
+# never appear in the byte stream, so _render_log must apply a recorded
+# offset/cols/rows timeline by resizing the emulated screen mid-replay.
+# ---------------------------------------------------------------------------
+
+class TestRenderLogResizeTimeline:
+    def test_timeline_splits_replay_and_matches_manual_resize(self):
+        import pyte
+
+        raw = (
+            b"x" * 60 + b"\r\n"
+            + b"y" * 60 + b"\r\n"
+            + b"z" * 60 + b"\r\n"
+        )
+        split_a = len(b"x" * 60 + b"\r\n")
+        split_b = split_a + len(b"y" * 60 + b"\r\n")
+        resizes = [
+            {"offset": split_a, "cols": 40, "rows": 20},
+            {"offset": split_b, "cols": 100, "rows": 30},
+        ]
+
+        out = _render_log(raw, resizes=resizes)
+
+        screen = agent_run._new_pyte_screen(
+            pyte, agent_run._RENDER_LOG_DEFAULT_WIDTH,
+            agent_run._RENDER_LOG_DEFAULT_HEIGHT, agent_run._RENDER_LOG_DEFAULT_HISTORY,
+        )
+        stream = pyte.ByteStream(screen)
+        agent_run._feed_pyte(stream, raw[:split_a])
+        screen.resize(20, 40)
+        agent_run._feed_pyte(stream, raw[split_a:split_b])
+        screen.resize(30, 100)
+        agent_run._feed_pyte(stream, raw[split_b:])
+        expected = _serialize_screen(screen)
+
+        assert out == expected
+
+    def test_pyte_resize_argument_order_is_lines_then_columns(self):
+        """Regression pin: pyte.Screen.resize(lines, columns) -- the reverse
+        of this module's own (cols, rows) convention. Getting the order
+        backwards silently swaps width and height instead of raising."""
+        raw = b"x" * 60 + b"\r\n" + b"after resize\r\n"
+        split = len(b"x" * 60 + b"\r\n")
+        # A narrow-but-tall resize (10 cols, 40 rows): if _render_log passed
+        # (cols, rows) into pyte's (lines, columns) signature, the emulator
+        # would end up 40 columns wide, so this 12-char line would survive
+        # intact instead of being cut to 10 characters.
+        out = _render_log(raw, resizes=[{"offset": split, "cols": 10, "rows": 40}])
+        assert "after resize" not in out
+        assert "after re" in out
+
+    @pytest.mark.parametrize(
+        "bad_record",
+        [
+            pytest.param("not-a-dict", id="not-a-mapping"),
+            pytest.param({"cols": 80, "rows": 24}, id="missing-offset"),
+            pytest.param({"offset": 3, "rows": 24}, id="missing-cols"),
+            pytest.param({"offset": 3, "cols": 80}, id="missing-rows"),
+            pytest.param({"offset": "3", "cols": 80, "rows": 24}, id="non-integer-offset"),
+            pytest.param({"offset": 3, "cols": "80", "rows": 24}, id="non-integer-cols"),
+            pytest.param({"offset": 3, "cols": 80, "rows": 24.5}, id="non-integer-rows"),
+            pytest.param({"offset": 3, "cols": 0, "rows": 24}, id="cols-zero"),
+            pytest.param({"offset": 3, "cols": 80, "rows": 0}, id="rows-zero"),
+            pytest.param(
+                {"offset": 3, "cols": 80, "rows": 3000}, id="rows-out-of-range"
+            ),
+            pytest.param(
+                {"offset": 3, "cols": 3000, "rows": 24}, id="cols-out-of-range"
+            ),
+            pytest.param({"offset": -1, "cols": 80, "rows": 24}, id="negative-offset"),
+            pytest.param({"offset": 999999, "cols": 80, "rows": 24}, id="offset-past-eof"),
+        ],
+    )
+    def test_malformed_or_out_of_range_record_is_skipped_without_raising(self, bad_record):
+        raw = b"hello world\r\n"
+        # A single bad record must simply be dropped, leaving the render
+        # identical to no timeline at all -- never an exception.
+        out = _render_log(raw, resizes=[bad_record])
+        assert out == _render_log(raw)
+
+    def test_non_monotonic_offset_is_skipped(self):
+        raw = b"a" * 20 + b"\r\n" + b"b" * 20 + b"\r\n"
+        first_split = len(b"a" * 20 + b"\r\n")
+        resizes = [
+            {"offset": first_split, "cols": 40, "rows": 20},
+            # Same offset again: not strictly greater than the last accepted
+            # one, so this second record must be dropped.
+            {"offset": first_split, "cols": 10, "rows": 5},
+            # Offset going backwards must also be dropped.
+            {"offset": 1, "cols": 10, "rows": 5},
+        ]
+        out = _render_log(raw, resizes=resizes)
+        expected = _render_log(raw, resizes=[{"offset": first_split, "cols": 40, "rows": 20}])
+        assert out == expected
+
+    def test_absent_timeline_reproduces_current_render(self, moon_log_bytes):
+        assert _render_log(moon_log_bytes, resizes=None) == _render_log(moon_log_bytes)
+
+    def test_empty_timeline_reproduces_current_render(self, moon_log_bytes):
+        assert _render_log(moon_log_bytes, resizes=[]) == _render_log(moon_log_bytes)
+
+    def test_validate_resize_timeline_helper_directly(self):
+        raw_len = 100
+        resizes = [
+            {"offset": 10, "cols": 80, "rows": 24},
+            {"offset": 5, "cols": 80, "rows": 24},  # non-monotonic, dropped
+            {"offset": 200, "cols": 80, "rows": 24},  # past EOF, dropped
+            "garbage",  # malformed shape, dropped
+            {"offset": 50, "cols": 80, "rows": 24},
+        ]
+        assert agent_run._validate_resize_timeline(resizes, raw_len) == [
+            (10, 80, 24),
+            (50, 80, 24),
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Incremental pyte feed — every partition must produce the same transcript as
 # a whole-file feed under the renderer's shared screen semantics.
 # ---------------------------------------------------------------------------

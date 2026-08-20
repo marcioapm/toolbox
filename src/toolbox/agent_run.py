@@ -5669,16 +5669,61 @@ def _serialize_screen(screen) -> str:
     return "\n".join(deduped) + "\n"
 
 
+def _validate_resize_timeline(
+    resizes: Optional[Sequence[dict]], raw_len: int
+) -> List[Tuple[int, int, int]]:
+    """Filter a raw resize timeline to well-formed, strictly increasing,
+    in-bounds ``(offset, cols, rows)`` tuples, in the input's order.
+
+    Each record is validated independently: a malformed shape, a
+    non-integer field, a dimension outside ``1..MAX_TERMINAL_DIMENSION``,
+    an offset not strictly greater than the last accepted one, or an offset
+    past the end of ``raw`` is dropped rather than raised, so a corrupt
+    timeline degrades to fewer resize points instead of an exception.
+    """
+    if not resizes:
+        return []
+    accepted: List[Tuple[int, int, int]] = []
+    last_offset = -1
+    for record in resizes:
+        try:
+            offset = record["offset"]
+            cols = record["cols"]
+            rows = record["rows"]
+        except (TypeError, KeyError):
+            continue
+        if not (isinstance(offset, int) and isinstance(cols, int) and isinstance(rows, int)):
+            continue
+        if not (1 <= cols <= MAX_TERMINAL_DIMENSION and 1 <= rows <= MAX_TERMINAL_DIMENSION):
+            continue
+        if offset <= last_offset or offset > raw_len:
+            continue
+        accepted.append((offset, cols, rows))
+        last_offset = offset
+    return accepted
+
+
 def _render_log(
     raw: bytes,
     width: int = _RENDER_LOG_DEFAULT_WIDTH,
     height: int = _RENDER_LOG_DEFAULT_HEIGHT,
     history: int = _RENDER_LOG_DEFAULT_HISTORY,
+    resizes: Optional[Sequence[dict]] = None,
 ) -> str:
     """Render a raw PTY-captured log (with ANSI/Ink redraw artifacts) into a
     plain-text transcript by replaying the byte stream through a VT100
     emulator (pyte). Returns the deduplicated screen history + final visible
     viewport, joined with newlines.
+
+    ``resizes`` is an optional timeline of ``{"offset", "cols", "rows"}``
+    records sorted by offset -- a resize is out-of-band (TIOCSWINSZ +
+    SIGWINCH), so it never appears in ``raw`` itself, and the recorded
+    offset is the only way to know where the geometry changed. ``raw`` is
+    fed in segments split at each valid offset, calling
+    ``screen.resize(rows, cols)`` between segments -- pyte's own argument
+    order is (lines, columns), the reverse of this function's. With
+    ``resizes`` absent or empty the render is byte-identical to feeding
+    ``raw`` whole.
 
     Pyte is loaded lazily so the rest of agent-run keeps working even if the
     extra is not installed (and so we get a clear error message when it is
@@ -5695,8 +5740,14 @@ def _render_log(
 
     screen = _new_pyte_screen(pyte, width, height, history)
     stream = pyte.ByteStream(screen)
+    timeline = _validate_resize_timeline(resizes, len(raw))
     try:
-        _feed_pyte(stream, raw)
+        start = 0
+        for offset, cols, rows in timeline:
+            _feed_pyte(stream, raw[start:offset])
+            screen.resize(rows, cols)
+            start = offset
+        _feed_pyte(stream, raw[start:])
     except Exception:
         return _strip_ansi_fallback(raw)
 
