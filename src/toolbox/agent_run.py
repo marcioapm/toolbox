@@ -2915,8 +2915,16 @@ def _watch_validate_repo_arg(repo_arg: Optional[str]) -> Optional[str]:
 _HOOK_MAX_EVENTS_ENV: Optional[int] = _safe_int(
     os.environ.get("AGENT_RUN_HOOK_MAX_EVENTS", "")
 )
+# Upper bound on the retained-event cap. The cap check reads
+# (cap + 1) * _HOOK_MAX_LINE_BYTES bytes, so an unclamped value makes that size
+# unrepresentable and the read raises where cmd_hook's mandatory success would
+# hide it. At this limit the window is ~8 GiB, far beyond any real hook volume.
+_HOOK_MAX_EVENTS_LIMIT: int = 1_000_000
+
 AGENT_RUN_HOOK_MAX_EVENTS: int = (
-    _HOOK_MAX_EVENTS_ENV if _HOOK_MAX_EVENTS_ENV and _HOOK_MAX_EVENTS_ENV > 0 else 1000
+    min(_HOOK_MAX_EVENTS_ENV, _HOOK_MAX_EVENTS_LIMIT)
+    if _HOOK_MAX_EVENTS_ENV and _HOOK_MAX_EVENTS_ENV > 0
+    else 1000
 )
 
 # Stdin payload cap. More than this is transcript content, not a signal.
@@ -3348,11 +3356,10 @@ def _hook_open_append(dir_fd: int) -> int:
     """Open hooks.jsonl for atomic append relative to dir_fd.
 
     Concurrent creators racing O_CREAT can each get ENOENT even though the
-    directory exists and the flags ask for creation: measured at ~5% of 40
-    simultaneous writers, with an immediate retry always succeeding and
-    pre-creating the file eliminating it entirely. Since cmd_hook must return 0
-    on every path, an unretried failure here silently drops the record it was
-    called to persist.
+    directory exists and the flags ask for creation. The condition is transient
+    and confined to creation. Since cmd_hook must return 0 on every path, an
+    unretried failure here is indistinguishable from a successful append and
+    silently drops the record it was called to persist.
 
     Retries ENOENT only. Every other errno propagates on the first attempt, and
     O_NOFOLLOW/O_NONBLOCK apply to each attempt, so a symlink or FIFO planted
@@ -3383,9 +3390,16 @@ def _hook_append_record(log_dir: Path, record: dict) -> None:
     # that many maximal lines with no slack, so crossing it makes
     # _hooks_read_tail discard the partial leading line and report at most
     # AGENT_RUN_HOOK_MAX_EVENTS - 1 — below the cap forever, disabling it.
-    existing, truncated = _hooks_read_tail(
-        log_dir, (AGENT_RUN_HOOK_MAX_EVENTS + 1) * _HOOK_MAX_LINE_BYTES
-    )
+    try:
+        existing, truncated = _hooks_read_tail(
+            log_dir, (AGENT_RUN_HOOK_MAX_EVENTS + 1) * _HOOK_MAX_LINE_BYTES
+        )
+    except (OverflowError, ValueError) as exc:
+        # An unrepresentable read size means the cap cannot be decided. Say so
+        # and drop this record: cmd_hook must return 0 either way, so an
+        # exception here would be indistinguishable from a successful append.
+        print(f"agent-run hook: cannot size the event-cap read: {exc}", file=sys.stderr)
+        return
     # A truncated read means the file is larger than the cap could ever need,
     # which is itself proof of being at the cap; counting is only meaningful
     # when the whole relevant region was read.
