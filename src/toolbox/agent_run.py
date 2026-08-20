@@ -414,6 +414,15 @@ LOGS_MAX_TOTAL_BYTES = 32 * 1024
 # scrollback bounded limits the resident cost of a long-lived HistoryScreen.
 _RENDER_LOG_DEFAULT_WIDTH = 120
 _RENDER_LOG_DEFAULT_HEIGHT = 60
+
+# Window size applied to a run's PTY at launch. A pty.fork()ed child inherits a
+# 0x0 winsize, so without this each agent falls back to a size of its own
+# choosing -- OpenCode picks 80x24 -- which the renderer cannot observe and does
+# not match. Setting it makes the geometry a recorded fact rather than an
+# inference, and matching the renderer defaults means absolute cursor positions
+# replay into the coordinate system they were computed for.
+_LAUNCH_TERMINAL_COLS = _RENDER_LOG_DEFAULT_WIDTH
+_LAUNCH_TERMINAL_ROWS = _RENDER_LOG_DEFAULT_HEIGHT
 _RENDER_LOG_DEFAULT_HISTORY = 2048
 
 # Statuses that are conclusively terminal: the run will never transition
@@ -9200,6 +9209,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         "interactive": args.interactive,
         "harness": harness,
         "agent_run_version": TOOLBOX_VERSION,
+        "terminal": {"cols": _LAUNCH_TERMINAL_COLS, "rows": _LAUNCH_TERMINAL_ROWS},
     }
     if is_managed:
         launch_run_json["model"] = getattr(args, "model", None)
@@ -10477,6 +10487,10 @@ def _run_interactive(
     with _block_handled_runner_signals():
         pty_pid, master_fd = pty.fork()
         if pty_pid != 0:
+            # Size the PTY before the child can query it. Losing that race is
+            # survivable rather than corrupting: the ioctl raises SIGWINCH, so an
+            # agent that already read 0x0 re-queries and repaints at this size.
+            _apply_resize(master_fd, _LAUNCH_TERMINAL_COLS, _LAUNCH_TERMINAL_ROWS)
             _publish_or_reap_child(state_dir, "pty_pid", pty_pid)
         else:
             _reset_runner_signal_handlers()
