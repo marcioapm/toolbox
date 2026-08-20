@@ -1206,7 +1206,108 @@ Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
 | `prompt` | copy of the `-f`/`--prompt-file` input, if one was given |
 | `session.json` | session attribution (managed mode only): `session_id`, `harness`, `acquisition`, `confidence`, `observed_at`; absent for raw runs |
 | `run.json` | launch and terminal facts (all modes): `name`, `argv`, `command`, `cwd`, `started_at`, `harness`, `interactive`, `model`, `agent_mode`; augmented with `ended_at`, `exit_code`, `status` at exit |
+| `hooks.jsonl` | append-only record of harness hook notifications, one JSON object per line: `event`, `kind`, `at`, `harness`, `message`, `payload`. Absent until a hook fires; agent-run never writes it itself, and never edits a harness config to make it happen. See [Harness hooks](#harness-hooks) |
 | `tmp/` | per-run scratch dir exported as `TMPDIR` and `BUN_TMPDIR`; removed only by `agent-run reap`, never on normal run exit |
+
+### Harness hooks
+
+A harness can tell `agent-run` when its agent finished a turn or stopped to ask
+for permission. `agent-run hook <event>` appends one record to the run's
+`hooks.jsonl`, and `agent-run watch --json` reports an aggregate, so a
+supervisor learns within about a second instead of inferring it from a silent
+log.
+
+**Hooks are opt-in and you configure them.** `agent-run` never writes, edits or
+injects harness configuration; it only exports `AGENT_RUN_NAME`,
+`AGENT_RUN_STATE_DIR` and `AGENT_RUN_LOG_DIR` into the agent's environment so
+the hook can identify the run without being told.
+
+`agent-run hook` always exits 0 and writes nothing to stdout, on every failure
+path including an unknown run, an unwritable log directory and malformed
+arguments. A hook that failed loudly would be worse than one that did nothing:
+claude treats a non-zero exit from a `Stop` hook as a decision to block, and
+codex warns on any output from a notify program.
+
+#### claude — `~/.claude/settings.json`
+
+```json
+{"hooks": {
+  "Stop": [{"matcher": "", "hooks": [{"type": "command",
+    "command": "agent-run hook stop"}]}],
+  "PermissionRequest": [{"matcher": "", "hooks": [{"type": "command",
+    "command": "agent-run hook permission-request"}]}]}}
+```
+
+The payload arrives on stdin and carries `last_assistant_message`.
+
+#### codex — `~/.codex/config.toml`
+
+```toml
+notify = ["agent-run", "hook", "turn-complete"]
+```
+
+The payload arrives as `argv[1]` and carries `last-assistant-message`. codex
+reports only turn completion this way. Its richer hook engine does have a
+`PermissionRequest` event, but enabling it needs
+`--dangerously-bypass-hook-trust`, which `codex app-server` — the binary that
+managed mode drives — does not accept, so `permission_required` is not
+available for managed codex runs.
+
+#### opencode — `~/.config/opencode/plugin/agent-run-hook.js`
+
+```js
+import { execFileSync } from "child_process"
+
+export const AgentRunHook = async () => ({
+  event: async ({ event }) => {
+    const kind = event.type === "session.idle" ? "session-idle"
+      : event.type.startsWith("permission.") ? "permission-request"
+      : null
+    if (!kind) return
+    execFileSync("agent-run", ["hook", kind, "--json", JSON.stringify(event)])
+  },
+})
+```
+
+The export must be a named factory returning an object of handlers. A default
+export such as `export default {onEvent}` loads without complaint and is never
+invoked, so the hook silently never fires.
+
+#### What a consumer reads
+
+The event name is yours to choose; `kind` is what a supervisor should branch on.
+It normalises each harness's vocabulary into `turn_complete`,
+`permission_required`, `session_start` or `other`, preferring evidence in the
+payload over the event name, so renaming your hook cannot break a consumer.
+
+```console
+$ agent-run watch my-run --json | jq .hooks
+{
+  "count": 3,
+  "last": {
+    "event": "stop",
+    "kind": "turn_complete",
+    "at": "2026-08-19T15:06:29Z",
+    "harness": "claude",
+    "message": "Refactor done; the suite is green at 1199 passed."
+  },
+  "last_event_age_s": 0.94,
+  "events": {"stop": 2, "permission-request": 1},
+  "kinds": {"turn_complete": 2, "permission_required": 1},
+  "at_cap": false,
+  "truncated": false
+}
+```
+
+`message` is the last assistant turn when the payload carries one, kept to
+4096 characters. Records are capped at `AGENT_RUN_HOOK_MAX_EVENTS` (default
+1000) per run; past that the hook drops the record rather than growing the file
+without bound.
+
+`scripts/verify-hook-delivery` exercises the whole chain — hook invoked,
+`AGENT_RUN_NAME` inherited, `hooks.jsonl` written, `watch` reporting it — for
+each harness in one-shot and interactive mode, and records the harness versions
+it tested against.
 
 ### Design notes
 

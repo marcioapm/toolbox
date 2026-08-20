@@ -155,10 +155,60 @@ Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs):
     run.json     immutable launch facts + exit facts (all modes): name, argv,
                  command, cwd, started_at, harness, interactive, model,
                  agent_mode; augmented with ended_at, exit_code, status on exit
+    hooks.jsonl  append-only log written by `agent-run hook`; one JSON object
+                 per line (event, kind, timestamp, harness, message excerpt,
+                 payload excerpt). kind normalises event/payload into
+                 turn_complete/permission_required/session_start/other across
+                 harnesses; message is the last assistant turn, when the
+                 payload carries one. Absent until a hook fires; agent-run
+                 never writes it itself. See "Harness hook integration" below.
     session-acquire.log  diagnostic log for session acquisition (managed mode)
     tmp/         per-run scratch dir exported as TMPDIR and BUN_TMPDIR (see
                  above); removed only by `agent-run reap`, never on normal
                  run exit
+
+Harness hook integration. Configure these yourself; agent-run never edits a
+harness config file:
+
+    claude (~/.claude/settings.json):
+        {"hooks": {
+          "Stop": [{"matcher": "", "hooks": [{"type": "command",
+            "command": "agent-run hook stop"}]}],
+          "PermissionRequest": [{"matcher": "", "hooks": [{"type": "command",
+            "command": "agent-run hook permission-request"}]}]}}
+
+    codex (~/.codex/config.toml):
+        notify = ["agent-run", "hook", "turn-complete"]
+
+        codex reports only turn completion this way: notify emits a single
+        agent-turn-complete event. Its richer hook engine, which does have a
+        PermissionRequest event, requires --dangerously-bypass-hook-trust,
+        which `codex app-server` -- the binary managed mode drives -- does not
+        accept, so permission_required is unavailable for managed codex runs.
+
+    opencode (~/.config/opencode/plugin/agent-run-hook.js; opencode plugins
+    are JavaScript, so the plugin shells out. The export must be a named
+    factory returning an object of handlers -- `export default {onEvent}` is
+    silently never invoked):
+        import { execFileSync } from "child_process"
+
+        export const AgentRunHook = async () => ({
+          event: async ({ event }) => {
+            const kind = event.type === "session.idle" ? "session-idle"
+              : event.type.startsWith("permission.") ? "permission-request"
+              : null
+            if (!kind) return
+            // Array argv: no shell, so event contents cannot inject.
+            execFileSync("agent-run", ["hook", kind, "--json",
+              JSON.stringify(event)])
+          },
+        })
+
+The runner exports AGENT_RUN_NAME, AGENT_RUN_STATE_DIR, and AGENT_RUN_LOG_DIR
+into the agent's environment, so a hook need not know how the run was
+launched. `agent-run hook` resolves the run from --name, else AGENT_RUN_NAME,
+else by matching its own process ancestry against a recorded pid/pgid, and
+exits 0 silently when none of those resolve.
 
 `status` reports "not running (log preserved)" when the state dir is gone
 but the log dir survived. `logs`/`tail`/`clean` always read from the log
@@ -2958,6 +3008,788 @@ def _watch_validate_repo_arg(repo_arg: Optional[str]) -> Optional[str]:
     return str(Path(repo_arg).resolve())
 
 
+# ---------------------------------------------------------------------------
+# agent-run hook — harness hook receiver
+# ---------------------------------------------------------------------------
+
+# Hook events retained per run. Further events are dropped. Advisory under
+# concurrency: N racing writers may overshoot by up to N records. A missing,
+# non-integer, or non-positive AGENT_RUN_HOOK_MAX_EVENTS falls back to 1000 —
+# the hook must not fail to start over a malformed environment.
+_HOOK_MAX_EVENTS_ENV: Optional[int] = _safe_int(
+    os.environ.get("AGENT_RUN_HOOK_MAX_EVENTS", "")
+)
+# Upper bound on the retained-event cap. The cap check reads
+# (cap + 1) * _HOOK_MAX_LINE_BYTES bytes, so an unclamped value makes that size
+# unrepresentable and the read raises where cmd_hook's mandatory success would
+# hide it. At this limit the window is ~8 GiB, far beyond any real hook volume.
+_HOOK_MAX_EVENTS_LIMIT: int = 1_000_000
+
+AGENT_RUN_HOOK_MAX_EVENTS: int = (
+    min(_HOOK_MAX_EVENTS_ENV, _HOOK_MAX_EVENTS_LIMIT)
+    if _HOOK_MAX_EVENTS_ENV and _HOOK_MAX_EVENTS_ENV > 0
+    else 1000
+)
+
+# Stdin payload cap. More than this is transcript content, not a signal.
+_HOOK_STDIN_MAX_BYTES: int = 64 * 1024
+
+# Wall-clock ceiling on the stdin read, so a harness that spawns the hook with
+# stdin held open by a silent writer still gets its turn back.
+_HOOK_STDIN_TIMEOUT_SECONDS: float = 2.0
+
+# A single os.write() to an O_APPEND fd on a local regular file is atomic
+# against other appenders regardless of size: POSIX makes the offset-update
+# and the write one operation for O_APPEND, so no writer can observe or
+# produce a torn line. PIPE_BUF (512 on macOS, 4096 on Linux) governs pipes
+# and FIFOs, not regular files, and does not bound this. Measured directly:
+# 40 concurrent processes x 25 lines each, every line checked for exact
+# length and writer identity, 0 torn lines at 512, 4096, 8192 and 16384
+# bytes. This guarantee is specific to local filesystems — NFS does not
+# make O_APPEND atomic, so AGENT_RUN_LOG_DIR must not be a network mount.
+_HOOK_MAX_LINE_BYTES: int = 8192
+
+# Event name cap, in JSON-encoded bytes rather than characters: ensure_ascii
+# escapes one astral char to 12 bytes, so a character cap bounds nothing.
+_HOOK_EVENT_MAX_BYTES: int = 64
+
+# Read ceiling for hooks.jsonl. Beyond this the tail is ignored rather than
+# buffered, so watch stays bounded on a file an agent has been appending to.
+# Deliberately not equal to AGENT_RUN_HOOK_MAX_EVENTS * _HOOK_MAX_LINE_BYTES
+# (1000 * 8192 = 8 MB) so a raised event cap does not silently collide with
+# this bound.
+_HOOKS_READ_MAX_BYTES: int = 32 * 1024 * 1024
+
+# Per-field payload cap, so one event cannot become a transcript store.
+# Payload fields are context, not the point of the record — message is.
+_HOOK_PAYLOAD_TRUNCATE_CHARS: int = 200
+
+# The assistant's last turn is what makes a wake actionable; it gets its own,
+# much larger budget than payload fields and is clipped last, not uniformly.
+_HOOK_MESSAGE_MAX_CHARS: int = 4096
+
+# Ancestry walk depth. A hook runs as a grandchild of the agent at worst;
+# 10 hops covers wrapper shells without walking to init on a broken ppid chain.
+_HOOK_ANCESTRY_MAX_HOPS: int = 10
+
+
+def _hook_resolve_run(name_override: Optional[str]) -> Optional[tuple[str, str]]:
+    """Return (run_name, resolved_by) for this hook invocation, or None.
+
+    Tries --name, then AGENT_RUN_NAME, then the caller's process ancestry; the
+    name must be valid and have an existing log dir. An explicitly-set but
+    unresolvable name returns None rather than falling through to ancestry, so
+    a stale AGENT_RUN_NAME cannot misattribute events to a neighbouring run.
+    Never raises.
+    """
+    if name_override:
+        return _hook_check_name(name_override, "name")
+
+    env_name = os.environ.get("AGENT_RUN_NAME", "").strip()
+    if env_name:
+        return _hook_check_name(env_name, "env")
+
+    ancestors = _hook_ancestor_pids()
+    if not ancestors:
+        return None
+
+    # setsid makes the runner its own session leader: sid == pgid == pid, so a
+    # hook in the run's session matches on pgid even with no ppid link left.
+    try:
+        my_sid: Optional[int] = os.getsid(0)
+    except OSError:
+        my_sid = None
+
+    try:
+        names = _real_subdir_names(STATE_ROOT)
+    except OSError:
+        return None
+
+    sid_matches: list[str] = []
+    for name in sorted(names):
+        if _hook_check_name(name, "ancestry") is None:
+            continue
+        entry = STATE_ROOT / name
+        pids = {
+            _safe_int(_read(entry / f))
+            for f in ("pid", "pgid", "pty_pid")
+        }
+        if pids & ancestors:
+            return name, "ancestry"  # direct ancestry beats a session match
+        if my_sid is not None and _safe_int(_read(entry / "pgid")) == my_sid:
+            sid_matches.append(name)
+
+    # Two runs in one session cannot be told apart; attribute to neither.
+    if len(sid_matches) == 1:
+        return sid_matches[0], "ancestry"
+    return None
+
+
+def _hook_check_name(name: str, resolved_by: str) -> Optional[tuple[str, str]]:
+    """Return (name, resolved_by) if name is a valid run with a log dir."""
+    try:
+        _validate_run_name(name)
+    except SystemExit:
+        return None
+    return (name, resolved_by) if _log_dir(name).is_dir() else None
+
+
+def _hook_ancestor_pids() -> set[int]:
+    """Pids of this process's ancestors, up to _HOOK_ANCESTRY_MAX_HOPS hops.
+
+    Reads /proc on Linux and falls back to `ps` elsewhere. Stops at pid 1 or at
+    the first unreadable link; a partial chain still resolves nearer ancestors.
+    """
+    pids: set[int] = set()
+    pid = os.getppid()
+    for _ in range(_HOOK_ANCESTRY_MAX_HOPS):
+        if pid <= 1:
+            break
+        pids.add(pid)
+        fields = _proc_stat_fields(pid)
+        parent = _safe_int(fields[1]) if fields else _safe_int(_ps_field(pid, "ppid") or "")
+        if parent is None:
+            break
+        pid = parent
+    return pids
+
+
+def _hook_parse_json(text: str) -> Any:
+    """Parse text as JSON, or return {"raw": excerpt} if it is not JSON.
+
+    RecursionError is a decode failure like any other here: json.loads recurses
+    per nesting level and blows the stack well before it runs out of input.
+    """
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        return {"raw": text[:_HOOK_PAYLOAD_TRUNCATE_CHARS]}
+
+
+def _hook_read_stdin() -> bytes:
+    """Read up to _HOOK_STDIN_MAX_BYTES from stdin, or b"" if it is a tty.
+
+    Returns within _HOOK_STDIN_TIMEOUT_SECONDS even if a writer holds the pipe
+    open without sending EOF: the deadline is re-checked before every select,
+    so total wall time is bounded regardless of how the writer chunks its data.
+    """
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return b""
+        fd = sys.stdin.fileno()
+    except (OSError, AttributeError, ValueError):
+        return b""
+
+    deadline = time.monotonic() + _HOOK_STDIN_TIMEOUT_SECONDS
+    chunks: list[bytes] = []
+    total = 0
+    while total < _HOOK_STDIN_MAX_BYTES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                break
+            chunk = os.read(fd, min(65536, _HOOK_STDIN_MAX_BYTES - total))
+        except (BlockingIOError, InterruptedError):
+            continue
+        except (OSError, ValueError):
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def _hook_read_payload(
+    json_flag: Optional[str],
+    extra_argv: list[str],
+) -> tuple[Any, str]:
+    """Return (payload, source) for the harness that invoked this hook.
+
+    Each harness delivers its payload differently: opencode via --json, codex
+    as argv[1], claude on stdin. Tries them in that order and falls back to
+    ({}, "none"). Non-JSON input becomes {"raw": excerpt} rather than an error.
+    """
+    if json_flag is not None:
+        return _hook_parse_json(json_flag), "flag"
+
+    if extra_argv and extra_argv[0][:1] in ("{", "["):
+        return _hook_parse_json(extra_argv[0]), "argv"
+
+    raw = _hook_read_stdin()
+    if not raw:
+        return {}, "none"
+    return _hook_parse_json(raw.decode("utf-8", errors="replace").strip()), "stdin"
+
+
+def _hook_extract_message(payload: Any) -> Optional[str]:
+    """Return the assistant's last turn from payload, or None.
+
+    Checks claude's last_assistant_message, codex's last-assistant-message,
+    then opencode's properties.message / properties.text, in that order.
+    A present but non-string value is skipped, not raised on. The result is
+    clipped to _HOOK_MESSAGE_MAX_CHARS encoded bytes so one message cannot
+    by itself force the payload out of the line budget.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for key in ("last_assistant_message", "last-assistant-message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return _json_clip(value, _HOOK_MESSAGE_MAX_CHARS)
+    properties = payload.get("properties")
+    if isinstance(properties, dict):
+        for key in ("message", "text"):
+            value = properties.get(key)
+            if isinstance(value, str) and value:
+                return _json_clip(value, _HOOK_MESSAGE_MAX_CHARS)
+    return None
+
+
+def _hook_truncate_payload(payload: Any) -> tuple[Any, bool]:
+    """Return (truncated_payload, was_truncated) with top-level values capped.
+
+    Caps each top-level string to _HOOK_PAYLOAD_TRUNCATE_CHARS characters and
+    clips strings inside top-level lists by the same limit. Nested content
+    beyond one level deep is not traversed; bulk nesting is caught by the byte
+    budget in _hook_encode_line. Non-dict payloads are returned unchanged.
+    """
+    if not isinstance(payload, dict):
+        return payload, False
+    result = {}
+    changed = False
+    for k, v in payload.items():
+        if isinstance(v, str) and len(v) > _HOOK_PAYLOAD_TRUNCATE_CHARS:
+            result[k] = v[:_HOOK_PAYLOAD_TRUNCATE_CHARS]
+            changed = True
+        elif isinstance(v, list):
+            clipped = []
+            list_changed = False
+            for item in v:
+                if isinstance(item, str) and len(item) > _HOOK_PAYLOAD_TRUNCATE_CHARS:
+                    clipped.append(item[:_HOOK_PAYLOAD_TRUNCATE_CHARS])
+                    list_changed = True
+                else:
+                    clipped.append(item)
+            result[k] = clipped
+            if list_changed:
+                changed = True
+        else:
+            result[k] = v
+    return result, changed
+
+
+def _json_clip(text: str, max_bytes: int) -> str:
+    """Longest prefix of text whose JSON string encoding fits in max_bytes.
+
+    Measures the encoding, not the input: under ensure_ascii one astral
+    character expands to a 12-byte surrogate-pair escape, so a character count
+    bounds nothing. Excludes the surrounding quotes from the budget.
+    """
+    def encoded_len(s: str) -> int:
+        return len(json.dumps(s, ensure_ascii=True)) - 2
+
+    if encoded_len(text) <= max_bytes:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if encoded_len(text[:mid]) <= max_bytes:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo]
+
+
+def _hook_encode_line(record: dict) -> bytes:
+    """Encode record as one JSONL line, always at most _HOOK_MAX_LINE_BYTES.
+
+    Priority ladder, each rung re-checking the bound and stopping as soon as
+    the line fits:
+
+        1. as-given
+        2. shrink payload only (descending byte budget, floor 8) — message
+           untouched, so a long transcript_path cannot eat the message budget
+        3. drop payload to {} — message still untouched
+        4. clip message progressively (halve from _HOOK_MESSAGE_MAX_CHARS,
+           floor 64 bytes)
+        5. drop message, keep the rest of the envelope
+
+    Rungs 4-5 are unreachable from cmd_hook: _cmd_hook_inner clips event to
+    _HOOK_EVENT_MAX_BYTES and message to _HOOK_MESSAGE_MAX_CHARS first, so the
+    worst-case rung-3 envelope is 4414 bytes against an 8192 budget. They bound
+    a caller that bypasses that clipping, and are kept for that reason.
+
+    The empty-payload, no-message envelope is the proven floor: every other
+    field is a short fixed-vocabulary scalar, and `event` is clipped to
+    _HOOK_EVENT_MAX_BYTES by _cmd_hook_inner before this call. allow_nan=False
+    makes NaN/Infinity a ValueError, which falls through to the next rung so
+    emitted lines are valid RFC-8259 JSON. A non-JSON-native value raises
+    TypeError instead, which encode() does not catch; cmd_hook's blanket
+    handler absorbs it, preserving the exit-0 guarantee.
+    """
+    def encode(rec: dict) -> bytes:
+        try:
+            return (
+                json.dumps(rec, ensure_ascii=True, separators=(",", ":"),
+                           allow_nan=False) + "\n"
+            ).encode()
+        except (ValueError, OverflowError):
+            return None  # type: ignore[return-value]
+
+    line = encode(record)
+    if line is not None and len(line) <= _HOOK_MAX_LINE_BYTES:
+        return line
+
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        # Descending per-field budget: halve from the initial cap until the
+        # line fits, floor at 8 bytes per field. message is not part of this
+        # candidate, so it rides along unclipped at every step.
+        budget = _HOOK_PAYLOAD_TRUNCATE_CHARS
+        while budget >= 8:
+            candidate: dict[str, Any] = {}
+            for k, v in payload.items():
+                if isinstance(v, str):
+                    candidate[k] = _json_clip(v, budget)
+                elif isinstance(v, list):
+                    candidate[k] = [
+                        _json_clip(item, budget) if isinstance(item, str) else item
+                        for item in v
+                    ]
+                else:
+                    candidate[k] = v
+            line = encode({**record, "payload": candidate, "payload_truncated": True})
+            if line is not None and len(line) <= _HOOK_MAX_LINE_BYTES:
+                return line
+            budget //= 2
+
+    # Payload dropped entirely; message is still whatever _cmd_hook_inner set.
+    base = {**record, "payload": {}, "payload_truncated": True}
+    line = encode(base)
+    if line is not None and len(line) <= _HOOK_MAX_LINE_BYTES:
+        return line
+
+    message = base.get("message")
+    if isinstance(message, str) and message:
+        # Clip the message itself: it is the last field worth keeping, so it
+        # is shrunk rather than dropped until the floor is reached.
+        clip_budget = _HOOK_MESSAGE_MAX_CHARS
+        while clip_budget >= 64:
+            clipped_message = _json_clip(message, clip_budget)
+            candidate = {**base, "message": clipped_message, "message_truncated": True}
+            line = encode(candidate)
+            if line is not None and len(line) <= _HOOK_MAX_LINE_BYTES:
+                return line
+            clip_budget //= 2
+
+    # Backstop: drop message entirely. The bare envelope is proven to fit.
+    line = encode({**base, "message": None})
+    if line is None:
+        # Reached when a non-message envelope field is non-finite: NaN/Inf in
+        # payload is resolved at rung 3, but in an envelope field it survives
+        # to here and makes encode() return None. Emit a minimal safe record.
+        line = encode({
+            "event": _json_clip(str(record.get("event", "")), _HOOK_EVENT_MAX_BYTES),
+            "at": record.get("at", ""),
+            "payload": {},
+            "payload_truncated": True,
+            "message": None,
+        })
+    # Final unconditional bound check: a line over budget would break append
+    # atomicity for every concurrent writer. Truncation at this point means
+    # the caller passed an un-clipped event; drop rather than corrupt the log.
+    if line is None or len(line) > _HOOK_MAX_LINE_BYTES:
+        return b""
+    return line
+
+
+def _hooks_read_tail(log_dir: Path, max_bytes: int) -> tuple[Optional[bytes], bool]:
+    """Read at most max_bytes from the tail of log_dir/hooks.jsonl.
+
+    Returns (data, truncated). truncated is True when the file exceeds max_bytes
+    and only the tail was read. The first partial line in a truncated read is
+    discarded so all returned lines are complete records.
+    """
+    try:
+        dir_fd = os.open(str(log_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None, False
+    try:
+        fd = os.open(
+            "hooks.jsonl",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=dir_fd,
+        )
+    except OSError:
+        return None, False
+    finally:
+        os.close(dir_fd)
+    try:
+        if not _stat_module.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None, False
+        os.set_blocking(fd, True)
+        with open(fd, "rb", closefd=True) as fh:
+            size = fh.seek(0, 2)  # seek to end to get file size
+            if size <= max_bytes:
+                fh.seek(0)
+                return fh.read(max_bytes), False
+            # Tail read: seek back max_bytes from end, drop the first partial line.
+            fh.seek(size - max_bytes)
+            raw = fh.read(max_bytes)
+            newline = raw.find(b"\n")
+            if newline >= 0:
+                raw = raw[newline + 1:]
+            return raw, True
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None, False
+
+
+_HOOK_OPEN_ENOENT_ATTEMPTS: int = 5
+
+
+def _hook_open_append(dir_fd: int) -> int:
+    """Open hooks.jsonl for atomic append relative to dir_fd.
+
+    Concurrent creators racing O_CREAT can each get ENOENT even though the
+    directory exists and the flags ask for creation. The condition is transient
+    and confined to creation. Since cmd_hook must return 0 on every path, an
+    unretried failure here is indistinguishable from a successful append and
+    silently drops the record it was called to persist.
+
+    Retries ENOENT only. Every other errno propagates on the first attempt, and
+    O_NOFOLLOW/O_NONBLOCK apply to each attempt, so a symlink or FIFO planted
+    between retries is refused exactly as on the first open.
+    """
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    for attempt in range(_HOOK_OPEN_ENOENT_ATTEMPTS):
+        try:
+            return os.open("hooks.jsonl", flags, 0o600, dir_fd=dir_fd)
+        except FileNotFoundError:
+            if attempt == _HOOK_OPEN_ENOENT_ATTEMPTS - 1:
+                raise
+    raise AssertionError("unreachable: loop returns or raises")
+
+
+def _hook_append_record(log_dir: Path, record: dict) -> None:
+    """Append one record to log_dir/hooks.jsonl, or drop it at the event cap.
+
+    O_NOFOLLOW refuses a symlink at the path and fstat refuses any non-regular
+    file that replaced it after the cap check, so neither can redirect the
+    write. A single os.write of at most _HOOK_MAX_LINE_BYTES to the O_APPEND
+    fd on a local regular file does not interleave with concurrent hooks —
+    the atomicity is O_APPEND's offset+write guarantee, not a PIPE_BUF limit.
+    Never raises; errors go to stderr.
+    """
+    # One line-length of headroom past the cap's worth of max-size lines. A
+    # window of exactly AGENT_RUN_HOOK_MAX_EVENTS * _HOOK_MAX_LINE_BYTES holds
+    # that many maximal lines with no slack, so crossing it makes
+    # _hooks_read_tail discard the partial leading line and report at most
+    # AGENT_RUN_HOOK_MAX_EVENTS - 1 — below the cap forever, disabling it.
+    try:
+        existing, truncated = _hooks_read_tail(
+            log_dir, (AGENT_RUN_HOOK_MAX_EVENTS + 1) * _HOOK_MAX_LINE_BYTES
+        )
+    except (OverflowError, ValueError) as exc:
+        # An unrepresentable read size means the cap cannot be decided. Say so
+        # and drop this record: cmd_hook must return 0 either way, so an
+        # exception here would be indistinguishable from a successful append.
+        print(f"agent-run hook: cannot size the event-cap read: {exc}", file=sys.stderr)
+        return
+    # A truncated read means the file is larger than the cap could ever need,
+    # which is itself proof of being at the cap; counting is only meaningful
+    # when the whole relevant region was read.
+    if truncated:
+        return
+    if existing is not None and sum(
+        1 for ln in existing.split(b"\n") if ln.strip()
+    ) >= AGENT_RUN_HOOK_MAX_EVENTS:
+        return
+
+    line = _hook_encode_line(record)
+    try:
+        dir_fd = os.open(str(log_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fd = _hook_open_append(dir_fd)
+            try:
+                if not _stat_module.S_ISREG(os.fstat(fd).st_mode):
+                    return
+                written = os.write(fd, line)
+                if written != len(line):
+                    # Terminate the partial line so readers see one bad record
+                    # rather than a splice of this one and the next.
+                    os.write(fd, b"\n")
+                    print(
+                        f"agent-run hook: short write ({written}/{len(line)} bytes)",
+                        file=sys.stderr,
+                    )
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        print(f"agent-run hook: cannot write hooks.jsonl: {exc}", file=sys.stderr)
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    """Record a harness hook notification in the run's hooks.jsonl.
+
+    Always returns 0: a claude Stop hook that exits non-zero is read by the
+    harness as a decision to block, so a broken hook would stall the session.
+    Diagnostics go to stderr only — codex warns on notify-program stdout. See
+    the module docstring for per-harness configuration.
+    """
+    try:
+        return _cmd_hook_inner(args)
+    except Exception as exc:  # noqa: BLE001
+        print(f"agent-run hook: unexpected error: {exc}", file=sys.stderr)
+        return 0
+
+
+def _hook_detect_harness(payload: Any) -> Optional[str]:
+    """Infer harness from payload key presence; returns None when unrecognised.
+
+    Detection is best-effort key presence, not authoritative: an agent that
+    controls hooks.jsonl can forge this field by adding keys from another
+    harness's shape. Use the `source` field (flag/argv/stdin) as a
+    cross-check when attribution matters — it reflects the delivery mechanism
+    the hook binary observed, which the agent cannot choose independently.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if "session_id" in payload and "hook_event_name" in payload:
+        return "claude"
+    if "type" in payload and "thread-id" in payload:
+        return "codex"
+    if "type" in payload and "properties" in payload:
+        return "opencode"
+    return None
+
+
+_HOOK_KIND_TURN_COMPLETE_EVENTS = frozenset(
+    {"stop", "turn-complete", "turn_complete", "session-idle", "session_idle", "idle"}
+)
+_HOOK_KIND_SESSION_START_EVENTS = frozenset({"session-start", "session_start"})
+
+# Only events naming a PENDING request. A resolved permission is not a reason
+# to wake anyone, so it is deliberately absent.
+_HOOK_KIND_PERMISSION_EVENTS = frozenset(
+    {
+        "permission",
+        "permission-request",
+        "permission_request",
+        "permission-asked",
+        "permission_asked",
+        "permission-required",
+        "permission_required",
+    }
+)
+
+
+def _hook_canonical_kind(harness: Optional[str], event: str, payload: Any) -> str:
+    """Return one of turn_complete/permission_required/session_start/other.
+
+    threadctl must consume this without knowing which harness ran or what a
+    user named their hook. Payload evidence is checked first, per harness,
+    because it cannot be renamed by a user's harness config the way the
+    event argv string can; the event string is only a fallback for payloads
+    that carry no recognisable shape.
+    """
+    if isinstance(payload, dict):
+        if harness == "claude":
+            hook_event_name = payload.get("hook_event_name")
+            if hook_event_name == "Stop":
+                return "turn_complete"
+            # Notification is claude's generic attention nag and carries no
+            # evidence a permission is pending, so it is not mapped here.
+            if hook_event_name == "PermissionRequest":
+                return "permission_required"
+            if hook_event_name == "SessionStart":
+                return "session_start"
+        elif harness == "codex":
+            if payload.get("type") == "agent-turn-complete":
+                return "turn_complete"
+            hook_event_name = payload.get("hook_event_name")
+            if hook_event_name == "Stop":
+                return "turn_complete"
+            if hook_event_name == "PermissionRequest":
+                return "permission_required"
+            if hook_event_name == "SessionStart":
+                return "session_start"
+        elif harness == "opencode":
+            event_type = payload.get("type")
+            if event_type == "session.idle":
+                return "turn_complete"
+            # Exact match, not a "permission." prefix: permission.replied
+            # reports a permission already answered, which is not pending.
+            if event_type == "permission.asked":
+                return "permission_required"
+            if event_type == "session.created":
+                return "session_start"
+
+    if event in _HOOK_KIND_TURN_COMPLETE_EVENTS:
+        return "turn_complete"
+    if event in _HOOK_KIND_PERMISSION_EVENTS:
+        return "permission_required"
+    if event in _HOOK_KIND_SESSION_START_EVENTS:
+        return "session_start"
+    return "other"
+
+
+def _cmd_hook_inner(args: argparse.Namespace) -> int:
+    resolved = _hook_resolve_run(getattr(args, "name", None))
+    if resolved is None:
+        return 0
+    name, resolved_by = resolved
+
+    payload, source = _hook_read_payload(
+        getattr(args, "json_payload", None),
+        list(getattr(args, "extra", []) or []),
+    )
+    truncated_payload, field_truncated = _hook_truncate_payload(payload)
+    # Kind derivation reads the un-clipped event string and the untruncated
+    # payload: both carry more signal than what ends up in the stored record.
+    normalized_event = args.event.lower().encode("utf-8", "replace").decode("utf-8")
+    harness = _hook_detect_harness(payload)
+    record: dict[str, Any] = {
+        # Clipped in encoded bytes so the envelope alone can never exceed
+        # _HOOK_MAX_LINE_BYTES and cost the write its atomicity.
+        "event": _json_clip(normalized_event, _HOOK_EVENT_MAX_BYTES),
+        "at": _now_iso(),
+        # harness is inferred from payload key presence; it is attacker-declared
+        # when the agent controls hooks.jsonl, not an authoritative fact.
+        "harness": harness,
+        # kind normalises event across harnesses and user-renamed hook argv;
+        # payload evidence is preferred over the possibly-misleading event.
+        "kind": _hook_canonical_kind(harness, normalized_event, payload),
+        "message": _hook_extract_message(payload),
+        "source": source,
+        "pid": os.getpid(),
+        "resolved_by": resolved_by,
+        "payload": truncated_payload,
+    }
+    if field_truncated:
+        record["payload_truncated"] = True
+    _hook_append_record(_log_dir(name), record)
+    return 0
+
+
+def _read_hooks_jsonl(log_dir: Path) -> Optional[dict]:
+    """Summarise hooks.jsonl, or return None if there is no readable one.
+
+    Total by contract, and the single place that guarantees it: `watch` calls
+    this while reporting a run's liveness, and an exception propagating from
+    here would land in cmd_watch's handler as status "unknown", which
+    _watch_is_terminal treats as terminal — a live run reported dead.
+    """
+    try:
+        return _hooks_summary(log_dir)
+    except Exception as exc:  # noqa: BLE001
+        print(f"agent-run: cannot summarise hooks.jsonl: {exc}", file=sys.stderr)
+        return None
+
+
+def _hooks_summary(log_dir: Path) -> Optional[dict]:
+    """Count and aggregate hooks.jsonl records; skip lines that are not JSON
+    objects. None when the file is absent or not a readable regular file.
+
+    Reads the tail of the file so `last` and `last_event_age_s` describe the
+    newest records even when the file exceeds _HOOKS_READ_MAX_BYTES. truncated
+    is True when the file was larger than the read cap and only the tail was
+    parsed; a consumer can use it to tell a complete aggregate from a partial one.
+    """
+    raw, truncated = _hooks_read_tail(log_dir, _HOOKS_READ_MAX_BYTES)
+    if raw is None:
+        return None
+
+    records: list[dict] = []
+    for line in raw.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(obj, dict):
+            records.append(obj)
+
+    if not records:
+        return {"count": 0, "last": None, "last_event_age_s": None,
+                "events": {}, "kinds": {}, "at_cap": False, "truncated": truncated}
+
+    last = records[-1]
+
+    def _clean(s: Any, max_chars: int) -> Optional[str]:
+        # Envelope fields come from a file any process can append to, so a
+        # non-string here is data, not a bug: summarise it as None rather
+        # than raising and losing the whole aggregate. The bound applies here
+        # rather than at write time because this dict is the watch contract: a
+        # supervisor polls it on a timer and renders it, so one oversized line
+        # in hooks.jsonl must not become an oversized field in every poll.
+        if not isinstance(s, str):
+            return None
+        return s.encode("utf-8", "replace").decode("utf-8")[:max_chars]
+
+    raw_message = last.get("message")
+    message = _clean(raw_message, _HOOK_MESSAGE_MAX_CHARS)
+    last_summary = {
+        "event": _clean(last.get("event"), _HOOK_EVENT_MAX_BYTES),
+        "at": _clean(last.get("at"), _HOOK_EVENT_MAX_BYTES),
+        "harness": _clean(last.get("harness"), _HOOK_EVENT_MAX_BYTES),
+        "kind": _clean(last.get("kind"), _HOOK_EVENT_MAX_BYTES),
+        "message": message,
+        "message_clipped": (
+            isinstance(raw_message, str) and len(message or "") < len(raw_message)
+        ),
+    }
+
+    last_event_age_s: Optional[float] = None
+    at_str = last.get("at")
+    if isinstance(at_str, str) and at_str:
+        try:
+            at_dt = datetime.strptime(at_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+            last_event_age_s = max(
+                0.0, (datetime.now(timezone.utc) - at_dt).total_seconds()
+            )
+        except (ValueError, TypeError):
+            pass
+
+    event_counts: dict[str, int] = {}
+    kind_counts: dict[str, int] = {}
+    for r in records:
+        # Counter keys are bounded for the same reason as last_summary: they
+        # are attacker-chosen strings that ship in every watch poll.
+        ev = _clean(r.get("event"), _HOOK_EVENT_MAX_BYTES)
+        if ev is not None:
+            event_counts[ev] = event_counts.get(ev, 0) + 1
+        kind = _clean(r.get("kind"), _HOOK_EVENT_MAX_BYTES)
+        if kind is not None:
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+
+    return {
+        "count": len(records),
+        "last": last_summary,
+        "last_event_age_s": last_event_age_s,
+        "events": event_counts,
+        "kinds": kind_counts,
+        # at_cap reflects whether the parsed record count meets the cap constant
+        # as seen by the watcher's process; hooks were written under the hook
+        # process's cap. Only reliable when both share the same environment.
+        "at_cap": len(records) >= AGENT_RUN_HOOK_MAX_EVENTS,
+        "truncated": truncated,
+    }
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Emit a stateless, read-only JSON fact snapshot for one run.
 
@@ -3373,7 +4205,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
     present in the run's log dir, null otherwise. Existing keys are unchanged.
     """
     payload = {
-        "schema": "agent-run.watch.v1",
+        "schema": "agent-run.watch.v2",
         "name": name,
         "observed_at": observed_at,
         "status": status,
@@ -3397,6 +4229,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
         "observation_error": None,
         "session": None,
         "scratch": _scratch_unknown("not_observed"),
+        "hooks": None,
     }
     unknown = set(fields) - set(payload)
     if unknown:
@@ -3462,14 +4295,13 @@ def _cmd_watch_observe(
 
     if state_dir_state == _DIR_MISSING:
         # State dir gone, log survived: cmd_status's "not running (log
-        # preserved)" case, usually a reboot. The `cwd` state file went with
-        # it, so git facts need an explicit --repo and every process fact is
-        # unknowable.
+        # preserved)" case, usually a reboot.
         session_data = _read_session_json(log_dir)
         payload = _watch_payload(
             name, observed_at, WATCH_STATUS_LOG_PRESERVED,
             **observed(repo_arg, None, repo_arg),
             session=session_data,
+            hooks=_read_hooks_jsonl(log_dir),
         )
         _watch_emit(
             payload,
@@ -3508,6 +4340,7 @@ def _cmd_watch_observe(
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
         session=session_data,
+        hooks=_read_hooks_jsonl(log_dir),
         # repo_str is for git-fact attribution; recorded_cwd is for scratch so
         # that --repo (correcting which repo to inspect) does not silently move
         # the scratch scan off the run's launch directory.
@@ -8478,6 +9311,13 @@ def _runner(
             os.environ["TMPDIR"] = str(tmp_dir)
             os.environ["BUN_TMPDIR"] = str(tmp_dir)
 
+        # Let harness hooks find this run without out-of-band configuration.
+        # setdefault on the roots so a hook inherits the roots this run was
+        # launched with rather than the process defaults.
+        os.environ["AGENT_RUN_NAME"] = state_dir.name
+        os.environ.setdefault("AGENT_RUN_STATE_DIR", str(STATE_ROOT))
+        os.environ.setdefault("AGENT_RUN_LOG_DIR", str(LOG_ROOT))
+
         runner_pgid = os.getpgid(my_pid)
         identity = _process_identity(my_pid)
         if identity is None:
@@ -10692,6 +11532,36 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_du.set_defaults(func=cmd_du)
 
+    sp_hook = sub.add_parser(
+        "hook",
+        help="receive a harness hook notification and record it in hooks.jsonl (always exits 0)",
+    )
+    sp_hook.add_argument(
+        "event",
+        help="hook event name (e.g. stop, turn-complete, session-idle); normalised to lowercase",
+    )
+    sp_hook.add_argument(
+        "extra",
+        nargs="*",
+        help="optional extra positional: if the first looks like JSON, treated as the "
+        "harness payload (codex notify shape passes JSON as argv[1])",
+    )
+    sp_hook.add_argument(
+        "--name",
+        default=None,
+        metavar="RUN",
+        help="resolve against this run name; overrides AGENT_RUN_NAME and ancestry walk",
+    )
+    sp_hook.add_argument(
+        "--json",
+        dest="json_payload",
+        default=None,
+        metavar="JSON",
+        help="harness payload as a JSON string (opencode plugin path); "
+        "takes priority over positional argv and stdin",
+    )
+    sp_hook.set_defaults(func=cmd_hook)
+
     sp_help = sub.add_parser("help", help="show this help")
     sp_help.set_defaults(func=lambda _a: (p.print_help() or 0))
 
@@ -10744,7 +11614,7 @@ class _LaunchArgv(NamedTuple):
 
 _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
     "status", "watch", "logs", "tail", "attach", "clean", "steer", "kill",
-    "list", "reap", "du", "help",
+    "list", "reap", "du", "hook", "help",
 })
 
 # Managed-mode flags that take a value. Each accepts "--flag value" and
@@ -11070,6 +11940,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except SystemExit as exc:
             if parsed.subcommand_tokens[0] == "watch" and exc.code == 2:
                 raise SystemExit(1) from exc
+            if parsed.subcommand_tokens[0] == "hook":
+                # argparse exits 2 on bad argv, but a misconfigured hook must
+                # still not look like a blocking decision to the harness.
+                return 0
             raise
         return int(args.func(args) or 0)
 

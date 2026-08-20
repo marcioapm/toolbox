@@ -22,7 +22,7 @@ WATCH_CONTRACT_KEYS = {
     "schema", "name", "observed_at", "status", "exit_code", "pid",
     "interactive", "started_at", "ended_at", "elapsed_s", "terminal",
     "launch_error", "log", "repo", "git", "git_error", "signals", "observation_error",
-    "session", "scratch",
+    "session", "scratch", "hooks",
 }
 
 # The `signals` object emitted whenever the log could not be read at all.
@@ -339,7 +339,7 @@ class TestStatusMapping:
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
         agent_run.cmd_watch(_watch_args("r4"))
         payload = json.loads(capsys.readouterr().out)
-        assert payload["schema"] == "agent-run.watch.v1"
+        assert payload["schema"] == "agent-run.watch.v2"
         assert set(payload.keys()) == WATCH_CONTRACT_KEYS
         assert set(payload["log"].keys()) == {
             "path", "bytes", "lines", "mtime_age_s", "growing",

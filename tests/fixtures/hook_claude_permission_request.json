@@ -1,0 +1,1 @@
+{"session_id":"df02eab6-9c2b-4da4-8372-ff3d23c69d19","transcript_path":"/Users/marcio/.claude/projects/-private-tmp-claude-capture-test/df02eab6-9c2b-4da4-8372-ff3d23c69d19.jsonl","cwd":"/private/tmp/claude-capture-test","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"whoami"}}

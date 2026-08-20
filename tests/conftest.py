@@ -12,6 +12,22 @@ import pytest
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def _ancestor_pids() -> set:
+    """This process's ancestor pids, stopping at init, a lookup failure, or a
+    cycle."""
+    from toolbox import agent_run
+
+    seen = set()
+    current = os.getppid()
+    while current and current > 1 and current not in seen:
+        seen.add(current)
+        try:
+            current = agent_run._pid_parent_pid(current)
+        except Exception:
+            break
+    return seen
+
+
 @pytest.fixture
 def fixtures_dir() -> Path:
     """Path to the bundled real-Claude log captures used as test inputs."""
@@ -56,6 +72,7 @@ def isolated_runs_root(request, tmp_path, monkeypatch) -> Path:
     monkeypatch.setattr(agent_run, "LOG_ROOT", logs)
 
     own_pid = os.getpid()
+    own_ancestors = _ancestor_pids()
 
     def _reap_all() -> None:
         """Kill every harness runner pid still recorded in the state root.
@@ -63,7 +80,7 @@ def isolated_runs_root(request, tmp_path, monkeypatch) -> Path:
         Only targets runs whose status is non-terminal (running or starting) —
         tests that use the pid file for other purposes (e.g. steer tests that
         write the test process's own pid) are not affected. Never signals the
-        current process or pid 0/negatives.
+        current process, one of its ancestors, or pid 0/negatives.
         """
         if not state.is_dir():
             return
@@ -84,8 +101,9 @@ def isolated_runs_root(request, tmp_path, monkeypatch) -> Path:
                 pid = int(pid_file.read_text().strip())
             except (ValueError, OSError):
                 continue
-            # Safety guard: never signal the test runner itself.
-            if pid <= 0 or pid == own_pid:
+            # An ancestry-resolution test may legitimately record an ancestor
+            # pid, and under CI the immediate parent is the step's shell.
+            if pid <= 0 or pid == own_pid or pid in own_ancestors:
                 continue
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:

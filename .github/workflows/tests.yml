@@ -9,6 +9,10 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     strategy:
+      # Report both jobs independently: with the default fail-fast, one job's
+      # failure cancels the other and its cancellation looks like a second,
+      # unrelated failure.
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
