@@ -54,7 +54,7 @@ Usage::
               [-i] [--model <model>] [--agent-mode <name>]
               [--session-id <id>] [--harness-arg <flag>]...
               <name>
-    agent-run attach <name>              # live keyboard + resize passthrough (Ctrl-C detaches)
+    agent-run attach <name>              # live keyboard + resize passthrough (Ctrl-D detaches)
     agent-run tail <name>                # follow log in real time
     agent-run logs <name> [N]            # last N lines (default 50)
     agent-run status <name>              # one-line status
@@ -3715,16 +3715,16 @@ def cmd_tail(args: argparse.Namespace) -> int:
 
 
 # Terminals that negotiate the "disambiguate escape codes" keyboard protocol
-# encode Ctrl-C as a CSI sequence instead of the raw 0x03 byte -- Claude
+# encode Ctrl-D as a CSI sequence instead of the raw 0x04 byte -- Claude
 # Code's TUI requests this protocol (`ESC[>1u`) on startup, and terminals
 # that honor it (iTerm2, kitty, wezterm, ghostty, ...) then send every
-# modified/disambiguated key, including Ctrl-C, as an escape sequence rather
-# than a legacy control byte. A plain search for 0x03 misses this entirely,
+# modified/disambiguated key, including Ctrl-D, as an escape sequence rather
+# than a legacy control byte. A plain search for 0x04 misses this entirely,
 # so the keystroke leaks straight through attach into the wrapped agent's
 # stdin instead of detaching. Recognize both encodings: the legacy xterm
-# "modifyOtherKeys" form (`ESC[27;<mod>;99~`) and the kitty-native CSI-u
-# form (`ESC[99;<mod>u`). <mod> is 1 + a bitmask of held modifiers
-# (Shift=1, Alt=2, Ctrl=4, ...); 99 is the codepoint for 'c'. Only trigger
+# "modifyOtherKeys" form (`ESC[27;<mod>;100~`) and the kitty-native CSI-u
+# form (`ESC[100;<mod>u`). <mod> is 1 + a bitmask of held modifiers
+# (Shift=1, Alt=2, Ctrl=4, ...); 100 is the codepoint for 'd'. Only trigger
 # when the Ctrl bit is set.
 #
 # Every parameter accepts colon-separated subparameters (alternate key
@@ -3733,9 +3733,9 @@ def cmd_tail(args: argparse.Namespace) -> int:
 # requested only the base protocol flag, and an empty subparameter means
 # "use the default" per ECMA-48. A stricter match would silently miss
 # conforming input and reintroduce the leak-through this detector prevents.
-_CTRL_C_CSI_RE = re.compile(
-    rb"\x1b\[(?:27(?::\d*)*;(\d+)(?::\d*)*;99(?::\d*)*~"
-    rb"|99(?::\d*)*;(\d+)(?::\d*)*(?:;[\d:]*)?u)"
+_CTRL_D_CSI_RE = re.compile(
+    rb"\x1b\[(?:27(?::\d*)*;(\d+)(?::\d*)*;100(?::\d*)*~"
+    rb"|100(?::\d*)*;(\d+)(?::\d*)*(?:;[\d:]*)?u)"
 )
 
 # Bracketed-paste delimiters. Everything between them is pasted content,
@@ -3746,7 +3746,7 @@ _PASTE_END = b"\x1b[201~"
 # Upper bound on a single bracketed paste before the in-paste state gives
 # up and treats input as typed again. Without it, an ESC[201~ that never
 # arrives (paste aborted, terminal reset, emulator drops the closer) makes
-# Ctrl-C unreachable for the rest of the attach session -- and Ctrl-C is
+# Ctrl-D unreachable for the rest of the attach session -- and Ctrl-D is
 # the only documented way out. Far above any realistic paste, so a genuine
 # one is never cut short.
 _MAX_PASTE_BYTES = 8 * 1024 * 1024
@@ -3756,17 +3756,17 @@ _MAX_PASTE_BYTES = 8 * 1024 * 1024
 # continuous burst, so a gap this long with no closing marker means the
 # paste is never going to finish -- and unlike the byte budget, this
 # recovers an aborted paste that sent very little data, which is the
-# common case (Ctrl-C mid-paste, tmux dropping the closer).
+# common case (Ctrl-D mid-paste, tmux dropping the closer).
 #
 # Idle rather than total duration: a large paste over a slow link trickles
 # in for far longer than this, and expiring mid-stream would rescan the
-# remaining payload as typed input, so an embedded 0x03 would truncate it.
+# remaining payload as typed input, so an embedded 0x04 would truncate it.
 _MAX_PASTE_IDLE_SECONDS = 5.0
 
 # Ceiling on the whole latch, measured from the opening marker regardless of
 # how busy the stream stays. The idle bound alone cannot end a paste that
 # never stops receiving bytes -- and inside a paste every byte is payload by
-# definition, so the Ctrl-C a user presses to escape a stuck paste is itself
+# definition, so the Ctrl-D a user presses to escape a stuck paste is itself
 # what renews the idle window. Without this, input arriving more often than
 # once per _MAX_PASTE_IDLE_SECONDS pins the latch open for the rest of the
 # session and pressing the escape key harder only holds it tighter.
@@ -3796,7 +3796,7 @@ _MAX_PENDING_ESCAPE_BYTES = 64
 # split across reads must not be torn, but a bare ESC keypress (Alt-prefix,
 # or Escape itself, which TUIs use to cancel) never gets follow-up bytes.
 # Sized to absorb SSH round-trip latency and a loaded scheduler -- too
-# short and a split CSI Ctrl-C leaks into the agent instead of detaching --
+# short and a split CSI Ctrl-D leaks into the agent instead of detaching --
 # while staying below the point where a solitary Escape feels delayed.
 _ESCAPE_HOLD_TIMEOUT_SECONDS = 0.3
 
@@ -3805,10 +3805,10 @@ _ESCAPE_HOLD_TIMEOUT_SECONDS = 0.3
 _FIFO_ATOMIC_WRITE_BYTES = getattr(select, "PIPE_BUF", 4096)
 
 
-def _find_ctrl_c_trigger(data: bytes) -> tuple:
-    """Return the ``(start, end)`` byte range of the earliest Ctrl-C detach
+def _find_ctrl_d_trigger(data: bytes) -> tuple:
+    """Return the ``(start, end)`` byte range of the earliest Ctrl-D detach
     trigger in ``data``, or ``(-1, -1)`` if there is none. Recognizes the
-    raw 0x03 byte and the CSI forms matched by _CTRL_C_CSI_RE.
+    raw 0x04 byte and the CSI forms matched by _CTRL_D_CSI_RE.
 
     Earliest wins because every byte before the trigger has already been
     committed to forwarding: picking a later match would forward an
@@ -3816,10 +3816,10 @@ def _find_ctrl_c_trigger(data: bytes) -> tuple:
     effect of detaching."""
     best_start = -1
     best_end = -1
-    raw_idx = data.find(b"\x03")
+    raw_idx = data.find(b"\x04")
     if raw_idx != -1:
         best_start, best_end = raw_idx, raw_idx + 1
-    for m in _CTRL_C_CSI_RE.finditer(data):
+    for m in _CTRL_D_CSI_RE.finditer(data):
         if not (int(m.group(1) or m.group(2)) - 1) & 4:
             continue
         # finditer runs left to right, so this first Ctrl-held match is
@@ -3897,7 +3897,7 @@ def _resync_paste_marker(data: bytes, released: bytes) -> tuple:
     Escape and the arrow keys stay responsive. When the bytes that follow
     turn out to complete a paste marker, the marker has to be reassembled
     before scanning or the payload is treated as typed input -- which is
-    what makes a `0x03` inside it detach mid-paste."""
+    what makes a `0x04` inside it detach mid-paste."""
     if not released or not data:
         return data, False
     joined = released + data
@@ -3947,14 +3947,14 @@ def _scan_local_input_for_detach(
 
     Detach triggers are recognized only outside a bracketed paste: between
     ``ESC[200~`` and ``ESC[201~`` the terminal is transmitting pasted
-    content, so a 0x03 byte or the literal text of a CSI Ctrl-C sequence is
+    content, so a 0x04 byte or the literal text of a CSI Ctrl-D sequence is
     data, not a keypress, and must be forwarded like any other byte. On a
     trigger, ``forwardable`` is everything strictly before it -- neither the
     trigger nor anything racing in behind it is forwarded.
 
     The in-paste state is bounded three ways, because an ``ESC[201~`` that
-    never arrives would otherwise make Ctrl-C unreachable for the rest of
-    the session and Ctrl-C is the only documented way out.
+    never arrives would otherwise make Ctrl-D unreachable for the rest of
+    the session and Ctrl-D is the only documented way out.
 
     ``paste_bytes`` caps total payload. ``paste_idle_since`` caps the gap
     since payload last arrived, tracking idleness rather than total duration
@@ -3962,7 +3962,7 @@ def _scan_local_input_for_detach(
     legitimately take minutes -- is never cut off mid-stream.
     ``paste_started`` caps the latch's whole lifetime: the idle bound alone
     cannot end a paste that keeps receiving bytes, and since every byte
-    inside a paste is payload, a user pressing Ctrl-C to escape a stuck
+    inside a paste is payload, a user pressing Ctrl-D to escape a stuck
     paste renews the idle window with each press. The ceiling is what makes
     the escape reachable in bounded time no matter how busy the stream is."""
     forwardable, held_escape = _split_trailing_incomplete_escape(data)
@@ -4003,7 +4003,7 @@ def _scan_local_input_for_detach(
             paste_idle_since, paste_started = None, None
             continue
         paste_at = forwardable.find(_PASTE_START, pos)
-        trigger_at, _trigger_end = _find_ctrl_c_trigger(forwardable[pos:])
+        trigger_at, _trigger_end = _find_ctrl_d_trigger(forwardable[pos:])
         if trigger_at != -1 and (paste_at == -1 or pos + trigger_at < paste_at):
             return (
                 forwardable[: pos + trigger_at],
@@ -4073,7 +4073,7 @@ def _drain_fifo_write(fd: int, data: bytes) -> bytes:
     returning whatever could not be delivered within
     _DETACH_FLUSH_TIMEOUT_SECONDS.
 
-    The bytes typed before Ctrl-C are already committed to the agent, so a
+    The bytes typed before Ctrl-D are already committed to the agent, so a
     single PIPE_BUF-sized write is not enough -- but the reader may be
     backpressured, and detach must not hang waiting for it."""
     deadline = time.monotonic() + _DETACH_FLUSH_TIMEOUT_SECONDS
@@ -4202,7 +4202,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
     # attach replays raw PTY bytes to a real terminal exactly like tail/logs
     # do (see _reset_terminal_modes above), so it must reset DEC private
     # modes on the way out, and an external SIGINT (kill -INT on this
-    # process, distinct from the in-band Ctrl-C byte handled below) must
+    # process, distinct from the in-band Ctrl-D byte handled below) must
     # exit quietly with the conventional 128+SIGINT status instead of a
     # traceback.
     try:
@@ -4223,7 +4223,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
                     # select() when more log data is queued). A bare
                     # `continue` back to the log read would let a wrapped
                     # agent emitting output continuously starve keystroke
-                    # forwarding, Ctrl-C detach, and resize delivery for as
+                    # forwarding, Ctrl-D detach, and resize delivery for as
                     # long as the burst lasts.
                     chunk = log_file.read(8192)
                     if chunk and not emit(chunk):
@@ -8671,12 +8671,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp_attach = sub.add_parser(
         "attach",
-        help="attach interactively (live keyboard + resize; Ctrl-C detaches, exit 0)",
+        help="attach interactively (live keyboard + resize; Ctrl-D detaches, exit 0)",
         description=(
             "Attach a real terminal to an interactive run: keystrokes are "
             "forwarded to the agent's stdin and terminal resizes are relayed "
-            "to its PTY. Ctrl-C detaches without stopping the agent and exits "
-            "0. Several clients may attach at once; output is mirrored to all "
+            "to its PTY. Ctrl-D detaches without stopping the agent and exits "
+            "0; Ctrl-C is forwarded to the wrapped agent like any other "
+            "keystroke. Several clients may attach at once; output is "
+            "mirrored to all "
             "of them, but only one should type at a time -- concurrent "
             "keyboard input from multiple clients is not reliable: each "
             "write is atomic up to PIPE_BUF, but a longer burst is split "
