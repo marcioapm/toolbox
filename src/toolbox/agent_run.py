@@ -6063,21 +6063,30 @@ def _atomic_write_text(path: Path, text: str, *, suffix: str) -> None:
 
 def _publish_clean(
     clean: Path, rendered: str, *, stat_result, offset: int, complete: bool,
+    width: int = _RENDER_LOG_DEFAULT_WIDTH, height: int = _RENDER_LOG_DEFAULT_HEIGHT,
     resize_identity: Tuple[int, int] = (0, 0),
 ) -> None:
     """Publish transcript then metadata identifying the raw prefix it covers."""
     _atomic_write_text(clean, rendered, suffix="clean")
     _publish_clean_metadata(
         clean, stat_result=stat_result, offset=offset, complete=complete,
-        resize_identity=resize_identity,
+        width=width, height=height, resize_identity=resize_identity,
     )
 
 
 def _publish_clean_metadata(
     clean: Path, *, stat_result, offset: int, complete: bool,
+    width: int = _RENDER_LOG_DEFAULT_WIDTH, height: int = _RENDER_LOG_DEFAULT_HEIGHT,
     resize_identity: Tuple[int, int] = (0, 0),
 ) -> None:
-    """Publish cache health metadata without treating diagnostic state as text."""
+    """Publish cache health metadata without treating diagnostic state as text.
+
+    ``width``/``height`` record the geometry the render actually used --
+    not necessarily the module defaults, since a run's own launch geometry
+    (run.json's ``terminal`` field) can override them. A reader must compare
+    against the geometry it would resolve for this log, not against a
+    hardcoded default, or it can hand back a render made at the wrong size.
+    """
     resize_count, resize_last_offset = resize_identity
     metadata = {
         "version": 1,
@@ -6086,8 +6095,8 @@ def _publish_clean_metadata(
         "offset": offset,
         "size": stat_result.st_size,
         "complete": complete,
-        "width": _RENDER_LOG_DEFAULT_WIDTH,
-        "height": _RENDER_LOG_DEFAULT_HEIGHT,
+        "width": width,
+        "height": height,
         "history": _RENDER_LOG_DEFAULT_HISTORY,
         # Identifies the resize timeline this render applied -- count plus
         # last offset is enough to detect a timeline that has since grown
@@ -6164,6 +6173,21 @@ def _current_resize_identity(log_dir: Path, raw_len: int) -> Tuple[int, int]:
     return (len(validated), validated[-1][0] if validated else 0)
 
 
+def _resolved_default_geometry(log_dir: Path) -> Tuple[int, int]:
+    """The geometry a render at the module defaults actually uses for
+    ``log_dir``: run.json's ``terminal`` field when present and valid,
+    else the render defaults themselves.
+
+    This is the geometry a cache reader must compare against -- not the
+    hardcoded defaults -- since a run's own launch geometry can differ from
+    them (only the case ``_LAUNCH_TERMINAL_COLS/ROWS == _RENDER_LOG_DEFAULT_
+    WIDTH/HEIGHT`` today makes the two coincide).
+    """
+    return _read_run_terminal_geometry(log_dir) or (
+        _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT
+    )
+
+
 def _render_log_dir(
     log_dir: Path, raw: bytes, *, width: int, height: int, history: int
 ) -> str:
@@ -6180,8 +6204,7 @@ def _render_log_dir(
     """
     if width != _RENDER_LOG_DEFAULT_WIDTH or height != _RENDER_LOG_DEFAULT_HEIGHT:
         return _render_log(raw, width=width, height=height, history=history)
-    geometry = _read_run_terminal_geometry(log_dir)
-    base_width, base_height = geometry or (width, height)
+    base_width, base_height = _resolved_default_geometry(log_dir)
     resize_records = _read_resize_timeline(log_dir)
     return _render_log(
         raw, width=base_width, height=base_height, history=history,
@@ -6200,9 +6223,11 @@ def _render_log_to_clean(log_dir: Path) -> None:
     log = log_dir / "log"
     clean = log_dir / "log.clean"
     raw = log.read_bytes()
-    rendered = _render_log_dir(
-        log_dir, raw, width=_RENDER_LOG_DEFAULT_WIDTH,
-        height=_RENDER_LOG_DEFAULT_HEIGHT, history=_RENDER_LOG_DEFAULT_HISTORY,
+    width, height = _resolved_default_geometry(log_dir)
+    resize_records = _read_resize_timeline(log_dir)
+    rendered = _render_log(
+        raw, width=width, height=height, history=_RENDER_LOG_DEFAULT_HISTORY,
+        resizes=resize_records,
     )
     with _watch_open_validated_log(log) as f:
         if f is None:
@@ -6211,7 +6236,7 @@ def _render_log_to_clean(log_dir: Path) -> None:
     resize_identity = _current_resize_identity(log_dir, len(raw))
     _publish_clean(
         clean, rendered, stat_result=stat_result, offset=stat_result.st_size,
-        complete=True, resize_identity=resize_identity,
+        complete=True, width=width, height=height, resize_identity=resize_identity,
     )
 
 
@@ -6460,13 +6485,18 @@ def _read_clean_cache(
             if metadata_file is None:
                 return None
             metadata = json.loads(metadata_file.read().decode("utf-8"))
+        # The geometry a render at the defaults actually resolves to for this
+        # log -- run.json's terminal field can override the defaults, so the
+        # cache is only a hit when it was published at that same resolved
+        # geometry, not merely at the (possibly different) module defaults.
+        resolved_width, resolved_height = _resolved_default_geometry(log_path.parent)
         if not (
             metadata.get("version") == 1
             and metadata.get("complete") is True
             and metadata.get("dev") == raw_stat.st_dev
             and metadata.get("ino") == raw_stat.st_ino
-            and metadata.get("width") == width
-            and metadata.get("height") == height
+            and metadata.get("width") == resolved_width
+            and metadata.get("height") == resolved_height
             and metadata.get("history") == history
         ):
             return None

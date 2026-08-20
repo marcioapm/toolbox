@@ -422,3 +422,68 @@ class TestRunJsonAndResizeTimelineWiring:
             {"offset": 3, "cols": 80, "rows": 24},
             {"offset": 10, "cols": 40, "rows": 20},
         ]
+
+    def test_cache_published_at_module_defaults_is_a_miss_for_a_differently_sized_run(
+        self, tmp_path
+    ):
+        """A cache published at 120x60 (the module defaults) for a run whose
+        run.json says 80x24 must be a miss: reusing it would hand back a
+        transcript rendered at the wrong geometry. This is the scenario that
+        only avoided biting because _LAUNCH_TERMINAL_COLS/ROWS happened to
+        equal the render defaults; changing either module default must not
+        silently start serving wrong transcripts from old caches."""
+        # A 100-char unbroken line: pyte does not autowrap past the viewport
+        # width, so this line survives intact at width 120 but is truncated
+        # to 80 characters at width 80 -- a geometry-sensitive difference,
+        # unlike short lines that render identically at both widths.
+        raw = b"x" * 100 + b"\r\n"
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log = log_dir / "log"
+        log.write_bytes(raw)
+        _write_run_json(log_dir, {"cols": 80, "rows": 24})
+
+        # Publish a cache as if it had been rendered at the module defaults
+        # (120x60), not the run's actual 80x24 geometry.
+        wrong_rendered = ar._render_log(raw, width=W, height=H)
+        log_stat = log.stat()
+        clean = log_dir / "log.clean"
+        clean.write_text(wrong_rendered, encoding="utf-8")
+        (log_dir / "log.clean.meta.json").write_text(json.dumps({
+            "version": 1, "dev": log_stat.st_dev, "ino": log_stat.st_ino,
+            "offset": log_stat.st_size, "size": log_stat.st_size, "complete": True,
+            "width": W, "height": H, "history": HIST,
+            "resize_count": 0, "resize_last_offset": 0, "updated_at": 0,
+        }))
+
+        assert ar._read_clean_cache(log, W, H, HIST) is None
+
+        correct = ar._render_log(raw, width=80, height=24)
+        assert wrong_rendered != correct  # sanity: the two geometries actually differ
+
+    def test_cache_published_at_the_resolved_geometry_is_a_hit(self, tmp_path):
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(20))
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log = log_dir / "log"
+        log.write_bytes(raw)
+        _write_run_json(log_dir, {"cols": 80, "rows": 24})
+
+        ar._render_log_to_clean(log_dir)
+        cached = (log_dir / "log.clean").read_text()
+
+        assert cached == ar._render_log(raw, width=80, height=24)
+        assert ar._read_clean_cache(log, W, H, HIST) == cached
+
+    def test_legacy_log_with_no_run_json_still_hits_as_before(self, tmp_path):
+        raw = b"legacy content\r\n"
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log = log_dir / "log"
+        log.write_bytes(raw)
+
+        ar._render_log_to_clean(log_dir)
+        cached = (log_dir / "log.clean").read_text()
+
+        assert cached == _render(raw)
+        assert ar._read_clean_cache(log, W, H, HIST) == cached
