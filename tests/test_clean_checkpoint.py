@@ -1,6 +1,7 @@
-"""Checkpoint-resume rendering: grounded offsets, state round-trip, cache resume."""
+"""Checkpoint-resume rendering: stream grounding, state round-trip, cache resume."""
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +29,30 @@ EXCLUDED = {
     "dirty": "repaint bookkeeping; load marks the whole viewport dirty",
 }
 
+# Payloads whose parser state a byte-level scanner is apt to model incorrectly:
+# three-byte ESC commands, ESC inside an OSC payload, C1 controls decoded from
+# UTF-8, malformed UTF-8, and multi-byte characters.
+GROUNDING_PAYLOADS = [
+    pytest.param(b"hello \x1b[31mred\x1b[0m text plain\r\n", id="csi-sgr"),
+    pytest.param("h\u00e9llo w\u00f6rld \u2014 dash \u2713 check\r\n".encode("utf-8"),
+                 id="multibyte-utf8"),
+    pytest.param(b"\x1b]0;title\x07plain after osc\r\n", id="osc-bel"),
+    pytest.param(b"A\x1b]0;x\x1b\x07BAD\x07Z", id="osc-containing-esc-bel"),
+    pytest.param(b"A\x1b]0;x\x1b\\Z", id="osc-string-terminator"),
+    pytest.param(b"A\x1b#8Z", id="esc-hash-decaln"),
+    pytest.param(b"A\x1b(0qZ", id="esc-charset-g0"),
+    pytest.param(b"A\x1b)Bq\x0eZ", id="esc-charset-g1"),
+    pytest.param(b"A\x1b%GZ", id="esc-percent-utf8"),
+    pytest.param(b"A\x1b%@\xe2\x80\x94Z", id="esc-percent-no-utf8"),
+    pytest.param(b"A\xc2\x9b31mX", id="c1-csi"),
+    pytest.param(b"A\xc2\x9d0;abcDEF\x07Z", id="c1-osc"),
+    pytest.param(b"A\x1b]0;x\xc2\x9cZ", id="c1-string-terminator"),
+    pytest.param(b"A\xffB", id="malformed-lead-byte"),
+    pytest.param(b"A\xc0\xafB", id="overlong-encoding"),
+    pytest.param(b"A\x80B", id="lone-continuation-byte"),
+    pytest.param(b"line one\r\nline two\r\n\x1b[2Kerased\r\n", id="erase-in-line"),
+]
+
 
 def _screen():
     return ar._new_pyte_screen(pyte, W, H, HIST)
@@ -37,22 +62,33 @@ def _render(raw: bytes) -> str:
     return ar._render_log(raw, width=W, height=H, history=HIST)
 
 
-def _render_via_checkpoint(raw: bytes, cut: int) -> str:
-    """Render raw by publishing a checkpoint at the grounded offset at or before
-    ``cut``, restoring it into a new screen, and feeding the remainder."""
-    ground = ar._grounded_offset(raw[:cut])
-    first = _screen()
-    ar._feed_pyte(pyte.ByteStream(first), raw[:ground])
+def _feed_prefix(raw: bytes, cut: int):
+    """Feed raw[:cut] through one stream and report the screen and grounding."""
+    screen = _screen()
+    stream = pyte.ByteStream(screen)
+    ar._feed_pyte(stream, raw[:cut])
+    return screen, ar._ckpt_stream_is_grounded(stream)
 
-    state = json.loads(json.dumps(ar._ckpt_dump_state(pyte, first)))
-    history_top = json.loads(json.dumps(
-        [ar._ckpt_dump_row(row) for row in first.history.top]
-    ))
 
-    second = _screen()
-    ar._ckpt_load_state(pyte, second, state, history_top)
-    ar._feed_pyte(pyte.ByteStream(second), raw[ground:])
-    return ar._serialize_screen(second)
+def _publish_checkpoint(log: Path, raw: bytes, *, offset_delta: int = 0):
+    """Publish transcript, metadata and checkpoint for a grounded prefix of raw,
+    then grow the log to its full length as a live run would.
+
+    Returns (clean, cut) or None when no grounded cut exists in the payload.
+    """
+    clean = log.with_name("log.clean")
+    for cut in range(len(raw) // 2, 0, -1):
+        screen, grounded = _feed_prefix(raw, cut)
+        if not grounded:
+            continue
+        log.write_bytes(raw[:cut])
+        ar._publish_clean(clean, ar._serialize_screen(screen),
+                          stat_result=os.stat(log), offset=cut, complete=True)
+        ar._ckpt_publish(clean, pyte, screen, offset=cut + offset_delta)
+        with log.open("ab") as handle:
+            handle.write(raw[cut:])
+        return clean, cut
+    return None
 
 
 def test_screen_state_surface_is_fully_accounted_for():
@@ -71,149 +107,124 @@ def test_fingerprint_is_stable_across_calls():
 
 
 def test_load_rejects_foreign_fingerprint():
-    screen = _screen()
-    state = ar._ckpt_dump_state(pyte, screen)
+    state = ar._ckpt_dump_state(pyte, _screen())
     state["fingerprint"] = "0" * 16
     with pytest.raises(ValueError):
-        ar._ckpt_load_state(pyte, _screen(), state, [])
+        ar._ckpt_load_state(pyte, _screen(), state)
 
 
 def test_load_rejects_unknown_version():
-    screen = _screen()
-    state = ar._ckpt_dump_state(pyte, screen)
+    state = ar._ckpt_dump_state(pyte, _screen())
     state["version"] = ar._CKPT_VERSION + 1
     with pytest.raises(ValueError):
-        ar._ckpt_load_state(pyte, _screen(), state, [])
+        ar._ckpt_load_state(pyte, _screen(), state)
 
 
-@pytest.mark.parametrize("payload", [
-    b"hello \x1b[31mred\x1b[0m text plain\r\n",
-    "h\u00e9llo w\u00f6rld \u2014 em dash and \u2713 check\r\n".encode("utf-8"),
-    b"\x1b]0;title\x07plain after osc\r\n",
-    b"line one\r\nline two\r\n\x1b[2Kerased\r\n",
-])
-def test_every_split_point_renders_identically(payload):
-    """A checkpoint at any cut must reproduce the one-pass render.
+@pytest.mark.parametrize("payload", GROUNDING_PAYLOADS)
+def test_grounded_split_points_render_identically(payload):
+    """Wherever the stream reports itself grounded, a checkpoint taken there must
+    reproduce the one-pass render.
 
-    Cuts landing inside an escape sequence or a multi-byte character are the
-    interesting ones: a fresh ByteStream loses both the escape FSM and the
-    incremental UTF-8 decoder, so the grounded offset must back away from them.
+    Cuts inside an escape sequence or a multi-byte character are the dangerous
+    ones: a fresh ByteStream loses both the parser FSM and the incremental UTF-8
+    decoder, so grounding must reject them.
     """
     expected = _render(payload)
     for cut in range(1, len(payload) + 1):
-        assert _render_via_checkpoint(payload, cut) == expected, f"cut={cut}"
+        screen, grounded = _feed_prefix(payload, cut)
+        if not grounded:
+            continue
+        state = json.loads(json.dumps(ar._ckpt_dump_state(pyte, screen)))
+        restored = _screen()
+        ar._ckpt_load_state(pyte, restored, state)
+        ar._feed_pyte(pyte.ByteStream(restored), payload[cut:])
+        assert ar._serialize_screen(restored) == expected, f"cut={cut}"
 
 
-@pytest.mark.parametrize("partial", [b"\x1b", b"\x1b[", b"\x1b[31", b"\x1b[31;1"])
-def test_grounded_offset_backs_away_from_partial_csi(partial):
-    """A CSI is complete only once its final byte (0x40-0x7E) arrives; until
-    then the whole sequence must stay unfed."""
-    prefix = b"hello "
-    assert ar._grounded_offset(prefix + partial) == len(prefix)
+@pytest.mark.parametrize("payload", GROUNDING_PAYLOADS)
+def test_every_payload_has_at_least_one_grounded_cut(payload):
+    """Grounding must not reject every offset: a payload that never grounds would
+    stall checkpoint publication for the rest of the run."""
+    assert any(_feed_prefix(payload, cut)[1] for cut in range(1, len(payload) + 1))
 
 
-def test_grounded_offset_accepts_complete_csi():
-    data = b"hello \x1b[31m"
-    assert ar._grounded_offset(data) == len(data)
-    assert ar._grounded_offset(data + b"x") == len(data) + 1
+@pytest.mark.parametrize("pending", [b"\x1b", b"\x1b[", b"\x1b[31", b"\x1b[31;1",
+                                     b"\x1b#", b"\x1b(", b"\x1b%", b"\x1b]0;partial"])
+def test_stream_is_not_grounded_mid_sequence(pending):
+    assert not _feed_prefix(b"hello " + pending, len(b"hello " + pending))[1]
 
 
-def test_grounded_offset_backs_away_from_partial_utf8():
-    data = "ab\u2014".encode("utf-8")  # em dash is three bytes
-    assert ar._grounded_offset(data[:-1]) == 2
-    assert ar._grounded_offset(data) == len(data)
+@pytest.mark.parametrize("partial", [b"\xe2", b"\xe2\x80"])
+def test_stream_is_not_grounded_mid_utf8_character(partial):
+    assert not _feed_prefix(b"ab" + partial, len(b"ab" + partial))[1]
 
 
-def test_grounded_offset_ignores_esc_inside_osc_payload():
-    """An OSC string terminator contains ESC, so a backward search for the last
-    ESC would mistake a completed OSC for a pending sequence."""
-    data = b"\x1b]0;t\x1b\\after"
-    assert ar._grounded_offset(data) == len(data)
+def test_stream_is_not_grounded_after_utf8_mode_is_disabled():
+    """ESC % @ clears ByteStream.use_utf8, which lives on the stream and is not
+    carried in the checkpoint."""
+    assert not _feed_prefix(b"A\x1b%@B", 6)[1]
+
+
+def test_history_top_window_survives_deque_rollover():
+    """history.top is a bounded deque: once full it evicts as it appends, so the
+    published window must be the current contents rather than an append log."""
+    screen = ar._new_pyte_screen(pyte, 20, 3, 5)
+    ar._feed_pyte(pyte.ByteStream(screen),
+                  b"".join(f"row{i}\r\n".encode() for i in range(40)))
+    assert len(screen.history.top) == screen.history.top.maxlen
+
+    state = json.loads(json.dumps(ar._ckpt_dump_state(pyte, screen)))
+    restored = ar._new_pyte_screen(pyte, 20, 3, 5)
+    ar._ckpt_load_state(pyte, restored, state)
+    assert ar._serialize_screen(restored) == ar._serialize_screen(screen)
 
 
 def test_read_clean_cache_resumes_from_published_checkpoint(tmp_path):
     raw = b"".join(f"line {i}\r\n".encode() for i in range(200))
     raw += b"\x1b[32mgreen tail\x1b[0m\r\n"
     log = tmp_path / "log"
-    clean = tmp_path / "log.clean"
-
-    cut = len(raw) // 2
-    ground = ar._grounded_offset(raw[:cut])
-    screen = _screen()
-    ar._feed_pyte(pyte.ByteStream(screen), raw[:ground])
-    log.write_bytes(raw[:ground])
-    ar._publish_clean(clean, ar._serialize_screen(screen),
-                      stat_result=os.stat(log), offset=ground, complete=True)
-    ar._ckpt_publish(clean, pyte, screen, history_written=0, offset=ground)
-    with log.open("ab") as handle:
-        handle.write(raw[ground:])
-
+    assert _publish_checkpoint(log, raw) is not None
     assert ar._read_clean_cache(log, W, H, HIST) == _render(raw)
 
 
 def test_read_clean_cache_falls_back_when_checkpoint_is_corrupt(tmp_path):
     raw = b"".join(f"line {i}\r\n".encode() for i in range(50))
     log = tmp_path / "log"
-    clean = tmp_path / "log.clean"
-
-    ground = ar._grounded_offset(raw[: len(raw) // 2])
-    screen = _screen()
-    ar._feed_pyte(pyte.ByteStream(screen), raw[:ground])
-    log.write_bytes(raw[:ground])
-    ar._publish_clean(clean, ar._serialize_screen(screen),
-                      stat_result=os.stat(log), offset=ground, complete=True)
-    ar._ckpt_publish(clean, pyte, screen, history_written=0, offset=ground)
-    with log.open("ab") as handle:
-        handle.write(raw[ground:])
-
+    clean, _cut = _publish_checkpoint(log, raw)
     ar._ckpt_state_path(clean).write_text("{not json", encoding="utf-8")
+    assert ar._read_clean_cache(log, W, H, HIST) is None
+
+
+@pytest.mark.parametrize("body", ["1", '"text"', "null", "[]"])
+def test_read_clean_cache_falls_back_on_non_object_checkpoint(tmp_path, body):
+    """Valid JSON of the wrong shape is a cache miss, not an AttributeError."""
+    raw = b"".join(f"line {i}\r\n".encode() for i in range(50))
+    log = tmp_path / "log"
+    clean, _cut = _publish_checkpoint(log, raw)
+    ar._ckpt_state_path(clean).write_text(body, encoding="utf-8")
+    assert ar._read_clean_cache(log, W, H, HIST) is None
+
+
+def test_read_clean_cache_falls_back_on_non_object_buffer_row(tmp_path):
+    raw = b"".join(f"line {i}\r\n".encode() for i in range(50))
+    log = tmp_path / "log"
+    clean, _cut = _publish_checkpoint(log, raw)
+    state = json.loads(ar._ckpt_state_path(clean).read_text(encoding="utf-8"))
+    state["buffer"] = {"0": 1}
+    ar._ckpt_state_path(clean).write_text(json.dumps(state), encoding="utf-8")
     assert ar._read_clean_cache(log, W, H, HIST) is None
 
 
 def test_read_clean_cache_rejects_checkpoint_for_another_offset(tmp_path):
     raw = b"".join(f"line {i}\r\n".encode() for i in range(50))
     log = tmp_path / "log"
-    clean = tmp_path / "log.clean"
-
-    ground = ar._grounded_offset(raw[: len(raw) // 2])
-    screen = _screen()
-    ar._feed_pyte(pyte.ByteStream(screen), raw[:ground])
-    log.write_bytes(raw[:ground])
-    ar._publish_clean(clean, ar._serialize_screen(screen),
-                      stat_result=os.stat(log), offset=ground, complete=True)
-    ar._ckpt_publish(clean, pyte, screen, history_written=0, offset=ground + 1)
-    with log.open("ab") as handle:
-        handle.write(raw[ground:])
-
+    assert _publish_checkpoint(log, raw, offset_delta=1) is not None
     assert ar._read_clean_cache(log, W, H, HIST) is None
 
 
-def test_ckpt_discard_removes_both_artifacts(tmp_path):
+def test_ckpt_discard_removes_the_checkpoint(tmp_path):
     clean = tmp_path / "log.clean"
-    screen = _screen()
-    ar._ckpt_publish(clean, pyte, screen, history_written=0, offset=0)
+    ar._ckpt_publish(clean, pyte, _screen(), offset=0)
     assert ar._ckpt_state_path(clean).exists()
     ar._ckpt_discard(clean)
     assert not ar._ckpt_state_path(clean).exists()
-    assert not ar._ckpt_history_path(clean).exists()
-
-
-def test_history_file_is_append_only(tmp_path):
-    """Scrolled-off lines are immutable, so publication appends rather than
-    rewriting a file that grows with run length."""
-    clean = tmp_path / "log.clean"
-    screen = _screen()
-    ar._feed_pyte(pyte.ByteStream(screen), b"".join(
-        f"row {i}\r\n".encode() for i in range(H + 40)
-    ))
-    written = ar._ckpt_publish(clean, pyte, screen, history_written=0, offset=1)
-    assert written > 0
-    first = ar._ckpt_history_path(clean).read_bytes()
-
-    ar._feed_pyte(pyte.ByteStream(screen), b"".join(
-        f"more {i}\r\n".encode() for i in range(20)
-    ))
-    ar._ckpt_publish(clean, pyte, screen, history_written=written, offset=2)
-    second = ar._ckpt_history_path(clean).read_bytes()
-    assert second.startswith(first)
-    assert len(second) > len(first)
