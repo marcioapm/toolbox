@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -108,6 +109,8 @@ class TestParseLaunchArgvHarness:
         r = _parse(["--harness", "opencode", "--agent-mode", "build", "--prompt", "hi", "myrun"])
         assert r.agent_mode == "build"
 
+
+
     def test_harness_arg_single(self):
         r = _parse(["--harness", "claude", "--prompt", "hi", "--harness-arg", "--foo", "myrun"])
         assert list(r.harness_args) == ["--foo"]
@@ -133,10 +136,68 @@ class TestParseLaunchArgvHarness:
             ])
         assert flag in str(exc.value)
 
+
     def test_interactive_with_harness(self):
         r = _parse(["-i", "--harness", "claude", "--prompt", "hi", "myrun"])
         assert r.interactive is True
         assert r.harness == "claude"
+
+    def test_capability_flags_require_harness(self):
+        with pytest.raises(agent_run._LaunchArgvError):
+            _parse(["--enable-planning", "myrun", "--", "echo", "hi"])
+
+    def test_capability_flags_parse_for_managed_harnesses(self):
+        r = _parse([
+            "--harness", "opencode", "--enable-planning", "--enable-questions",
+            "--prompt", "hi", "myrun",
+        ])
+        assert r.enable_planning is True
+        assert r.enable_questions is True
+
+    def test_codex_enable_planning_fails_fast(self):
+        with pytest.raises(agent_run._LaunchArgvError, match="unsupported.*codex"):
+            _parse(["--harness", "codex", "--enable-planning", "--prompt", "hi", "myrun"])
+
+    def test_claude_permission_mode_plan_rejected_when_planning_disabled(self):
+        """Two-token --permission-mode plan would start Claude in plan mode,
+        bypassing the EnterPlanMode/ExitPlanMode denies."""
+        with pytest.raises(agent_run._LaunchArgvError, match="plan mode"):
+            _parse([
+                "--harness", "claude", "--prompt", "hi",
+                "--harness-arg", "--permission-mode",
+                "--harness-arg", "plan",
+                "myrun",
+            ])
+
+    def test_claude_permission_mode_equals_plan_rejected_when_planning_disabled(self):
+        with pytest.raises(agent_run._LaunchArgvError, match="plan mode"):
+            _parse([
+                "--harness", "claude", "--prompt", "hi",
+                "--harness-arg", "--permission-mode=plan",
+                "myrun",
+            ])
+
+    def test_claude_permission_mode_plan_allowed_with_enable_planning(self):
+        r = _parse([
+            "--harness", "claude", "--enable-planning",
+            "--prompt", "hi",
+            "--harness-arg", "--permission-mode",
+            "--harness-arg", "plan",
+            "myrun",
+        ])
+        assert r.enable_planning is True
+        assert list(r.harness_args) == ["--permission-mode", "plan"]
+
+    def test_claude_permission_mode_bypass_not_rejected(self):
+        """Only the 'plan' value is rejected; other --permission-mode values pass."""
+        r = _parse([
+            "--harness", "claude", "--prompt", "hi",
+            "--harness-arg", "--permission-mode",
+            "--harness-arg", "bypassPermissions",
+            "myrun",
+        ])
+        assert "--permission-mode" in list(r.harness_args)
+
 
     def test_all_harness_flags_combined(self):
         r = _parse([
@@ -233,6 +294,7 @@ class TestParseLaunchArgvHarness:
         assert r.cwd == "/tmp"
         assert r.name == "myrun"
 
+
     @pytest.mark.parametrize("sub", sorted(agent_run._KNOWN_SUBCOMMANDS))
     def test_subcommand_dispatch_unaffected(self, sub):
         r = _parse([sub, "myrun"])
@@ -273,6 +335,11 @@ class TestParserHelpShowsManagedMode:
 
     def test_harness_arg_flag_in_help(self):
         assert "--harness-arg" in self._help_text()
+
+    @pytest.mark.parametrize("flag", ["--enable-planning", "--enable-questions"])
+    def test_capability_flags_in_help(self, flag):
+        assert flag in self._help_text()
+
 
     def test_raw_usage_line_present(self):
         # The raw-mode usage line must remain visible so the existing contract
@@ -343,6 +410,19 @@ class TestBuildManagedArgv:
         assert "--model" in argv
         i = argv.index("--model")
         assert argv[i + 1] == "claude-opus-4-5"
+
+    def test_claude_default_denies_planning_and_questions_after_prompt(self):
+        argv = self._build("claude", prompt="deliver this prompt", session_id="u")
+        assert argv.index("deliver this prompt") < argv.index("--disallowedTools")
+        denied = [argv[index + 1] for index, value in enumerate(argv[:-1]) if value == "--disallowedTools"]
+        assert denied == ["EnterPlanMode", "ExitPlanMode", "AskUserQuestion"]
+
+    def test_claude_escape_hatches_omit_corresponding_denies(self):
+        argv = self._build(
+            "claude", prompt="hi", enable_planning=True, enable_questions=True,
+        )
+        assert "--disallowedTools" not in argv
+
 
     # opencode one-shot
     def test_opencode_oneshot_uses_run_subcommand(self):
@@ -433,6 +513,150 @@ class TestBuildManagedArgv:
         argv = self._build("claude", session_id="u", harness_args=["--foo", "--bar=baz"])
         assert "--foo" in argv
         assert "--bar=baz" in argv
+
+    def test_claude_bare_harness_arg_not_swallowed_by_disallowed_tools(self):
+        """A bare (non-flag) --harness-arg token must survive as its own argv element.
+
+        --disallowedTools is variadic: the claude CLI consumes every bare token
+        following it as a tool name.  harness_args must appear before the deny
+        block so a bare user arg cannot be silently absorbed into the deny list.
+        """
+        bare_token = "SomeBareArg"
+        argv = self._build(
+            "claude",
+            prompt="hi",
+            session_id="u",
+            harness_args=[bare_token],
+            # denies active so --disallowedTools is present
+            enable_planning=False,
+            enable_questions=False,
+        )
+        assert bare_token in argv, f"bare harness_arg {bare_token!r} missing from argv: {argv}"
+        # The token must not appear as the argument to any --disallowedTools entry.
+        deny_targets = [
+            argv[i + 1] for i, tok in enumerate(argv[:-1]) if tok == "--disallowedTools"
+        ]
+        assert bare_token not in deny_targets, (
+            f"bare harness_arg {bare_token!r} was absorbed into --disallowedTools targets: "
+            f"{deny_targets}; full argv: {argv}"
+        )
+        # harness_args must precede the first --disallowedTools flag.
+        if "--disallowedTools" in argv:
+            assert argv.index(bare_token) < argv.index("--disallowedTools"), (
+                f"bare harness_arg {bare_token!r} appears after --disallowedTools: {argv}"
+            )
+
+
+class TestOpenCodePolicyConfig:
+    def test_preserves_unrelated_content_and_denies_by_default(self):
+        config = json.loads(agent_run._opencode_policy_config(
+            json.dumps({"model": "kept", "permission": {"bash": "allow"}}),
+            enable_planning=False,
+            enable_questions=False,
+        ))
+        assert config["model"] == "kept"
+        assert config["permission"] == {
+            "bash": "allow",
+            "question": "deny",
+            "plan_enter": "deny",
+            "plan_exit": "deny",
+        }
+
+    def test_escape_hatches_allow_only_requested_capabilities(self):
+        config = json.loads(agent_run._opencode_policy_config(
+            None, enable_planning=True, enable_questions=True,
+        ))
+        assert config["permission"] == {
+            "question": "allow",
+            "plan_enter": "allow",
+            "plan_exit": "allow",
+        }
+
+    def test_per_agent_allow_block_is_overridden_by_policy(self):
+        # A project opencode.json with a per-agent allow block must come out
+        # with the deny applied at both global scope and the agent scope.
+        existing = json.dumps({
+            "permission": {"bash": "allow"},
+            "agent": {
+                "build": {
+                    "permission": {
+                        "question": "allow",
+                        "plan_enter": "allow",
+                        "plan_exit": "allow",
+                    },
+                    "model": "kept",
+                },
+            },
+        })
+        config = json.loads(agent_run._opencode_policy_config(
+            existing, enable_planning=False, enable_questions=False,
+        ))
+        # Global scope: deny applied, unrelated key preserved.
+        assert config["permission"]["bash"] == "allow"
+        assert config["permission"]["question"] == "deny"
+        assert config["permission"]["plan_enter"] == "deny"
+        assert config["permission"]["plan_exit"] == "deny"
+        # Per-agent scope: deny applied, unrelated field preserved.
+        build = config["agent"]["build"]
+        assert build["model"] == "kept"
+        assert build["permission"]["question"] == "deny"
+        assert build["permission"]["plan_enter"] == "deny"
+        assert build["permission"]["plan_exit"] == "deny"
+
+    def test_per_agent_blocks_without_policy_keys_receive_policy_injected(self):
+        # "build" is always a target agent, so it gets a permission block even
+        # when it had none. "test" is not a target but already has a permission
+        # block, so the policy is merged into it. Unrelated fields survive.
+        existing = json.dumps({
+            "agent": {
+                "build": {"model": "claude-3"},
+                "test": {"permission": {"bash": "allow"}},
+
+            },
+        })
+        config = json.loads(agent_run._opencode_policy_config(
+            existing, enable_planning=False, enable_questions=False,
+        ))
+        assert config["agent"]["build"]["model"] == "claude-3"
+        assert config["agent"]["build"]["permission"]["question"] == "deny"
+        assert config["agent"]["build"]["permission"]["plan_enter"] == "deny"
+        assert config["agent"]["build"]["permission"]["plan_exit"] == "deny"
+        assert config["agent"]["test"]["permission"]["bash"] == "allow"
+        assert config["agent"]["test"]["permission"]["question"] == "deny"
+
+
+class TestOpenCodeAgentNameParsing:
+    @pytest.mark.parametrize("harness_args,expected", [
+        (["--agent", "myagent"], {"myagent"}),
+        (["--agent=myagent"], {"myagent"}),
+        (["--agent", "a", "--agent", "b"], {"a", "b"}),
+        (["--auto", "--model", "sonnet"], set()),
+        ([], set()),
+    ])
+    def test_agent_names_extracted(self, harness_args, expected):
+        assert agent_run._opencode_agent_names_from_harness_args(harness_args) == expected
+
+    def test_agent_name_drives_policy_target(self):
+        """The name parsed out of harness_args is the exact key
+        _opencode_policy_config writes a deny block under. If the two ever
+        disagree on the string, a per-agent allow escapes the policy.
+        """
+        agent_name = "myspecialagent"
+        extra = agent_run._opencode_agent_names_from_harness_args(["--agent", agent_name])
+        policy = json.loads(agent_run._opencode_policy_config(
+            None,
+            enable_planning=False,
+            enable_questions=False,
+            extra_agent_names=extra,
+        ))
+        agent_block = policy.get("agent", {}).get(agent_name)
+        assert agent_block is not None, (
+            f"_opencode_policy_config did not create a block for agent {agent_name!r}; "
+            f"the parsed name from harness_args did not reach target_agents"
+        )
+        assert agent_block.get("permission", {}).get("question") == "deny", (
+            f"agent block for {agent_name!r} does not carry the deny: {agent_block!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +948,7 @@ def _kill_run_pid(state_dir: Path) -> None:
             time.sleep(0.3)
 
 
+
 def _wait_terminal(state_dir: Path, timeout: float = 15.0) -> str:
     """Poll <state_dir>/status until it is terminal; return the last status seen.
 
@@ -743,6 +968,7 @@ def _wait_terminal(state_dir: Path, timeout: float = 15.0) -> str:
     if status not in agent_run.TERMINAL_STATUSES:
         _kill_run_pid(state_dir)
     return status
+
 
 
 def _launch_and_wait(
@@ -775,6 +1001,8 @@ def _launch_and_wait(
         prompt=prompt,
         model=model,
         agent_mode=None,
+
+
         harness_args=[],
         permissions="bypass",
     )
@@ -784,6 +1012,7 @@ def _launch_and_wait(
     state_dir = state_root / name
     log_dir = log_root / name
     status = _wait_terminal(state_dir, timeout=timeout)
+
 
     session_data = agent_run._read_session_json(log_dir)
     return status, session_data
@@ -854,6 +1083,39 @@ class TestManagedClaudeLaunch:
                     break
             time.sleep(0.05)
         assert "--session-id" in log_content, f"Expected --session-id in log: {log_content!r}"
+
+
+    def test_claude_oneshot_delivers_prompt_via_stdin_with_denies_in_argv(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        fake = tmp_path / "claude"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n"
+            "printf '<stdin:%s>\\n' \"$(cat)\"\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        name = "claude-prompt-after-denies"
+        _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="claude", interactive=False, prompt="unique managed prompt",
+        )
+        delivered = (isolated_log_root / name / "log").read_text()
+        # Prompt arrives on stdin; the managed path materialises it to a file
+        # and _build_managed_argv suppresses the positional arg.
+        assert "<stdin:unique managed prompt>" in delivered
+        # Each deny must appear as a flag/value pair, not as a bare positional.
+        lines = delivered.splitlines()
+        for tool in ("EnterPlanMode", "ExitPlanMode", "AskUserQuestion"):
+            try:
+                idx = lines.index(f"<{tool}>")
+            except ValueError:
+                raise AssertionError(f"<{tool}> not found in delivered argv: {delivered!r}")
+            assert lines[idx - 1] == "<--disallowedTools>", (
+                f"<{tool}> must be immediately preceded by <--disallowedTools>: {delivered!r}"
+            )
+
 
     def test_claude_oneshot_never_emits_session_prompt_together_in_argv(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
@@ -1288,6 +1550,7 @@ class TestManagedCodexInteractiveAppServer:
 
         # Wait for the run to reach running (session.json is written then).
         reached_running = self._wait_for_running(state_dir, timeout=10.0)
+
         assert reached_running, "Interactive codex run must reach 'running'"
 
         # session.json must show minted/certain at this point.
@@ -1322,6 +1585,7 @@ class TestManagedCodexInteractiveAppServer:
 
         self._wait_for_terminal(state_dir, timeout=12.0)
 
+
         log_path = log_dir / "log"
         log_content = log_path.read_text() if log_path.exists() else ""
         assert "initial response" in log_content, (
@@ -1347,6 +1611,7 @@ class TestManagedCodexInteractiveAppServer:
             harness="codex", prompt="initial prompt", model=None, agent_mode=None,
             harness_args=[],
         )
+
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
         log_dir = isolated_log_root / name
@@ -1388,6 +1653,7 @@ class TestManagedCodexInteractiveAppServer:
         log_dir = isolated_log_root / name
 
         self._wait_for_terminal(state_dir, timeout=15.0)
+
         session = agent_run._read_session_json(log_dir)
         assert session is not None, "session.json must always be written"
         assert session["confidence"] == "missing"
@@ -1751,6 +2017,22 @@ class TestEndToEndThroughMain:
         fake.chmod(0o755)
         return str(fake_dir)
 
+    def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
+        """Wait for terminal status. Kills the runner on timeout."""
+        deadline = time.monotonic() + timeout
+        status = "starting"
+        while time.monotonic() < deadline:
+            try:
+                status = (state_dir / "status").read_text().strip()
+            except FileNotFoundError:
+                pass
+            if status in agent_run.TERMINAL_STATUSES:
+                break
+            time.sleep(0.05)
+        if status not in agent_run.TERMINAL_STATUSES:
+            _kill_run_pid(state_dir)
+        return status
+
     def test_main_claude_oneshot_produces_session_json(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
@@ -1761,12 +2043,13 @@ class TestEndToEndThroughMain:
         rc = agent_run.main(["--harness", "claude", "--prompt", "say hi", name])
         assert rc == 0, f"main() returned non-zero: {rc}"
         state_dir = isolated_runs_root / name
-        _wait_terminal(state_dir)
+        self._wait_terminal(state_dir)
         session = agent_run._read_session_json(isolated_log_root / name)
         assert session is not None
         assert session["harness"] == "claude"
         assert session["acquisition"] == "pushed"
         assert session["confidence"] == "certain"
+
 
     def test_main_codex_oneshot_produces_session_json(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
@@ -1778,11 +2061,113 @@ class TestEndToEndThroughMain:
         rc = agent_run.main(["--harness", "codex", "--prompt", "say hello", name])
         assert rc == 0
         state_dir = isolated_runs_root / name
-        _wait_terminal(state_dir)
+        self._wait_terminal(state_dir)
         session = agent_run._read_session_json(isolated_log_root / name)
         assert session is not None
         assert session["session_id"] == "main-e2e-tid"
         assert session["confidence"] == "certain"
+
+    def test_main_codex_questions_policy_reaches_appserver(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        fake_dir = tmp_path / "codex-bin"
+        fake_dir.mkdir()
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "with open(sys.argv[0] + '.args', 'w') as f: json.dump(sys.argv[1:], f)\n"
+            "def recv(): return json.loads(sys.stdin.readline())\n"
+            "def send(obj): print(json.dumps(obj), flush=True)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {}}); recv()\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'thread': {'id': 'policy-thread'}}})\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}})\n"
+            "send({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        name = "main-codex-question-policy"
+        assert agent_run.main(["--harness", "codex", "--prompt", "hi", name]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+        args = json.loads((fake.with_name("codex.args")).read_text())
+        assert "tools.experimental_request_user_input={enabled=false}" in args
+
+    def test_main_codex_questions_enabled_arm_reaches_appserver(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """--enable-questions flips the codex policy arg to {enabled=true}."""
+        fake_dir = tmp_path / "codex-bin-enabled"
+        fake_dir.mkdir()
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "with open(sys.argv[0] + '.args', 'w') as f: json.dump(sys.argv[1:], f)\n"
+            "def recv(): return json.loads(sys.stdin.readline())\n"
+            "def send(obj): print(json.dumps(obj), flush=True)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {}}); recv()\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'thread': {'id': 'enabled-thread'}}})\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}})\n"
+            "send({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        name = "main-codex-question-enabled"
+        assert agent_run.main([
+            "--harness", "codex", "--enable-questions", "--prompt", "hi", name,
+        ]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+        args = json.loads((fake.with_name("codex.args")).read_text())
+        assert "tools.experimental_request_user_input={enabled=true}" in args
+        assert "tools.experimental_request_user_input={enabled=false}" not in args
+
+    def test_main_opencode_managed_launch_delivers_policy_env(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """OPENCODE_CONFIG_CONTENT with the three policy keys reaches the child process."""
+        fake = tmp_path / "opencode"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "printf 'ENVPROBE:%s\\n' \"$OPENCODE_CONFIG_CONTENT\"\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        name = "oc-policy-env"
+        assert agent_run.main(["--harness", "opencode", "--prompt", "hi", name]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+        log = (isolated_log_root / name / "log").read_text()
+        probe_lines = [l for l in log.splitlines() if l.startswith("ENVPROBE:")]
+        assert probe_lines, f"ENVPROBE line not found in log: {log!r}"
+        cfg = json.loads(probe_lines[0].split("ENVPROBE:", 1)[1].strip())
+        assert cfg["permission"]["question"] == "deny"
+        assert cfg["permission"]["plan_enter"] == "deny"
+        assert cfg["permission"]["plan_exit"] == "deny"
+
+    def test_main_claude_escape_hatches_reach_argv_via_cli(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """--enable-planning and --enable-questions remove the deny flags through main()."""
+        fake = tmp_path / "claude"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n"
+            "printf '<stdin:%s>\\n' \"$(cat)\"\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+        name = "main-claude-escape-hatches"
+        assert agent_run.main([
+            "--harness", "claude",
+            "--enable-questions", "--enable-planning",
+            "--prompt", "hi",
+            name,
+        ]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+        log = (isolated_log_root / name / "log").read_text()
+        assert "<--disallowedTools>" not in log, (
+            f"--disallowedTools must be absent when both escape hatches are set: {log!r}"
+        )
+
 
     def test_main_model_rejected_for_codex(self, isolated_runs_root, isolated_log_root, monkeypatch):
         """main() with --model and --harness codex exits non-zero before creating state."""
@@ -1808,6 +2193,7 @@ class TestEndToEndThroughMain:
             ])
         assert exc_info.value.code != 0
         assert not (isolated_runs_root / name).exists()
+
 
     def test_main_bad_harness_arg_rejected_before_starting(
         self, isolated_runs_root, isolated_log_root, monkeypatch
@@ -1841,6 +2227,285 @@ class TestEndToEndThroughMain:
         assert argv[argv.index("--session-id") + 1] == fixed_id
         session = agent_run._read_session_json(isolated_log_root / name)
         assert session["session_id"] == fixed_id
+
+
+# ---------------------------------------------------------------------------
+# Escape-hatch wiring: --enable-planning × --enable-questions, per harness.
+#
+# Each case captures the argv/env actually delivered to a fake child process,
+# so wiring the two booleans to each other or dropping a deny target fails here.
+# ---------------------------------------------------------------------------
+
+def _policy_flags(enable_planning: bool, enable_questions: bool) -> list[str]:
+    return (
+        (["--enable-planning"] if enable_planning else [])
+        + (["--enable-questions"] if enable_questions else [])
+    )
+
+
+def _assert_opencode_policy_values(
+    cfg: dict, *, enable_planning: bool, enable_questions: bool, where: str
+) -> None:
+    """Assert the three policy keys carry the expected values at global scope
+    and in the "build" agent block, which is the default agent selection.
+    """
+    expected_question = "allow" if enable_questions else "deny"
+    expected_plan = "allow" if enable_planning else "deny"
+    perm = cfg.get("permission", {})
+    build_perm = cfg.get("agent", {}).get("build", {}).get("permission", {})
+    for scope, block in (("permission", perm), ("agent.build.permission", build_perm)):
+        for key, expected in (
+            ("question", expected_question),
+            ("plan_enter", expected_plan),
+            ("plan_exit", expected_plan),
+        ):
+            assert block.get(key) == expected, (
+                f"{where}: {scope}.{key}={block.get(key)!r} != {expected!r}; "
+                f"full config: {cfg!r}"
+            )
+
+
+class TestFlagCombinations:
+    def _wait_terminal(self, state_dir: Path, timeout: float = 12.0) -> str:
+        deadline = time.monotonic() + timeout
+        status = "starting"
+        while time.monotonic() < deadline:
+            try:
+                status = (state_dir / "status").read_text().strip()
+            except FileNotFoundError:
+                pass
+            if status in agent_run.TERMINAL_STATUSES:
+                break
+            time.sleep(0.05)
+        if status not in agent_run.TERMINAL_STATUSES:
+            _kill_run_pid(state_dir)
+        return status
+
+    def _fake_codex_on_path(self, bin_dir: Path, monkeypatch) -> Path:
+        """Install a codex app-server stub that records its argv and completes one turn.
+
+        Returns the path the stub writes its argv JSON to.
+        """
+        bin_dir.mkdir()
+        argv_file = bin_dir / "codex.argv"
+        fake = bin_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"open({str(argv_file)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+            "def recv(): return json.loads(sys.stdin.readline())\n"
+            "def send(obj): print(json.dumps(obj), flush=True)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}}); recv()\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'thread': {'id': 'tid', 'sessionId': 'tid', 'path': '~/.codex/r.jsonl'}}})\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'turn': {'id': 't1'}}})\n"
+            "send({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir) + ":" + os.environ.get("PATH", ""))
+        return argv_file
+
+    @pytest.mark.parametrize("enable_planning,enable_questions,expected_denied", [
+        (False, False, ["EnterPlanMode", "ExitPlanMode", "AskUserQuestion"]),
+        (True,  False, ["AskUserQuestion"]),
+        (False, True,  ["EnterPlanMode", "ExitPlanMode"]),
+        (True,  True,  []),
+    ])
+    def test_claude_flag_combinations_exact_deny_targets(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch,
+        enable_planning, enable_questions, expected_denied,
+    ):
+        argv_file = tmp_path / "claude.argv"
+        script = tmp_path / "claude"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"open({str(argv_file)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+            "sys.exit(0)\n"
+        )
+        script.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+
+        name = f"policy-claude-ep{int(enable_planning)}-eq{int(enable_questions)}"
+        assert agent_run.main([
+            "--harness", "claude",
+            *_policy_flags(enable_planning, enable_questions),
+            "--prompt", "hi", name,
+        ]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+
+        assert argv_file.exists(), (
+            f"fake claude did not write argv file; "
+            f"log: {(isolated_log_root / name / 'log').read_text()!r}"
+        )
+        argv = json.loads(argv_file.read_text())
+        denied = [argv[i + 1] for i, tok in enumerate(argv[:-1]) if tok == "--disallowedTools"]
+        assert sorted(denied) == sorted(expected_denied), (
+            f"claude enable_planning={enable_planning} enable_questions={enable_questions}: "
+            f"denied tools {denied!r} != expected {expected_denied!r}; full argv: {argv}"
+        )
+
+    @pytest.mark.parametrize("enable_planning,enable_questions", [
+        (False, False),
+        (True,  True),
+    ])
+    def test_opencode_flag_combinations_exact_env(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch,
+        enable_planning, enable_questions,
+    ):
+        """Full main() path proves OPENCODE_CONFIG_CONTENT reaches the runner
+        grandchild, not only the prefork mint.
+
+        Only the fully-deny and fully-allow cases run here because each costs the
+        prefork-mint health poll; the crossed combinations are covered without
+        that cost in TestPreforkMintEnvDelivery.
+        """
+        env_file = tmp_path / "opencode.env"
+        script = tmp_path / "opencode"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            f"open({str(env_file)!r}, 'w').write(os.environ.get('OPENCODE_CONFIG_CONTENT', ''))\n"
+            "sys.exit(0)\n"
+        )
+        script.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ.get("PATH", ""))
+
+        name = f"policy-oc-ep{int(enable_planning)}-eq{int(enable_questions)}"
+        assert agent_run.main([
+            "--harness", "opencode",
+            *_policy_flags(enable_planning, enable_questions),
+            "--prompt", "hi", name,
+        ]) == 0
+        # The prefork-mint health poll runs up to 30 s before falling back to
+        # launching the runner; 40 s covers the poll plus the runner exec.
+        self._wait_terminal(isolated_runs_root / name, timeout=40.0)
+
+        assert env_file.exists(), (
+            f"fake opencode did not write env file; log: "
+            f"{(isolated_log_root / name / 'log').read_text()!r}"
+        )
+        cfg = json.loads(env_file.read_text())
+        _assert_opencode_policy_values(
+            cfg, enable_planning=enable_planning, enable_questions=enable_questions,
+            where=f"opencode ep={enable_planning} eq={enable_questions}",
+        )
+
+    @pytest.mark.parametrize("enable_questions,expected_arg", [
+        (False, "tools.experimental_request_user_input={enabled=false}"),
+        (True,  "tools.experimental_request_user_input={enabled=true}"),
+    ])
+    def test_codex_flag_combinations_exact_argv(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch,
+        enable_questions, expected_arg,
+    ):
+        """Codex has no planning equivalent, so only enable_questions varies;
+        --enable-planning with codex is rejected by the parser.
+        """
+        argv_file = self._fake_codex_on_path(tmp_path / "codex-bin", monkeypatch)
+
+        name = f"policy-codex-eq{int(enable_questions)}"
+        assert agent_run.main([
+            "--harness", "codex",
+            *_policy_flags(False, enable_questions),
+            "--prompt", "hi", name,
+        ]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+
+        assert argv_file.exists(), (
+            f"fake codex did not write argv file; log: "
+            f"{(isolated_log_root / name / 'log').read_text()!r}"
+        )
+        argv = json.loads(argv_file.read_text())
+        assert expected_arg in argv, (
+            f"codex eq={enable_questions}: {expected_arg!r} not in argv {argv!r}"
+        )
+
+    def test_codex_caller_dash_c_lands_last(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """codex resolves duplicate -c keys last-occurrence-wins, so a caller's
+        -c must be positioned after the managed policy -c to take effect.
+        """
+        argv_file = self._fake_codex_on_path(tmp_path / "codex-last-bin", monkeypatch)
+
+        name = "policy-codex-caller-last"
+        caller_c = "tools.experimental_request_user_input={enabled=true}"
+        assert agent_run.main([
+            "--harness", "codex", "--prompt", "hi",
+            "--harness-arg", "-c",
+            "--harness-arg", caller_c,
+            name,
+        ]) == 0
+        self._wait_terminal(isolated_runs_root / name)
+
+        assert argv_file.exists(), (
+            f"fake codex did not write argv file; log: "
+            f"{(isolated_log_root / name / 'log').read_text()!r}"
+        )
+        argv = json.loads(argv_file.read_text())
+
+        policy_arg = "tools.experimental_request_user_input={enabled=false}"
+        assert policy_arg in argv, f"policy arg missing from argv: {argv!r}"
+        assert caller_c in argv, f"caller arg missing from argv: {argv!r}"
+        assert argv.index(caller_c) > argv.index(policy_arg), (
+            f"caller -c arg {caller_c!r} appears before policy arg {policy_arg!r}: {argv!r}"
+        )
+
+
+class TestPreforkMintEnvDelivery:
+    """_opencode_prefork_mint must pass the policy to the temporary opencode
+    process it starts, or the minted session is created under an allow config.
+    A fake Popen captures the env without starting a real process.
+    """
+
+    @pytest.mark.parametrize("enable_planning,enable_questions", [
+        (False, False),
+        (True,  False),
+        (False, True),
+        (True,  True),
+    ])
+    def test_prefork_mint_delivers_policy_env(
+        self, tmp_path, monkeypatch, enable_planning, enable_questions
+    ):
+        captured_envs: list[dict] = []
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured_envs.append(dict(kwargs.get("env", {})))
+                self.pid = os.getpid()
+                self.returncode = 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+
+        # Returns None (no real opencode to poll), but the env is captured.
+        agent_run._opencode_prefork_mint(
+            12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+            enable_planning=enable_planning,
+            enable_questions=enable_questions,
+            opencode_agent_mode="build",
+        )
+        assert captured_envs, "Popen was not called"
+        env_content = captured_envs[0].get("OPENCODE_CONFIG_CONTENT", "")
+        assert env_content, "OPENCODE_CONFIG_CONTENT not set in prefork-mint env"
+        try:
+            cfg = json.loads(env_content)
+        except json.JSONDecodeError:
+            raise AssertionError(
+                f"OPENCODE_CONFIG_CONTENT is not valid JSON: {env_content!r}"
+            )
+        _assert_opencode_policy_values(
+            cfg, enable_planning=enable_planning, enable_questions=enable_questions,
+            where=f"prefork mint ep={enable_planning} eq={enable_questions}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1941,6 +2606,7 @@ class TestAppServerTeardown:
         state_dir = isolated_runs_root / name
         # Wait for runner to start and app-server to be running.
         reached = self._wait_for_status(state_dir, "running", timeout=10.0)
+
         assert reached, f"Run never reached running; status={agent_run._read(state_dir / 'status')!r}"
 
         # Confirm app-server is alive.
@@ -1989,6 +2655,7 @@ class TestAppServerTeardown:
 
         state_dir = isolated_runs_root / name
         reached = self._wait_for_status(state_dir, "running", timeout=10.0)
+
         assert reached, "Run never reached running"
 
         pids_before = self._get_codex_pids(tmp_path)
@@ -2135,6 +2802,22 @@ class TestCodexRpcEdgeCases:
         _kill_run_pid(state_dir)
         return False
 
+    def _wait_terminal(self, state_dir: Path, timeout: float = 15.0) -> str:
+        """Wait for terminal status. Kills the runner on timeout."""
+        deadline = time.monotonic() + timeout
+        status = "starting"
+        while time.monotonic() < deadline:
+            try:
+                status = (state_dir / "status").read_text().strip()
+            except FileNotFoundError:
+                pass
+            if status in agent_run.TERMINAL_STATUSES:
+                break
+            time.sleep(0.05)
+        if status not in agent_run.TERMINAL_STATUSES:
+            _kill_run_pid(state_dir)
+        return status
+
     def test_result_null_frame_does_not_crash_interactive_runner(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
@@ -2156,7 +2839,8 @@ class TestCodexRpcEdgeCases:
         state_dir = isolated_runs_root / name
         log_dir = isolated_log_root / name
 
-        _wait_terminal(state_dir, timeout=15.0)
+        self._wait_terminal(state_dir, timeout=15.0)
+
 
         # Run must not crash (status must be a normal terminal, not a traceback-induced failure)
         status = agent_run._read(state_dir / "status", "").strip()
@@ -2190,6 +2874,7 @@ class TestCodexRpcEdgeCases:
             harness="codex", prompt="initial", model=None, agent_mode=None,
             harness_args=[],
         )
+
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
         log_dir = isolated_log_root / name
@@ -2203,12 +2888,13 @@ class TestCodexRpcEdgeCases:
         steer_ns = argparse.Namespace(name=name, message=["DO SOMETHING"], raw=False, esc=False)
         agent_run.cmd_steer(steer_ns)
 
-        _wait_terminal(state_dir, timeout=12.0)
+        self._wait_terminal(state_dir, timeout=12.0)
 
         acquire_log = log_dir / "session-acquire.log"
         log_text = acquire_log.read_text() if acquire_log.exists() else ""
         # The steer must have gone as turn/steer (active_turn_id was set).
         assert "turn/steer" in log_text, (
+
             f"Steer must dispatch as turn/steer when active_turn_id is set: {log_text!r}"
         )
         # The rpc error from the server must be recorded.
@@ -2233,6 +2919,7 @@ class TestCodexRpcEdgeCases:
             harness="codex", prompt="first", model=None, agent_mode=None,
             harness_args=[],
         )
+
         agent_run.cmd_launch(ns)
         state_dir = isolated_runs_root / name
         log_dir = isolated_log_root / name
@@ -2244,7 +2931,8 @@ class TestCodexRpcEdgeCases:
         # Send steer: if active_turn_id was cleared correctly, this becomes turn/start.
         steer_ns = argparse.Namespace(name=name, message=["after-turn"], raw=False, esc=False)
         agent_run.cmd_steer(steer_ns)
-        _wait_terminal(state_dir, timeout=12.0)
+        self._wait_terminal(state_dir, timeout=12.0)
+
 
         acquire_log = log_dir / "session-acquire.log"
         log_text = acquire_log.read_text() if acquire_log.exists() else ""
@@ -2253,6 +2941,7 @@ class TestCodexRpcEdgeCases:
         assert "turn/start (steer idle)" in log_text, (
             f"Acquire log must show idle-path turn/start (active_turn_id was cleared): {log_text!r}"
         )
+
 
 
 
@@ -2523,3 +3212,229 @@ class TestCwdLaunch:
             assert not (isolated_runs_root / name).exists()
         finally:
             target.chmod(0o700)
+
+
+# ---------------------------------------------------------------------------
+# OpenCode real-resolver policy tests
+#
+# These run the real `opencode debug agent` resolver (no model calls, no API
+# cost) to check that the managed deny beats an allow from each external config
+# source. Skipped when opencode is not on PATH.
+# ---------------------------------------------------------------------------
+
+_ALLOW_ALL_POLICY = {"question": "allow", "plan_enter": "allow", "plan_exit": "allow"}
+
+
+def _allow_agent_config(agent_name: str) -> str:
+    """Serialised opencode.json granting an agent all three policy keys."""
+    return json.dumps({"agent": {agent_name: {"permission": dict(_ALLOW_ALL_POLICY)}}})
+
+
+def _oc_policy_env(agent_mode: Optional[str] = None) -> dict:
+    """Return an env dict with OPENCODE_CONFIG_CONTENT set to the full deny policy."""
+    policy = agent_run._opencode_policy_config(
+        None,
+        enable_planning=False,
+        enable_questions=False,
+        opencode_agent_mode=agent_mode,
+    )
+    return {**os.environ, "OPENCODE_CONFIG_CONTENT": policy}
+
+
+def _oc_debug_agent(agent_name: str, cwd: str, env: dict, timeout: float = 10.0) -> dict:
+    """Run `opencode debug agent <agent_name>` and return the parsed JSON result.
+
+    Raises AssertionError if the command exits non-zero or the output is not
+    valid JSON — callers must require successful exit before asserting policy.
+    """
+    result = subprocess.run(
+        ["opencode", "debug", "agent", agent_name],
+        capture_output=True, text=True, env=env, cwd=cwd, timeout=timeout,
+    )
+    stderr = result.stderr
+    assert result.returncode == 0, (
+        f"opencode debug agent {agent_name!r} exited {result.returncode}; "
+        f"stderr={stderr!r}"
+    )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"opencode debug agent {agent_name!r} output is not valid JSON: {exc}; "
+            f"stdout={result.stdout[:300]!r}"
+        ) from exc
+
+
+@pytest.mark.skipif(shutil.which("opencode") is None, reason="requires real opencode binary on PATH")
+class TestOpenCodeRealResolverPolicy:
+    """The managed deny must beat an allow from the project, user/XDG,
+    OPENCODE_CONFIG, and named-agent config sources.
+
+    TestOpenCodePolicyConfig only covers the JSON transformation; these tests
+    run the resolver that decides at run time, so they also validate the config
+    load order the transformation depends on.
+    """
+
+    def _assert_policy_denied(self, data: dict, agent_name: str) -> None:
+        """Assert the three policy keys resolve to deny for ``agent_name``.
+
+        question resolves to a tool (``tools.question`` must be False);
+        plan_enter and plan_exit resolve to permission rules only, where the
+        last matching rule decides.
+        """
+        tools = data.get("tools", {})
+        assert tools.get("question") is False, (
+            f"opencode resolved agent {agent_name!r} has tools.question={tools.get('question')!r} "
+            f"(expected False); the managed deny did not win. Full tools: {tools}"
+        )
+        perms = data.get("permission", [])
+        for perm_key in ("plan_enter", "plan_exit"):
+            matching = [p for p in perms if p.get("permission") == perm_key]
+            assert matching, (
+                f"opencode resolved agent {agent_name!r} has no permission rules for {perm_key!r}; "
+                f"deny was not applied. Full permission list: {perms}"
+            )
+            last_action = matching[-1].get("action")
+            assert last_action == "deny", (
+                f"opencode resolved agent {agent_name!r}: last {perm_key!r} rule is "
+                f"{last_action!r} (expected 'deny'); the managed deny did not win. "
+                f"Matching rules: {matching}"
+            )
+
+    @pytest.mark.parametrize("agent_name", ["build", "myagent"])
+    def test_project_per_agent_allow_defeated(self, tmp_path, agent_name):
+        """A per-agent allow in the project opencode.json is defeated, for both
+        the default agent and a custom named one."""
+        proj = tmp_path / f"proj-{agent_name}"
+        proj.mkdir()
+        (proj / "opencode.json").write_text(_allow_agent_config(agent_name))
+        data = _oc_debug_agent(agent_name, str(proj), _oc_policy_env(agent_mode=agent_name))
+        self._assert_policy_denied(data, agent_name)
+
+    def test_opencode_config_env_per_agent_allow_defeated(self, tmp_path):
+        """A per-agent allow in the file named by OPENCODE_CONFIG is defeated."""
+        allow_cfg = tmp_path / "allow.json"
+        allow_cfg.write_text(_allow_agent_config("build"))
+        proj = tmp_path / "proj-envcfg"
+        proj.mkdir()
+        env = {
+            **_oc_policy_env(agent_mode="build"),
+            "OPENCODE_CONFIG": str(allow_cfg),
+        }
+        data = _oc_debug_agent("build", str(proj), env)
+        self._assert_policy_denied(data, "build")
+
+    def test_user_xdg_per_agent_allow_defeated(self, tmp_path):
+        """A per-agent allow in the user/XDG config is defeated."""
+        oc_config_dir = tmp_path / "config" / "opencode"
+        oc_config_dir.mkdir(parents=True)
+        (oc_config_dir / "opencode.json").write_text(_allow_agent_config("build"))
+        proj = tmp_path / "proj-xdg"
+        proj.mkdir()
+        (tmp_path / "fakehome").mkdir()
+        env = {
+            **_oc_policy_env(agent_mode="build"),
+            # Both are redirected so the real user config is neither read nor written.
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "HOME": str(tmp_path / "fakehome"),
+        }
+        data = _oc_debug_agent("build", str(proj), env)
+        self._assert_policy_denied(data, "build")
+
+    def test_global_deny_beats_project_allow_no_agent_block(self, tmp_path):
+        """A project allow in the global permission section, with no agent block
+        anywhere, is defeated by the global scope of the managed policy."""
+        proj = tmp_path / "proj-global"
+        proj.mkdir()
+        (proj / "opencode.json").write_text(json.dumps({"permission": dict(_ALLOW_ALL_POLICY)}))
+        data = _oc_debug_agent("build", str(proj), _oc_policy_env(agent_mode="build"))
+        self._assert_policy_denied(data, "build")
+
+    def test_harness_arg_agent_allow_defeated(self, tmp_path):
+        """An agent selected via --harness-arg --agent rather than --agent-mode
+        still gets a deny block, sourced from the harness-args scan.
+        """
+        proj = tmp_path / "proj-harg"
+        proj.mkdir()
+        (proj / "opencode.json").write_text(_allow_agent_config("myagent"))
+        policy = agent_run._opencode_policy_config(
+            None,
+            enable_planning=False,
+            enable_questions=False,
+            opencode_agent_mode=None,
+            extra_agent_names=agent_run._opencode_agent_names_from_harness_args(
+                ["--agent", "myagent"]
+            ),
+        )
+        env = {**os.environ, "OPENCODE_CONFIG_CONTENT": policy}
+        data = _oc_debug_agent("myagent", str(proj), env)
+        self._assert_policy_denied(data, "myagent")
+
+
+# ---------------------------------------------------------------------------
+# Codex config key tripwire — fails loudly if codex renames the policy key
+# ---------------------------------------------------------------------------
+
+def _codex_strict_config(config_key: str) -> tuple[int, str, str]:
+    """Run `codex app-server --strict-config -c <config_key>`.
+
+    Returns (returncode, stdout, stderr). stdin is /dev/null, so app-server
+    exits on EOF and only a config rejection produces a non-zero exit.
+    """
+    result = subprocess.run(
+        ["codex", "app-server", "--strict-config", "-c", config_key],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10.0,
+    )
+    return (
+        result.returncode,
+        result.stdout.decode("utf-8", errors="replace"),
+        result.stderr.decode("utf-8", errors="replace"),
+    )
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="requires real codex binary on PATH")
+class TestCodexPolicyKeyTripwire:
+    """Verifies that codex still recognises tools.experimental_request_user_input.
+
+    codex app-server silently ignores unknown -c keys by default, so a rename
+    would silently disable the policy on every managed run. --strict-config
+    converts that silent no-op into a launch failure, which this test catches.
+    """
+
+    def test_codex_strict_config_accepts_policy_key(self):
+        returncode, stdout, stderr = _codex_strict_config(
+            "tools.experimental_request_user_input={enabled=false}"
+        )
+        assert returncode == 0, (
+            f"tools.experimental_request_user_input is no longer recognised by codex "
+            f"(or codex exited non-zero for another reason). "
+            f"If the key was renamed, update _codex_policy_args. "
+            f"returncode={returncode} stderr={stderr!r} stdout={stdout!r}"
+        )
+        assert "unknown configuration field" not in stderr, (
+            f"tools.experimental_request_user_input is no longer recognised by codex. "
+            f"The managed policy key has been renamed — update _codex_policy_args. "
+            f"stderr={stderr!r}"
+        )
+
+    def test_codex_strict_config_rejects_unknown_key(self):
+        """Negative control: without it, the test above cannot tell an accepted
+        key from strict validation not running at all.
+        """
+        returncode, stdout, stderr = _codex_strict_config(
+            "tools.agent_run_nonexistent_sentinel_key_xyz={enabled=false}"
+        )
+        assert returncode != 0, (
+            f"codex accepted a nonexistent key under --strict-config; "
+            f"strict validation may be disabled or the flag name changed. "
+            f"returncode={returncode} stderr={stderr!r} stdout={stdout!r}"
+        )
+        assert "unknown configuration field" in stderr or "unknown" in stderr.lower(), (
+            f"codex exited non-zero but did not mention an unknown field; "
+            f"the strict-config error message may have changed. "
+            f"returncode={returncode} stderr={stderr!r}"
+        )
+
