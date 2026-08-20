@@ -638,9 +638,47 @@ All existing raw-mode launch forms keep working.
 --permissions bypass|prompt       bypass (default): appends --permission-mode bypassPermissions
                                   or --auto; prompt: omits those flags so the harness's own
                                   permission UI is used
---harness-arg FLAG                pass FLAG verbatim after the harness's own args; repeatable
+--harness-arg FLAG                pass FLAG verbatim after the harness's own args; repeatable.
+                                  For claude and codex, values are appended after
+                                  agent-run's own managed-mode args so a caller can
+                                  override injected flags (codex uses last-occurrence-wins
+                                  for -c). For opencode, the three managed policy keys
+                                  (question, plan_enter, plan_exit) are not overridable
+                                  this way; use --enable-planning / --enable-questions
+                                  to relax them.
+--enable-planning                 allow planning; disabled by default. Unsupported by codex,
+                                  whose managed app-server path does not expose plan mode
+--enable-questions                allow interactive questions; disabled by default
 --cwd DIR                         working directory for the launched command (also raw mode)
 ```
+
+`--enable-planning` and `--enable-questions` are managed-mode escape hatches.
+Without them, agent-run disables planning and interactive questions for every
+managed child process: Claude receives per-process `--disallowedTools` (the
+deny arm; the enabled arm simply omits those flags and falls back to the user's
+own Claude project config), OpenCode receives a merged process-local
+`OPENCODE_CONFIG_CONTENT` permission policy with explicit `allow`/`deny` for
+both states, and Codex app-server receives
+`tools.experimental_request_user_input={enabled=false}` or `enabled=true`.
+Codex's managed app-server API does not expose plan mode, so
+`--enable-planning --harness codex` fails before creating run state. Raw mode
+is unaffected.
+
+**`--harness-arg` precedence:** for claude and codex, values are appended after
+agent-run's injected managed-mode args so a caller can override them. Codex uses
+last-occurrence-wins for `-c` keys, so a duplicate key in `--harness-arg` takes
+effect. Claude's `--disallowedTools` is additive, so a caller cannot re-enable a
+denied tool via `--harness-arg` regardless of ordering. For opencode, policy is
+delivered via `OPENCODE_CONFIG_CONTENT` (env), not argv; `--harness-arg` passes
+flags to the opencode process but cannot override the three managed policy keys
+(`question`, `plan_enter`, `plan_exit`) — use `--enable-planning` or
+`--enable-questions` instead.
+
+**`--harness-arg --permission-mode` for claude:** passing `--permission-mode plan`
+via `--harness-arg` is rejected when planning is disabled, because it would start
+Claude directly in plan mode, bypassing the `EnterPlanMode`/`ExitPlanMode` tool
+denies. Use `--enable-planning` to enable plan mode through the supported policy
+path.
 
 #### One-shot examples
 
@@ -725,6 +763,7 @@ Absent for raw-mode runs.
   "cwd": "/Users/you/project",
   "started_at": "2026-08-16T15:20:10Z",
   "harness": "claude",
+  "agent_run_version": "0.1.0",
   "interactive": false,
   "model": null,
   "agent_mode": null,
@@ -735,7 +774,8 @@ Absent for raw-mode runs.
 ```
 
 Written atomically at launch with the fields above, then updated at exit with
-`ended_at`, `exit_code`, and `status`. Present for both raw and managed runs.
+`ended_at`, `exit_code`, and `status`. `agent_run_version` records the harness
+version that created the run. Present for both raw and managed runs.
 Liveness state (`pid`, `status`, `stdin` FIFO, etc.) remains in the ephemeral
 `/tmp/agent-runs/<name>/` directory only — a missing entry there unambiguously
 means "not running", and that invariant is intact.
@@ -750,7 +790,8 @@ the run's persistent log dir, `session` is the parsed object; otherwise it is
 
 ```json
 {
-  "schema": "agent-run.watch.v1",
+  "schema": "agent-run.watch.v2",
+  "agent_run_version": "0.1.0",
   "name": "build",
   "status": "done",
   "terminal": true,

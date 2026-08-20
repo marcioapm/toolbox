@@ -359,6 +359,7 @@ from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from toolbox import __version__ as TOOLBOX_VERSION
 
 
 # Absolutised against the invocation directory at import: --cwd chdirs the
@@ -4206,6 +4207,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
     """
     payload = {
         "schema": "agent-run.watch.v2",
+        "agent_run_version": TOOLBOX_VERSION,
         "name": name,
         "observed_at": observed_at,
         "status": status,
@@ -4295,7 +4297,9 @@ def _cmd_watch_observe(
 
     if state_dir_state == _DIR_MISSING:
         # State dir gone, log survived: cmd_status's "not running (log
-        # preserved)" case, usually a reboot.
+        # preserved)" case, usually a reboot. The `cwd` state file went with
+        # it, so git facts need an explicit --repo and every process fact is
+        # unknowable.
         session_data = _read_session_json(log_dir)
         payload = _watch_payload(
             name, observed_at, WATCH_STATUS_LOG_PRESERVED,
@@ -8574,12 +8578,19 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     prompt_file: Optional[str] = getattr(args, "prompt_file", None)
     if prompt_file and not Path(prompt_file).is_file():
         sys.exit(f"agent-run: prompt file not found: {prompt_file}")
-    # _parse_launch_argv rejects this too; repeated here because cmd_launch is
+    enable_planning: bool = bool(getattr(args, "enable_planning", False))
+    enable_questions: bool = bool(getattr(args, "enable_questions", False))
+    # _parse_launch_argv rejects these too; repeated here because cmd_launch is
     # also called with a hand-built Namespace, which bypasses the parser.
     if harness == "codex" and getattr(args, "model", None):
         sys.exit(
             "agent-run: --model is not supported for --harness codex; "
             "use --harness-arg -c model=<model> to set the model via codex config"
+        )
+    if harness == "codex" and enable_planning:
+        sys.exit(
+            "agent-run: --enable-planning is unsupported for --harness codex; "
+            "the codex app-server path does not expose plan mode"
         )
     echo: bool = bool(getattr(args, "echo", False))
     echo_interval: float = float(getattr(args, "echo_interval", 2.0))
@@ -8711,13 +8722,24 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     acquire_log = log_d / "session-acquire.log"
     managed_prompt: Optional[str] = None
     managed_harness_args: List[str] = []
+    managed_agent_mode: Optional[str] = None
+    opencode_extra_agent_names: set[str] = set()
     if is_managed:
         opencode_port: Optional[int] = None
         managed_prompt = getattr(args, "prompt", None)
         managed_model = getattr(args, "model", None)
-        managed_agent_mode: Optional[str] = getattr(args, "agent_mode", None)
+        managed_agent_mode = getattr(args, "agent_mode", None)
         managed_harness_args = getattr(args, "harness_args", [])
         managed_session_id: Optional[str] = None
+
+        # Every agent name that could be selected at run time and could carry a
+        # per-agent allow in an external config source; passed to
+        # _opencode_policy_config so each one gets an explicit deny block.
+        if harness == "opencode":
+            opencode_extra_agent_names = (
+                _opencode_agent_names_from_harness_args(managed_harness_args)
+                | _opencode_collect_config_agent_names(cwd)
+            )
 
         # Materialise an inline prompt into a file so every delivery path
         # (stdin for one-shot, FIFO for interactive) reads from prompt_file.
@@ -8750,7 +8772,11 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
 
             if opencode_port is not None:
                 managed_session_id = _opencode_prefork_mint(
-                    opencode_port, name, cwd or str(Path.cwd()), acquire_log, state_dir=d
+                    opencode_port, name, cwd or str(Path.cwd()), acquire_log, state_dir=d,
+                    enable_planning=enable_planning,
+                    enable_questions=enable_questions,
+                    opencode_agent_mode=managed_agent_mode,
+                    extra_agent_names=opencode_extra_agent_names,
                 )
                 if managed_session_id:
                     _record_session(log_d, acquire_log, "opencode", managed_session_id,
@@ -8786,6 +8812,8 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                 harness_args=managed_harness_args,
                 opencode_port=opencode_port,
                 permissions=managed_permissions,
+                enable_planning=enable_planning,
+                enable_questions=enable_questions,
             )
 
     _write(d / "command", _pretty_command(argv) + "\n")
@@ -8804,10 +8832,13 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         "started_at": (_read(d / "started_at") or "").strip() or None,
         "interactive": args.interactive,
         "harness": harness,
+        "agent_run_version": TOOLBOX_VERSION,
     }
     if is_managed:
         launch_run_json["model"] = getattr(args, "model", None)
         launch_run_json["agent_mode"] = getattr(args, "agent_mode", None)
+        launch_run_json["enable_planning"] = enable_planning
+        launch_run_json["enable_questions"] = enable_questions
     try:
         _write_run_json(log_d, launch_run_json)
     except Exception:  # noqa: BLE001
@@ -8889,8 +8920,15 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         tmp_dir=scratch_dir,
         idle_timeout=getattr(args, "idle_timeout", None),
         managed_harness=harness,
-        codex_appserver_args=managed_harness_args if is_managed else None,
+        codex_appserver_args=(
+            _codex_policy_args(enable_questions=enable_questions) + managed_harness_args
+            if harness == "codex" else None
+        ),
         managed_prompt=managed_prompt if is_managed else None,
+        enable_planning=enable_planning,
+        enable_questions=enable_questions,
+        opencode_agent_mode=managed_agent_mode,
+        extra_agent_names=opencode_extra_agent_names,
     )
     return 0  # never reached
 
@@ -9172,6 +9210,179 @@ def _teardown_children(
             pass
 
 
+def _codex_policy_args(*, enable_questions: bool) -> List[str]:
+    """Return the `-c` overrides carrying managed policy into codex app-server.
+
+    The value must be a struct literal; codex rejects a bare boolean here.
+    Plan mode has no codex app-server equivalent, so only questions are set —
+    --enable-planning is rejected before launch.
+
+    These args are prepended before any caller-supplied managed_harness_args so
+    that codex's last-occurrence-wins layering lets a caller's -c override ours.
+    """
+    enabled = "true" if enable_questions else "false"
+    return ["-c", f"tools.experimental_request_user_input={{enabled={enabled}}}"]
+
+
+def _opencode_agent_names_from_harness_args(harness_args: Sequence[str]) -> set[str]:
+    """Return every agent name selected via --agent in a harness_args sequence.
+
+    Accepts both the ``--agent NAME`` and ``--agent=NAME`` spellings.
+    """
+    names: set[str] = set()
+    for i, token in enumerate(harness_args):
+        if token.startswith("--agent="):
+            name = token[len("--agent="):]
+        elif token == "--agent":
+            following = harness_args[i + 1:i + 2]
+            # A flag-form token after --agent is the next option, not a name.
+            name = following[0] if following and not following[0].startswith("-") else ""
+        else:
+            continue
+        if name:
+            names.add(name)
+    return names
+
+
+def _opencode_collect_config_agent_names(cwd: Optional[str]) -> set[str]:
+    """Return every agent name defined in OpenCode's external config sources.
+
+    Reads the project ``opencode.json`` in ``cwd``, the user config at
+    ``$XDG_CONFIG_HOME/opencode/opencode.json`` (or ``$HOME/.config/opencode/
+    opencode.json`` when XDG_CONFIG_HOME is unset), and the file named by
+    ``OPENCODE_CONFIG``. Sources are parsed independently, so an unreadable or
+    malformed one does not hide the agents defined in the others.
+    """
+    names: set[str] = set()
+
+    def _agent_names_from_file(path: str) -> set[str]:
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+            if isinstance(data, dict) and isinstance(data.get("agent"), dict):
+                return {k for k in data["agent"] if isinstance(k, str) and k}
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+        return set()
+
+    if cwd:
+        names |= _agent_names_from_file(os.path.join(cwd, "opencode.json"))
+
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+    home = os.environ.get("HOME")
+    if xdg_cfg:
+        names |= _agent_names_from_file(os.path.join(xdg_cfg, "opencode", "opencode.json"))
+    elif home:
+        names |= _agent_names_from_file(
+            os.path.join(home, ".config", "opencode", "opencode.json")
+        )
+
+    oc_cfg = os.environ.get("OPENCODE_CONFIG")
+    if oc_cfg:
+        names |= _agent_names_from_file(oc_cfg)
+
+    return names
+
+
+def _opencode_policy_config(
+    existing: Optional[str],
+    *,
+    enable_planning: bool,
+    enable_questions: bool,
+    opencode_agent_mode: Optional[str] = None,
+    extra_agent_names: Optional[Iterable[str]] = None,
+) -> str:
+    """Merge the managed permission policy into an OPENCODE_CONFIG_CONTENT value.
+
+    Sets the three policy keys (question, plan_enter, plan_exit) at global scope
+    and inside a per-agent block for every agent that could be selected at run
+    time. OpenCode loads config sources in order — user/XDG, project
+    opencode.json, OPENCODE_CONFIG, then OPENCODE_CONFIG_CONTENT — and merges
+    per-agent blocks last-match-wins, so a per-agent allow from any other source
+    defeats a global-only deny but not a per-agent deny placed here.
+
+    ``opencode_agent_mode`` is the agent named by ``--agent-mode``;
+    ``extra_agent_names`` covers agents named by ``--harness-arg --agent`` and
+    agents defined in the external config sources.
+
+    Any other config the caller already had survives untouched. Unparseable or
+    non-object input is replaced rather than raising — the policy must apply even
+    if the inherited value is junk.
+
+    Ordering asymmetry vs claude/codex: opencode policy is delivered via env,
+    not argv, so --harness-arg has no effect on the three policy keys
+    (question, plan_enter, plan_exit).  A caller-supplied OPENCODE_CONFIG_CONTENT
+    in the parent environment is read here as the base but its policy keys are
+    always overwritten by the managed values.  Use --enable-planning or
+    --enable-questions to relax the policy; there is no per-key override path.
+    """
+    try:
+        config = json.loads(existing) if existing else {}
+    except json.JSONDecodeError:
+        if existing:
+            print(
+                f"agent-run: warning: OPENCODE_CONFIG_CONTENT is not valid JSON; "
+                f"managed policy applied to empty config. "
+                f"first 200 chars: {existing[:200]!r}",
+                file=sys.stderr,
+            )
+        config = {}
+    if not isinstance(config, dict):
+        if existing:
+            print(
+                f"agent-run: warning: OPENCODE_CONFIG_CONTENT parsed to a non-object "
+                f"({type(config).__name__}); managed policy applied to empty config.",
+                file=sys.stderr,
+            )
+        config = {}
+
+    policy_values = {
+        "question": "allow" if enable_questions else "deny",
+        "plan_enter": "allow" if enable_planning else "deny",
+        "plan_exit": "allow" if enable_planning else "deny",
+    }
+
+    # Set at global scope.
+    permission = config.get("permission")
+    if not isinstance(permission, dict):
+        permission = {}
+        config["permission"] = permission
+    permission.update(policy_values)
+
+    # "build" is OpenCode's built-in primary agent and the default when no
+    # --agent is given, so it always needs a block.
+    target_agents: set[str] = {"build"}
+    if opencode_agent_mode:
+        target_agents.add(opencode_agent_mode)
+    for name in extra_agent_names or ():
+        if isinstance(name, str) and name:
+            target_agents.add(name)
+
+    agents = config.get("agent")
+    if not isinstance(agents, dict):
+        agents = {}
+        config["agent"] = agents
+
+    # A target agent gets a block created if it has none; an agent block the
+    # caller already had gets the policy merged into its existing permission
+    # block. Either way OPENCODE_CONFIG_CONTENT is loaded last, so these values
+    # are the last match and win over allows from the other sources.
+    for agent_name in target_agents | set(agents):
+        required = agent_name in target_agents
+        agent_cfg = agents.get(agent_name)
+        if not isinstance(agent_cfg, dict):
+            if not required:
+                continue
+            agent_cfg = agents[agent_name] = {}
+        agent_perm = agent_cfg.get("permission")
+        if not isinstance(agent_perm, dict):
+            if not required:
+                continue
+            agent_perm = agent_cfg["permission"] = {}
+        agent_perm.update(policy_values)
+
+    return json.dumps(config, separators=(",", ":"))
+
+
 def _runner(
     state_dir: Path,
     log_dir: Path,
@@ -9188,6 +9399,10 @@ def _runner(
     managed_harness: Optional[str] = None,
     codex_appserver_args: Optional[List[str]] = None,
     managed_prompt: Optional[str] = None,
+    enable_planning: bool = False,
+    enable_questions: bool = False,
+    opencode_agent_mode: Optional[str] = None,
+    extra_agent_names: Optional[Iterable[str]] = None,
 ) -> None:
     """Execute in the detached session-leader process.
 
@@ -9195,6 +9410,11 @@ def _runner(
     a PTY child and shuttles FIFO <-> PTY master <-> log (interactive), or drives
     codex over app-server JSON-RPC (managed_harness == "codex"). Any prompt has
     already been materialised to prompt_file by the launcher.
+
+    Must only be called in the post-setsid grandchild. This function mutates
+    process-global os.environ (OPENCODE_CONFIG_CONTENT, TMPDIR, BUN_TMPDIR) and
+    terminates via os._exit — calling it pre-fork leaks env mutations into the
+    parent and any concurrent agent-run invocations sharing that process.
     """
     my_pid = os.getpid()
     log_fd = -1
@@ -9310,6 +9530,17 @@ def _runner(
             # dir — no second directory is created.
             os.environ["TMPDIR"] = str(tmp_dir)
             os.environ["BUN_TMPDIR"] = str(tmp_dir)
+        if managed_harness == "opencode":
+            # Same rationale as TMPDIR above: the runner process exists solely
+            # for this run, so exporting here scopes the policy to the agent
+            # and every helper it forks, without touching shared config files.
+            os.environ["OPENCODE_CONFIG_CONTENT"] = _opencode_policy_config(
+                os.environ.get("OPENCODE_CONFIG_CONTENT"),
+                enable_planning=enable_planning,
+                enable_questions=enable_questions,
+                opencode_agent_mode=opencode_agent_mode,
+                extra_agent_names=extra_agent_names,
+            )
 
         # Let harness hooks find this run without out-of-band configuration.
         # setdefault on the roots so a hook inherits the roots this run was
@@ -9863,7 +10094,6 @@ def _open_fifo_reader(fifo_path: Path) -> int:
     return fifo_fd
 
 
-
 def _run_interactive(
     state_dir: Path,
     argv: Sequence[str],
@@ -10210,6 +10440,10 @@ def _opencode_prefork_mint(
     cwd: str,
     acquire_log: Path,
     state_dir: Optional[Path] = None,
+    enable_planning: bool = False,
+    enable_questions: bool = False,
+    opencode_agent_mode: Optional[str] = None,
+    extra_agent_names: Optional[Iterable[str]] = None,
 ) -> Optional[str]:
     """Start a temporary opencode process, mint a session, return the session id.
 
@@ -10222,11 +10456,20 @@ def _opencode_prefork_mint(
     state_dir lets the signal handler resolve the phantom status=starting run
     that would otherwise be left behind if the launcher is killed mid-poll.
     """
+    mint_env = dict(os.environ)
+    mint_env["OPENCODE_CONFIG_CONTENT"] = _opencode_policy_config(
+        mint_env.get("OPENCODE_CONFIG_CONTENT"),
+        enable_planning=enable_planning,
+        enable_questions=enable_questions,
+        opencode_agent_mode=opencode_agent_mode,
+        extra_agent_names=extra_agent_names,
+    )
     try:
         proc = subprocess.Popen(
             ["opencode", "--port", str(port), "--auto"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=mint_env,
             cwd=cwd,
         )
     except OSError as exc:
@@ -10912,6 +11155,8 @@ def _build_managed_argv(
     harness_args: List[str],
     opencode_port: Optional[int] = None,
     permissions: str = _PERMISSIONS_BYPASS,
+    enable_planning: bool = False,
+    enable_questions: bool = False,
 ) -> List[str]:
     """Build the argv for the given harness and mode. Returns [] for codex.
 
@@ -10950,7 +11195,24 @@ def _build_managed_argv(
                 argv.append("--print")
                 if prompt and not prompt_file:
                     argv.append(prompt)
+        # --disallowedTools is variadic: claude consumes every bare (non-flag)
+        # token that follows it as a tool name.  Two hazards must both be
+        # avoided:
+        #   1. The inline prompt positional must precede every deny flag, or
+        #      claude would swallow it as a tool name.
+        #   2. harness_args must NOT immediately follow a --disallowedTools
+        #      block, or a bare caller token would be silently absorbed into
+        #      the deny list.
+        # Solution: place harness_args after the prompt but before the deny
+        # block.  The deny flags that follow terminate the preceding variadic
+        # with a flag-form token, so no bare harness_arg can be swallowed.
+        # --disallowedTools is additive (not last-wins), so positioning it
+        # last does not affect the user's ability to override other flags.
         argv.extend(harness_args)
+        if not enable_planning:
+            argv.extend(["--disallowedTools", "EnterPlanMode", "--disallowedTools", "ExitPlanMode"])
+        if not enable_questions:
+            argv.extend(["--disallowedTools", "AskUserQuestion"])
 
     elif harness == "opencode":
         argv.append("opencode")
@@ -11133,8 +11395,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "--harness-arg",
         metavar="FLAG",
         default=argparse.SUPPRESS,
-        help="pass FLAG verbatim to the harness command after agent-run's own constructed "
-        "arguments; repeatable escape hatch for flags agent-run does not model",
+        help="pass FLAG verbatim to the harness command; repeatable. "
+        "For claude and codex, values are appended after agent-run's own managed-mode args "
+        "so they can override injected flags (codex uses last-occurrence-wins for -c). "
+        "For opencode, policy is delivered via OPENCODE_CONFIG_CONTENT (env) and is not "
+        "overridable this way; --harness-arg still passes flags to the opencode process "
+        "but cannot override the three managed policy keys (question, plan_enter, plan_exit).",
+    )
+    mg.add_argument(
+        "--enable-planning",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="allow planning in managed mode (not supported by codex app-server)",
+    )
+    mg.add_argument(
+        "--enable-questions",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="allow interactive questions in managed mode",
     )
 
     sp_status = sub.add_parser("status", help="print one-line status")
@@ -11584,11 +11862,13 @@ class _LaunchArgv(NamedTuple):
     in that case and ignores all other fields.
 
     Managed-mode fields (harness is not None):
-      harness       — "claude" | "opencode" | "codex"
-      prompt        — inline prompt string (mutually exclusive with prompt_file)
-      model         — model string forwarded to the harness
-      agent_mode    — harness agent/mode name (opencode --agent)
-      harness_args  — extra raw args forwarded verbatim after harness's own args
+      harness          — "claude" | "opencode" | "codex"
+      prompt           — inline prompt string (mutually exclusive with prompt_file)
+      model            — model string forwarded to the harness
+      agent_mode       — harness agent/mode name (opencode --agent)
+      harness_args     — extra raw args forwarded verbatim after harness's own args
+      enable_planning  — allow the harness planning capability where supported
+      enable_questions — allow the harness interactive-question capability
     """
     interactive: bool
     prompt_file: Optional[str]
@@ -11610,6 +11890,8 @@ class _LaunchArgv(NamedTuple):
     # "bypass" (default) appends --permission-mode bypassPermissions / --auto.
     # "prompt" omits those flags so the harness's own permission UI is used.
     permissions: str = _PERMISSIONS_BYPASS
+    enable_planning: bool = False
+    enable_questions: bool = False
 
 
 _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
@@ -11667,6 +11949,8 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     harness_args: List[str] = []
     permissions: str = _PERMISSIONS_BYPASS
     cwd: Optional[str] = None
+    enable_planning = False
+    enable_questions = False
 
     # Consume flags in any order before the name.
     while tokens:
@@ -11717,6 +12001,14 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                 idle_timeout = _parse_idle_timeout_flag(tokens[0].split("=", 1)[1])
             except argparse.ArgumentTypeError as exc:
                 raise _LaunchArgvError(f"agent-run: --idle-timeout {exc}") from exc
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--enable-planning":
+            enable_planning = True
+            tokens = tokens[1:]
+            continue
+        if tokens[0] == "--enable-questions":
+            enable_questions = True
             tokens = tokens[1:]
             continue
         # Managed-mode flags (see _MANAGED_VALUE_FLAGS).
@@ -11771,10 +12063,11 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     if harness is None and (
         prompt is not None or model is not None or agent_mode is not None
         or bool(harness_args) or permissions != _PERMISSIONS_BYPASS
+        or enable_planning or enable_questions
     ):
         raise _LaunchArgvError(
-            "agent-run: --prompt/--model/--agent-mode/--harness-arg/--permissions "
-            "require --harness <claude|opencode|codex>"
+            "agent-run: --prompt/--model/--agent-mode/--harness-arg/--permissions/"
+            "--enable-planning/--enable-questions require --harness <claude|opencode|codex>"
         )
 
     # A bare "--" before any name has no run to attach the command to.
@@ -11792,6 +12085,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         or idle_timeout is not None or harness is not None or prompt is not None
         or model is not None or agent_mode is not None or cwd is not None
         or bool(harness_args) or permissions != _PERMISSIONS_BYPASS
+        or enable_planning or enable_questions
     )
     if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
         return _LaunchArgv(
@@ -11838,22 +12132,40 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         # cannot strand a phantom run at status=starting.
         for ha in harness_args:
             flag = ha.split("=", 1)[0]
-            if flag == "--prompt":
+            if flag in {"--session", "-s", "--session-id", "--port", "--prompt"}:
                 raise _LaunchArgvError(
-                    "agent-run: --harness-arg '--prompt' would collide with the "
-                    "prompt agent-run sends; use agent-run's own --prompt or --prompt-file"
+                    f"agent-run: --harness-arg {flag!r} is managed internally; "
+                    f"use the corresponding agent-run flag instead"
                 )
-            if flag in {"--session", "-s", "--session-id", "--port"}:
-                raise _LaunchArgvError(
-                    f"agent-run: --harness-arg {flag!r} is managed internally by "
-                    f"agent-run and cannot be overridden"
-                )
+        # Caller args are appended after the managed --permission-mode
+        # bypassPermissions, so a later --permission-mode plan wins and starts
+        # claude in plan mode without ever hitting the EnterPlanMode/ExitPlanMode
+        # denies. Both spellings are rejected.
+        if harness == "claude" and not enable_planning:
+            for i, token in enumerate(harness_args):
+                if token == "--permission-mode=plan":
+                    raise _LaunchArgvError(
+                        "agent-run: --harness-arg --permission-mode=plan selects Claude plan mode "
+                        "directly, bypassing the planning deny policy; use --enable-planning to "
+                        "relax the policy instead"
+                    )
+                if token == "--permission-mode" and harness_args[i + 1:i + 2] == ["plan"]:
+                    raise _LaunchArgvError(
+                        "agent-run: --harness-arg --permission-mode --harness-arg plan selects "
+                        "Claude plan mode directly, bypassing the planning deny policy; use "
+                        "--enable-planning to relax the policy instead"
+                    )
         # thread/start has no model field, so a forwarded --model would be
         # silently ignored rather than applied.
         if model is not None and harness == "codex":
             raise _LaunchArgvError(
                 "agent-run: --model is not supported for --harness codex; "
                 "use --harness-arg -c model=<model> to set the model via codex config"
+            )
+        if enable_planning and harness == "codex":
+            raise _LaunchArgvError(
+                "agent-run: --enable-planning is unsupported for --harness codex; "
+                "the codex app-server path does not expose plan mode"
             )
         return _LaunchArgv(
             interactive=interactive,
@@ -11872,6 +12184,8 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             agent_mode=agent_mode,
             harness_args=tuple(harness_args),
             permissions=permissions,
+            enable_planning=enable_planning,
+            enable_questions=enable_questions,
         )
 
     # Raw mode.
@@ -11969,6 +12283,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         harness_args=list(parsed.harness_args),
         permissions=parsed.permissions,
         cwd=parsed.cwd,
+        enable_planning=parsed.enable_planning,
+        enable_questions=parsed.enable_questions,
     )
     return cmd_launch(ns)
 
