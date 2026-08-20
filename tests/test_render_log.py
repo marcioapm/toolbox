@@ -271,6 +271,9 @@ class TestRenderLogResizeTimeline:
             ),
             pytest.param({"offset": -1, "cols": 80, "rows": 24}, id="negative-offset"),
             pytest.param({"offset": 999999, "cols": 80, "rows": 24}, id="offset-past-eof"),
+            pytest.param({"offset": 3, "cols": True, "rows": 24}, id="bool-cols"),
+            pytest.param({"offset": 3, "cols": 80, "rows": True}, id="bool-rows"),
+            pytest.param({"offset": True, "cols": 80, "rows": 24}, id="bool-offset"),
         ],
     )
     def test_malformed_or_out_of_range_record_is_skipped_without_raising(self, bad_record):

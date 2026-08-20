@@ -5694,6 +5694,11 @@ def _validate_resize_timeline(
             continue
         if not (isinstance(offset, int) and isinstance(cols, int) and isinstance(rows, int)):
             continue
+        # bool is an int subclass in Python (isinstance(True, int) is True,
+        # and True == 1), so an unguarded check above would let a boolean
+        # field pass as a 1-cell dimension.
+        if isinstance(offset, bool) or isinstance(cols, bool) or isinstance(rows, bool):
+            continue
         if not (1 <= cols <= MAX_TERMINAL_DIMENSION and 1 <= rows <= MAX_TERMINAL_DIMENSION):
             continue
         if offset <= last_offset or offset > raw_len:
