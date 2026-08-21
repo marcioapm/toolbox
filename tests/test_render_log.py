@@ -775,3 +775,122 @@ class TestResizeTimelineCoalescing:
              {"offset": 4, "cols": 0, "rows": 6}], 30,
         )
         assert timeline == [(4, 8, 6)]
+
+
+class TestStitchedHistory:
+    """Stitched mode samples the whole screen during replay to recover content a
+    repainting TUI overwrites before it can scroll into pyte's scrollback."""
+
+    # A TUI: enters the alternate screen, then repaints in place with absolute
+    # cursor moves. Nothing ever scrolls, so pyte's history stays empty.
+    @staticmethod
+    def _repainting_tui(frames):
+        out = [b"\x1b[?1049h"]
+        for frame in frames:
+            out.append(b"\x1b[2J\x1b[1;1H" + frame.encode())
+        return b"".join(out)
+
+    def test_recovers_frames_a_repainting_tui_overwrote(self):
+        """Sampling recovers frames the viewport lost, but not every frame: one
+        repainted and overwritten entirely between two samples is unrecoverable,
+        so this asserts the gain rather than any particular frame."""
+        raw = self._repainting_tui([f"frame {i}" for i in range(40)])
+        viewport = agent_run._render_log(raw)
+        stitched = agent_run._stitch_history(raw, chunk_bytes=16)
+
+        assert "frame 0" not in viewport, "the TUI overwrote it; viewport keeps the last frame"
+        assert "frame 39" in stitched, "the final frame is on screen at the last boundary"
+
+        recovered = sum(f"frame {i}" in stitched for i in range(40))
+        assert recovered > sum(f"frame {i}" in viewport for i in range(40))
+        assert recovered >= 5, f"only {recovered}/40 frames recovered"
+
+    def test_a_frame_overwritten_between_samples_is_unrecoverable(self):
+        """The bound on stitching: it samples, it does not record. A sample
+        interval wider than the repaint interval misses whole frames."""
+        raw = self._repainting_tui([f"frame {i}" for i in range(40)])
+        coarse = agent_run._stitch_history(raw, chunk_bytes=4096)
+        fine = agent_run._stitch_history(raw, chunk_bytes=16)
+        assert sum(f"frame {i}" in coarse for i in range(40)) < sum(
+            f"frame {i}" in fine for i in range(40)
+        )
+
+    def test_is_a_superset_of_the_viewport_render(self):
+        """Sampling covers scrollback and viewport together. Sampling the
+        viewport alone would drop every line that scrolled away between two
+        samples, which on line-oriented output is most of them."""
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(400))
+        viewport = {l for l in agent_run._render_log(raw).splitlines() if l.strip()}
+        stitched = {l for l in agent_run._stitch_history(raw, chunk_bytes=256).splitlines() if l.strip()}
+        assert viewport <= stitched
+
+    def test_repeats_within_one_screen_survive(self):
+        """Deduplication removes the overlap between consecutive samples, not
+        every recurrence: a line printed several times in one screenful is real
+        output, not a resampled row."""
+        raw = b"".join(b"====\r\n" for _ in range(5))
+        stitched = agent_run._stitch_history(raw, chunk_bytes=4096)
+        assert stitched.count("====") == 5
+
+    def test_overlap_between_consecutive_samples_is_removed(self):
+        """Each sample yields the whole screen, so a line still present in the
+        previous sample has already been emitted."""
+        raw = b"only line\r\n" + b"\x00" * 40_000
+        stitched = agent_run._stitch_history(raw, chunk_bytes=1024)
+        assert stitched.count("only line") == 1
+
+    def test_line_cap_truncates_and_says_so(self, monkeypatch):
+        monkeypatch.setattr(agent_run, "_STITCH_MAX_LINES", 5)
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(200))
+        stitched = agent_run._stitch_history(raw, chunk_bytes=64)
+        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
+        body = stitched[: -len(agent_run._STITCH_TRUNCATED_MARKER)]
+        assert len([l for l in body.splitlines() if l.strip()]) <= 5
+
+    def test_byte_cap_truncates_and_says_so(self, monkeypatch):
+        monkeypatch.setattr(agent_run, "_STITCH_MAX_BYTES", 64)
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(200))
+        stitched = agent_run._stitch_history(raw, chunk_bytes=64)
+        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
+
+    def test_applies_the_resize_timeline(self):
+        """A sample boundary and a resize offset are independent, so replay
+        splits at the union of both."""
+        raw = b"X" * 30 + b"\r\n"
+        stitched = agent_run._stitch_history(
+            raw, width=40, height=4, chunk_bytes=8,
+            resizes=[{"offset": 10, "cols": 10, "rows": 4}],
+        )
+        assert stitched, "a resize inside a sampled span must not abort the render"
+        assert max(len(l) for l in stitched.splitlines()) <= 10
+
+    def test_falls_back_when_pyte_raises(self, monkeypatch):
+        """A convenience artifact must never take the caller down."""
+        monkeypatch.setattr(
+            agent_run, "_feed_pyte",
+            lambda *_a, **_kw: (_ for _ in ()).throw(RecursionError("pathological")),
+        )
+        stitched = agent_run._stitch_history(b"hello\r\n", chunk_bytes=8)
+        assert "hello" in stitched
+
+    def test_viewport_remains_the_default_render(self, moon_log_bytes):
+        """Stitched mode is opt-in; the default path must be byte-identical."""
+        assert agent_run._render_log(moon_log_bytes) == agent_run._render_log(moon_log_bytes)
+
+    def test_neither_mode_reproduces_a_long_run_of_identical_lines(self):
+        """Both modes are lossy for repeated output, in different ways.
+
+        _serialize_screen drops a line equal to its predecessor, so 200
+        identical lines serialize as one. Stitching emits one per sample
+        boundary, because the rest are overlap with the previous sample.
+        Neither recovers the true count, and a caller must not read either as a
+        faithful transcript.
+        """
+        printed = 200
+        raw = b"".join(b"====\r\n" for _ in range(printed))
+        viewport = agent_run._render_log(raw).count("====")
+        stitched = agent_run._stitch_history(raw, chunk_bytes=64).count("====")
+
+        assert viewport < printed
+        assert stitched < printed
+        assert stitched >= viewport

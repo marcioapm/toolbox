@@ -361,7 +361,7 @@ import platform
 from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 from toolbox import __version__ as TOOLBOX_VERSION
 
 
@@ -5790,14 +5790,21 @@ def _new_pyte_screen(pyte, width: int, height: int, history: int):
     return screen
 
 
+def _screen_lines(screen) -> "Iterator[str]":
+    """Every line the screen currently holds: scrollback, then viewport.
+
+    ``history.top`` rows are sparse cell maps rather than strings, so they are
+    joined in column order; ``display`` is already rendered.
+    """
+    for entry in screen.history.top:
+        yield ("".join(entry[col].data for col in sorted(entry)) if entry else "").rstrip()
+    for row in screen.display:
+        yield row.rstrip()
+
+
 def _serialize_screen(screen) -> str:
     """Serialize a pyte HistoryScreen to the transcript cache format."""
-    rows: List[str] = []
-    for entry in screen.history.top:
-        text = "".join(entry[col].data for col in sorted(entry)) if entry else ""
-        rows.append(text.rstrip())
-    for row in screen.display:
-        rows.append(row.rstrip())
+    rows: List[str] = list(_screen_lines(screen))
     deduped: List[str] = []
     for line in rows:
         if not deduped or deduped[-1] != line:
@@ -5890,6 +5897,106 @@ def _resize_screen(screen, cols: int, rows: int) -> None:
     screen.resize(rows, cols)
     screen.cursor.x = min(screen.cursor.x, screen.columns)
     screen.cursor.y = min(screen.cursor.y, screen.lines - 1)
+
+
+# Snapshot interval for stitched history. Smaller recovers more (measured on a
+# 9.2 MB TUI log: 64 KB -> 742 lines, 8 KB -> 1707) at a proportional cost in
+# viewport scans.
+_STITCH_CHUNK_BYTES = 8 * 1024
+
+# Ceilings on a stitched transcript. A repainting TUI can emit far more distinct
+# lines than a reader wants, and the accumulator holds every one of them.
+_STITCH_MAX_LINES = 50_000
+_STITCH_MAX_BYTES = 8 * 1024 * 1024
+_STITCH_TRUNCATED_MARKER = "[agent-run: stitched history truncated]\n"
+
+
+def _stitch_history(
+    raw: bytes,
+    width: int = _RENDER_LOG_DEFAULT_WIDTH,
+    height: int = _RENDER_LOG_DEFAULT_HEIGHT,
+    history: int = _RENDER_LOG_DEFAULT_HISTORY,
+    resizes: "Optional[Sequence[dict]]" = None,
+    chunk_bytes: int = _STITCH_CHUNK_BYTES,
+) -> str:
+    """Replay ``raw`` and accumulate every distinct line the viewport ever held.
+
+    ``pyte.HistoryScreen`` makes a line durable only when it scrolls off the
+    top, and a TUI repainting in place never scrolls, so ``_serialize_screen``
+    returns the final frame alone -- 21 lines for a 9.2 MB log. Sampling the
+    screen every ``chunk_bytes`` and keeping first-seen lines recovers what the
+    next repaint would have overwritten.
+
+    Each sample covers scrollback and viewport together, so the result is a
+    superset of the viewport render: sampling the viewport alone would drop
+    every line that scrolled away between two samples, which on line-oriented
+    output is most of them.
+
+    This is a lossy reconstruction, not a transcript, and the losses are
+    inherent rather than incidental:
+
+    - Deduplication removes the overlap between consecutive samples, so a line
+      that leaves the screen and is printed again later appears twice, while a
+      line still on screen across several samples appears once. Repeats within
+      one screen survive.
+    - A sample can land mid-repaint, so partially drawn rows are kept as if
+      they were real output.
+    - Order is first-seen. A pane that rescrolls old content leaves those lines
+      at their original position rather than where they reappeared.
+
+    Falls back to an ANSI-stripped render if pyte raises, matching
+    ``_render_log``: a convenience artifact must never take the caller down.
+    """
+    try:
+        import pyte  # type: ignore
+    except ImportError as exc:
+        raise RenderDependencyError(_RENDER_DEPENDENCY_MESSAGE) from exc
+
+    timeline = _validate_resize_timeline(resizes, len(raw))
+    geometry_at = {offset: (cols, rows) for offset, cols, rows in timeline}
+    # Sample boundaries and resize boundaries are independent; replay splits at
+    # the union so a resize still lands at its recorded offset.
+    boundaries = sorted(
+        set(geometry_at)
+        | set(range(chunk_bytes, len(raw), max(chunk_bytes, 1)))
+        | {len(raw)}
+    )
+
+    screen = _new_pyte_screen(pyte, width, height, history)
+    stream = pyte.ByteStream(screen)
+    previous: "set[str]" = set()
+    lines: List[str] = []
+    total = 0
+    truncated = False
+    position = 0
+    try:
+        for boundary in boundaries:
+            if boundary > position:
+                _feed_pyte(stream, raw[position:boundary])
+                position = boundary
+            geometry = geometry_at.get(boundary)
+            if geometry is not None:
+                _resize_screen(screen, *geometry)
+            current: "set[str]" = set()
+            for text in _screen_lines(screen):
+                if not text:
+                    continue
+                current.add(text)
+                if text in previous:
+                    continue
+                if len(lines) >= _STITCH_MAX_LINES or total >= _STITCH_MAX_BYTES:
+                    truncated = True
+                    break
+                lines.append(text)
+                total += len(text) + 1
+            previous = current
+            if truncated:
+                break
+    except Exception:
+        return _strip_ansi_fallback(raw)
+
+    rendered = "".join(line + "\n" for line in lines)
+    return rendered + _STITCH_TRUNCATED_MARKER if truncated else rendered
 
 
 def _render_log(
@@ -6399,7 +6506,8 @@ def _resolved_default_geometry(log_dir: Path) -> Tuple[int, int]:
 
 
 def _render_log_dir(
-    log_dir: Path, raw: bytes, *, width: int, height: int, history: int
+    log_dir: Path, raw: bytes, *, width: int, height: int, history: int,
+    stitched: bool = False,
 ) -> str:
     """Render ``raw`` for ``log_dir``, applying its recorded launch geometry
     and resize timeline only when the caller asked for the render defaults.
@@ -6412,11 +6520,12 @@ def _render_log_dir(
     the defaults with no resizes, reproducing every pre-existing log byte
     for byte.
     """
+    render = _stitch_history if stitched else _render_log
     if width != _RENDER_LOG_DEFAULT_WIDTH or height != _RENDER_LOG_DEFAULT_HEIGHT:
-        return _render_log(raw, width=width, height=height, history=history)
+        return render(raw, width=width, height=height, history=history)
     base_width, base_height = _resolved_default_geometry(log_dir)
     resize_records = _read_resize_timeline(log_dir)
-    return _render_log(
+    return render(
         raw, width=base_width, height=base_height, history=history,
         resizes=resize_records,
     )
@@ -6793,7 +6902,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     # Prefer log.clean, written by the --echo daemon, over re-rendering.
     # Reusing the cache saves cmd_clean the pyte replay on large logs.
-    rendered = _read_clean_cache(log, width=args.width, height=args.height, history=args.history)
+    # A stitched render is a different artifact than the one log.clean holds,
+    # so that mode always replays.
+    stitched = getattr(args, "history_mode", "viewport") == "stitched"
+    rendered = None if stitched else _read_clean_cache(
+        log, width=args.width, height=args.height, history=args.history
+    )
     if rendered is None:
         with _watch_open_validated_log(log) as f:
             if f is None:
@@ -6805,6 +6919,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 width=args.width,
                 height=args.height,
                 history=args.history,
+                stitched=stitched,
             )
         except RenderDependencyError as exc:
             sys.exit(str(exc))
@@ -12476,6 +12591,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_nonnegative_int,
         default=_RENDER_LOG_DEFAULT_HISTORY,
         help=f"scrollback line budget for the emulator (default: {_RENDER_LOG_DEFAULT_HISTORY})",
+    )
+    sp_clean.add_argument(
+        "--history-mode",
+        choices=("viewport", "stitched"),
+        default="viewport",
+        help=(
+            "viewport (default): pyte's scrollback plus the final frame, which "
+            "for a TUI repainting in place is the last frame alone. stitched: "
+            "also keep every distinct line the viewport held during replay -- a "
+            "lossy reconstruction, not a transcript (repeated lines collapse, "
+            "mid-repaint frames leak, ordering is first-seen)"
+        ),
     )
     clean_slice = sp_clean.add_mutually_exclusive_group()
     clean_slice.add_argument(
