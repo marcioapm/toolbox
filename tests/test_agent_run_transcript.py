@@ -471,6 +471,89 @@ class TestClaudeReader:
         entries, _ = transcript.read_transcript("claude", session_id, "/Users/x/proj")
         assert entries == []
 
+    def test_main_and_subagent_entries_merged_by_timestamp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-interleave"
+        base = tmp_path / "-Users-x-proj"
+
+        def rec(role, text, ts):
+            return {
+                "type": role,
+                "sessionId": session_id,
+                "timestamp": ts,
+                "message": {"role": role, "content": text},
+            }
+
+        # Main stream spans the whole run; the subagent runs in the middle
+        # of it, so a naive concatenation would put every subagent entry
+        # after every main entry despite the subagent finishing first.
+        _write_jsonl(
+            base / f"{session_id}.jsonl",
+            [
+                rec("user", "main-1", "2026-08-16T00:00:00Z"),
+                rec("assistant", "main-2", "2026-08-16T00:00:10Z"),
+                rec("assistant", "main-3", "2026-08-16T00:00:30Z"),
+            ],
+        )
+        _write_jsonl(
+            base / session_id / "subagents" / "agent-mid.jsonl",
+            [
+                rec("assistant", "sub-1", "2026-08-16T00:00:05Z"),
+                rec("assistant", "sub-2", "2026-08-16T00:00:15Z"),
+            ],
+        )
+        entries, _ = transcript.read_transcript("claude", session_id, "/Users/x/proj")
+        assert [e.text for e in entries] == ["main-1", "sub-1", "main-2", "sub-2", "main-3"]
+
+    def test_equal_timestamps_across_files_keep_deterministic_order(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-tie"
+        base = tmp_path / "-Users-x-proj"
+
+        def rec(role, text, ts):
+            return {
+                "type": role,
+                "sessionId": session_id,
+                "timestamp": ts,
+                "message": {"role": role, "content": text},
+            }
+
+        same_ts = "2026-08-16T00:00:00Z"
+        _write_jsonl(base / f"{session_id}.jsonl", [rec("user", "main-a", same_ts), rec("user", "main-b", same_ts)])
+        _write_jsonl(
+            base / session_id / "subagents" / "agent-tie.jsonl",
+            [rec("assistant", "sub-a", same_ts), rec("assistant", "sub-b", same_ts)],
+        )
+        entries, _ = transcript.read_transcript("claude", session_id, "/Users/x/proj")
+        # Same across both runs: file discovery order (main first, then
+        # subagents sorted by filename), then position within the file.
+        assert [e.text for e in entries] == ["main-a", "main-b", "sub-a", "sub-b"]
+
+    def test_file_with_no_timestamps_keeps_internal_order(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-notime"
+        base = tmp_path / "-Users-x-proj"
+        records = [
+            {
+                "type": "user",
+                "sessionId": session_id,
+                "message": {"role": "user", "content": "first"},
+            },
+            {
+                "type": "assistant",
+                "sessionId": session_id,
+                "message": {"role": "assistant", "content": "second"},
+            },
+            {
+                "type": "user",
+                "sessionId": session_id,
+                "message": {"role": "user", "content": "third"},
+            },
+        ]
+        _write_jsonl(base / f"{session_id}.jsonl", records)
+        entries, _ = transcript.read_transcript("claude", session_id, "/Users/x/proj")
+        assert [e.text for e in entries] == ["first", "second", "third"]
+
     def test_large_tool_output_is_bounded(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-bigout"

@@ -299,7 +299,8 @@ def _claude_session_path(session_id: str, cwd: Optional[str]) -> Path:
 
 def _read_claude(session_id: str, cwd: Optional[str]) -> "tuple[list[TranscriptEntry], int]":
     path = _claude_session_path(session_id, cwd)
-    entries, skipped = _read_claude_jsonl(path, session_id, subagent=None)
+    main_entries, skipped = _read_claude_jsonl(path, session_id, subagent=None)
+    sources = [main_entries]
 
     # Subagent transcripts live in <session>/subagents/*.jsonl next to the
     # main .jsonl file. Included only when each record's own sessionId
@@ -312,9 +313,54 @@ def _read_claude(session_id: str, cwd: Optional[str]) -> "tuple[list[TranscriptE
         sub_files = []
     for sub_path in sub_files:
         sub_entries, sub_skipped = _read_claude_jsonl(sub_path, session_id, subagent=sub_path.stem)
-        entries.extend(sub_entries)
+        sources.append(sub_entries)
         skipped += sub_skipped
-    return entries, skipped
+    return _merge_claude_entries(sources), skipped
+
+
+def _parse_claude_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _merge_claude_entries(sources: list[list[TranscriptEntry]]) -> list[TranscriptEntry]:
+    """Interleave the main stream and every subagent stream by parsed
+    timestamp instead of concatenating them: appending each subagent file
+    after the whole main stream makes every entry in the default
+    `--tail 50` window subagent output whenever a subagent ran long.
+
+    An entry with no parseable timestamp of its own inherits its nearest
+    timestamped neighbour's sort key within the *same* file (nearer
+    preceding entry first, nearer following entry otherwise), so it lands
+    next to the entry it followed there rather than drifting to another
+    file's part of the merge. A file with no timestamps anywhere keeps its
+    entries' relative order, sorted after every timestamped entry.
+    """
+    keyed: list[tuple[Optional[datetime], int, int, TranscriptEntry]] = []
+    for file_index, entries in enumerate(sources):
+        parsed = [_parse_claude_timestamp(entry.time) for entry in entries]
+        sort_time: list[Optional[datetime]] = list(parsed)
+        last_seen = None
+        for i, value in enumerate(sort_time):
+            if value is not None:
+                last_seen = value
+            else:
+                sort_time[i] = last_seen
+        next_seen = None
+        for i in range(len(sort_time) - 1, -1, -1):
+            if sort_time[i] is not None:
+                next_seen = sort_time[i]
+            else:
+                sort_time[i] = next_seen
+        for position, (entry, when) in enumerate(zip(entries, sort_time)):
+            keyed.append((when, file_index, position, entry))
+    keyed.sort(key=lambda item: (item[0] is None, item[0] or datetime.min, item[1], item[2]))
+    return [item[3] for item in keyed]
 
 
 def _claude_tool_result_text(content: Any) -> Optional[str]:
