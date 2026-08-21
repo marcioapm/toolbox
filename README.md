@@ -531,12 +531,12 @@ log even though the ephemeral process state is gone:
 - `/tmp/agent-runs/<name>/` — ephemeral process state (pid, status,
   exit_code, FIFO). tmpfs on Linux, wiped on reboot — a missing entry here
   unambiguously means "not running". Override with `AGENT_RUN_STATE_DIR`.
-- `/var/tmp/agent-runs/<name>/` — persistent log, cleaned transcript, a
+- `/var/tmp/agent-runs/<name>/` — persistent log, a
   copy of the prompt file, and a per-run scratch dir (`tmp/`, mode 0700)
   exported as `TMPDIR` and `BUN_TMPDIR` into the launched command's
   environment. Survives reboot/crash; the log fd is opened here from the
   start, so there's no copy-on-exit step a crash could lose. Override with
-  `AGENT_RUN_LOG_DIR`. `log`/`log.clean`/`prompt` are pruned automatically
+  `AGENT_RUN_LOG_DIR`. `log`/`prompt` are pruned automatically
   after 21 days; the `tmp/` scratch dir is instead cleaned up by
   `agent-run reap` (see below).
 
@@ -816,6 +816,8 @@ agent-run list --status died,killed       # only runs whose status is in this se
 agent-run list --include-logs             # also show preserved-log-only runs
 agent-run status <name>                   # one-line status
 agent-run logs <name> [--tail N | --head N]    # last/first N lines (default --tail 50)
+agent-run logs <name> --plain                  # ANSI-stripped, for grepping/piping
+agent-run logs <name> --clean                  # pyte-rendered transcript; slow on a large log
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
 agent-run attach <name>                   # attach interactively (Ctrl-C detaches)
@@ -872,7 +874,7 @@ runs (state dir already gone) are hidden by default — pass `--include-logs`
 `--all`/`--status`, which govern only the state-backed sections above it.
 When hidden preserved logs exist, a one-line hint is printed to stderr
 (never stdout, so `agent-run list | grep ...` stays honest). `logs`/`tail`/
-`clean` always read the persistent log, falling back to the old
+`attach` always read the persistent log, falling back to the old
 single-directory layout for runs launched before the state/log split.
 
 ### Reaping
@@ -923,12 +925,12 @@ single-directory layout for runs launched before the state/log split.
     newest recursive mtime is older than `--log-min-age-hours` (or
     `AGENT_RUN_LOG_MIN_AGE_HOURS`, default 21 days — matching the existing
     unconditional whole-log-dir prune) are removed entirely, including
-    `log`/`log.clean`/`prompt`/`tmp/`. **Deliberately independent of
+    `log`/`prompt`/`tmp/`. **Deliberately independent of
     `--min-age-hours`**: a preserved log is the artifact an operator wanted
     to keep, not disposable state bookkeeping, so it defaults to a much
     longer retention window and is never influenced by the state-dir
     threshold. Off by default — without `--include-logs`, reap never
-    touches a preserved log, matching the persistent `log`/`log.clean`/
+    touches a preserved log, matching the persistent `log`/
     `prompt` behaviour of step 3. A run with a live state dir is never
     touched by this step regardless of age. Runs after step 3 (so a state
     dir step 3 just removed can become log-only and eligible in the same
@@ -1038,7 +1040,7 @@ Run `agent-run du --by-run --top 20` to see that, and
 removal on a timer.
 
 On disk, `--log-min-age-hours` mainly affects the long tail of old logs: on a
-busy host, most bytes are in *recent* logs, and PTY-captured `--echo` runs are
+busy host, most bytes are in *recent* logs, and PTY-captured `-i` runs are
 by far the largest individual directories (potentially hundreds of MB each
 from the captured transcript). A long retention window may free very little on
 a host whose volume is dominated by the last few days. Run
@@ -1242,8 +1244,7 @@ Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
 
 | File | Contents |
 |------|----------|
-| `log` | combined stdout+stderr (PTY-captured in interactive mode) |
-| `log.clean` | rendered transcript (only when launched with `--echo`) |
+| `log` | combined stdout+stderr (PTY-captured in interactive mode); `agent-run logs --clean` renders it into a readable transcript on demand |
 | `prompt` | copy of the `-f`/`--prompt-file` input, if one was given |
 | `session.json` | session attribution (managed mode only): `session_id`, `harness`, `acquisition`, `confidence`, `observed_at`; absent for raw runs |
 | `run.json` | launch and terminal facts (all modes): `name`, `argv`, `command`, `cwd`, `started_at`, `harness`, `interactive`, `model`, `agent_mode`; augmented with `ended_at`, `exit_code`, `status` at exit |
