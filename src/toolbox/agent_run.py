@@ -207,8 +207,8 @@ else by matching its own process ancestry against a recorded pid/pgid, and
 exits 0 silently when none of those resolve.
 
 `status` reports "not running (log preserved)" when the state dir is gone
-but the log dir survived. `logs`/`tail`/`clean` always read from the log
-dir, falling back to the old single-directory layout for runs started
+but the log dir survived. `logs` and `tail` always read from the log dir,
+falling back to the old single-directory layout for runs started
 before this split. Log dirs older than 21 days are pruned opportunistically
 on `list`/launch; that whole-log-dir prune can remove any surviving `tmp/`
 scratch directory too (for example when reap's min-age threshold is configured
@@ -400,17 +400,14 @@ MAX_TERMINAL_DIMENSION = 2000
 LOGS_MAX_LINE_BYTES = 8 * 1024
 LOGS_MAX_TOTAL_BYTES = 32 * 1024
 
-# Terminal geometry, used both for the PTY at launch and as the render
-# fallback when a log's run.json has no `terminal` field. A single pair:
-# nothing compares launch geometry against render geometry any more, so
-# there is no reason for them to differ.
+# Terminal geometry used for the PTY at launch and as the render fallback
+# when a log's run.json has no `terminal` field.
 #
 # A pty.fork()ed child inherits a 0x0 winsize, so without applying this at
 # launch each agent falls back to a size of its own choosing -- OpenCode
 # picks 80x24 -- that a renderer cannot observe and does not match. run.json
-# records these values and _resolved_default_geometry resolves them, so
-# absolute cursor positions replay into the coordinate system they were
-# computed for.
+# records these values, so absolute cursor positions replay into the
+# coordinate system they were computed for.
 _LAUNCH_TERMINAL_COLS = 120
 _LAUNCH_TERMINAL_ROWS = 40
 _RENDER_LOG_DEFAULT_WIDTH = _LAUNCH_TERMINAL_COLS
@@ -4684,31 +4681,29 @@ _TRUNCATION_MARKER_STR = "[agent-run: output truncated]\n"
 _TRUNCATION_MARKER_BYTES = _TRUNCATION_MARKER_STR.encode("utf-8")
 
 
-def _budget_bytes_lines(lines: "Iterable[bytes]", *, strip: bool) -> "tuple[bytes, bool]":
+def _budget_bytes_lines(lines: "Iterable[bytes]") -> "tuple[bytes, bool]":
     """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to raw log lines.
 
-    ANSI-strips each line when ``strip`` is true, caps it at
-    LOGS_MAX_LINE_BYTES, and stops once the running total (including one
-    newline per emitted line) reaches LOGS_MAX_TOTAL_BYTES. Returns
-    (output, truncated).
+    Caps each line at LOGS_MAX_LINE_BYTES and stops once the running total
+    (including one newline per emitted line) reaches LOGS_MAX_TOTAL_BYTES.
+    Returns (output, truncated).
     """
     out_parts: "list[bytes]" = []
     total = 0
     truncated = False
     for line in lines:
-        clean = _strip_ansi_bytes(line) if strip else line
-        if len(clean) > LOGS_MAX_LINE_BYTES:
-            clean = clean[:LOGS_MAX_LINE_BYTES]
+        if len(line) > LOGS_MAX_LINE_BYTES:
+            line = line[:LOGS_MAX_LINE_BYTES]
             truncated = True
         remaining = LOGS_MAX_TOTAL_BYTES - total
         if remaining <= 0:
             truncated = True
             break
-        if len(clean) > remaining:
-            clean = clean[:remaining]
+        if len(line) > remaining:
+            line = line[:remaining]
             truncated = True
-        out_parts.append(clean + b"\n")
-        total += len(clean) + 1
+        out_parts.append(line + b"\n")
+        total += len(line) + 1
     return b"".join(out_parts), truncated
 
 
@@ -4761,11 +4756,11 @@ def cmd_logs(args: argparse.Namespace) -> int:
                     sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
                 raw = f.read()
             try:
-                rendered = _render_log_dir(
-                    log.parent, raw,
-                    width=_RENDER_LOG_DEFAULT_WIDTH,
-                    height=_RENDER_LOG_DEFAULT_HEIGHT,
+                width, height = _resolved_default_geometry(log.parent)
+                rendered = _render_log(
+                    raw, width=width, height=height,
                     history=_RENDER_LOG_DEFAULT_HISTORY,
+                    resizes=_read_resize_timeline(log.parent),
                 )
             except RenderDependencyError as exc:
                 sys.exit(str(exc))
@@ -4793,7 +4788,9 @@ def cmd_logs(args: argparse.Namespace) -> int:
         # back); --plain strips ANSI for grepping/piping/agent consumption.
         # The byte budget applies either way, so raw mode spends part of its
         # budget on escape sequences rather than visible text.
-        out, truncated = _budget_bytes_lines(lines, strip=bool(getattr(args, "plain", False)))
+        if bool(getattr(args, "plain", False)):
+            lines = (_strip_ansi_bytes(line) for line in lines)
+        out, truncated = _budget_bytes_lines(lines)
         try:
             sys.stdout.buffer.write(out)
             if truncated:
@@ -5679,8 +5676,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
 # Fallback ANSI stripper used when pyte itself can't safely render a log
 # (e.g. a RecursionError from a pathological escape-sequence pattern). Not
 # as faithful as a real VT100 replay — no cursor-motion collapsing — but it
-# never crashes, which is the point: the clean transcript is a convenience
-# artifact and must never take the run down with it.
+# provides readable output when emulation fails.
 _OSC_RE = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _CSI_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]")
 _ESC_RE = re.compile(rb"\x1b.", re.DOTALL)
@@ -5831,7 +5827,7 @@ def _screen_lines(screen) -> "Iterable[str]":
 
 
 def _serialize_screen(screen) -> str:
-    """Serialize a pyte HistoryScreen to the transcript cache format."""
+    """Serialize a pyte HistoryScreen as a readable transcript."""
     deduped: List[str] = []
     for line in _screen_lines(screen):
         if not deduped or deduped[-1] != line:
@@ -5952,9 +5948,7 @@ def _render_log(
     extra is not installed (and so we get a clear error message when it is
     really needed). If pyte itself fails to render (e.g. a RecursionError
     triggered by a pathological escape-sequence pattern), this degrades to
-    a best-effort ANSI-stripped plain-text render rather than crashing —
-    the clean transcript is a convenience artifact and must never take the
-    run down with it.
+    a best-effort ANSI-stripped plain-text render.
     """
     try:
         import pyte  # type: ignore
@@ -6030,41 +6024,9 @@ def _read_resize_timeline(log_dir: Path) -> List[dict]:
 
 
 def _resolved_default_geometry(log_dir: Path) -> Tuple[int, int]:
-    """The geometry a render at the module defaults actually uses for
-    ``log_dir``: run.json's ``terminal`` field when present and valid,
-    else the render defaults themselves.
-
-    This is the geometry a cache reader must compare against -- not the
-    hardcoded defaults -- since a run's own launch geometry differs from them:
-    runs are launched at ``_LAUNCH_TERMINAL_COLS``x``_LAUNCH_TERMINAL_ROWS``,
-    while the fallback applies only to logs whose run.json predates the
-    terminal field.
-    """
+    """Return the recorded launch geometry, or the render fallback."""
     return _read_run_terminal_geometry(log_dir) or (
         _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT
-    )
-
-
-def _render_log_dir(
-    log_dir: Path, raw: bytes, *, width: int, height: int, history: int,
-) -> str:
-    """Render ``raw`` for ``log_dir``, applying its recorded launch geometry
-    and resize timeline only when the caller asked for the render defaults.
-
-    A caller requesting a specific width/height wants a render at that exact
-    size; the recorded timeline describes a different geometry (the run's own
-    PTY) and does not apply. At the defaults, the initial geometry comes from
-    run.json's ``terminal`` field and the timeline from resizes.jsonl; either
-    absent or malformed falls back to the defaults with no resizes,
-    reproducing every pre-existing log byte for byte.
-    """
-    if width != _RENDER_LOG_DEFAULT_WIDTH or height != _RENDER_LOG_DEFAULT_HEIGHT:
-        return _render_log(raw, width=width, height=height, history=history)
-    base_width, base_height = _resolved_default_geometry(log_dir)
-    resize_records = _read_resize_timeline(log_dir)
-    return _render_log(
-        raw, width=base_width, height=base_height, history=history,
-        resizes=resize_records,
     )
 
 
