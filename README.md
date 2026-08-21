@@ -815,10 +815,13 @@ Every store is opened strictly read-only — a live run may hold it open, and
 transcript; `transcript` exits non-zero naming the two alternatives (relaunch
 under `--harness`, or use `logs --clean` on the captured PTY log). Unparseable
 individual records are skipped and counted on stderr; a missing or unusable
-store is an error. A single tool result is
+store is an error, and so is a store that opens and reads cleanly but yields
+zero entries for the session — both exit non-zero, so a caller can tell "no
+transcript" apart from ordinary success. A single tool result is
 truncated at 40 lines / 4 KiB with a marker naming how much was dropped,
 independent of `--head`/`--tail`, which slice whole entries (not bytes) using
-the same defaults as `logs`.
+the same defaults as `logs`. For `claude`, entries from the main session and
+any subagent transcripts are merged by timestamp, not concatenated per file.
 
 
 ```json
