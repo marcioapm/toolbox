@@ -6424,25 +6424,32 @@ def _render_log_to_clean(log_dir: Path) -> None:
     """
     log = log_dir / "log"
     clean = log_dir / "log.clean"
-    raw = log.read_bytes()
     width, height = _resolved_default_geometry(log_dir)
     resize_records = _read_resize_timeline(log_dir)
+    # Read and stat through one descriptor: a path read followed by a separate
+    # stat lets bytes land in between, and publishing the newer size would claim
+    # the transcript covers output it never saw.
+    with _watch_open_validated_log(log) as f:
+        if f is None:
+            raise OSError("log is not a regular file")
+        raw = f.read()
+        stat_result = os.fstat(f.fileno())
     rendered = _render_log(
         raw, width=width, height=height, history=_RENDER_LOG_DEFAULT_HISTORY,
         resizes=resize_records,
     )
-    with _watch_open_validated_log(log) as f:
-        if f is None:
-            raise OSError("log is not a regular file")
-        stat_result = os.fstat(f.fileno())
     # Digest the snapshot just rendered rather than re-reading resizes.jsonl,
     # so the metadata cannot describe a timeline the transcript never used.
     resize_identity = _resize_timeline_digest(
         (width, height), _validate_resize_timeline(resize_records, len(raw))
     )
+    # The offset is what was read, never the stat size: a log that grew during
+    # the read is published as an incomplete prefix, which a reader resumes from
+    # rather than trusting as exact.
     _publish_clean(
-        clean, rendered, stat_result=stat_result, offset=stat_result.st_size,
-        complete=True, width=width, height=height, resize_identity=resize_identity,
+        clean, rendered, stat_result=stat_result, offset=len(raw),
+        complete=len(raw) == stat_result.st_size,
+        width=width, height=height, resize_identity=resize_identity,
     )
 
 
@@ -6707,7 +6714,11 @@ def _read_clean_cache(
         ):
             return None
         published = metadata.get("offset")
-        if published != metadata.get("size") or not isinstance(published, int):
+        if not _bounded_int(published, 0, raw_stat.st_size):
+            return None
+        if not _bounded_int(metadata.get("size"), 0, raw_stat.st_size):
+            return None
+        if published != metadata.get("size"):
             return None
         # A resize recorded after this cache was published, or a geometry that
         # no longer resolves the same way, changes what the render should have
@@ -6722,10 +6733,6 @@ def _read_clean_cache(
                 if clean_file is None:
                     return None
                 return clean_file.read().decode("utf-8", errors="replace")
-        if published > raw_stat.st_size:
-            # The log shrank since publication: the cache describes a file that
-            # no longer exists.
-            return None
         return _resume_clean_cache(log_path, clean, published, raw_stat)
     except (OSError, ValueError, TypeError):
         return None
@@ -10666,26 +10673,36 @@ def _pack_resize(cols: int, rows: int) -> bytes:
     )
 
 
-def _apply_resize(master_fd: int, cols: int, rows: int) -> None:
+def _apply_resize(master_fd: int, cols: int, rows: int) -> bool:
+    """Set the PTY window size, returning whether the ioctl succeeded.
+
+    Never raises: resizing is auxiliary, and a failure here must not end a run
+    that is otherwise healthy, nor escape at launch before the child pid has
+    been published and become reapable.
+
+    The return value gates the resize timeline: recording a geometry the kernel
+    rejected would make replay change size at an offset where the live PTY never
+    did.
+    """
     try:
         fcntl.ioctl(
             master_fd,
             termios.TIOCSWINSZ,
             struct.pack("HHHH", rows, cols, 0, 0),
         )
-    except OSError as exc:
-        if exc.errno not in {errno.EBADF, errno.EIO, errno.EINVAL, errno.ENOTTY}:
-            raise
+    except OSError:
+        return False
+    return True
 
 
-def _write_all_to_log(log_fd: int, data: bytes) -> int:
-    """Write all of ``data`` to ``log_fd``, returning the bytes written.
+def _write_all_to_log(log_fd: int, data: bytes) -> "tuple[int, bool]":
+    """Write all of ``data`` to ``log_fd``, returning (bytes written, complete).
 
     A short write would otherwise drop the tail of a chunk, and every later
     resize offset would name a position in a truncated capture rather than in
     the byte stream the child emitted. EINTR retries; any other OSError stops
-    the loop and returns what was written, leaving the caller's offset accurate
-    for the bytes that did land.
+    the loop and reports the write as incomplete, since the unwritten suffix has
+    already been consumed from the master and cannot be recovered.
     """
     written = 0
     while written < len(data):
@@ -10694,8 +10711,8 @@ def _write_all_to_log(log_fd: int, data: bytes) -> int:
         except InterruptedError:
             continue
         except OSError:
-            break
-    return written
+            return written, False
+    return written, True
 
 
 def _drain_master_to_log(master_fd: int, log_fd: int) -> int:
@@ -10710,13 +10727,16 @@ def _drain_master_to_log(master_fd: int, log_fd: int) -> int:
     while True:
         try:
             data = os.read(master_fd, 65536)
-        except (BlockingIOError, InterruptedError):
-            break
-        except OSError:
+        except InterruptedError:
+            continue  # the read was interrupted, not exhausted
+        except (BlockingIOError, OSError):
             break
         if not data:
             break
-        total += _write_all_to_log(log_fd, data)
+        written, complete = _write_all_to_log(log_fd, data)
+        total += written
+        if not complete:
+            break
     return total
 
 
@@ -10799,9 +10819,13 @@ def _drain_resize_records(
         _magic, _version, cols, rows, _sum = struct.unpack(
             RESIZE_RECORD_FORMAT, last_record
         )
-        _apply_resize(master_fd, cols, rows)
-        if on_applied is not None:
-            on_applied(cols, rows)
+        if _apply_resize(master_fd, cols, rows):
+            if on_applied is not None:
+                on_applied(cols, rows)
+        elif warn is not None:
+            # Common during teardown once the master is closed, so this is a
+            # note rather than a fault; the timeline deliberately gets no record.
+            warn(f"terminal resize to {cols}x{rows} was refused; size unchanged")
     return buffered
 
 
@@ -10971,11 +10995,12 @@ def _run_interactive(
     with _block_handled_runner_signals():
         pty_pid, master_fd = pty.fork()
         if pty_pid != 0:
-            # Size the PTY before the child can query it. Losing that race is
-            # survivable rather than corrupting: the ioctl raises SIGWINCH, so an
-            # agent that already read 0x0 re-queries and repaints at this size.
-            _apply_resize(master_fd, _LAUNCH_TERMINAL_COLS, _LAUNCH_TERMINAL_ROWS)
+            # Publish first: an exception before this strands a live child that
+            # teardown has no record of. Sizing the PTY afterwards still beats
+            # the child to its first TIOCGWINSZ in practice, and the ioctl
+            # raises SIGWINCH, so an agent that already read 0x0 re-queries.
             _publish_or_reap_child(state_dir, "pty_pid", pty_pid)
+            _apply_resize(master_fd, _LAUNCH_TERMINAL_COLS, _LAUNCH_TERMINAL_ROWS)
         else:
             _reset_runner_signal_handlers()
     if pty_pid == 0:
@@ -11063,13 +11088,17 @@ def _run_interactive(
             pass
 
     log_bytes_written = 0
+    # Cleared when a log write fails: recorded offsets index the captured log,
+    # so a gap makes every later offset meaningless.
+    log_capture_intact = True
 
     def record_resize(cols: int, rows: int) -> None:
+        nonlocal log_capture_intact
         # Resizes are out-of-band (TIOCSWINSZ + SIGWINCH): no byte of the
         # ioctl reaches the log, so the offset it took effect at has to be
         # recorded here, not recovered from the stream later. Bytes at or
         # after log_bytes_written are the first the new geometry applies to.
-        if log_dir is None:
+        if log_dir is None or not log_capture_intact:
             return
         record = json.dumps(
             {"offset": log_bytes_written, "cols": cols, "rows": rows}
@@ -11116,7 +11145,15 @@ def _run_interactive(
                     break
                 # master closed but child still alive? unusual — loop again.
             else:
-                log_bytes_written += _write_all_to_log(log_fd, data)
+                written, complete = _write_all_to_log(log_fd, data)
+                log_bytes_written += written
+                if not complete and log_capture_intact:
+                    log_capture_intact = False
+                    warn_resize(
+                        "log write failed; the capture is truncated and resize "
+                        "offsets can no longer locate a geometry change, so the "
+                        "resize timeline stops here"
+                    )
 
         if fifo_fd in r:
             try:

@@ -203,13 +203,35 @@ def test_apply_resize_ignores_closed_or_non_tty_master(monkeypatch, error):
 
 
 @pytest.mark.parametrize("error", [errno.EACCES, errno.EPERM])
-def test_apply_resize_reraises_unexpected_errno(monkeypatch, error):
+def test_apply_resize_reports_failure_rather_than_raising(monkeypatch, error):
+    """Resizing is auxiliary and must never end a run.
+
+    At launch this runs between pty.fork() and _publish_or_reap_child, so an
+    escaping error ends the runner while the forked child stays alive with its
+    pid unrecorded, beyond the reach of teardown.
+    """
     def fail_ioctl(*_args):
         raise OSError(error, "expected test failure")
 
     monkeypatch.setattr(agent_run.fcntl, "ioctl", fail_ioctl)
-    with pytest.raises(OSError):
-        agent_run._apply_resize(99, 120, 42)
+    assert agent_run._apply_resize(99, 120, 42) is False
+
+
+def test_a_refused_resize_is_not_recorded_in_the_timeline(monkeypatch):
+    """A geometry the kernel rejected never took effect, so replaying a size
+    change at that offset would diverge from what the live PTY did."""
+    monkeypatch.setattr(agent_run.fcntl, "ioctl",
+                        lambda *_a: (_ for _ in ()).throw(OSError(errno.EIO, "io")))
+    recorded = []
+    warnings = []
+
+    agent_run._drain_resize_records(
+        7, agent_run._pack_resize(80, 24), warnings.append,
+        lambda cols, rows: recorded.append((cols, rows)),
+    )
+
+    assert recorded == []
+    assert warnings and "80x24" in warnings[0]
 
 
 def test_drain_resize_records_preserves_partial_suffix(monkeypatch):
@@ -307,7 +329,7 @@ def test_drain_resize_records_invokes_on_applied_callback(monkeypatch):
     """_run_interactive passes a callback that records the resize timeline;
     it must fire exactly once per applied record, with that record's
     dimensions, and only after _apply_resize itself succeeds."""
-    monkeypatch.setattr(agent_run, "_apply_resize", lambda master_fd, cols, rows: None)
+    monkeypatch.setattr(agent_run, "_apply_resize", lambda master_fd, cols, rows: True)
     record = agent_run._pack_resize(120, 42)
     applied = []
 
