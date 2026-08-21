@@ -244,12 +244,12 @@ def test_watchdog_escalation_does_not_signal_aux_pid_with_wrong_parent(
     assert 9999 not in [p for p, _ in os_kills], "unrelated aux pid must not be signalled"
 
 
-def test_watchdog_escalation_reaps_legacy_echo_and_render_pid(
+def test_watchdog_escalation_reaps_echo_and_render_pid_state_files(
     isolated_runs_root, monkeypatch
 ):
-    """A runner started by a pre-upgrade build can still have echo_pid/
-    render_pid files on disk even though no current runner writes them;
-    a mixed-version escalation must still discover and kill them."""
+    """echo_pid/render_pid are read-only entries in _AUX_PID_FIELDS: a state
+    directory carrying either file must still have its pid signalled during
+    escalation, independent of which component wrote the file."""
     state = _seed_run(isolated_runs_root)
     (state / agent_run.IDLE_TIMEOUT_MARKER).write_text("5\n")
     (state / "echo_pid").write_text("7001\n")
