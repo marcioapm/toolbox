@@ -8967,7 +8967,14 @@ def _block_handled_runner_signals():
         pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
-_AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "watchdog_pid", "appserver_pid")
+_AUX_PID_FIELDS = (
+    "agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "watchdog_pid", "appserver_pid",
+    # Legacy teardown entries: no runner writes these any more, but a runner
+    # started by a pre-upgrade build can still have them on disk, and a
+    # mixed-version force-kill must still reap that runner's echo/render
+    # children rather than leave them reparented.
+    "echo_pid", "render_pid",
+)
 
 
 # Distinguishes a watchdog kill from an ordinary SIGTERM in `_finalize`.
