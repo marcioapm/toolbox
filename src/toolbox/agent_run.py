@@ -420,10 +420,17 @@ _RENDER_LOG_DEFAULT_HEIGHT = 60
 # 0x0 winsize, so without this each agent falls back to a size of its own
 # choosing -- OpenCode picks 80x24 -- which the renderer cannot observe and does
 # not match. Setting it makes the geometry a recorded fact rather than an
-# inference, and matching the renderer defaults means absolute cursor positions
-# replay into the coordinate system they were computed for.
-_LAUNCH_TERMINAL_COLS = _RENDER_LOG_DEFAULT_WIDTH
-_LAUNCH_TERMINAL_ROWS = _RENDER_LOG_DEFAULT_HEIGHT
+# inference: run.json records these values and every renderer resolves them
+# through _resolved_default_geometry, so absolute cursor positions replay into
+# the coordinate system they were computed for.
+#
+# Deliberately larger than, and independent of, the render fallback above. A
+# wider PTY makes the agent emit wider lines, which is the only way to get
+# them: width cannot be recovered at render time from bytes drawn narrow.
+# The fallback stays 120x60 because it is what every log recorded before
+# run.json carried a terminal field is rendered at.
+_LAUNCH_TERMINAL_COLS = 200
+_LAUNCH_TERMINAL_ROWS = 100
 _RENDER_LOG_DEFAULT_HISTORY = 2048
 
 # Statuses that are conclusively terminal: the run will never transition
@@ -6478,9 +6485,10 @@ def _resolved_default_geometry(log_dir: Path) -> Tuple[int, int]:
     else the render defaults themselves.
 
     This is the geometry a cache reader must compare against -- not the
-    hardcoded defaults -- since a run's own launch geometry can differ from
-    them (only the case ``_LAUNCH_TERMINAL_COLS/ROWS == _RENDER_LOG_DEFAULT_
-    WIDTH/HEIGHT`` today makes the two coincide).
+    hardcoded defaults -- since a run's own launch geometry differs from them:
+    runs are launched at ``_LAUNCH_TERMINAL_COLS``x``_LAUNCH_TERMINAL_ROWS``,
+    while the fallback applies only to logs whose run.json predates the
+    terminal field.
     """
     return _read_run_terminal_geometry(log_dir) or (
         _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT
@@ -6652,10 +6660,19 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
     except ImportError:
         return
 
+    # The geometry every other reader resolves for this log: run.json's
+    # terminal field, else the render fallback. Rendering at the module
+    # defaults instead would publish a transcript at a size no reader accepts.
+    width, height = _resolved_default_geometry(log_dir)
+    # This loop feeds bytes incrementally and never applies the resize
+    # timeline, so the identity it publishes names an empty timeline at that
+    # geometry. A recorded resize makes the reader's identity differ, which
+    # correctly forces a full re-render rather than a hit at the wrong size.
+    resize_identity = _resize_timeline_digest((width, height), ())
+
     def new_state():
         screen = _new_pyte_screen(
-            pyte, _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT,
-            _RENDER_LOG_DEFAULT_HISTORY,
+            pyte, width, height, _RENDER_LOG_DEFAULT_HISTORY,
         )
         return screen, pyte.ByteStream(screen)
 
@@ -6720,7 +6737,11 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
                 if failures >= 2:
                     blocked = identity
                     try:
-                        _publish_clean_metadata(clean, stat_result=current, offset=0, complete=False)
+                        _publish_clean_metadata(
+                            clean, stat_result=current, offset=0, complete=False,
+                            width=width, height=height,
+                            resize_identity=resize_identity,
+                        )
                     except OSError:
                         pass
                 time.sleep(interval)
@@ -6740,10 +6761,14 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
             try:
                 if rendered is not None:
                     _publish_clean(clean, rendered, stat_result=source_stat,
-                                   offset=published_offset, complete=complete)
+                                   offset=published_offset, complete=complete,
+                                   width=width, height=height,
+                                   resize_identity=resize_identity)
                 else:
                     _publish_clean_metadata(clean, stat_result=source_stat,
-                                            offset=published_offset, complete=complete)
+                                            offset=published_offset, complete=complete,
+                                            width=width, height=height,
+                                            resize_identity=resize_identity)
             except OSError:
                 time.sleep(interval)
                 continue

@@ -495,3 +495,114 @@ class TestRunJsonAndResizeTimelineWiring:
 
         assert cached == _render(raw)
         assert ar._read_clean_cache(log, W, H, HIST) == cached
+
+
+class TestLaunchGeometryIsIndependentOfTheRenderFallback:
+    """Runs launch at _LAUNCH_TERMINAL_COLS/ROWS and record it in run.json; the
+    render fallback applies only to logs whose run.json predates that field.
+    Coupling the two would either shrink new runs to the fallback or shift every
+    legacy transcript."""
+
+    def test_launch_geometry_is_wider_than_the_render_fallback(self):
+        """A wider PTY is the only way to get wider lines: width cannot be
+        recovered at render time from bytes the agent drew narrow."""
+        assert ar._LAUNCH_TERMINAL_COLS > ar._RENDER_LOG_DEFAULT_WIDTH
+        assert ar._LAUNCH_TERMINAL_ROWS > ar._RENDER_LOG_DEFAULT_HEIGHT
+
+    def test_a_log_without_run_json_resolves_to_the_render_fallback(self, tmp_path):
+        """Every log recorded before run.json carried a terminal field must keep
+        rendering at the fallback, not at whatever launch geometry is today."""
+        log_dir = tmp_path / "legacy"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(b"hello\r\n")
+        assert ar._resolved_default_geometry(log_dir) == (
+            ar._RENDER_LOG_DEFAULT_WIDTH, ar._RENDER_LOG_DEFAULT_HEIGHT
+        )
+
+    def test_a_run_json_geometry_wins_over_the_fallback(self, tmp_path):
+        log_dir = tmp_path / "new"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(b"hello\r\n")
+        _write_run_json(log_dir, {"cols": ar._LAUNCH_TERMINAL_COLS,
+                                  "rows": ar._LAUNCH_TERMINAL_ROWS})
+        assert ar._resolved_default_geometry(log_dir) == (
+            ar._LAUNCH_TERMINAL_COLS, ar._LAUNCH_TERMINAL_ROWS
+        )
+
+    def test_launch_geometry_widens_the_rendered_line(self, tmp_path):
+        """The point of the bump: a line the agent draws at 160 columns survives
+        at the launch geometry and is truncated at the fallback."""
+        raw = b"x" * 160 + b"\r\n"
+        legacy = tmp_path / "legacy"
+        legacy.mkdir()
+        (legacy / "log").write_bytes(raw)
+        wide = tmp_path / "wide"
+        wide.mkdir()
+        (wide / "log").write_bytes(raw)
+        _write_run_json(wide, {"cols": ar._LAUNCH_TERMINAL_COLS,
+                               "rows": ar._LAUNCH_TERMINAL_ROWS})
+
+        narrow_render = ar._render_log_dir(
+            legacy, raw, width=ar._RENDER_LOG_DEFAULT_WIDTH,
+            height=ar._RENDER_LOG_DEFAULT_HEIGHT, history=ar._RENDER_LOG_DEFAULT_HISTORY,
+        )
+        wide_render = ar._render_log_dir(
+            wide, raw, width=ar._RENDER_LOG_DEFAULT_WIDTH,
+            height=ar._RENDER_LOG_DEFAULT_HEIGHT, history=ar._RENDER_LOG_DEFAULT_HISTORY,
+        )
+        assert max(len(l) for l in narrow_render.splitlines()) == ar._RENDER_LOG_DEFAULT_WIDTH
+        assert max(len(l) for l in wide_render.splitlines()) == 160
+
+
+class TestEchoDaemonPublishesAtTheResolvedGeometry:
+    """The daemon rendered at the module defaults while _render_log_to_clean
+    rendered at the resolved geometry. They agreed only while launch geometry
+    equalled the fallback; a bump would have made every new run's cache a
+    permanent miss, and a reader that skipped the geometry gate would have been
+    handed a transcript rendered at the wrong size."""
+
+    def _run_one_tick(self, log_dir):
+        pytest.importorskip("pyte")
+        ar._render_log_to_clean(log_dir)
+
+    def test_metadata_records_the_runs_own_geometry(self, tmp_path):
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(b"x" * 160 + b"\r\n")
+        _write_run_json(log_dir, {"cols": 200, "rows": 100})
+        self._run_one_tick(log_dir)
+
+        meta = json.loads((log_dir / "log.clean.meta.json").read_text())
+        assert (meta["width"], meta["height"]) == (200, 100)
+
+    def test_that_cache_is_a_hit_for_a_reader_at_the_defaults(self, tmp_path):
+        """A reader asking for the module defaults resolves this run's 200x100
+        and must accept the cache published at that geometry."""
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        raw = b"x" * 160 + b"\r\n"
+        (log_dir / "log").write_bytes(raw)
+        _write_run_json(log_dir, {"cols": 200, "rows": 100})
+        self._run_one_tick(log_dir)
+
+        cached = ar._read_clean_cache(
+            log_dir / "log", ar._RENDER_LOG_DEFAULT_WIDTH,
+            ar._RENDER_LOG_DEFAULT_HEIGHT, ar._RENDER_LOG_DEFAULT_HISTORY,
+        )
+        assert cached is not None
+        assert cached == ar._render_log_dir(
+            log_dir, raw, width=ar._RENDER_LOG_DEFAULT_WIDTH,
+            height=ar._RENDER_LOG_DEFAULT_HEIGHT,
+            history=ar._RENDER_LOG_DEFAULT_HISTORY,
+        )
+
+    def test_a_legacy_log_still_publishes_at_the_fallback(self, tmp_path):
+        log_dir = tmp_path / "legacy"
+        log_dir.mkdir()
+        (log_dir / "log").write_bytes(b"hello\r\n")
+        self._run_one_tick(log_dir)
+
+        meta = json.loads((log_dir / "log.clean.meta.json").read_text())
+        assert (meta["width"], meta["height"]) == (
+            ar._RENDER_LOG_DEFAULT_WIDTH, ar._RENDER_LOG_DEFAULT_HEIGHT
+        )
