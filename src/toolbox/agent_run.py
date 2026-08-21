@@ -9074,10 +9074,11 @@ def _block_handled_runner_signals():
 
 _AUX_PID_FIELDS = (
     "agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "watchdog_pid", "appserver_pid",
-    # Legacy teardown entries: no runner writes these any more, but a runner
-    # started by a pre-upgrade build can still have them on disk, and a
-    # mixed-version force-kill must still reap that runner's echo/render
-    # children rather than leave them reparented.
+    # echo_pid/render_pid: state-file names for a runner's echo/render helper
+    # children. _force_kill and _watchdog_escalate discover children solely
+    # through this tuple, so a state directory carrying either name must
+    # still resolve to a pid teardown signals, even though no runner in this
+    # tree writes them.
     "echo_pid", "render_pid",
 )
 
