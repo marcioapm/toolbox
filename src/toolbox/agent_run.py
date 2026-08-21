@@ -4737,9 +4737,9 @@ def _cut_with_closure(content: bytes, cap: int) -> "tuple[bytes, bool]":
 
     A first cut at ``cap`` is closed; if that closure appended ST (ESC \\),
     the result is ``len(_STRING_TERMINATOR)`` bytes over budget, so the cut
-    point is moved back by that many bytes and closed again -- the second
-    closure lands inside the same control string (if any) and adds the same
-    fixed-size terminator, landing exactly at or under ``cap``. Returns
+    point is moved back by that many bytes and closed again. Closing can only
+    append those same two bytes or drop a dangling ESC/introducer, never grow
+    the result further, so the second pass lands at or under ``cap``. Returns
     (result, was_cut).
     """
     if len(content) <= cap:

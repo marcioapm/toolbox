@@ -39,3 +39,14 @@ def test_verify_session_attribution_fails_loudly_when_clean_is_unsupported():
     source = (SCRIPTS_DIR / "verify-session-attribution").read_text()
     assert "preflight_err" in source
     assert "ABORT" in source
+
+
+def test_verify_session_attribution_emits_json_when_an_abort_precedes_cells():
+    """--json callers decode stdout unconditionally, so an abort that returns
+    before the summary must still write a failure object rather than nothing."""
+    source = (SCRIPTS_DIR / "verify-session-attribution").read_text()
+    assert "def _emit_abort_json(" in source
+    # Both pre-cell aborts route through it: the binary preflight and the
+    # database check.
+    assert source.count("_emit_abort_json(args.json,") == 2
+    assert '"aborted": reason' in source

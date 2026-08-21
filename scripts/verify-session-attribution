@@ -828,6 +828,20 @@ def _resolve_agent_run_bin(override: Optional[str]) -> list[str]:
     return [sys.executable, str(_BRANCH_SCRIPT)]
 
 
+def _emit_abort_json(json_mode: bool, reason: str) -> None:
+    """Write the --json failure object for an abort that precedes cell execution.
+
+    --json callers decode stdout unconditionally, so an abort that returns
+    before the summary would hand them an empty stream. Cell counts are zero
+    because no cell ran.
+    """
+    if not json_mode:
+        return
+    print(json.dumps({
+        "pass": 0, "fail": 0, "skip": 0, "cells": [], "aborted": reason,
+    }, indent=2))
+
+
 def _preflight_branch_binary(bin_argv: list[str]) -> Optional[str]:
     """Return an error string if the branch binary does not support `logs
     --clean`, else None.
@@ -930,6 +944,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     preflight_err = _preflight_branch_binary(_agent_run_bin)
     if preflight_err:
         _log(f"ABORT: {preflight_err}")
+        _emit_abort_json(args.json, preflight_err)
         return 1
     _log("Branch binary preflight OK\n")
 
@@ -962,6 +977,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         db_err = _db_preflight()
         if db_err:
             _log(f"ABORT: {db_err}")
+            _emit_abort_json(args.json, db_err)
             _log("DB path is down — cannot distinguish 'no row' from 'transport error'.")
             _log("Fix the SSH tunnel / container before running.")
             return 1
