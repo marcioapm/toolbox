@@ -47,7 +47,6 @@ Usage::
     agent-run [flags] <name> -- <cmd...>  # recommended: explicit separator
     agent-run <name> <cmd...>            # non-interactive (one-shot)
     agent-run -i <name> -- <cmd...>      # interactive (PTY-wrapped, steerable)
-    agent-run --echo <name> -- <cmd...>  # accepted for backward compat; log.clean is now always produced
     agent-run --idle-timeout N <name> -- <cmd...>  # self-terminate after N idle seconds
     agent-run --cwd <dir> <name> -- <cmd...>  # run the command in <dir> (managed mode too)
     agent-run --harness claude|opencode|codex   # managed mode (no trailing --)
@@ -58,6 +57,8 @@ Usage::
     agent-run attach <name>              # live keyboard + resize passthrough (Ctrl-C detaches)
     agent-run tail <name>                # follow log in real time
     agent-run logs <name> [--tail N | --head N]  # last/first N lines (default --tail 50)
+    agent-run logs <name> --plain        # ANSI-stripped (default is raw bytes)
+    agent-run logs <name> --clean        # pyte-rendered transcript, slow on large logs
     agent-run status <name>              # one-line status
     agent-run watch <name> [--json] [--repo PATH]  # stateless fact snapshot for pollers
     agent-run steer <name> <msg...>      # send text to agent stdin (needs -i)
@@ -122,10 +123,6 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     pty_pid      PTY child pid (interactive only)
     keeper_pid   FIFO-keeper pid (interactive only)
     prompt_pid   initial-prompt helper pid (when -f and interactive)
-    echo_pid     transcript renderer pid (live incremental renderer, always present)
-    render_pid   final-transcript-render child pid (present only while the
-                 bounded final render is in flight, so ``_force_kill`` can
-                 discover and reap it if the runner itself is wedged)
     command      pretty-printed launch command
     argv         JSON-encoded argv (authoritative form for replay)
     submit_mode  cr | crlf (selected from argv for interactive submission)
@@ -148,7 +145,6 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
 Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs)::
 
     log          captured stdout+stderr (PTY-captured when interactive)
-    log.clean    rendered transcript (produced for every run that generates output)
     prompt       copy of the -f/--prompt-file input, if one was given
     session.json session attribution (managed mode only): session_id, harness,
                  acquisition, confidence, observed_at; absent for raw runs
@@ -253,8 +249,8 @@ performed) in one invocation:
       have their ephemeral state dir *and* their persistent scratch dir
       ($AGENT_RUN_LOG_DIR/<name>/tmp) removed. State-less orphaned scratch
       dirs left after a reboot are independently collected once their own
-      contents are old enough. The persistent `log`, `log.clean`, and
-      `prompt` files are never touched by this step — with `--include-logs`
+      contents are old enough. The persistent `log` and `prompt` files
+      are never touched by this step — with `--include-logs`
       (see below), preserved logs get their own separate, independently
       thresholded pass instead. A `stalled` run (alive pid, idle
       log — see `_effective_status`) is not terminal and is never
@@ -332,8 +328,6 @@ import codecs
 from contextlib import contextmanager
 import errno
 import fcntl
-import hashlib
-import importlib.metadata
 import json
 import math
 import os
@@ -361,7 +355,6 @@ import platform
 from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import Counter
 from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 from toolbox import __version__ as TOOLBOX_VERSION
 
@@ -399,38 +392,29 @@ RESIZE_PROTOCOL_MARKER = "resize_protocol"
 # get near this, so anything above it is corrupt framing that happened to
 # satisfy the checksum rather than a real size worth applying.
 MAX_TERMINAL_DIMENSION = 2000
-MAX_FINAL_RENDER_BYTES = 16 * 1024 * 1024
-FINAL_RENDER_TIMEOUT_SECONDS = 10.0
-FINAL_RENDER_REAP_TIMEOUT_SECONDS = 5.0
-# Per-tick new-bytes cap for the echo daemon's incremental pyte feed.
-ECHO_LOOP_MAX_RENDER_BYTES = 16 * 1024 * 1024
-# Per-line and total byte caps for `logs` and `clean` output. A single TUI line
+# Per-line and total byte caps for `logs` output. A single TUI line
 # can be megabytes long (one \n per session, many \r redraw frames), so a line
 # count alone does not bound output. The primary consumer, the threadctl drift
 # check, reads at most 32 000 bytes and forwards the last 4 000 characters to an
 # LLM; anything above 32 KiB total is discarded before use.
 LOGS_MAX_LINE_BYTES = 8 * 1024
 LOGS_MAX_TOTAL_BYTES = 32 * 1024
-# Geometry used by the daemon cache and by clean's default rendering. Keeping
-# scrollback bounded limits the resident cost of a long-lived HistoryScreen.
-_RENDER_LOG_DEFAULT_WIDTH = 120
-_RENDER_LOG_DEFAULT_HEIGHT = 60
 
-# Window size applied to a run's PTY at launch. A pty.fork()ed child inherits a
-# 0x0 winsize, so without this each agent falls back to a size of its own
-# choosing -- OpenCode picks 80x24 -- which the renderer cannot observe and does
-# not match. Setting it makes the geometry a recorded fact rather than an
-# inference: run.json records these values and every renderer resolves them
-# through _resolved_default_geometry, so absolute cursor positions replay into
-# the coordinate system they were computed for.
+# Terminal geometry, used both for the PTY at launch and as the render
+# fallback when a log's run.json has no `terminal` field. A single pair:
+# nothing compares launch geometry against render geometry any more, so
+# there is no reason for them to differ.
 #
-# Deliberately larger than, and independent of, the render fallback above. A
-# wider PTY makes the agent emit wider lines, which is the only way to get
-# them: width cannot be recovered at render time from bytes drawn narrow.
-# The fallback stays 120x60 because it is what every log recorded before
-# run.json carried a terminal field is rendered at.
-_LAUNCH_TERMINAL_COLS = 200
-_LAUNCH_TERMINAL_ROWS = 100
+# A pty.fork()ed child inherits a 0x0 winsize, so without applying this at
+# launch each agent falls back to a size of its own choosing -- OpenCode
+# picks 80x24 -- that a renderer cannot observe and does not match. run.json
+# records these values and _resolved_default_geometry resolves them, so
+# absolute cursor positions replay into the coordinate system they were
+# computed for.
+_LAUNCH_TERMINAL_COLS = 120
+_LAUNCH_TERMINAL_ROWS = 40
+_RENDER_LOG_DEFAULT_WIDTH = _LAUNCH_TERMINAL_COLS
+_RENDER_LOG_DEFAULT_HEIGHT = _LAUNCH_TERMINAL_ROWS
 _RENDER_LOG_DEFAULT_HISTORY = 2048
 
 # Statuses that are conclusively terminal: the run will never transition
@@ -4674,11 +4658,15 @@ def _slice_str_lines(text: str, n: int, *, from_end: bool) -> str:
 
 
 # Terminal-control sequences are invisible in a terminal but consume tokens and
-# corrupt matching for the LLM consumers that read `logs` output.
+# corrupt matching for the LLM consumers that read `logs --plain` output.
 _LOGS_OSC_RE = re.compile(rb"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
 _LOGS_PARTIAL_OSC_HEAD_RE = re.compile(rb"\x1b\].*\Z", re.DOTALL)
 _LOGS_PARTIAL_OSC_TAIL_RE = re.compile(rb"\A[^\x07]*(?:\x07|\x1b\\)", re.DOTALL)
-_LOGS_CSI_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]")
+# Parameter bytes are 0x30-0x3F: digits, `;`, `:`, and the private-parameter
+# bytes `<=>?` (ECMA-48 5.4c) -- `\x1b[>4;1m` (xterm modifyOtherKeys query
+# reply) uses `>` and was previously left unmatched, leaking `>4;1m` as
+# literal text.
+_LOGS_CSI_RE = re.compile(rb"\x1b\[[0-9;:<=>?]*[ -/]*[@-~]")
 _LOGS_ESC_RE = re.compile(rb"\x1b.", re.DOTALL)
 
 
@@ -4696,18 +4684,19 @@ _TRUNCATION_MARKER_STR = "[agent-run: output truncated]\n"
 _TRUNCATION_MARKER_BYTES = _TRUNCATION_MARKER_STR.encode("utf-8")
 
 
-def _budget_bytes_lines(lines: "Iterable[bytes]") -> "tuple[bytes, bool]":
+def _budget_bytes_lines(lines: "Iterable[bytes]", *, strip: bool) -> "tuple[bytes, bool]":
     """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to raw log lines.
 
-    ANSI-strips each line, caps it at LOGS_MAX_LINE_BYTES, and stops once the
-    running total (including one newline per emitted line) reaches
-    LOGS_MAX_TOTAL_BYTES. Returns (output, truncated).
+    ANSI-strips each line when ``strip`` is true, caps it at
+    LOGS_MAX_LINE_BYTES, and stops once the running total (including one
+    newline per emitted line) reaches LOGS_MAX_TOTAL_BYTES. Returns
+    (output, truncated).
     """
     out_parts: "list[bytes]" = []
     total = 0
     truncated = False
     for line in lines:
-        clean = _strip_ansi_bytes(line)
+        clean = _strip_ansi_bytes(line) if strip else line
         if len(clean) > LOGS_MAX_LINE_BYTES:
             clean = clean[:LOGS_MAX_LINE_BYTES]
             truncated = True
@@ -4761,7 +4750,38 @@ def _budget_str(text: str) -> "tuple[str, bool]":
 
 def cmd_logs(args: argparse.Namespace) -> int:
     log = _require_log(_validate_run_name(args.name))
+    clean = bool(getattr(args, "clean", False))
     try:
+        if clean:
+            # Dumb and synchronous: read the whole log, render it inline
+            # through pyte, then slice. A byte-sliced fragment starts
+            # mid-escape-sequence, so head/tail apply to the rendered text.
+            with _watch_open_validated_log(log) as f:
+                if f is None:
+                    sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
+                raw = f.read()
+            try:
+                rendered = _render_log_dir(
+                    log.parent, raw,
+                    width=_RENDER_LOG_DEFAULT_WIDTH,
+                    height=_RENDER_LOG_DEFAULT_HEIGHT,
+                    history=_RENDER_LOG_DEFAULT_HISTORY,
+                )
+            except RenderDependencyError as exc:
+                sys.exit(str(exc))
+            if args.head is not None:
+                rendered = _slice_str_lines(rendered, args.head, from_end=False)
+            else:
+                rendered = _slice_str_lines(rendered, args.tail if args.tail is not None else 50, from_end=True)
+            budgeted, truncated = _budget_str(rendered)
+            if truncated:
+                budgeted += _TRUNCATION_MARKER_STR
+            try:
+                sys.stdout.buffer.write(budgeted.encode("utf-8"))
+            except BrokenPipeError:
+                pass
+            return 0
+
         with _watch_open_validated_log(log) as f:
             if f is None:
                 sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
@@ -4769,7 +4789,11 @@ def cmd_logs(args: argparse.Namespace) -> int:
                 lines = _head_bytes(f, args.head)
             else:
                 lines = _tail_bytes(f, args.tail if args.tail is not None else 50)
-        out, truncated = _budget_bytes_lines(lines)
+        # Default is raw bytes (a human piping to a terminal gets the drawing
+        # back); --plain strips ANSI for grepping/piping/agent consumption.
+        # The byte budget applies either way, so raw mode spends part of its
+        # budget on escape sequences rather than visible text.
+        out, truncated = _budget_bytes_lines(lines, strip=bool(getattr(args, "plain", False)))
         try:
             sys.stdout.buffer.write(out)
             if truncated:
@@ -5649,7 +5673,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# clean (render PTY-captured logs into readable transcripts)
+# `logs --clean` (render a PTY-captured log into a readable transcript)
 # ---------------------------------------------------------------------------
 
 # Fallback ANSI stripper used when pyte itself can't safely render a log
@@ -5736,7 +5760,7 @@ class RenderDependencyError(RuntimeError):
 
 
 _RENDER_DEPENDENCY_MESSAGE = (
-    "agent-run: `pyte` is required for `clean` and the live transcript renderer. "
+    "agent-run: `pyte` is required for `logs --clean`. "
     "Install with: pipx inject mmartins-toolbox pyte  (or uv tool install --with pyte ...)"
 )
 
@@ -5902,90 +5926,6 @@ def _resize_screen(screen, cols: int, rows: int) -> None:
     screen.cursor.y = min(screen.cursor.y, screen.lines - 1)
 
 
-# Smaller snapshot intervals recover more overwritten lines at the cost of scans.
-_STITCH_CHUNK_BYTES = 8 * 1024
-
-# Bound the memory and output consumed by distinct lines from repainting TUIs.
-# _STITCH_MAX_BYTES counts UTF-8 bytes of the accumulated body, excluding the
-# truncation marker.
-_STITCH_MAX_LINES = 50_000
-_STITCH_MAX_BYTES = 8 * 1024 * 1024
-_STITCH_TRUNCATED_MARKER = "[agent-run: stitched history truncated]\n"
-
-
-def _stitch_history(
-    raw: bytes,
-    width: int = _RENDER_LOG_DEFAULT_WIDTH,
-    height: int = _RENDER_LOG_DEFAULT_HEIGHT,
-    history: int = _RENDER_LOG_DEFAULT_HISTORY,
-    resizes: "Optional[Sequence[dict]]" = None,
-    chunk_bytes: int = _STITCH_CHUNK_BYTES,
-) -> str:
-    """Replay ``raw`` and accumulate lines sampled from scrollback and viewport.
-
-    Consecutive samples are deduplicated by multiplicity, so a row printed again
-    while an identical row is still on screen is kept. The reconstruction
-    preserves first-seen order and may include partial repaints. Pyte failures
-    fall back to ANSI stripping.
-
-    Contains every nonempty line of the viewport render unless a cap truncates
-    it: empty rows are dropped, and truncation stops replay before the final
-    screen, so a truncated result omits the tail the viewport render ends with.
-    """
-    try:
-        import pyte  # type: ignore
-    except ImportError as exc:
-        raise RenderDependencyError(_RENDER_DEPENDENCY_MESSAGE) from exc
-
-    if not _bounded_int(chunk_bytes, 1, sys.maxsize):
-        raise ValueError(f"chunk_bytes must be a positive int, got {chunk_bytes!r}")
-
-    timeline = _validate_resize_timeline(resizes, len(raw))
-    geometry_at = {offset: (cols, rows) for offset, cols, rows in timeline}
-    # Sample boundaries and resize boundaries are independent; replay splits at
-    # the union so a resize still lands at its recorded offset.
-    boundaries = sorted(
-        set(geometry_at) | set(range(chunk_bytes, len(raw), chunk_bytes)) | {len(raw)}
-    )
-
-    previous: "Counter[str]" = Counter()
-    lines: List[str] = []
-    total_bytes = 0
-    position = 0
-    try:
-        screen = _new_pyte_screen(pyte, width, height, history)
-        stream = pyte.ByteStream(screen)
-        for boundary in boundaries:
-            if boundary > position:
-                _feed_pyte(stream, raw[position:boundary])
-                position = boundary
-            geometry = geometry_at.get(boundary)
-            if geometry is not None:
-                _resize_screen(screen, *geometry)
-            current: "Counter[str]" = Counter()
-            for text in _screen_lines(screen):
-                if not text:
-                    continue
-                current[text] += 1
-                # Only occurrences beyond the previous sample's count are new:
-                # the rest are the same rows observed again.
-                if current[text] <= previous[text]:
-                    continue
-                line_bytes = len(text.encode("utf-8")) + 1
-                if (
-                    len(lines) >= _STITCH_MAX_LINES
-                    or total_bytes + line_bytes > _STITCH_MAX_BYTES
-                ):
-                    return "".join(line + "\n" for line in lines) + _STITCH_TRUNCATED_MARKER
-                lines.append(text)
-                total_bytes += line_bytes
-            previous = current
-    except Exception:
-        return _strip_ansi_fallback(raw)
-
-    return "".join(line + "\n" for line in lines)
-
-
 def _render_log(
     raw: bytes,
     width: int = _RENDER_LOG_DEFAULT_WIDTH,
@@ -6035,360 +5975,6 @@ def _render_log(
         return _strip_ansi_fallback(raw)
 
     return _serialize_screen(screen)
-
-
-
-# ---------------------------------------------------------------------------
-# screen checkpoints for incremental clean rendering
-# ---------------------------------------------------------------------------
-
-# A checkpoint restores pyte's Screen but not its ByteStream, which holds the
-# escape-sequence parser state and the incremental UTF-8 decoder. Resuming with
-# a fresh stream is correct only at an offset where the original stream held no
-# pending state; mid-sequence, the remainder renders as literal text.
-#
-# The stream is asked rather than its byte grammar re-implemented. pyte accepts
-# forms a scanner is apt to miss -- three-byte commands (ESC # % ( )), C1
-# controls decoded from UTF-8 (U+009B CSI, U+009D OSC, U+009C ST), ESC within an
-# OSC payload, malformed UTF-8 consumed as U+FFFD -- and each disagreement
-# yields a silently wrong transcript rather than an error.
-
-
-def _ckpt_stream_is_grounded(stream) -> bool:
-    """True when ``stream`` holds no parser or decoder state that a fresh
-    ByteStream would lack.
-
-    Reads pyte internals: ``_taking_plain_text`` is falsy while an escape
-    sequence is being accumulated, ``utf8_decoder`` retains the bytes of an
-    incomplete character, and ``use_utf8`` -- cleared by ``ESC % @`` -- lives on
-    the stream rather than the screen. Anything unrecognised counts as pending,
-    so a pyte whose internals moved stops publishing checkpoints instead of
-    publishing unsound ones.
-    """
-    try:
-        if not stream._taking_plain_text or not stream.use_utf8:
-            return False
-        pending, _flags = stream.utf8_decoder.getstate()
-        return not pending
-    except (AttributeError, TypeError, ValueError):
-        return False
-
-
-_CKPT_VERSION = 2
-
-# Bumped when the metadata layout changes: a reader must reject an older cache
-# outright rather than read absent fields as defaults that could match.
-_CLEAN_META_VERSION = 2
-
-
-def _ckpt_charsets() -> dict:
-    """Stable tags for pyte's charset tables. g0/g1 hold the mapping table
-    itself rather than a name, so a tag is needed to round-trip them."""
-    from pyte import charsets
-    return {
-        "B": charsets.LAT1_MAP,
-        "0": charsets.VT100_MAP,
-        "U": charsets.IBMPC_MAP,
-        "V": charsets.VAX42_MAP,
-    }
-
-
-def _ckpt_tag_for_charset(table) -> str:
-    for tag, known in _ckpt_charsets().items():
-        if known is table:
-            return tag
-    return "B"  # an unknown table cannot be restored; Latin-1 is pyte's default
-
-
-def _ckpt_charset_for_tag(tag: str):
-    charsets = _ckpt_charsets()
-    return charsets.get(tag, charsets["B"])
-
-
-def _ckpt_dump_row(row) -> dict:
-    """One sparse row as {column: char}; unwritten cells stay implicit."""
-    return {str(x): list(char) for x, char in row.items()}
-
-
-def _ckpt_load_row(pyte, data, default):
-    if not isinstance(data, dict):
-        raise ValueError("checkpoint row is not an object")
-    row = pyte.screens.StaticDefaultDict(default)
-    for x, values in data.items():
-        row[int(x)] = pyte.screens.Char(*values)
-    return row
-
-
-def _ckpt_dump_scrollback(row) -> str:
-    """A scrolled-off row as the text ``_serialize_screen`` would emit for it.
-
-    That serialization joins written cells in column order, so a sparse row
-    contributes no leading blanks and cell attributes are never read.
-    """
-    return "".join(row[col].data for col in sorted(row)) if row else ""
-
-
-def _ckpt_load_scrollback(pyte, line, default):
-    """Rebuild a scrolled-off row from text, one character per column.
-
-    Column indices need not match the original row: serialization joins cells in
-    column order, so any contiguous placement reproduces the same line.
-    """
-    if not isinstance(line, str):
-        raise ValueError("checkpoint scrollback line is not a string")
-    row = pyte.screens.StaticDefaultDict(default)
-    for col, char in enumerate(line):
-        row[col] = default._replace(data=char)
-    return row
-
-
-def _ckpt_dump_savepoint(pyte, sp) -> dict:
-    return {
-        "cursor": [sp.cursor.x, sp.cursor.y, sp.cursor.hidden, list(sp.cursor.attrs)],
-        "g0": _ckpt_tag_for_charset(sp.g0_charset),
-        "g1": _ckpt_tag_for_charset(sp.g1_charset),
-        "charset": sp.charset,
-        "origin": sp.origin,
-        "wrap": sp.wrap,
-    }
-
-
-def _ckpt_load_savepoint(pyte, data: dict):
-    x, y, hidden, attrs = data["cursor"]
-    cursor = pyte.screens.Cursor(x, y, pyte.screens.Char(*attrs))
-    cursor.hidden = hidden
-    return pyte.screens.Savepoint(
-        cursor,
-        _ckpt_charset_for_tag(data["g0"]),
-        _ckpt_charset_for_tag(data["g1"]),
-        data["charset"],
-        data["origin"],
-        data["wrap"],
-    )
-
-
-def _ckpt_surface_fingerprint(pyte) -> str:
-    """Hash of pyte's screen attribute surface and Char layout. Recorded in the
-    checkpoint so a pyte upgrade that reshapes either invalidates stale caches
-    instead of having them loaded into a screen they no longer describe."""
-    probe = pyte.HistoryScreen(
-        _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT,
-        history=_RENDER_LOG_DEFAULT_HISTORY, ratio=0.5,
-    )
-    parts = sorted(k for k in vars(probe) if not k.startswith("__"))
-    parts += list(pyte.screens.Char._fields)
-    try:
-        parts.append(importlib.metadata.version("pyte"))
-    except importlib.metadata.PackageNotFoundError:
-        parts.append("unknown")
-    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:16]
-
-
-def _ckpt_dump_state(pyte, screen) -> dict:
-    """Serializable screen state.
-
-    ``history.top`` is a ``deque(maxlen=history)``: once full, each scrolled-off
-    line evicts the oldest, so its length stops growing while its contents keep
-    changing, and an append-structured artifact cannot describe it. The whole
-    window is written on every tick instead, as text: ``_serialize_screen`` reads
-    only ``Char.data`` from a scrolled-off row, so cell attributes would cost
-    bytes -- 19 MB per tick for a filled window of wide content -- without ever
-    reaching the transcript.
-    """
-    return {
-        "version": _CKPT_VERSION,
-        "fingerprint": _ckpt_surface_fingerprint(pyte),
-        "columns": screen.columns,
-        "lines": screen.lines,
-        "buffer": {str(y): _ckpt_dump_row(row) for y, row in screen.buffer.items()},
-        "cursor": {
-            "x": screen.cursor.x,
-            "y": screen.cursor.y,
-            "hidden": screen.cursor.hidden,
-            "attrs": list(screen.cursor.attrs),
-        },
-        "charset": screen.charset,
-        "g0": _ckpt_tag_for_charset(screen.g0_charset),
-        "g1": _ckpt_tag_for_charset(screen.g1_charset),
-        "tabstops": sorted(screen.tabstops),
-        "savepoints": [_ckpt_dump_savepoint(pyte, sp) for sp in screen.savepoints],
-        "margins": None if screen.margins is None else list(screen.margins),
-        "mode": sorted(screen.mode),
-        "saved_columns": screen.saved_columns,
-        "title": screen.title,
-        "icon_name": screen.icon_name,
-        "history": {
-            "top": [_ckpt_dump_scrollback(row) for row in screen.history.top],
-            "bottom": [_ckpt_dump_scrollback(row) for row in screen.history.bottom],
-            "ratio": screen.history.ratio,
-            "size": screen.history.size,
-            "position": screen.history.position,
-        },
-    }
-
-
-def _ckpt_load_state(pyte, screen, state: dict) -> None:
-    """Restore ``state`` into ``screen`` in place.
-
-    Raises ValueError when the checkpoint does not describe this screen; callers
-    treat any failure as a cache miss and replay the log in full.
-    """
-    if state.get("version") != _CKPT_VERSION:
-        raise ValueError(f"unsupported checkpoint version {state.get('version')!r}")
-    if state.get("fingerprint") != _ckpt_surface_fingerprint(pyte):
-        raise ValueError("checkpoint was written against a different pyte surface")
-    if state["columns"] != screen.columns or state["lines"] != screen.lines:
-        raise ValueError("checkpoint geometry does not match screen geometry")
-
-    default = screen.default_char
-    screen.buffer.clear()
-    for y, row in state["buffer"].items():
-        screen.buffer[int(y)] = _ckpt_load_row(pyte, row, default)
-
-    cursor = state["cursor"]
-    screen.cursor.x = cursor["x"]
-    screen.cursor.y = cursor["y"]
-    screen.cursor.hidden = cursor["hidden"]
-    screen.cursor.attrs = pyte.screens.Char(*cursor["attrs"])
-
-    screen.charset = state["charset"]
-    screen.g0_charset = _ckpt_charset_for_tag(state["g0"])
-    screen.g1_charset = _ckpt_charset_for_tag(state["g1"])
-    screen.tabstops = set(state["tabstops"])
-    screen.savepoints = [_ckpt_load_savepoint(pyte, sp) for sp in state["savepoints"]]
-    screen.margins = None if state["margins"] is None else pyte.screens.Margins(*state["margins"])
-    screen.mode = set(state["mode"])
-    screen.saved_columns = state["saved_columns"]
-    screen.title = state["title"]
-    screen.icon_name = state["icon_name"]
-
-    history = state["history"]
-    screen.history.top.clear()
-    for line in history["top"]:
-        screen.history.top.append(_ckpt_load_scrollback(pyte, line, default))
-    screen.history.bottom.clear()
-    for line in history["bottom"]:
-        screen.history.bottom.append(_ckpt_load_scrollback(pyte, line, default))
-    screen.history = screen.history._replace(
-        ratio=history["ratio"], size=history["size"], position=history["position"]
-    )
-
-    screen.dirty.clear()
-    screen.dirty.update(range(screen.lines))
-
-
-def _ckpt_state_path(clean: Path) -> Path:
-    return clean.with_name(f"{clean.name}.state.json")
-
-
-def _ckpt_publish(clean: Path, pyte, screen, *, offset: int) -> None:
-    """Write the screen checkpoint covering raw-log byte ``offset``.
-
-    The state file is replaced atomically, but not atomically with respect to
-    ``log.clean`` and its metadata, so the offset is recorded here and compared
-    by the reader; a checkpoint from another tick is rejected rather than loaded
-    against mismatched metadata.
-    """
-    state = _ckpt_dump_state(pyte, screen)
-    state["offset"] = offset
-    _atomic_write_text(
-        _ckpt_state_path(clean), json.dumps(state, sort_keys=True), suffix="state",
-    )
-
-
-def _ckpt_discard(clean: Path) -> None:
-    """Remove the checkpoint. Readers fall back to a full replay, which is
-    always correct; a checkpoint that cannot be trusted must not survive."""
-    try:
-        _ckpt_state_path(clean).unlink()
-    except OSError:
-        pass
-
-
-def _ckpt_load(clean: Path, pyte, screen, *, offset: int) -> bool:
-    """Restore the checkpoint covering ``offset`` into ``screen``.
-
-    Returns False when no checkpoint applies, for any reason: absent, malformed,
-    written by a different pyte, or naming another offset. The caller then
-    replays the log in full.
-    """
-    try:
-        with _watch_open_validated_log(_ckpt_state_path(clean)) as handle:
-            if handle is None:
-                return False
-            state = json.loads(handle.read().decode("utf-8"))
-        # json.loads yields any JSON value; every access below assumes a mapping.
-        if not isinstance(state, dict) or state.get("offset") != offset:
-            return False
-        _ckpt_load_state(pyte, screen, state)
-    except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError):
-        return False
-    return True
-
-
-def _cache_metadata_path(clean: Path) -> Path:
-    return clean.with_name(f"{clean.name}.meta.json")
-
-
-def _atomic_write_text(path: Path, text: str, *, suffix: str) -> None:
-    """Atomically replace a text file with a process-unique temporary path."""
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.{suffix}")
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        tmp.replace(path)
-    finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def _publish_clean(
-    clean: Path, rendered: str, *, stat_result, offset: int, complete: bool,
-    width: int = _RENDER_LOG_DEFAULT_WIDTH, height: int = _RENDER_LOG_DEFAULT_HEIGHT,
-    resize_identity: Optional[str] = None,
-) -> None:
-    """Publish transcript then metadata identifying the raw prefix it covers."""
-    _atomic_write_text(clean, rendered, suffix="clean")
-    _publish_clean_metadata(
-        clean, stat_result=stat_result, offset=offset, complete=complete,
-        width=width, height=height, resize_identity=resize_identity,
-    )
-
-
-def _publish_clean_metadata(
-    clean: Path, *, stat_result, offset: int, complete: bool,
-    width: int = _RENDER_LOG_DEFAULT_WIDTH, height: int = _RENDER_LOG_DEFAULT_HEIGHT,
-    resize_identity: Optional[str] = None,
-) -> None:
-    """Publish cache health metadata without treating diagnostic state as text.
-
-    ``width``/``height`` record the geometry the render actually used --
-    not necessarily the module defaults, since a run's own launch geometry
-    (run.json's ``terminal`` field) can override them. A reader must compare
-    against the geometry it would resolve for this log, not against a
-    hardcoded default, or it can hand back a render made at the wrong size.
-    """
-    if resize_identity is None:
-        # Callers omitting an identity describe the legacy default render.
-        resize_identity = _resize_timeline_digest(
-            (_RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT), ()
-        )
-    metadata = {
-        "version": _CLEAN_META_VERSION,
-        "dev": stat_result.st_dev,
-        "ino": stat_result.st_ino,
-        "offset": offset,
-        "size": stat_result.st_size,
-        "complete": complete,
-        "width": width,
-        "height": height,
-        "history": _RENDER_LOG_DEFAULT_HISTORY,
-        # Digest of the geometry and resize timeline this render applied.
-        "resize_identity": resize_identity,
-        "updated_at": time.time(),
-    }
-    _atomic_write_text(_cache_metadata_path(clean), json.dumps(metadata, sort_keys=True), suffix="meta")
 
 
 def _read_run_terminal_geometry(log_dir: Path) -> Optional[Tuple[int, int]]:
@@ -6443,37 +6029,6 @@ def _read_resize_timeline(log_dir: Path) -> List[dict]:
     return records
 
 
-def _resize_timeline_digest(
-    geometry: Tuple[int, int], timeline: Sequence[Tuple[int, int, int]]
-) -> str:
-    """Digest of the initial ``geometry`` and the validated ``timeline`` that a
-    render applied.
-
-    A render is determined by the initial geometry plus the exact sequence of
-    (offset, cols, rows) triples, so the digest must cover all of it: a count
-    and a last offset collide across timelines with different intermediate
-    offsets or different dimensions, and a cache reader comparing only those
-    accepts a render made from another timeline.
-    """
-    hasher = hashlib.sha256()
-    hasher.update(struct.pack(">II", *geometry))
-    for offset, cols, rows in timeline:
-        hasher.update(struct.pack(">QII", offset, cols, rows))
-    return hasher.hexdigest()[:16]
-
-
-def _current_resize_identity(log_dir: Path, raw_len: int) -> str:
-    """Digest of the geometry and resize timeline that currently apply to
-    ``raw_len`` bytes of ``log_dir``'s raw log.
-
-    Compared by ``_read_clean_cache`` against the digest a cached render
-    recorded, to reject a cache published under a different geometry or before
-    a resize was recorded.
-    """
-    timeline = _validate_resize_timeline(_read_resize_timeline(log_dir), raw_len)
-    return _resize_timeline_digest(_resolved_default_geometry(log_dir), timeline)
-
-
 def _resolved_default_geometry(log_dir: Path) -> Tuple[int, int]:
     """The geometry a render at the module defaults actually uses for
     ``log_dir``: run.json's ``terminal`` field when present and valid,
@@ -6492,470 +6047,25 @@ def _resolved_default_geometry(log_dir: Path) -> Tuple[int, int]:
 
 def _render_log_dir(
     log_dir: Path, raw: bytes, *, width: int, height: int, history: int,
-    stitched: bool = False,
 ) -> str:
     """Render ``raw`` for ``log_dir``, applying its recorded launch geometry
     and resize timeline only when the caller asked for the render defaults.
 
-    A caller requesting a specific width/height (``clean --width``) wants a
-    render at that exact size; the recorded timeline describes a different
-    geometry (the run's own PTY) and does not apply. At the defaults, the
-    initial geometry comes from run.json's ``terminal`` field and the
-    timeline from resizes.jsonl; either absent or malformed falls back to
-    the defaults with no resizes, reproducing every pre-existing log byte
-    for byte.
+    A caller requesting a specific width/height wants a render at that exact
+    size; the recorded timeline describes a different geometry (the run's own
+    PTY) and does not apply. At the defaults, the initial geometry comes from
+    run.json's ``terminal`` field and the timeline from resizes.jsonl; either
+    absent or malformed falls back to the defaults with no resizes,
+    reproducing every pre-existing log byte for byte.
     """
-    render = _stitch_history if stitched else _render_log
     if width != _RENDER_LOG_DEFAULT_WIDTH or height != _RENDER_LOG_DEFAULT_HEIGHT:
-        return render(raw, width=width, height=height, history=history)
+        return _render_log(raw, width=width, height=height, history=history)
     base_width, base_height = _resolved_default_geometry(log_dir)
     resize_records = _read_resize_timeline(log_dir)
-    return render(
+    return _render_log(
         raw, width=base_width, height=base_height, history=history,
         resizes=resize_records,
     )
-
-
-def _render_log_to_clean(log_dir: Path) -> None:
-    """Atomically render ``log`` to ``log.clean`` in ``log_dir``.
-
-    Initial geometry comes from run.json's ``terminal`` field and the
-    resize timeline from resizes.jsonl; either absent or malformed falls
-    back to the render defaults, reproducing every pre-existing log byte
-    for byte.
-    """
-    log = log_dir / "log"
-    clean = log_dir / "log.clean"
-    width, height = _resolved_default_geometry(log_dir)
-    resize_records = _read_resize_timeline(log_dir)
-    # Read and stat through one descriptor: a path read followed by a separate
-    # stat lets bytes land in between, and publishing the newer size would claim
-    # the transcript covers output it never saw.
-    with _watch_open_validated_log(log) as f:
-        if f is None:
-            raise OSError("log is not a regular file")
-        raw = f.read()
-        stat_result = os.fstat(f.fileno())
-    rendered = _render_log(
-        raw, width=width, height=height, history=_RENDER_LOG_DEFAULT_HISTORY,
-        resizes=resize_records,
-    )
-    # Digest the snapshot just rendered rather than re-reading resizes.jsonl,
-    # so the metadata cannot describe a timeline the transcript never used.
-    resize_identity = _resize_timeline_digest(
-        (width, height), _validate_resize_timeline(resize_records, len(raw))
-    )
-    # The offset is what was read, never the stat size: a log that grew during
-    # the read is published as an incomplete prefix, which a reader resumes from
-    # rather than trusting as exact.
-    _publish_clean(
-        clean, rendered, stat_result=stat_result, offset=len(raw),
-        complete=len(raw) == stat_result.st_size,
-        width=width, height=height, resize_identity=resize_identity,
-    )
-
-
-def _bounded_final_render(
-    log_dir: Path, register: Optional["callable"] = None
-) -> Optional[str]:
-    """Best-effort final render with strict byte and wall-clock limits.
-
-    Rendering occurs in a dedicated child so an uninterruptible or pathological
-    renderer cannot hold the runner in a nonterminal state.  The child writes
-    ``log.clean`` atomically through ``_render_log_to_clean``; the parent waits
-    only ``FINAL_RENDER_TIMEOUT_SECONDS`` before killing it.  Returns an error
-    description suitable for the raw log, or ``None`` on success.
-
-    ``register(pid)`` is invoked with the child's pid right after fork (and
-    with ``None`` once it no longer needs tracking) so a caller can fold this
-    child into its own signal-handler teardown *and* publish it to a state
-    file (the ``_runner`` caller does both, via ``render_pid``) — without
-    that, a signal delivered while rendering would find no pid file for this
-    child and leave it orphaned, and a wedged runner's own SIGTERM handler
-    would never even get to run to find it via ``extra_pids``.
-    """
-    try:
-        size = (log_dir / "log").stat().st_size
-    except OSError as exc:
-        return f"cannot stat log: {exc}"
-    if size == 0:
-        # An empty log carries no transcript to render; producing log.clean
-        # with an empty rendering and complete=True would be a misleading artifact.
-        return None
-    if size > MAX_FINAL_RENDER_BYTES:
-        return f"log is {size} bytes; final render limit is {MAX_FINAL_RENDER_BYTES} bytes"
-
-    with _block_handled_runner_signals():
-        pid = os.fork()
-        if pid == 0:
-            _reset_runner_signal_handlers()
-        elif register is not None:
-            register(pid)
-    if pid == 0:
-        try:
-            _render_log_to_clean(log_dir)
-        except BaseException:
-            os._exit(1)
-        os._exit(0)
-
-    try:
-        deadline = time.monotonic() + FINAL_RENDER_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            try:
-                waited, status = os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                return "renderer child could not be reaped"
-            if waited == pid:
-                return None if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else "renderer failed"
-            time.sleep(0.05)
-
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        # Bounded WNOHANG poll rather than a blocking waitpid: a renderer
-        # stuck in uninterruptible filesystem I/O can survive SIGKILL for an
-        # unbounded time, and this helper must never hold the runner hostage
-        # waiting for it.
-        reap_deadline = time.monotonic() + FINAL_RENDER_REAP_TIMEOUT_SECONDS
-        while time.monotonic() < reap_deadline:
-            try:
-                waited, _status = os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if waited == pid:
-                break
-            time.sleep(0.05)
-        else:
-            return f"renderer exceeded {FINAL_RENDER_TIMEOUT_SECONDS:g}-second deadline; still unreaped after SIGKILL"
-        return f"renderer exceeded {FINAL_RENDER_TIMEOUT_SECONDS:g}-second deadline"
-    finally:
-        if register is not None:
-            register(None)
-
-
-def _echo_loop(log_dir: "Path", interval: float) -> None:
-    """Incrementally render a verified raw-log prefix into ``log.clean``.
-
-    Each tick feeds only the bytes appended since the last verified offset, so a
-    published cache always identifies the exact (dev, ino, offset) prefix it
-    covers via ``log.clean.meta.json``. Any parse or publication failure leaves
-    that contract unpublished and is retried after discarding mutated pyte state.
-
-    A checkpoint is published only for a tick that leaves the stream grounded --
-    no pending escape sequence, no partial UTF-8 character, UTF-8 mode intact --
-    so a reader resuming at that offset starts a fresh ByteStream in the same
-    state and needs no parser state from the checkpoint. The transcript and its
-    metadata are published either way; only the checkpoint waits.
-    """
-    log = log_dir / "log"
-    clean = log_dir / "log.clean"
-    try:
-        import pyte  # type: ignore
-    except ImportError:
-        return
-
-    # The geometry every other reader resolves for this log: run.json's
-    # terminal field, else the render fallback. Rendering at the module
-    # defaults instead would publish a transcript at a size no reader accepts.
-    width, height = _resolved_default_geometry(log_dir)
-    # This loop feeds bytes incrementally and never applies the resize
-    # timeline, so the identity it publishes names an empty timeline at that
-    # geometry. A recorded resize makes the reader's identity differ, which
-    # correctly forces a full re-render rather than a hit at the wrong size.
-    resize_identity = _resize_timeline_digest((width, height), ())
-
-    def new_state():
-        screen = _new_pyte_screen(
-            pyte, width, height, _RENDER_LOG_DEFAULT_HISTORY,
-        )
-        return screen, pyte.ByteStream(screen)
-
-    screen, stream = new_state()
-    offset = 0
-    log_ino = -1
-    log_dev = -1
-    # (rendered-or-None, source stat, offset, grounded) awaiting publication;
-    # retried on a publish failure. rendered None means the text is unchanged
-    # (metadata only). grounded records whether the stream could be checkpointed
-    # at that offset.
-    pending: Optional[tuple[Optional[str], Any, int, bool]] = None
-    last_rendered: Optional[str] = None
-    failures = 0
-    # (dev, ino) whose byte-zero prefix deterministically fails to parse; its
-    # cache stays marked incomplete so readers re-render instead of trusting it.
-    blocked: Optional[tuple[int, int]] = None
-
-    while True:
-        try:
-            with _watch_open_validated_log(log) as f:
-                if f is None:
-                    raise OSError("cannot open regular log")
-                current = os.fstat(f.fileno())
-                identity = (current.st_dev, current.st_ino)
-                if current.st_size < offset or (offset and identity != (log_dev, log_ino)):
-                    # Truncation or replacement: re-parse the new file from zero.
-                    screen, stream = new_state()
-                    offset = 0
-                    log_ino = current.st_ino
-                    log_dev = current.st_dev
-                    pending = None
-                    failures = 0
-                    _ckpt_discard(clean)
-                if current.st_size > offset:
-                    read_size = min(current.st_size - offset, ECHO_LOOP_MAX_RENDER_BYTES)
-                    f.seek(offset)
-                    chunk = f.read(read_size)
-                    if len(chunk) != read_size:
-                        raise OSError("short read from log")
-                else:
-                    chunk = b""
-        except OSError:
-            time.sleep(interval)
-            continue
-
-        if chunk:
-            if blocked == identity:
-                time.sleep(interval)
-                continue
-            try:
-                _feed_pyte(stream, chunk)
-                rendered = _serialize_screen(screen)
-            except Exception:
-                # Feed/serialize can mutate pyte before raising; rebuild from
-                # zero so no later publication uses partial state.
-                screen, stream = new_state()
-                offset = 0
-                pending = None
-                failures += 1
-                _ckpt_discard(clean)
-                if failures >= 2:
-                    blocked = identity
-                    try:
-                        _publish_clean_metadata(
-                            clean, stat_result=current, offset=0, complete=False,
-                            width=width, height=height,
-                            resize_identity=resize_identity,
-                        )
-                    except OSError:
-                        pass
-                time.sleep(interval)
-                continue
-            offset += len(chunk)
-            log_ino = current.st_ino
-            log_dev = current.st_dev
-            pending = (rendered if rendered != last_rendered else None, current, offset,
-                       _ckpt_stream_is_grounded(stream))
-            last_rendered = rendered
-            failures = 0
-            blocked = None
-
-        if pending is not None:
-            rendered, source_stat, published_offset, grounded = pending
-            complete = published_offset == source_stat.st_size
-            try:
-                if rendered is not None:
-                    _publish_clean(clean, rendered, stat_result=source_stat,
-                                   offset=published_offset, complete=complete,
-                                   width=width, height=height,
-                                   resize_identity=resize_identity)
-                else:
-                    _publish_clean_metadata(clean, stat_result=source_stat,
-                                            offset=published_offset, complete=complete,
-                                            width=width, height=height,
-                                            resize_identity=resize_identity)
-            except OSError:
-                time.sleep(interval)
-                continue
-            if grounded:
-                try:
-                    _ckpt_publish(clean, pyte, screen, offset=published_offset)
-                except (OSError, ValueError, TypeError):
-                    # The transcript stands on its own; a missing checkpoint only
-                    # costs the next reader a full replay.
-                    _ckpt_discard(clean)
-            else:
-                # Publishing here would name an offset a fresh ByteStream cannot
-                # resume from. The stale checkpoint must go too: its offset no
-                # longer matches the metadata, and the next grounded tick
-                # republishes.
-                _ckpt_discard(clean)
-            pending = None
-        time.sleep(interval)
-
-
-def _read_clean_cache(
-    log_path: Path,
-    width: int,
-    height: int,
-    history: int,
-) -> "Optional[str]":
-    """Return a rendered transcript from cache, or None to render in full.
-
-    An exact cache -- metadata covering the whole raw log -- is returned as-is.
-    Otherwise a checkpoint covering a grounded prefix is resumed: the recorded
-    screen state is restored and only the bytes appended since that offset are
-    fed. Any failure returns None; a resumed render is never a guess.
-    """
-    if (
-        width != _RENDER_LOG_DEFAULT_WIDTH
-        or height != _RENDER_LOG_DEFAULT_HEIGHT
-        or history != _RENDER_LOG_DEFAULT_HISTORY
-    ):
-        return None
-    with _watch_open_validated_log(log_path) as log_file:
-        if log_file is None:
-            return None
-        try:
-            raw_stat = os.fstat(log_file.fileno())
-        except OSError:
-            return None
-    clean = log_path.parent / "log.clean"
-    metadata_path = _cache_metadata_path(clean)
-    try:
-        with _watch_open_validated_log(metadata_path) as metadata_file:
-            if metadata_file is None:
-                return None
-            metadata = json.loads(metadata_file.read().decode("utf-8"))
-        # The geometry a render at the defaults actually resolves to for this
-        # log -- run.json's terminal field can override the defaults, so the
-        # cache is only a hit when it was published at that same resolved
-        # geometry, not merely at the (possibly different) module defaults.
-        resolved_width, resolved_height = _resolved_default_geometry(log_path.parent)
-        if not (
-            metadata.get("version") == _CLEAN_META_VERSION
-            and metadata.get("complete") is True
-            and metadata.get("dev") == raw_stat.st_dev
-            and metadata.get("ino") == raw_stat.st_ino
-            and metadata.get("width") == resolved_width
-            and metadata.get("height") == resolved_height
-            and metadata.get("history") == history
-        ):
-            return None
-        published = metadata.get("offset")
-        if not _bounded_int(published, 0, raw_stat.st_size):
-            return None
-        if not _bounded_int(metadata.get("size"), 0, raw_stat.st_size):
-            return None
-        if published != metadata.get("size"):
-            return None
-        # A resize recorded after this cache was published, or a geometry that
-        # no longer resolves the same way, changes what the render should have
-        # been. The checkpoint in log.clean.state.json shares this gate: a
-        # mismatch here already forces a full re-render.
-        if _current_resize_identity(log_path.parent, raw_stat.st_size) != metadata.get(
-            "resize_identity"
-        ):
-            return None
-        if published == raw_stat.st_size:
-            with _watch_open_validated_log(clean) as clean_file:
-                if clean_file is None:
-                    return None
-                return clean_file.read().decode("utf-8", errors="replace")
-        return _resume_clean_cache(
-            log_path, clean, published, raw_stat,
-            width=resolved_width, height=resolved_height,
-        )
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def _resume_clean_cache(
-    log_path: Path,
-    clean: Path,
-    published: int,
-    raw_stat,
-    *,
-    width: int,
-    height: int,
-) -> "Optional[str]":
-    """Render by restoring the checkpoint at ``published`` and feeding the tail.
-
-    Returns None on any failure -- unusable checkpoint, a log that changed
-    identity or length mid-read, a pyte exception -- so the caller replays in
-    full. ``_read_clean_cache`` validates ``width`` and ``height`` against the
-    metadata and current run geometry before reaching here.
-    """
-    try:
-        import pyte  # type: ignore
-    except ImportError:
-        return None
-    try:
-        screen = _new_pyte_screen(
-            pyte, width, height, _RENDER_LOG_DEFAULT_HISTORY,
-        )
-        if not _ckpt_load(clean, pyte, screen, offset=published):
-            return None
-        with _watch_open_validated_log(log_path) as log_file:
-            if log_file is None:
-                return None
-            reread = os.fstat(log_file.fileno())
-            if (reread.st_dev, reread.st_ino) != (raw_stat.st_dev, raw_stat.st_ino):
-                return None
-            log_file.seek(published)
-            tail = log_file.read(raw_stat.st_size - published)
-        if len(tail) != raw_stat.st_size - published:
-            return None
-        _feed_pyte(pyte.ByteStream(screen), tail)
-        return _serialize_screen(screen)
-    except Exception:
-        # A full replay is always correct, so every failure here is a cache miss
-        # rather than an error worth propagating.
-        return None
-
-
-def cmd_clean(args: argparse.Namespace) -> int:
-    log = _require_log(_validate_run_name(args.name))
-
-    # Prefer log.clean, written by the --echo daemon, over re-rendering.
-    # Reusing the cache saves cmd_clean the pyte replay on large logs.
-    # A stitched render is a different artifact than the one log.clean holds,
-    # so that mode always replays.
-    stitched = getattr(args, "history_mode", "viewport") == "stitched"
-    rendered = None if stitched else _read_clean_cache(
-        log, width=args.width, height=args.height, history=args.history
-    )
-    if rendered is None:
-        with _watch_open_validated_log(log) as f:
-            if f is None:
-                sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
-            raw = f.read()
-        try:
-            rendered = _render_log_dir(
-                log.parent, raw,
-                width=args.width,
-                height=args.height,
-                history=args.history,
-                stitched=stitched,
-            )
-        except RenderDependencyError as exc:
-            sys.exit(str(exc))
-
-    # Slice after rendering, never before: pyte replays the byte stream as a
-    # VT100 emulator, so a byte-sliced fragment starts mid-escape-sequence.
-    # getattr: internal callers construct Namespaces without tail/head.
-    tail_n: Optional[int] = getattr(args, "tail", None)
-    head_n: Optional[int] = getattr(args, "head", None)
-    if tail_n is not None:
-        rendered = _slice_str_lines(rendered, tail_n, from_end=True)
-    elif head_n is not None:
-        rendered = _slice_str_lines(rendered, head_n, from_end=False)
-
-    # Same byte budget as cmd_logs: real renders reach hundreds of KB, which
-    # would otherwise flood both the -o file and the stdout consumer.
-    budgeted, truncated = _budget_str(rendered)
-    if truncated:
-        budgeted = budgeted + _TRUNCATION_MARKER_STR
-
-    out_path = getattr(args, "out", None)
-    if out_path:
-        data = budgeted.encode("utf-8")
-        Path(out_path).write_bytes(data)
-        size = len(data)
-        sys.stderr.write(f"agent-run: wrote {size} bytes of cleaned transcript to {out_path}\n")
-        return 0
-    sys.stdout.write(budgeted)
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -9523,8 +8633,6 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             "agent-run: --enable-planning is unsupported for --harness codex; "
             "the codex app-server path does not expose plan mode"
         )
-    echo: bool = bool(getattr(args, "echo", False))
-    echo_interval: float = float(getattr(args, "echo_interval", 2.0))
     _opportunistic_heal()
     d = _state_dir(name)
     log_d = _log_dir(name)
@@ -9639,8 +8747,6 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             shutil.copyfile(prompt_file, log_d / "prompt")
         except OSError:
             pass
-    if echo:
-        _write(d / "echo", f"{echo_interval}\n")
     idle_timeout: Optional[float] = getattr(args, "idle_timeout", None)
     if idle_timeout is not None:
         # Persisted so introspection can tell whether a running run is guarded
@@ -9847,8 +8953,6 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         lock_fd,
         prompt_file,
         submit_mode,
-        echo,
-        echo_interval,
         tmp_dir=scratch_dir,
         idle_timeout=getattr(args, "idle_timeout", None),
         managed_harness=harness,
@@ -9901,7 +9005,7 @@ def _block_handled_runner_signals():
         pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
-_AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "echo_pid", "render_pid", "watchdog_pid", "appserver_pid")
+_AUX_PID_FIELDS = ("agent_pid", "pty_pid", "keeper_pid", "prompt_pid", "watchdog_pid", "appserver_pid")
 
 
 # Distinguishes a watchdog kill from an ordinary SIGTERM in `_finalize`.
@@ -10068,8 +9172,8 @@ def _teardown_children(
     state_dir: Path, grace: float = 2.0, extra_pids: Optional[Iterable[int]] = None
 ) -> None:
     """SIGTERM (then SIGKILL after `grace` seconds) every child pid this
-    runner recorded (agent_pid / pty_pid / keeper_pid / prompt_pid / echo_pid /
-    render_pid), reaping each one.
+    runner recorded (agent_pid / pty_pid / keeper_pid / prompt_pid /
+    watchdog_pid), reaping each one.
 
     ``extra_pids`` covers children forked but not yet (or never) published to
     a state file — e.g. the state-file write itself failed. Publication is
@@ -10324,8 +9428,6 @@ def _runner(
     lock_fd: int = -1,
     prompt_file: Optional[str] = None,
     submit_mode: str = SUBMIT_MODE_CR,
-    echo: bool = False,
-    echo_interval: float = 2.0,
     tmp_dir: Optional[Path] = None,
     idle_timeout: Optional[float] = None,
     managed_harness: Optional[str] = None,
@@ -10432,7 +9534,6 @@ def _runner(
             })
 
     handling_signal = False
-    render_pid: Optional[int] = None
 
     def _on_signal(signum: int, _frame) -> None:
         nonlocal handling_signal
@@ -10443,7 +9544,7 @@ def _runner(
         handling_signal = True
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)
-        _teardown_children(state_dir, extra_pids=[render_pid] if render_pid else None)
+        _teardown_children(state_dir)
         _finalize(128 + signum)
         os._exit(128 + signum)
 
@@ -10508,27 +9609,6 @@ def _runner(
         signal.signal(signal.SIGTERM, _on_signal)
         signal.signal(signal.SIGINT, _on_signal)
         signal.signal(signal.SIGHUP, _on_signal)
-
-        # Fork a background renderer that periodically writes a cleaned
-        # transcript next to the raw log.  Runs unconditionally for every
-        # launch mode so log.clean is always present; stays alive for the
-        # whole run and is torn down by the signal handler on shutdown.
-        with _block_handled_runner_signals():
-            echo_pid = os.fork()
-            if echo_pid != 0:
-                _publish_or_reap_child(state_dir, "echo_pid", echo_pid)
-            else:
-                _reset_runner_signal_handlers()
-        if echo_pid == 0:
-            _reset_runner_signal_handlers()
-            try:
-                os.close(ready_fd)
-            except OSError:
-                pass
-            try:
-                _echo_loop(log_dir, echo_interval)
-            finally:
-                os._exit(0)
 
         # Opt-in stall guard: a sibling child watching log mtime, so a wedged
         # agent reaches a terminal status instead of running forever.
@@ -10634,7 +9714,7 @@ def _runner(
         # A crash mid-run may have skipped the normal cleanup path (e.g. an
         # exception inside _run_interactive's select loop, before it reaches
         # its own "kill keeper_pid" tail), leaving the launched agent (and
-        # keeper/echo helpers) orphaned. Never exit without reaping them.
+        # keeper helpers) orphaned. Never exit without reaping them.
         _teardown_children(state_dir)
         if not ready_sent:
             # Setup failed before the run became controllable (e.g. FIFO
@@ -10665,43 +9745,7 @@ def _runner(
     # Persistent helpers outlive the agent by design, so reap them on
     # successful completion as well as on crashes and external signals.
     _teardown_children(state_dir)
-    # Publish the agent's terminal state *before* producing a convenience
-    # transcript artifact.  A pathological renderer can never leave a dead
-    # agent reported as starting/running.
     _finalize(exit_code)
-    # The periodic renderer may never tick on a short run, or may have run
-    # just before the agent's final output.  Render once in a bounded child
-    # after stopping it.  The status is already terminal if this times out.
-    def _track_render_pid(pid: Optional[int]) -> None:
-        nonlocal render_pid
-        if pid is None:
-            render_pid = None
-            try:
-                (state_dir / "render_pid").unlink()
-            except FileNotFoundError:
-                pass
-            return
-        render_pid = pid
-        try:
-            # Same publish-or-reap path used at every other fork site, so
-            # a state-file write failure for render_pid cannot orphan the
-            # render child either -- _publish_or_reap_child kills and
-            # reaps it itself before raising.
-            _publish_or_reap_child(state_dir, "render_pid", pid)
-        except OSError:
-            render_pid = None
-
-    render_error = _bounded_final_render(log_dir, register=_track_render_pid)
-    if render_error:
-        try:
-            os.write(
-                log_fd,
-                f"\nagent-run: final render failed: {render_error}\n".encode(
-                    errors="replace"
-                ),
-            )
-        except OSError:
-            pass
     os._exit(exit_code)
 
 
@@ -12375,16 +11419,6 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _nonnegative_int(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be an integer") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be at least 0")
-    return parsed
-
-
 def _positive_finite_float(value: str) -> float:
     try:
         parsed = float(value)
@@ -12405,7 +11439,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "agent-run [flags] NAME -- <cmd...>\n"
             "       agent-run [flags] NAME <cmd...>\n"
             "       agent-run --harness claude|opencode|codex [options] NAME\n"
-            "       agent-run {status,watch,logs,tail,clean,steer,kill,list,reap,du,help} ..."
+            "       agent-run {status,watch,logs,tail,attach,steer,kill,list,reap,du,help} ..."
         ),
     )
     sub = p.add_subparsers(dest="sub")
@@ -12539,6 +11573,17 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="print the first N lines; reads forward until N newlines found or EOF",
     )
+    logs_mode = sp_logs.add_mutually_exclusive_group()
+    logs_mode.add_argument(
+        "--plain",
+        action="store_true",
+        help="ANSI-stripped output, for grepping/piping/agent consumption",
+    )
+    logs_mode.add_argument(
+        "--clean",
+        action="store_true",
+        help="render the log through pyte and print the transcript; slow on a large log",
+    )
     sp_logs.set_defaults(func=cmd_logs)
 
     sp_tail = sub.add_parser("tail", help="follow log in real time (tail -f)")
@@ -12568,65 +11613,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_attach.add_argument("name")
     sp_attach.set_defaults(func=cmd_attach)
-
-    sp_clean = sub.add_parser(
-        "clean",
-        help="render PTY-captured TUI log into a readable transcript via pyte",
-        allow_abbrev=False,
-    )
-    sp_clean.add_argument("name")
-    sp_clean.add_argument(
-        "-o",
-        "--out",
-        default=None,
-        help="write the cleaned transcript to this file (default: stdout)",
-    )
-    sp_clean.add_argument(
-        "--width",
-        type=_positive_int,
-        default=_RENDER_LOG_DEFAULT_WIDTH,
-        help=f"emulated terminal width in columns (default: {_RENDER_LOG_DEFAULT_WIDTH})",
-    )
-    sp_clean.add_argument(
-        "--height",
-        type=_positive_int,
-        default=_RENDER_LOG_DEFAULT_HEIGHT,
-        help=f"emulated viewport height in rows (default: {_RENDER_LOG_DEFAULT_HEIGHT})",
-    )
-    sp_clean.add_argument(
-        "--history",
-        type=_nonnegative_int,
-        default=_RENDER_LOG_DEFAULT_HISTORY,
-        help=f"scrollback line budget for the emulator (default: {_RENDER_LOG_DEFAULT_HISTORY})",
-    )
-    sp_clean.add_argument(
-        "--history-mode",
-        choices=("viewport", "stitched"),
-        default="viewport",
-        help=(
-            "viewport (default): pyte's scrollback plus the final frame, which "
-            "for a TUI repainting in place is the last frame alone. stitched: "
-            "also keep every distinct line the viewport held during replay -- a "
-            "lossy reconstruction, not a transcript (repeated lines collapse, "
-            "mid-repaint frames leak, ordering is first-seen)"
-        ),
-    )
-    clean_slice = sp_clean.add_mutually_exclusive_group()
-    clean_slice.add_argument(
-        "--tail",
-        type=_positive_int,
-        default=None,
-        metavar="N",
-        help="print the last N lines of the rendered transcript (default: unbounded)",
-    )
-    clean_slice.add_argument(
-        "--head",
-        type=_positive_int,
-        default=None,
-        metavar="N",
-        help="print the first N lines of the rendered transcript (default: unbounded)",
-    )
-    sp_clean.set_defaults(func=cmd_clean)
 
     sp_steer = sub.add_parser(
         "steer",
@@ -12966,8 +11952,6 @@ class _LaunchArgv(NamedTuple):
     """
     interactive: bool
     prompt_file: Optional[str]
-    echo: bool
-    echo_interval: float
     submit_mode: Optional[str]
     idle_timeout: Optional[float]
     name: str
@@ -12989,7 +11973,7 @@ class _LaunchArgv(NamedTuple):
 
 
 _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
-    "status", "watch", "logs", "tail", "attach", "clean", "steer", "kill",
+    "status", "watch", "logs", "tail", "attach", "steer", "kill",
     "list", "reap", "du", "hook", "help",
 })
 
@@ -13011,7 +11995,6 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     Handles all current flag forms in any order before the name:
       -i / --interactive
       -f X / --prompt-file X / --prompt-file=X
-      --echo / --echo=N
       --submit-mode=cr|crlf
       --idle-timeout N / --idle-timeout=N
       the managed-mode flags in _MANAGED_VALUE_FLAGS
@@ -13032,8 +12015,6 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     tokens = list(raw)
     interactive = False
     prompt_file: Optional[str] = None
-    echo: bool = False
-    echo_interval: float = 2.0
     submit_mode: Optional[str] = None
     idle_timeout: Optional[float] = None
     harness: Optional[str] = None
@@ -13060,19 +12041,6 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             continue
         if tokens[0].startswith("--prompt-file="):
             prompt_file = tokens[0].split("=", 1)[1]
-            tokens = tokens[1:]
-            continue
-        if tokens[0] == "--echo":
-            echo = True
-            tokens = tokens[1:]
-            continue
-        if tokens[0].startswith("--echo="):
-            echo = True
-            value = tokens[0].split("=", 1)[1]
-            try:
-                echo_interval = _positive_finite_float(value)
-            except argparse.ArgumentTypeError as exc:
-                raise _LaunchArgvError(f"agent-run: --echo interval {exc}") from exc
             tokens = tokens[1:]
             continue
         if tokens[0].startswith("--submit-mode="):
@@ -13175,7 +12143,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     # argparse.  A run may not be named after a subcommand, so a "--" after a
     # subcommand name is still part of that subcommand's own argv.
     any_launch_flag = (
-        interactive or prompt_file or echo or submit_mode is not None
+        interactive or prompt_file or submit_mode is not None
         or idle_timeout is not None or harness is not None or prompt is not None
         or model is not None or agent_mode is not None or cwd is not None
         or bool(harness_args) or permissions != _PERMISSIONS_BYPASS
@@ -13183,7 +12151,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     )
     if tokens and tokens[0] in _KNOWN_SUBCOMMANDS and not any_launch_flag:
         return _LaunchArgv(
-            interactive=False, prompt_file=None, echo=False, echo_interval=2.0,
+            interactive=False, prompt_file=None,
             submit_mode=None, idle_timeout=None, name="", command=[],
             subcommand_tokens=tokens,
         )
@@ -13191,8 +12159,8 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     if len(tokens) < 1 or (len(tokens) < 2 and harness is None):
         # Signal main() to print help; name/command are meaningless here.
         return _LaunchArgv(
-            interactive=interactive, prompt_file=prompt_file, echo=echo,
-            echo_interval=echo_interval, submit_mode=submit_mode,
+            interactive=interactive, prompt_file=prompt_file,
+            submit_mode=submit_mode,
             idle_timeout=idle_timeout, name="", command=[],
             subcommand_tokens=None, cwd=cwd,
             harness=harness, prompt=prompt, model=model,
@@ -13264,8 +12232,6 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         return _LaunchArgv(
             interactive=interactive,
             prompt_file=prompt_file,
-            echo=echo,
-            echo_interval=echo_interval,
             submit_mode=submit_mode,
             idle_timeout=idle_timeout,
             name=name,
@@ -13303,7 +12269,7 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             # become argv[0] and exec would fail with an opaque ENOENT.
             raise _LaunchArgvError(
                 f"agent-run: {command[0]!r} looks like an agent-run flag, not "
-                "part of the launch command; agent-run flags (-i, -f, --echo, "
+                "part of the launch command; agent-run flags (-i, -f, "
                 "--submit-mode, --idle-timeout) must precede the run name, or "
                 "separate them from the launch command with '--': "
                 "'agent-run [flags] NAME -- <command> [args...]'"
@@ -13312,8 +12278,6 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     return _LaunchArgv(
         interactive=interactive,
         prompt_file=prompt_file,
-        echo=echo,
-        echo_interval=echo_interval,
         submit_mode=submit_mode,
         idle_timeout=idle_timeout,
         name=name,
@@ -13366,8 +12330,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         command=parsed.command,
         interactive=parsed.interactive,
         prompt_file=parsed.prompt_file,
-        echo=parsed.echo,
-        echo_interval=parsed.echo_interval,
         submit_mode=parsed.submit_mode,
         idle_timeout=parsed.idle_timeout if parsed.idle_timeout is not None else _idle_timeout_env_seconds(),
         harness=parsed.harness,
