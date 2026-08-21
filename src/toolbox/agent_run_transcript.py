@@ -150,11 +150,18 @@ def _read_opencode(session_id: str) -> tuple[list[TranscriptEntry], int]:
     it or trigger a checkpoint. `part.data` carries the event; the joined
     `message.data` supplies the role (user/assistant) and fallback
     timestamp a `text`/`reasoning` part does not itself carry.
+
+    `timeout=0` plus an explicit `PRAGMA busy_timeout=0` (the latter for
+    SQLite builds where the connect-time timeout does not bind the busy
+    handler) make a held write lock fail immediately instead of blocking
+    for the default 5s: `mode=ro` stops this reader from writing, but it
+    does not make lock acquisition non-blocking.
     """
     if not OPENCODE_DB_PATH.exists():
         raise TranscriptSourceError(f"opencode session store not found at {OPENCODE_DB_PATH}")
     try:
-        conn = sqlite3.connect(f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True, timeout=0)
+        conn.execute("pragma busy_timeout=0")
     except sqlite3.OperationalError as exc:
         raise TranscriptSourceError(f"cannot open opencode session store at {OPENCODE_DB_PATH}: {exc}") from exc
 
@@ -180,6 +187,10 @@ def _read_opencode(session_id: str) -> tuple[list[TranscriptEntry], int]:
             entry = _opencode_entry(part, message)
             if entry is not None:
                 entries.append(entry)
+    except sqlite3.OperationalError as exc:
+        raise TranscriptSourceError(
+            f"opencode session store at {OPENCODE_DB_PATH} is locked by another writer: {exc}"
+        ) from exc
     except sqlite3.DatabaseError as exc:
         # A file that opens but isn't a valid/complete sqlite database (mid-
         # write copy, truncated backup): the store as a whole is unusable,

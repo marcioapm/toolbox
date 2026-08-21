@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -183,6 +184,22 @@ class TestOpencodeReader:
         monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
         with pytest.raises(transcript.TranscriptSourceError):
             transcript.read_transcript("opencode", "ses_1", None)
+
+    def test_held_exclusive_lock_fails_fast_not_after_default_busy_timeout(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        locker = sqlite3.connect(db)
+        locker.execute("begin exclusive")
+        locker.execute("insert into message (id, session_id, time_created, data) values ('x', 'ses_1', 1, '{}')")
+        try:
+            start = time.monotonic()
+            with pytest.raises(transcript.TranscriptSourceError, match="lock"):
+                transcript.read_transcript("opencode", "ses_1", None)
+            assert time.monotonic() - start < 1.0
+        finally:
+            locker.rollback()
+            locker.close()
 
     def test_large_tool_output_is_bounded(self, tmp_path, monkeypatch):
         db = tmp_path / "opencode.db"
