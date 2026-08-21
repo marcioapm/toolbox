@@ -312,6 +312,27 @@ class TestRenderLogResizeTimeline:
         ]
 
 
+class TestReadResizeTimelineFile:
+    """`_read_resize_timeline` reads resizes.jsonl straight off disk, so it
+    must degrade to an empty timeline rather than raise on every input a
+    concurrently-written or corrupted file can contain."""
+
+    def test_missing_file_yields_empty_timeline(self, tmp_path):
+        assert agent_run._read_resize_timeline(tmp_path) == []
+
+    def test_invalid_utf8_yields_empty_timeline(self, tmp_path):
+        (tmp_path / "resizes.jsonl").write_bytes(b"\xff\xfe")
+        assert agent_run._read_resize_timeline(tmp_path) == []
+
+    def test_valid_utf8_with_malformed_json_line_is_skipped(self, tmp_path):
+        (tmp_path / "resizes.jsonl").write_text(
+            '{"offset": 3, "cols": 80, "rows": 24}\nnot json\n'
+        )
+        assert agent_run._read_resize_timeline(tmp_path) == [
+            {"offset": 3, "cols": 80, "rows": 24}
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Incremental pyte feed — every partition must produce the same transcript as
 # a whole-file feed under the renderer's shared screen semantics.

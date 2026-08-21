@@ -6001,13 +6001,14 @@ def _read_resize_timeline(log_dir: Path) -> List[dict]:
     """Read ``resizes.jsonl`` into a list of raw JSON-object records.
 
     A line that fails to parse, or does not decode as a JSON object, is
-    skipped individually; a missing or unreadable file yields an empty
-    timeline. Never raises -- ``_validate_resize_timeline`` still screens
-    every field of every returned record before it is trusted.
+    skipped individually; a missing, unreadable, or non-UTF-8 file yields an
+    empty timeline (``UnicodeDecodeError`` is a ``ValueError`` subclass).
+    Never raises -- ``_validate_resize_timeline`` still screens every field
+    of every returned record before it is trusted.
     """
     try:
         text = (log_dir / "resizes.jsonl").read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
         return []
     records: List[dict] = []
     for line in text.splitlines():
