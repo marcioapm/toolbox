@@ -57,6 +57,12 @@ INTERACTIVE_SECOND_REPLY_TIMEOUT = float(os.environ.get("INTERACTIVE_SECOND_REPL
 STATE_ROOT = Path(os.environ.get("AGENT_RUN_STATE_DIR", "/tmp/agent-runs"))
 LOG_ROOT   = Path(os.environ.get("AGENT_RUN_LOG_DIR",   "/var/tmp/agent-runs"))
 
+# Branch code under test -- never the bare PATH agent-run, which is a separately
+# installed build that can predate the branch's subcommand surface.
+_REPO_ROOT    = Path(__file__).resolve().parent.parent
+_BRANCH_PYTHON = _REPO_ROOT / ".venv" / "bin" / "python"
+_BRANCH_SCRIPT = _REPO_ROOT / "src" / "toolbox" / "agent_run.py"
+
 # Cheap models, to keep the suite's cost near zero.
 CLAUDE_MODEL   = os.environ.get("CLAUDE_MODEL",   "claude-haiku-4-5")
 OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "llmproxy-anthropic/claude-haiku-4.5")
@@ -95,6 +101,7 @@ SKIP = "SKIP"
 # runs whose cell never got to its own teardown.
 _active_runs: set[str] = set()
 _json_mode: bool = False
+_agent_run_bin: list[str] = []  # argv prefix for the branch binary
 
 
 def _ensure_openai_key() -> None:
@@ -157,9 +164,10 @@ def _run(*cmd: str, check: bool = True, timeout: int = 30) -> subprocess.Complet
 
 
 def _agent_run_quiet(*args: str) -> None:
-    """Best-effort `agent-run` subcommand used on teardown paths; never raises."""
+    """Best-effort branch `agent-run` subcommand used on teardown paths; never raises."""
     try:
-        _run("agent-run", *args, timeout=30, check=False)
+        subprocess.run([*_agent_run_bin, *args], capture_output=True,
+                       timeout=30, check=False)
     except Exception:
         pass
 
@@ -213,10 +221,14 @@ def _count_in_assistant_region(run_name: str, token: str) -> int:
     The interactive log is a raw PTY capture, so the prompt is echoed into it and
     ANSI sequences (ESC[27m, cursor reports) contain bare digits; only the
     pyte-rendered transcript separates model output from input and control bytes.
-    Claude prefixes user input with '❯', opencode with '┃'.
+    Claude prefixes user input with '❯', opencode with '┃'. A render failure here
+    is treated as "no matches yet" (this runs inside a poll loop before the run
+    may have produced a log); `_preflight_branch_binary` is what catches a
+    resolved binary that cannot run `logs --clean` at all.
     """
     try:
-        rendered = _run("agent-run", "logs", run_name, "--clean", timeout=15, check=False)
+        rendered = subprocess.run([*_agent_run_bin, "logs", run_name, "--clean"],
+                                  capture_output=True, text=True, timeout=15, check=False)
         transcript = rendered.stdout if rendered.returncode == 0 else ""
     except Exception:
         return 0
@@ -584,7 +596,7 @@ def _wait_for_reply(run_name: str, harness: str, token: str, min_count: int,
 def cell_oneshot(harness: str, run_name: str, expected_client: str, cwd: str,
                  result: CellResult) -> None:
     _log(f"  Launching {harness} one-shot → run={run_name!r}")
-    cmd = ["agent-run", "--harness", harness, *_harness_args(harness),
+    cmd = [*_agent_run_bin, "--harness", harness, *_harness_args(harness),
            "--prompt", TURN1_PROMPT, run_name]
     if not _launch(cmd, run_name, 30, result):
         return
@@ -608,7 +620,7 @@ def cell_interactive(harness: str, run_name: str, expected_client: str, cwd: str
     in for an answer that never came.
     """
     _log(f"  Launching {harness} interactive → run={run_name!r}")
-    cmd = ["agent-run", "-i", "--harness", harness, *_harness_args(harness),
+    cmd = [*_agent_run_bin, "-i", "--harness", harness, *_harness_args(harness),
            "--prompt", TURN1_PROMPT, run_name]
     if not _launch(cmd, run_name, 60, result):
         return
@@ -628,7 +640,7 @@ def cell_interactive(harness: str, run_name: str, expected_client: str, cwd: str
     before_steer = _reply_count(run_name, harness, TURN2_TOKEN)
     _log("  Steering second prompt…")
     try:
-        _run("agent-run", "steer", run_name, TURN2_PROMPT, timeout=15)
+        _run(*_agent_run_bin, "steer", run_name, TURN2_PROMPT, timeout=15)
     except subprocess.CalledProcessError as exc:
         result.fail("link1-steer", f"agent-run steer failed: {(exc.stderr or '')[:200]}")
         return
@@ -642,7 +654,7 @@ def cell_interactive(harness: str, run_name: str, expected_client: str, cwd: str
         # once before concluding the turn was never answered.
         _log("  Turn-2 reply not seen; re-steering once…")
         try:
-            _run("agent-run", "steer", run_name, TURN2_PROMPT, timeout=15)
+            _run(*_agent_run_bin, "steer", run_name, TURN2_PROMPT, timeout=15)
             answered = _wait_for_reply(run_name, harness, TURN2_TOKEN, before_steer + 1,
                                        INTERACTIVE_SECOND_REPLY_TIMEOUT)
         except subprocess.CalledProcessError:
@@ -671,7 +683,7 @@ def cell_subagent(harness: str, run_name: str, expected_client: str, cwd: str,
     assertion is the same either way.
     """
     _log(f"  Launching {harness} sub-agent → run={run_name!r}")
-    cmd = ["agent-run", "--harness", harness, *_harness_args(harness)]
+    cmd = [*_agent_run_bin, "--harness", harness, *_harness_args(harness)]
     if harness == "opencode":
         cmd += ["--agent-mode", "build"]
     cmd += ["--prompt", SUBAGENT_PROMPTS[harness], run_name]
@@ -801,6 +813,50 @@ def run_cell(cell_name: str, keep: bool) -> CellResult:
 
 
 # ---------------------------------------------------------------------------
+# Binary preflight
+# ---------------------------------------------------------------------------
+
+def _resolve_agent_run_bin(override: Optional[str]) -> list[str]:
+    if override:
+        # Accept a multi-token override so callers can supply "python script.py".
+        parts = shlex.split(override)
+        return parts if parts else [override]
+    if _BRANCH_PYTHON.exists():
+        return [str(_BRANCH_PYTHON), str(_BRANCH_SCRIPT)]
+    # Fall back to the current interpreter with the branch script. This works
+    # in worktrees that share a venv via PYTHONPATH rather than installing.
+    return [sys.executable, str(_BRANCH_SCRIPT)]
+
+
+def _preflight_branch_binary(bin_argv: list[str]) -> Optional[str]:
+    """Return an error string if the branch binary does not support `logs
+    --clean`, else None.
+
+    link3's `_count_in_assistant_region` treats a `logs --clean` failure as
+    "no matches yet" because it runs inside a poll loop before the run may
+    have produced output; that would silently misreport a resolved binary
+    that lacks `--clean` entirely as a missing interactive reply. Checked
+    once here, before any cell runs, so the failure is unambiguous.
+    """
+    try:
+        cp = subprocess.run([*bin_argv, "logs", "--help"],
+                            capture_output=True, text=True, timeout=10, check=False)
+        out = cp.stdout + cp.stderr
+        if cp.returncode == 0 and "--clean" in out:
+            return None
+        return (f"'{' '.join(bin_argv)} logs --help' exited {cp.returncode} or "
+                f"its output did not mention '--clean'. "
+                "Ensure the branch binary is .venv/bin/python src/toolbox/agent_run.py "
+                "and that `logs --clean` is present.")
+    except FileNotFoundError as exc:
+        return (f"branch binary not found: {exc}. "
+                "Supply --agent-run 'python /path/to/agent_run.py' or "
+                "ensure .venv/bin/python exists in the repo root.")
+    except Exception as exc:
+        return f"preflight error: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -821,6 +877,10 @@ DB access: ssh VIBES_HOST → ssh LLMPROXY_HOST → docker exec psql
 
 Approximate cost: ~$0.02–0.05 per full run (haiku/mini models, trivial prompts).
 
+--agent-run overrides the branch binary (default: .venv/bin/python src/toolbox/agent_run.py).
+Bare agent-run on PATH is a separately installed build that can lag the branch's subcommand
+surface; do not override to the PATH binary or every cell can fail or misreport.
+
 --keep preserves agent-run state and log dirs for debugging. The run itself is
 still terminated, so no TUI or app-server is left behind.
 
@@ -832,7 +892,7 @@ Typical debug workflow:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    global _json_mode
+    global _json_mode, _agent_run_bin
 
     parser = argparse.ArgumentParser(
         prog="verify-session-attribution",
@@ -855,10 +915,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--json", action="store_true",
                         help=("Emit machine-readable JSON summary to stdout; human log goes to "
                               "stderr. stdout is valid JSON on both pass and fail paths."))
+    parser.add_argument("--agent-run", metavar="PATH", dest="agent_run_override",
+                        help=("Override the branch binary; default is "
+                              ".venv/bin/python src/toolbox/agent_run.py. "
+                              "Never use the bare PATH agent-run."))
     args = parser.parse_args(argv)
     _json_mode = args.json
 
     _install_signal_handlers()
+
+    _agent_run_bin = _resolve_agent_run_bin(args.agent_run_override)
+    _log(f"branch binary: {' '.join(_agent_run_bin)}")
+    _log("Checking branch binary supports logs --clean…")
+    preflight_err = _preflight_branch_binary(_agent_run_bin)
+    if preflight_err:
+        _log(f"ABORT: {preflight_err}")
+        return 1
+    _log("Branch binary preflight OK\n")
 
     all_cells = list(CELLS)
     if args.only:
