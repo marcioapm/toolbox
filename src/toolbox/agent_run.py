@@ -4569,7 +4569,7 @@ def _terminal_restored_on_signal_death(restore):
                 pass
 
 
-def _tail_bytes(f: BinaryIO, n: int) -> List[bytes]:
+def _tail_bytes(f: BinaryIO, n: int, *, keep_delimiters: bool = False) -> List[bytes]:
     """Return the last ``n`` lines of ``f``, walking backward from EOF.
 
     Reads 8 KiB blocks in reverse until n+1 newlines are seen or byte 0 is
@@ -4579,9 +4579,14 @@ def _tail_bytes(f: BinaryIO, n: int) -> List[bytes]:
     costs one whole-file read, and the caller's byte budget, not this
     function, is what bounds the emitted output.
 
-    Lines are split on ``\\n`` only, with a trailing ``\\r`` stripped from each
-    segment: terminal logs use ``\\r`` as an in-line cursor-home for progress
-    redraws, not as a line terminator. Returns [] for n < 1.
+    Lines are split on ``\\n`` only. With ``keep_delimiters`` false (the
+    default), a trailing ``\\r`` is stripped from each segment -- terminal
+    logs use ``\\r`` as an in-line cursor-home for progress redraws, not a
+    line terminator -- and no terminator is added back. With
+    ``keep_delimiters`` true, every segment keeps its original trailing
+    ``\\n`` (or ``\\r\\n``) intact, and an unterminated final segment at EOF
+    is returned with none added, so concatenating the result reproduces the
+    corresponding tail of ``f`` byte for byte. Returns [] for n < 1.
     """
     if n < 1:
         return []
@@ -4596,13 +4601,23 @@ def _tail_bytes(f: BinaryIO, n: int) -> List[bytes]:
         chunk = f.read(read_size)
         chunks.append(chunk)
         newline_count += chunk.count(b"\n")
-    lines = [seg.rstrip(b"\r") for seg in b"".join(reversed(chunks)).split(b"\n")]
-    if lines[-1] == b"":
-        lines = lines[:-1]  # trailing empty segment from a file-final \n
+    pieces = b"".join(reversed(chunks)).split(b"\n")
+    had_final_newline = pieces[-1] == b""
+    if had_final_newline:
+        pieces = pieces[:-1]  # trailing empty segment from a file-final \n
+    if keep_delimiters:
+        if had_final_newline:
+            lines = [piece + b"\n" for piece in pieces]
+        else:
+            lines = [piece + b"\n" for piece in pieces[:-1]]
+            if pieces:
+                lines.append(pieces[-1])
+    else:
+        lines = [piece.rstrip(b"\r") for piece in pieces]
     return lines[-n:]
 
 
-def _head_bytes(f: BinaryIO, n: int) -> List[bytes]:
+def _head_bytes(f: BinaryIO, n: int, *, keep_delimiters: bool = False) -> List[bytes]:
     """Return the first ``n`` lines of ``f``, scanning forward in 8 KiB reads.
 
     Each chunk is scanned once for ``\\n`` rather than re-scanning accumulated
@@ -4611,7 +4626,8 @@ def _head_bytes(f: BinaryIO, n: int) -> List[bytes]:
     first n lines span the whole file — again, the single-line multi-megabyte
     case — is read in full, and the caller's byte budget bounds the output.
 
-    Same line grammar as ``_tail_bytes``. Returns [] for n < 1.
+    Same line grammar and ``keep_delimiters`` semantics as ``_tail_bytes``.
+    Returns [] for n < 1.
     """
     if n < 1:
         return []
@@ -4621,7 +4637,8 @@ def _head_bytes(f: BinaryIO, n: int) -> List[bytes]:
         chunk = f.read(8192)
         if not chunk:
             if pending:
-                lines.append(b"".join(pending).rstrip(b"\r"))  # unterminated final line
+                unterminated = b"".join(pending)
+                lines.append(unterminated if keep_delimiters else unterminated.rstrip(b"\r"))
             break
         start = 0
         while start < len(chunk) and len(lines) < n:
@@ -4630,8 +4647,10 @@ def _head_bytes(f: BinaryIO, n: int) -> List[bytes]:
                 pending.append(chunk[start:])
                 start = len(chunk)
             else:
-                pending.append(chunk[start:nl])
-                lines.append(b"".join(pending).rstrip(b"\r"))
+                end = nl + 1 if keep_delimiters else nl
+                pending.append(chunk[start:end])
+                terminated = b"".join(pending)
+                lines.append(terminated if keep_delimiters else terminated.rstrip(b"\r"))
                 pending = []
                 start = nl + 1
     return lines
@@ -4679,30 +4698,77 @@ def _strip_ansi_bytes(data: bytes) -> bytes:
 _TRUNCATION_MARKER_STR = "[agent-run: output truncated]\n"
 _TRUNCATION_MARKER_BYTES = _TRUNCATION_MARKER_STR.encode("utf-8")
 
+# OSC (ESC ]), DCS (ESC P), PM (ESC ^), and APC (ESC _) open a control string
+# terminated by BEL or ST (ESC \). A byte-cut line can end between the
+# introducer and its terminator; the receiving terminal then keeps consuming
+# following bytes -- including the truncation marker -- as string payload.
+_STRING_CONTROL_TERMINATED_RE = re.compile(rb"\x1b[\]P^_].*?(?:\x07|\x1b\\)", re.DOTALL)
+_STRING_CONTROL_INTRODUCER_RE = re.compile(rb"\x1b[\]P^_]")
+_STRING_TERMINATOR = b"\x1b\\"
 
-def _budget_bytes_lines(lines: "Iterable[bytes]") -> "tuple[bytes, bool]":
+
+def _close_unterminated_string_control(data: bytes) -> bytes:
+    """Append ST (ESC \\) to ``data`` if it ends inside an open OSC/DCS/PM/APC
+    control string, so a byte-cut string introducer cannot swallow whatever a
+    terminal reads next. Every complete control string is removed first, so an
+    introducer surviving in the remainder never reached its own terminator.
+    """
+    remainder = _STRING_CONTROL_TERMINATED_RE.sub(b"", data)
+    if _STRING_CONTROL_INTRODUCER_RE.search(remainder):
+        return data + _STRING_TERMINATOR
+    return data
+
+
+def _budget_bytes_lines(
+    lines: "Iterable[bytes]", *, keep_delimiters: bool = False
+) -> "tuple[bytes, bool]":
     """Apply LOGS_MAX_LINE_BYTES / LOGS_MAX_TOTAL_BYTES to raw log lines.
 
-    Caps each line at LOGS_MAX_LINE_BYTES and stops once the running total
-    (including one newline per emitted line) reaches LOGS_MAX_TOTAL_BYTES.
-    Returns (output, truncated).
+    With ``keep_delimiters`` false (the default, used by ``--plain``), each
+    input ``line`` is content with no terminator; LOGS_MAX_LINE_BYTES caps
+    that content, and this function appends the ``\\n`` each emitted line
+    is billed for. With ``keep_delimiters`` true (used by raw mode), each
+    input ``line`` already carries whatever terminator
+    ``_tail_bytes``/``_head_bytes`` preserved -- ``\\n``, ``\\r\\n``, or none
+    for an unterminated final segment -- and LOGS_MAX_LINE_BYTES caps the
+    whole segment; nothing is added.
+
+    LOGS_MAX_TOTAL_BYTES bounds every byte this function emits, including
+    synthesized newlines: a content cut leaves one byte of headroom for the
+    newline about to be appended, and reaching the total stops emission
+    before starting a line that has no headroom left, even for an empty one.
+    The truncation marker the caller appends on a true return is not
+    accounted here and falls outside both caps.
+
+    A line whose content is cut gets a closing ST appended when the cut
+    left a control string open (see ``_close_unterminated_string_control``);
+    that ST is likewise outside both caps. Returns (output, truncated).
     """
     out_parts: "list[bytes]" = []
     total = 0
     truncated = False
     for line in lines:
+        line_cut = False
         if len(line) > LOGS_MAX_LINE_BYTES:
             line = line[:LOGS_MAX_LINE_BYTES]
-            truncated = True
+            line_cut = True
         remaining = LOGS_MAX_TOTAL_BYTES - total
-        if remaining <= 0:
+        content_room = remaining if keep_delimiters else remaining - 1
+        if content_room < 0:
             truncated = True
             break
-        if len(line) > remaining:
-            line = line[:remaining]
+        if len(line) > content_room:
+            line = line[:content_room]
+            line_cut = True
+        if line_cut:
+            line = _close_unterminated_string_control(line)
             truncated = True
-        out_parts.append(line + b"\n")
-        total += len(line) + 1
+        if keep_delimiters:
+            out_parts.append(line)
+            total += len(line)
+        else:
+            out_parts.append(line + b"\n")
+            total += len(line) + 1
     return b"".join(out_parts), truncated
 
 
@@ -4715,6 +4781,12 @@ def _budget_str(text: str) -> "tuple[str, bool]":
     ``errors="ignore"``, so an accepted line can bill fewer bytes than the cap it
     was cut at. Routing this through the bytes version would change that
     accounting and therefore the truncation point.
+
+    LOGS_MAX_LINE_BYTES caps line content; LOGS_MAX_TOTAL_BYTES bounds every
+    byte this function emits, including the appended ``\\n``, so content is
+    accepted only up to one byte less than the remaining total. The
+    truncation marker the caller appends on a true return is not accounted
+    here and falls outside both caps.
 
     Returns (output, truncated); output stays newline-terminated.
     """
@@ -4730,11 +4802,12 @@ def _budget_str(text: str) -> "tuple[str, bool]":
             line = line_bytes.decode("utf-8", errors="ignore")
             truncated = True
         remaining = LOGS_MAX_TOTAL_BYTES - total
-        if remaining <= 0:
+        content_room = remaining - 1
+        if content_room < 0:
             truncated = True
             break
-        if len(line_bytes) > remaining:
-            line_bytes = line_bytes[:remaining]
+        if len(line_bytes) > content_room:
+            line_bytes = line_bytes[:content_room]
             line = line_bytes.decode("utf-8", errors="ignore")
             truncated = True
         out_parts.append(line + "\n")
@@ -4776,20 +4849,25 @@ def cmd_logs(args: argparse.Namespace) -> int:
                 pass
             return 0
 
+        plain = bool(getattr(args, "plain", False))
         with _watch_open_validated_log(log) as f:
             if f is None:
                 sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
             if args.head is not None:
-                lines = _head_bytes(f, args.head)
+                lines = _head_bytes(f, args.head, keep_delimiters=not plain)
             else:
-                lines = _tail_bytes(f, args.tail if args.tail is not None else 50)
+                lines = _tail_bytes(
+                    f, args.tail if args.tail is not None else 50, keep_delimiters=not plain
+                )
         # Default is raw bytes (a human piping to a terminal gets the drawing
-        # back); --plain strips ANSI for grepping/piping/agent consumption.
-        # The byte budget applies either way, so raw mode spends part of its
-        # budget on escape sequences rather than visible text.
-        if bool(getattr(args, "plain", False)):
+        # back, `\r` mid-line and all, since it is how the PTY drove a
+        # progress redraw); --plain strips ANSI and normalizes line endings
+        # for grepping/piping/agent consumption. The byte budget applies
+        # either way, so raw mode spends part of its budget on escape
+        # sequences rather than visible text.
+        if plain:
             lines = (_strip_ansi_bytes(line) for line in lines)
-        out, truncated = _budget_bytes_lines(lines)
+        out, truncated = _budget_bytes_lines(lines, keep_delimiters=not plain)
         try:
             sys.stdout.buffer.write(out)
             if truncated:
