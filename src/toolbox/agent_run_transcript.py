@@ -319,13 +319,26 @@ def _read_claude(session_id: str, cwd: Optional[str]) -> "tuple[list[TranscriptE
 
 
 def _parse_claude_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """Parse a claude record timestamp to an aware UTC datetime.
+
+    A store quirk can leave one record's timestamp missing its offset
+    while a neighbour's carries `Z`; `datetime.fromisoformat` happily
+    returns a naive datetime for the former, and comparing that against an
+    aware one raises TypeError during the merge sort. A naive result is
+    assumed UTC (every claude timestamp this reader has seen is UTC, `Z`
+    suffix or not) and given that tzinfo explicitly rather than discarded,
+    since it still carries real ordering information.
+    """
     if not isinstance(value, str) or not value:
         return None
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
-        return datetime.fromisoformat(normalized)
+        parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _merge_claude_entries(sources: list[list[TranscriptEntry]]) -> list[TranscriptEntry]:

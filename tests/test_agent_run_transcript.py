@@ -505,6 +505,33 @@ class TestClaudeReader:
         entries, _ = transcript.read_transcript("claude", session_id, "/Users/x/proj")
         assert [e.text for e in entries] == ["main-1", "sub-1", "main-2", "sub-2", "main-3"]
 
+    def test_mixed_naive_and_aware_timestamps_merge_without_raising(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-mixed-tz"
+        base = tmp_path / "-Users-x-proj"
+
+        def rec(role, text, ts):
+            record = {"type": role, "sessionId": session_id, "message": {"role": role, "content": text}}
+            if ts is not None:
+                record["timestamp"] = ts
+            return record
+
+        # "aware" carries a Z offset; "naive" carries none, a store quirk
+        # that must not crash the sort comparing the two.
+        _write_jsonl(
+            base / f"{session_id}.jsonl",
+            [
+                rec("user", "aware", "2026-01-01T00:00:00Z"),
+                rec("user", "naive", "2026-01-01T00:00:01"),
+            ],
+        )
+        _write_jsonl(
+            base / session_id / "subagents" / "agent-mid.jsonl",
+            [rec("assistant", "sub", "2026-01-01T00:00:00.500000Z")],
+        )
+        entries, _ = transcript.read_transcript("claude", session_id, "/Users/x/proj")
+        assert [e.text for e in entries] == ["aware", "sub", "naive"]
+
     def test_equal_timestamps_across_files_keep_deterministic_order(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-tie"
