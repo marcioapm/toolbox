@@ -348,28 +348,56 @@ def _merge_claude_entries(sources: list[list[TranscriptEntry]]) -> list[Transcri
     `--tail 50` window subagent output whenever a subagent ran long.
 
     An entry with no parseable timestamp of its own inherits its nearest
-    timestamped neighbour's sort key within the *same* file (nearer
-    preceding entry first, nearer following entry otherwise), so it lands
-    next to the entry it followed there rather than drifting to another
-    file's part of the merge. A file with no timestamps anywhere keeps its
+    timestamped neighbour's sort key within the *same* file, measured in
+    entry positions to the nearest preceding and nearest following
+    timestamped entry; a tie is broken toward the preceding entry. This
+    keeps the entry next to whichever neighbour it actually followed there
+    rather than drifting to another file's part of the merge, while never
+    sorting before an entry it inherited backward from or after one it
+    inherited forward from. A file with no timestamps anywhere keeps its
     entries' relative order, sorted after every timestamped entry.
     """
     keyed: list[tuple[Optional[datetime], int, int, TranscriptEntry]] = []
     for file_index, entries in enumerate(sources):
-        parsed = [_parse_claude_timestamp(entry.time) for entry in entries]
-        sort_time: list[Optional[datetime]] = list(parsed)
-        last_seen = None
-        for i, value in enumerate(sort_time):
-            if value is not None:
-                last_seen = value
+        own = [_parse_claude_timestamp(entry.time) for entry in entries]
+        n = len(own)
+
+        preceding_time: list[Optional[datetime]] = [None] * n
+        preceding_distance: list[Optional[int]] = [None] * n
+        last_time: Optional[datetime] = None
+        last_distance: Optional[int] = None
+        for i in range(n):
+            if own[i] is not None:
+                last_time, last_distance = own[i], 0
+            elif last_time is not None:
+                last_distance += 1
+            preceding_time[i], preceding_distance[i] = last_time, last_distance
+
+        following_time: list[Optional[datetime]] = [None] * n
+        following_distance: list[Optional[int]] = [None] * n
+        next_time: Optional[datetime] = None
+        next_distance: Optional[int] = None
+        for i in range(n - 1, -1, -1):
+            if own[i] is not None:
+                next_time, next_distance = own[i], 0
+            elif next_time is not None:
+                next_distance += 1
+            following_time[i], following_distance[i] = next_time, next_distance
+
+        sort_time: list[Optional[datetime]] = []
+        for i in range(n):
+            if own[i] is not None:
+                sort_time.append(own[i])
+                continue
+            pt, pd = preceding_time[i], preceding_distance[i]
+            nt, nd = following_time[i], following_distance[i]
+            if pt is not None and nt is not None:
+                sort_time.append(pt if pd <= nd else nt)
+            elif pt is not None:
+                sort_time.append(pt)
             else:
-                sort_time[i] = last_seen
-        next_seen = None
-        for i in range(len(sort_time) - 1, -1, -1):
-            if sort_time[i] is not None:
-                next_seen = sort_time[i]
-            else:
-                sort_time[i] = next_seen
+                sort_time.append(nt)
+
         for position, (entry, when) in enumerate(zip(entries, sort_time)):
             keyed.append((when, file_index, position, entry))
     keyed.sort(key=lambda item: (item[0] is None, item[0] or datetime.min, item[1], item[2]))

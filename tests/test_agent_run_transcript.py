@@ -581,6 +581,41 @@ class TestClaudeReader:
         entries, _ = transcript.read_transcript("claude", session_id, "/Users/x/proj")
         assert [e.text for e in entries] == ["first", "second", "third"]
 
+    def test_untimestamped_entry_inherits_the_nearer_neighbour_not_always_preceding(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-nearest"
+        base = tmp_path / "-Users-x-proj"
+
+        def rec(role, text, ts=None):
+            record = {"type": role, "sessionId": session_id, "message": {"role": role, "content": text}}
+            if ts is not None:
+                record["timestamp"] = ts
+            return record
+
+        # Main file: prev(t=0) is one position from "gapX" and two from
+        # "missing"; nxt(t=30) is one position from "missing". A
+        # cross-file entry sits between them at t=20. Correct nearest-
+        # neighbour inheritance puts "missing" next to nxt (after t5);
+        # inheriting only ever from the preceding entry (the old bug)
+        # would instead sort it with prev, before t5.
+        _write_jsonl(
+            base / f"{session_id}.jsonl",
+            [
+                rec("user", "prev", "2026-08-16T00:00:00Z"),
+                rec("user", "gapX"),
+                rec("user", "missing"),
+                rec("assistant", "nxt", "2026-08-16T00:00:30Z"),
+            ],
+        )
+        _write_jsonl(
+            base / session_id / "subagents" / "agent-t5.jsonl",
+            [rec("assistant", "t5", "2026-08-16T00:00:20Z")],
+        )
+        entries, _ = transcript.read_transcript("claude", session_id, "/Users/x/proj")
+        assert [e.text for e in entries] == ["prev", "gapX", "t5", "missing", "nxt"]
+
     def test_large_tool_output_is_bounded(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-bigout"
