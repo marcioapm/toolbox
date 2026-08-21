@@ -628,8 +628,8 @@ def _read_codex(session_id: str) -> tuple[list[TranscriptEntry], int]:
 
 # Wrapper elements codex prepends to a session's first user turn, carrying cwd,
 # shell and permission profile rather than anything the user typed. Paired
-# as (opening tag, closing tag): the wrapper spans the *entire* stripped
-# message, not merely its start.
+# as (opening tag, closing tag); a session's first turn can carry more than
+# one of these back to back in a single message.
 _CODEX_INJECTED_CONTEXT_TAGS = (
     ("<environment_context>", "</environment_context>"),
     ("<user_instructions>", "</user_instructions>"),
@@ -637,15 +637,31 @@ _CODEX_INJECTED_CONTEXT_TAGS = (
 
 
 def _is_codex_injected_context(text: str) -> bool:
-    """True when a codex user message is wholly harness-injected context,
-    not input the user typed. Prefix alone is not enough: a genuine
-    message that starts with, quotes, or mentions an injected tag without
-    being that complete wrapper must survive."""
-    stripped = text.strip()
-    return any(
-        stripped.startswith(open_tag) and stripped.endswith(close_tag)
-        for open_tag, close_tag in _CODEX_INJECTED_CONTEXT_TAGS
-    )
+    """True when a codex user message is wholly one or more harness-injected
+    wrappers, not input the user typed. A real first turn can carry
+    `<environment_context>` immediately followed by `<user_instructions>`
+    in the same message, so this repeatedly peels a leading complete
+    wrapper -- remaining text starts with a recognised opening tag and
+    contains that tag's closing counterpart -- off the front, discarding
+    the block and any whitespace after it, until nothing recognised
+    remains at the front. Suppressed only when that process consumes the
+    entire message; a wrapper followed by genuine text, or text that
+    merely starts with, quotes, or mentions a tag without closing it,
+    leaves something behind and survives."""
+    remaining = text.strip()
+    consumed_any = False
+    progressed = True
+    while progressed:
+        progressed = False
+        for open_tag, close_tag in _CODEX_INJECTED_CONTEXT_TAGS:
+            if remaining.startswith(open_tag):
+                close_index = remaining.find(close_tag)
+                if close_index != -1:
+                    remaining = remaining[close_index + len(close_tag):].lstrip()
+                    consumed_any = True
+                    progressed = True
+                    break
+    return consumed_any and not remaining
 
 
 def _fallback_tool_summary(tool_input: Optional[dict]) -> Optional[str]:

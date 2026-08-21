@@ -717,6 +717,36 @@ class TestCodexReader:
         entries, _ = transcript.read_transcript("codex", session_id, None)
         assert [e.text for e in entries] == [starts_with_tag_but_not_wrapped, merely_mentions_tag]
 
+    def test_consecutive_wrappers_in_one_message_both_suppressed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "double-wrapper-session"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+
+        def msg_record(text, ts):
+            return {
+                "timestamp": ts,
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
+            }
+
+        # Real codex sessions can put both wrappers in one message: it
+        # starts with <environment_context> and ends with
+        # </user_instructions>, so neither wrapper's own tag pair spans
+        # the whole message -- the single-pair check in U2's regression
+        # test misses this case entirely.
+        double_wrapper = (
+            "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>\n"
+            "<user_instructions>\nBe concise.\n</user_instructions>"
+        )
+        wrapper_then_real_text = double_wrapper + "\nplease also fix the bug in foo.py"
+        records = [
+            msg_record(double_wrapper, "2026-08-19T00:00:00Z"),
+            msg_record(wrapper_then_real_text, "2026-08-19T00:00:01Z"),
+        ]
+        _write_jsonl(path, records)
+        entries, _ = transcript.read_transcript("codex", session_id, None)
+        assert [e.text for e in entries] == [wrapper_then_real_text]
+
     def test_missing_store_raises_source_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
         with pytest.raises(transcript.TranscriptSourceError):
