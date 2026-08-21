@@ -377,25 +377,31 @@ def _claude_tool_result_text(content: Any) -> Optional[str]:
 
 
 def _read_jsonl_objects(path: Path) -> tuple[list[dict], int]:
-    try:
-        lines = path.read_text(errors="replace").splitlines()
-    except OSError as exc:
-        raise TranscriptSourceError(f"cannot read {path}: {exc}") from exc
+    """Parse one JSONL file into (records, skipped_count).
 
+    Iterates the file line by line rather than reading the whole text and
+    splitting it into a list at once: the two would otherwise coexist in
+    memory, roughly doubling peak usage for a large transcript.
+    """
     records = []
     skipped = 0
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            skipped += 1
-            continue
-        if isinstance(record, dict):
-            records.append(record)
-        else:
-            skipped += 1
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    skipped += 1
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+                else:
+                    skipped += 1
+    except OSError as exc:
+        raise TranscriptSourceError(f"cannot read {path}: {exc}") from exc
     return records, skipped
 
 
