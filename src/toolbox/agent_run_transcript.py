@@ -252,7 +252,22 @@ def _mangle_cwd(cwd: str) -> str:
     return cwd.replace("/", "-")
 
 
-def _claude_session_path(session_id: str, cwd: Optional[str]) -> Optional[Path]:
+def _claude_file_matches_session(path: Path, session_id: str) -> bool:
+    """True if `path` holds at least one user/assistant record whose own
+    `sessionId` equals `session_id` -- the only basis for trusting a
+    filename match, since two project directories can each hold a
+    `<session_id>.jsonl` left by unrelated runs."""
+    try:
+        records, _ = _read_jsonl_objects(path)
+    except TranscriptSourceError:
+        return False
+    return any(
+        record.get("type") in ("user", "assistant") and record.get("sessionId") == session_id
+        for record in records
+    )
+
+
+def _claude_session_path(session_id: str, cwd: Optional[str]) -> Path:
     if cwd:
         candidate = CLAUDE_PROJECTS_DIR / _mangle_cwd(cwd) / f"{session_id}.jsonl"
         if candidate.is_file():
@@ -261,15 +276,29 @@ def _claude_session_path(session_id: str, cwd: Optional[str]) -> Optional[Path]:
         matches = sorted(CLAUDE_PROJECTS_DIR.glob(f"*/{session_id}.jsonl"))
     except OSError:
         matches = []
-    return matches[0] if matches else None
+    if not matches:
+        raise TranscriptSourceError(
+            f"no claude session transcript found for session {session_id!r} under {CLAUDE_PROJECTS_DIR}"
+        )
+    # The cwd-derived path missed (wrong or unknown cwd), so the filename
+    # alone is the only lead -- and a filename collision across project
+    # directories is possible. Content, not pathname order, decides.
+    verified = [path for path in matches if _claude_file_matches_session(path, session_id)]
+    if not verified:
+        raise TranscriptSourceError(
+            f"no claude session transcript found for session {session_id!r} under {CLAUDE_PROJECTS_DIR}"
+        )
+    if len(verified) > 1:
+        joined = ", ".join(str(path) for path in verified)
+        raise TranscriptSourceError(
+            f"ambiguous claude session transcript for session {session_id!r}: "
+            f"{len(verified)} candidates carry matching records: {joined}"
+        )
+    return verified[0]
 
 
 def _read_claude(session_id: str, cwd: Optional[str]) -> "tuple[list[TranscriptEntry], int]":
     path = _claude_session_path(session_id, cwd)
-    if path is None:
-        raise TranscriptSourceError(
-            f"no claude session transcript found for session {session_id!r} under {CLAUDE_PROJECTS_DIR}"
-        )
     entries, skipped = _read_claude_jsonl(path, session_id, subagent=None)
 
     # Subagent transcripts live in <session>/subagents/*.jsonl next to the
@@ -341,8 +370,9 @@ def _read_claude_jsonl(
         rtype = record.get("type")
         if rtype not in ("user", "assistant"):
             continue  # attachment/queue-operation/mode/permission-mode/etc: not conversation
-        if subagent is not None and record.get("sessionId") != session_id:
-            continue
+        record_session_id = record.get("sessionId")
+        if record_session_id is not None and record_session_id != session_id:
+            continue  # a record naming a different session is not part of this transcript
         message = record.get("message")
         if not isinstance(message, dict):
             skipped += 1

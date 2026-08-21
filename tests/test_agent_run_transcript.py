@@ -307,6 +307,78 @@ class TestClaudeReader:
         entries, _ = transcript.read_transcript("claude", session_id, "/nonexistent/cwd")
         assert [e.text for e in entries] == ["hello"]
 
+    def test_glob_fallback_with_two_colliding_filenames_picks_matching_content(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "wanted-sid"
+        _write_jsonl(
+            tmp_path / "-proj-a" / f"{session_id}.jsonl",
+            [
+                {
+                    "type": "user",
+                    "sessionId": "SOMEONE-ELSE",
+                    "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "foreign content"},
+                }
+            ],
+        )
+        _write_jsonl(
+            tmp_path / "-proj-b" / f"{session_id}.jsonl",
+            [
+                {
+                    "type": "user",
+                    "sessionId": session_id,
+                    "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "correct content"},
+                }
+            ],
+        )
+        entries, _ = transcript.read_transcript("claude", session_id, "/nonexistent/cwd")
+        assert [e.text for e in entries] == ["correct content"]
+
+    def test_glob_fallback_with_genuine_ambiguity_fails_loudly(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "wanted-sid-ambiguous"
+        record = {
+            "type": "user",
+            "sessionId": session_id,
+            "timestamp": "2026-08-16T00:00:00Z",
+            "message": {"role": "user", "content": "hi"},
+        }
+        path_a = tmp_path / "-proj-a" / f"{session_id}.jsonl"
+        path_b = tmp_path / "-proj-b" / f"{session_id}.jsonl"
+        _write_jsonl(path_a, [record])
+        _write_jsonl(path_b, [record])
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.read_transcript("claude", session_id, "/nonexistent/cwd")
+        message = str(exc_info.value)
+        assert str(path_a) in message
+        assert str(path_b) in message
+
+    def test_main_file_record_with_mismatched_session_id_excluded(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-main-mismatch"
+        cwd = "/Users/x/proj"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user",
+                    "sessionId": session_id,
+                    "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "mine"},
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": "some-other-session",
+                    "timestamp": "2026-08-16T00:00:01Z",
+                    "message": {"role": "assistant", "content": "not mine"},
+                },
+            ],
+        )
+        entries, _ = transcript.read_transcript("claude", session_id, cwd)
+        assert [e.text for e in entries] == ["mine"]
+
     def test_missing_store_raises_source_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         with pytest.raises(transcript.TranscriptSourceError):
