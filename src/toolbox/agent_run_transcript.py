@@ -608,13 +608,25 @@ def _read_codex(session_id: str) -> tuple[list[TranscriptEntry], int]:
 # ---------------------------------------------------------------------------
 
 # Wrapper elements codex prepends to a session's first user turn, carrying cwd,
-# shell and permission profile rather than anything the user typed.
-_CODEX_INJECTED_CONTEXT_TAGS = ("<environment_context>", "<user_instructions>")
+# shell and permission profile rather than anything the user typed. Paired
+# as (opening tag, closing tag): the wrapper spans the *entire* stripped
+# message, not merely its start.
+_CODEX_INJECTED_CONTEXT_TAGS = (
+    ("<environment_context>", "</environment_context>"),
+    ("<user_instructions>", "</user_instructions>"),
+)
 
 
 def _is_codex_injected_context(text: str) -> bool:
-    """True when a codex user message is harness-injected context, not input."""
-    return text.lstrip().startswith(_CODEX_INJECTED_CONTEXT_TAGS)
+    """True when a codex user message is wholly harness-injected context,
+    not input the user typed. Prefix alone is not enough: a genuine
+    message that starts with, quotes, or mentions an injected tag without
+    being that complete wrapper must survive."""
+    stripped = text.strip()
+    return any(
+        stripped.startswith(open_tag) and stripped.endswith(close_tag)
+        for open_tag, close_tag in _CODEX_INJECTED_CONTEXT_TAGS
+    )
 
 
 def _fallback_tool_summary(tool_input: Optional[dict]) -> Optional[str]:

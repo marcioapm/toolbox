@@ -666,6 +666,30 @@ class TestCodexReader:
         entries, _ = transcript.read_transcript("codex", session_id, None)
         assert [e.text for e in entries] == ["hi"]
 
+    def test_injected_context_wrapper_suppressed_genuine_message_preserved(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "injected-context-session"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+
+        def msg_record(text, ts):
+            return {
+                "timestamp": ts,
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
+            }
+
+        real_boilerplate = "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>"
+        starts_with_tag_but_not_wrapped = "<environment_context> is a tag codex uses, and here's my question"
+        merely_mentions_tag = "Why does codex inject <environment_context> into every session?"
+        records = [
+            msg_record(real_boilerplate, "2026-08-19T00:00:00Z"),
+            msg_record(starts_with_tag_but_not_wrapped, "2026-08-19T00:00:01Z"),
+            msg_record(merely_mentions_tag, "2026-08-19T00:00:02Z"),
+        ]
+        _write_jsonl(path, records)
+        entries, _ = transcript.read_transcript("codex", session_id, None)
+        assert [e.text for e in entries] == [starts_with_tag_but_not_wrapped, merely_mentions_tag]
+
     def test_missing_store_raises_source_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
         with pytest.raises(transcript.TranscriptSourceError):
