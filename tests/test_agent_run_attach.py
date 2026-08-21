@@ -14,6 +14,7 @@ import contextlib
 import errno
 import fcntl
 import io
+import json
 import os
 import pty
 import random
@@ -202,13 +203,35 @@ def test_apply_resize_ignores_closed_or_non_tty_master(monkeypatch, error):
 
 
 @pytest.mark.parametrize("error", [errno.EACCES, errno.EPERM])
-def test_apply_resize_reraises_unexpected_errno(monkeypatch, error):
+def test_apply_resize_reports_failure_rather_than_raising(monkeypatch, error):
+    """Resizing is auxiliary and must never end a run.
+
+    At launch this runs between pty.fork() and _publish_or_reap_child, so an
+    escaping error ends the runner while the forked child stays alive with its
+    pid unrecorded, beyond the reach of teardown.
+    """
     def fail_ioctl(*_args):
         raise OSError(error, "expected test failure")
 
     monkeypatch.setattr(agent_run.fcntl, "ioctl", fail_ioctl)
-    with pytest.raises(OSError):
-        agent_run._apply_resize(99, 120, 42)
+    assert agent_run._apply_resize(99, 120, 42) is False
+
+
+def test_a_refused_resize_is_not_recorded_in_the_timeline(monkeypatch):
+    """A geometry the kernel rejected never took effect, so replaying a size
+    change at that offset would diverge from what the live PTY did."""
+    monkeypatch.setattr(agent_run.fcntl, "ioctl",
+                        lambda *_a: (_ for _ in ()).throw(OSError(errno.EIO, "io")))
+    recorded = []
+    warnings = []
+
+    agent_run._drain_resize_records(
+        7, agent_run._pack_resize(80, 24), warnings.append,
+        lambda cols, rows: recorded.append((cols, rows)),
+    )
+
+    assert recorded == []
+    assert warnings and "80x24" in warnings[0]
 
 
 def test_drain_resize_records_preserves_partial_suffix(monkeypatch):
@@ -300,6 +323,75 @@ def test_drain_resize_records_discards_a_batch_with_no_record_boundary(monkeypat
 
     assert agent_run._drain_resize_records(7, b"\x00\x01\x02\x03") == b""
     assert applied == []
+
+
+def test_drain_resize_records_invokes_on_applied_callback(monkeypatch):
+    """_run_interactive passes a callback that records the resize timeline;
+    it must fire exactly once per applied record, with that record's
+    dimensions, and only after _apply_resize itself succeeds."""
+    monkeypatch.setattr(agent_run, "_apply_resize", lambda master_fd, cols, rows: True)
+    record = agent_run._pack_resize(120, 42)
+    applied = []
+
+    suffix = agent_run._drain_resize_records(
+        7, record, on_applied=lambda cols, rows: applied.append((cols, rows))
+    )
+
+    assert suffix == b""
+    assert applied == [(120, 42)]
+
+
+def test_run_interactive_appends_one_resize_record_at_the_log_offset(tmp_path):
+    """A resize applied while the run is live must append exactly one
+    well-formed line to resizes.jsonl, carrying the byte offset the log had
+    already reached -- resizes leave no trace in the byte stream itself
+    (TIOCSWINSZ + SIGWINCH), so this is the only record of where a replay
+    must switch geometry."""
+    state_dir = tmp_path / "state"
+    log_dir = tmp_path / "log"
+    state_dir.mkdir()
+    log_dir.mkdir()
+    log_path = log_dir / "log"
+    log_path.touch()
+    os.mkfifo(state_dir / "stdin")
+    os.mkfifo(state_dir / "resize")
+
+    script = "import sys, time; sys.stdout.write('READY'); sys.stdout.flush(); time.sleep(30)"
+
+    pid = os.fork()
+    if pid == 0:
+        log_fd = os.open(str(log_path), os.O_WRONLY | os.O_TRUNC)
+        try:
+            agent_run._run_interactive(
+                state_dir,
+                [sys.executable, "-c", script],
+                log_fd,
+                lambda: None,
+                log_dir=log_dir,
+            )
+        finally:
+            os._exit(0)
+
+    try:
+        assert _wait_until(lambda: log_path.stat().st_size == len("READY"))
+        resize_fd = os.open(str(state_dir / "resize"), os.O_WRONLY)
+        try:
+            os.write(resize_fd, agent_run._pack_resize(101, 32))
+        finally:
+            os.close(resize_fd)
+
+        records_path = log_dir / "resizes.jsonl"
+        assert _wait_until(lambda: records_path.exists() and records_path.read_text().strip())
+        lines = records_path.read_text().strip().splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0]) == {"offset": len("READY"), "cols": 101, "rows": 32}
+    finally:
+        pty_pid = int((state_dir / "pty_pid").read_text().strip())
+        try:
+            os.kill(pty_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
 
 
 def test_interactive_launch_creates_stdin_and_resize_fifos(isolated_runs_root):
@@ -1199,6 +1291,241 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
             _detach(second, second_master)
     finally:
         _detach(first, first_master)
+        _stop_run(state)
+
+
+def test_register_attach_presence_creates_a_locked_marker(tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    marker_fd = agent_run._register_attach_presence(state_dir)
+    try:
+        assert marker_fd is not None
+        assert (state_dir / "attached" / str(os.getpid())).is_file()
+    finally:
+        if marker_fd is not None:
+            os.close(marker_fd)
+
+
+def _presence_run(runs_root, log_root, name, terminal=None):
+    """Seed a run with a resize FIFO and optional recorded launch geometry.
+
+    Returns (state_dir, reader_fd, writer_fd); the caller closes both fds.
+    """
+    state_dir = runs_root / name
+    state_dir.mkdir()
+    log_dir = log_root / name
+    log_dir.mkdir()
+    if terminal is not None:
+        (log_dir / "run.json").write_text(json.dumps({"terminal": terminal}))
+    os.mkfifo(state_dir / "resize")
+    reader = os.open(state_dir / "resize", os.O_RDONLY | os.O_NONBLOCK)
+    writer = os.open(state_dir / "resize", os.O_WRONLY | os.O_NONBLOCK)
+    return state_dir, reader, writer
+
+
+def _hold_marker_in_child(state_dir, pid_name):
+    """Fork a child holding an exclusive lock on a presence marker.
+
+    A live peer must be a real process holding a real lock: the lock, not the
+    file, marks a client present, so a touched file cannot stand in. Returns
+    the child pid; the caller kills and reaps it.
+    """
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            marker = state_dir / "attached" / pid_name
+            marker.parent.mkdir(exist_ok=True)
+            fd = os.open(marker, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.write(write_fd, b"held")
+            time.sleep(30)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    assert os.read(read_fd, 4) == b"held"
+    os.close(read_fd)
+    return pid
+
+
+def test_last_client_to_detach_sends_a_restore_record(isolated_runs_root, isolated_log_root):
+    state_dir, reader, writer = _presence_run(
+        isolated_runs_root, isolated_log_root, "detach-restore", {"cols": 80, "rows": 24}
+    )
+    try:
+        marker_fd = agent_run._register_attach_presence(state_dir)
+
+        agent_run._deregister_attach_presence_and_restore(
+            "detach-restore", state_dir, marker_fd, writer
+        )
+
+        assert not (state_dir / "attached" / str(os.getpid())).exists()
+        assert os.read(reader, 4096) == agent_run._pack_resize(80, 24)
+    finally:
+        os.close(reader)
+        os.close(writer)
+
+
+def test_detaching_while_another_client_remains_attached_sends_nothing(
+    isolated_runs_root, isolated_log_root
+):
+    state_dir, reader, writer = _presence_run(
+        isolated_runs_root, isolated_log_root, "detach-shared", {"cols": 80, "rows": 24}
+    )
+    peer_pid = None
+    try:
+        marker_fd = agent_run._register_attach_presence(state_dir)
+        peer_pid = _hold_marker_in_child(state_dir, "peer")
+
+        agent_run._deregister_attach_presence_and_restore(
+            "detach-shared", state_dir, marker_fd, writer
+        )
+
+        assert (state_dir / "attached" / "peer").exists()
+        readable, _, _ = select.select([reader], [], [], 0.2)
+        assert not readable, "a restore must not be sent while a peer is still attached"
+    finally:
+        if peer_pid is not None:
+            os.kill(peer_pid, signal.SIGKILL)
+            os.waitpid(peer_pid, 0)
+        os.close(reader)
+        os.close(writer)
+
+
+def test_deregister_sends_nothing_when_run_json_has_no_terminal(
+    isolated_runs_root, isolated_log_root
+):
+    """A run launched by an older build has no `terminal` field in run.json
+    (or no run.json at all); the last detaching client must send nothing
+    rather than guess a geometry."""
+    state_dir, reader, writer = _presence_run(
+        isolated_runs_root, isolated_log_root, "detach-no-geometry"
+    )
+    try:
+        marker_fd = agent_run._register_attach_presence(state_dir)
+
+        agent_run._deregister_attach_presence_and_restore(
+            "detach-no-geometry", state_dir, marker_fd, writer
+        )
+
+        readable, _, _ = select.select([reader], [], [], 0.2)
+        assert not readable
+    finally:
+        os.close(reader)
+        os.close(writer)
+
+
+def test_marker_left_by_a_killed_client_does_not_suppress_the_restore(
+    isolated_runs_root, isolated_log_root
+):
+    """A client killed with SIGKILL cannot unlink its marker. Presence is held
+    by an exclusive lock the kernel drops on exit, so the marker is identified
+    as stale and reaped rather than suppressing every future restore."""
+    state_dir, reader, writer = _presence_run(
+        isolated_runs_root, isolated_log_root, "detach-stale", {"cols": 80, "rows": 24}
+    )
+    try:
+        dead_pid = _hold_marker_in_child(state_dir, "dead")
+        os.kill(dead_pid, signal.SIGKILL)
+        os.waitpid(dead_pid, 0)
+        assert (state_dir / "attached" / "dead").exists()
+
+        marker_fd = agent_run._register_attach_presence(state_dir)
+        agent_run._deregister_attach_presence_and_restore(
+            "detach-stale", state_dir, marker_fd, writer
+        )
+
+        assert os.read(reader, 4096) == agent_run._pack_resize(80, 24)
+        assert not (state_dir / "attached" / "dead").exists()
+    finally:
+        os.close(reader)
+        os.close(writer)
+
+
+def test_registration_is_ordered_against_a_concurrent_last_detach(
+    isolated_runs_root, isolated_log_root
+):
+    """Registration and the detach restore share one lock, so a client that
+    registers while another is detaching is either seen as present (no restore)
+    or registers afterwards -- never both, which would leave the PTY at launch
+    geometry while a live client believes it set its own size."""
+    state_dir, reader, writer = _presence_run(
+        isolated_runs_root, isolated_log_root, "detach-race", {"cols": 80, "rows": 24}
+    )
+    peer_pid = None
+    try:
+        marker_fd = agent_run._register_attach_presence(state_dir)
+        with agent_run._attach_presence_lock(state_dir):
+            peer_pid = _hold_marker_in_child(state_dir, "late")
+            # The detach cannot proceed while this lock is held, so the late
+            # registration is already visible when it does.
+        agent_run._deregister_attach_presence_and_restore(
+            "detach-race", state_dir, marker_fd, writer
+        )
+
+        readable, _, _ = select.select([reader], [], [], 0.2)
+        assert not readable, "a client registered before the detach must suppress it"
+    finally:
+        if peer_pid is not None:
+            os.kill(peer_pid, signal.SIGKILL)
+            os.waitpid(peer_pid, 0)
+        os.close(reader)
+        os.close(writer)
+
+
+def test_last_detach_restores_launch_geometry_end_to_end(
+    isolated_runs_root, isolated_log_root
+):
+    """Real attach: detaching the only client applies run.json's launch
+    geometry back to the PTY, observably through resizes.jsonl (the
+    resize timeline recorded by _run_interactive, part 1)."""
+    env = _environment(isolated_runs_root, isolated_log_root)
+    script = """\
+import os, sys, termios, tty
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+print("READY", flush=True)
+while True:
+    b = os.read(fd, 1)
+    if not b:
+        break
+    size = os.get_terminal_size(fd)
+    print(f"SIZE:{size.columns}x{size.lines}", flush=True)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+"""
+    state = _launch_interactive("detach-restore-e2e", script, env)
+    log_dir = isolated_log_root / "detach-restore-e2e"
+    run_json = json.loads((log_dir / "run.json").read_text())
+    launch_cols = run_json["terminal"]["cols"]
+    launch_rows = run_json["terminal"]["rows"]
+
+    process, master_fd = _spawn_attach("detach-restore-e2e", env, rows=24, cols=80)
+    try:
+        _read_until(master_fd, b"READY")
+        # Resize away from the launch geometry so the eventual restore is
+        # observable rather than a no-op.
+        _poke_until_size(master_fd, b"s", b"SIZE:80x24")
+    finally:
+        _detach(process, master_fd)
+
+    def _last_record_is_launch_geometry() -> bool:
+        records_path = log_dir / "resizes.jsonl"
+        if not records_path.exists():
+            return False
+        lines = records_path.read_text().strip().splitlines()
+        if not lines:
+            return False
+        record = json.loads(lines[-1])
+        return record["cols"] == launch_cols and record["rows"] == launch_rows
+
+    try:
+        assert _wait_until(_last_record_is_launch_geometry, timeout=5)
+        attached_dir = state / "attached"
+        assert not attached_dir.exists() or not any(attached_dir.iterdir())
+    finally:
         _stop_run(state)
 
 

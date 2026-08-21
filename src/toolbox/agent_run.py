@@ -328,9 +328,12 @@ than STATE_ROOT and LOG_ROOT combined. See its own `--help` for `--top`,
 from __future__ import annotations
 
 import argparse
+import codecs
 from contextlib import contextmanager
 import errno
 import fcntl
+import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -358,6 +361,7 @@ import platform
 from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import Counter
 from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 from toolbox import __version__ as TOOLBOX_VERSION
 
@@ -411,6 +415,22 @@ LOGS_MAX_TOTAL_BYTES = 32 * 1024
 # scrollback bounded limits the resident cost of a long-lived HistoryScreen.
 _RENDER_LOG_DEFAULT_WIDTH = 120
 _RENDER_LOG_DEFAULT_HEIGHT = 60
+
+# Window size applied to a run's PTY at launch. A pty.fork()ed child inherits a
+# 0x0 winsize, so without this each agent falls back to a size of its own
+# choosing -- OpenCode picks 80x24 -- which the renderer cannot observe and does
+# not match. Setting it makes the geometry a recorded fact rather than an
+# inference: run.json records these values and every renderer resolves them
+# through _resolved_default_geometry, so absolute cursor positions replay into
+# the coordinate system they were computed for.
+#
+# Deliberately larger than, and independent of, the render fallback above. A
+# wider PTY makes the agent emit wider lines, which is the only way to get
+# them: width cannot be recovered at render time from bytes drawn narrow.
+# The fallback stays 120x60 because it is what every log recorded before
+# run.json carried a terminal field is rendered at.
+_LAUNCH_TERMINAL_COLS = 200
+_LAUNCH_TERMINAL_ROWS = 100
 _RENDER_LOG_DEFAULT_HISTORY = 2048
 
 # Statuses that are conclusively terminal: the run will never transition
@@ -5196,6 +5216,132 @@ def _drain_fifo_write(fd: int, data: bytes) -> bytes:
     return data
 
 
+@contextmanager
+def _attach_presence_lock(state_dir: Path):
+    """Serialize presence registration, the emptiness test, and the restore
+    write for one run.
+
+    Without it a client can register between another's unlink and its
+    directory scan, so the departing client sends the launch geometry after
+    the new client has already published its own size and the final geometry
+    becomes scheduling-dependent.
+    """
+    lock_path = state_dir / "attached.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield fd
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _register_attach_presence(state_dir: Path) -> Optional[int]:
+    """Create ``<state_dir>/attached/<pid>`` and hold an exclusive lock on it
+    for the lifetime of this attach, returning the open descriptor.
+
+    The lock, not the file, is what marks this client present: the kernel
+    releases it when the process exits for any reason, so a client killed with
+    SIGKILL leaves a file that other clients can identify as stale rather than
+    a marker that suppresses the detach restore forever. A PID is only a
+    filename here, so PID reuse cannot make a dead client look alive.
+
+    Returns ``None`` when the marker cannot be created or locked; the client
+    then attaches normally but is not counted, which at worst skips a restore.
+    """
+    try:
+        presence_dir = state_dir / "attached"
+        presence_dir.mkdir(exist_ok=True)
+        fd = os.open(presence_dir / str(os.getpid()), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _attach_presence_is_empty(state_dir: Path, own_pid: int) -> bool:
+    """True when no live client other than ``own_pid`` holds a presence marker.
+
+    A marker whose lock can be taken belongs to a process that has exited
+    without unlinking it; it is removed here rather than left to suppress every
+    future restore.
+    """
+    presence_dir = state_dir / "attached"
+    try:
+        entries = list(presence_dir.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if entry.name == str(own_pid):
+            continue
+        try:
+            fd = os.open(entry, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False  # still held: that client is alive
+        else:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+    return True
+
+
+def _deregister_attach_presence_and_restore(
+    name: str, state_dir: Path, marker_fd: Optional[int], resize_fd: Optional[int]
+) -> None:
+    """Drop this client's presence marker and, if it was the last live one,
+    restore the run's PTY to its launch-time geometry.
+
+    A resize is last-writer-wins and out-of-band (TIOCSWINSZ + SIGWINCH): once
+    every client has detached, the PTY otherwise stays at whatever size the last
+    one left it, and every byte the wrapped agent writes afterward is at a
+    geometry nobody recorded. One final resize record carrying run.json's
+    ``terminal`` geometry closes that gap; a run launched by an older build has
+    no recorded geometry, so nothing is sent.
+
+    The whole sequence runs under ``_attach_presence_lock`` so a client
+    registering concurrently either counts as present here or publishes its own
+    size after this restore, never both.
+    """
+    if marker_fd is None:
+        return
+    own_pid = os.getpid()
+    try:
+        with _attach_presence_lock(state_dir):
+            try:
+                (state_dir / "attached" / str(own_pid)).unlink()
+            except OSError:
+                pass
+            os.close(marker_fd)
+            if resize_fd is None or not _attach_presence_is_empty(state_dir, own_pid):
+                return
+            geometry = _read_run_terminal_geometry(_log_dir(name))
+            if geometry is None:
+                return
+            try:
+                _drain_fifo_write(resize_fd, _pack_resize(*geometry))
+            except OSError:
+                pass
+    except OSError:
+        try:
+            os.close(marker_fd)
+        except OSError:
+            pass
+
+
 def cmd_attach(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     state_dir, pid = _require_live_interactive_run(name)
@@ -5243,6 +5389,13 @@ def cmd_attach(args: argparse.Namespace) -> int:
         except OSError as exc:
             os.close(stdin_fd)
             sys.exit(f"agent-run: failed to open resize FIFO at {resize_path}: {exc}")
+    # Presence registration: once every client has detached, the last one
+    # restores the run's PTY to its launch geometry (see
+    # _deregister_attach_presence_and_restore). Registering under the presence
+    # lock keeps it ordered against a concurrent last-detach, and the try/finally
+    # below drops the marker on Ctrl-C, an error, and normal exit alike.
+    with _attach_presence_lock(state_dir):
+        attach_marker_fd = _register_attach_presence(state_dir)
     pending_input = b""
     pending_resize = b""
     resize_requested = True
@@ -5485,6 +5638,11 @@ def cmd_attach(args: argparse.Namespace) -> int:
                 previous_winch if previous_winch is not None else signal.SIG_DFL,
             )
         os.close(stdin_fd)
+        # Deregister before closing resize_fd: restoring the launch geometry
+        # (when this is the last live client) writes through it.
+        _deregister_attach_presence_and_restore(
+            name, state_dir, attach_marker_fd, resize_fd
+        )
         if resize_fd is not None:
             os.close(resize_fd)
         restore_terminal()
@@ -5640,16 +5798,18 @@ def _new_pyte_screen(pyte, width: int, height: int, history: int):
     return screen
 
 
+def _screen_lines(screen) -> "Iterable[str]":
+    """Yield scrollback's sparse cell maps, then the rendered viewport."""
+    for entry in screen.history.top:
+        yield ("".join(entry[col].data for col in sorted(entry)) if entry else "").rstrip()
+    for row in screen.display:
+        yield row.rstrip()
+
+
 def _serialize_screen(screen) -> str:
     """Serialize a pyte HistoryScreen to the transcript cache format."""
-    rows: List[str] = []
-    for entry in screen.history.top:
-        text = "".join(entry[col].data for col in sorted(entry)) if entry else ""
-        rows.append(text.rstrip())
-    for row in screen.display:
-        rows.append(row.rstrip())
     deduped: List[str] = []
-    for line in rows:
+    for line in _screen_lines(screen):
         if not deduped or deduped[-1] != line:
             deduped.append(line)
     while deduped and not deduped[-1]:
@@ -5657,16 +5817,196 @@ def _serialize_screen(screen) -> str:
     return "\n".join(deduped) + "\n"
 
 
+def _bounded_int(value, lower: int, upper: int) -> bool:
+    """True when ``value`` is an ``int`` (not a ``bool``) within the closed
+    range ``lower..upper``.
+
+    ``bool`` subclasses ``int`` and ``True == 1``, so an ``isinstance`` check
+    would admit a boolean as a one-cell dimension or a zero offset.
+    """
+    return type(value) is int and lower <= value <= upper
+
+
+def _validate_resize_timeline(
+    resizes: Optional[Sequence[dict]], raw_len: int
+) -> List[Tuple[int, int, int]]:
+    """Filter a raw resize timeline to well-formed, strictly increasing,
+    in-bounds ``(offset, cols, rows)`` tuples, in the input's order.
+
+    Each record is validated independently: a malformed shape, a
+    non-integer field, a dimension outside ``1..MAX_TERMINAL_DIMENSION``, an
+    offset before the last accepted one, or an offset past the end of ``raw``
+    is dropped rather than raised, so a corrupt timeline degrades to fewer
+    resize points instead of an exception. Records sharing an offset coalesce
+    to the last valid one.
+    """
+    if not resizes:
+        return []
+    accepted: List[Tuple[int, int, int]] = []
+    last_offset = -1
+    for record in resizes:
+        try:
+            offset = record["offset"]
+            cols = record["cols"]
+            rows = record["rows"]
+        except (TypeError, KeyError):
+            continue
+        if not (
+            _bounded_int(offset, max(last_offset, 0), raw_len)
+            and _bounded_int(cols, 1, MAX_TERMINAL_DIMENSION)
+            and _bounded_int(rows, 1, MAX_TERMINAL_DIMENSION)
+        ):
+            continue
+        if accepted and offset == last_offset:
+            # Several resizes can be applied with no log output between them
+            # (attach startup then detach restore, two clients, a drag burst).
+            # TIOCSWINSZ is last-writer-wins, so the final geometry at an
+            # offset is the one that was in effect for the bytes after it.
+            accepted[-1] = (offset, cols, rows)
+            continue
+        accepted.append((offset, cols, rows))
+        last_offset = offset
+    return accepted
+
+
+def _resize_screen(screen, cols: int, rows: int) -> None:
+    """Resize ``screen`` to ``cols`` x ``rows`` and clamp the cursor into it.
+
+    ``pyte.Screen.resize`` clips cells at the right and rows at the top but
+    leaves the cursor where it was, so a cursor beyond the new bounds keeps
+    drawing into cells outside ``screen.columns``/``screen.lines`` that
+    ``_serialize_screen`` never reads: on a 10-column screen resized to 5, the
+    next character lands at column 10 and disappears.
+
+    ``cursor.x == columns`` is not out of bounds -- it is the DECAWM
+    pending-wrap state that ``draw`` tests for -- so x clamps to ``columns``
+    rather than ``columns - 1``, preserving a pending wrap across the resize.
+    ``savepoints`` need no clamping: ``restore_cursor`` bounds the restored
+    position itself.
+
+    Replay across a resize is approximate, and this clamp does not make it
+    faithful. ``pyte.Screen.resize`` clips where a terminal reflows: on a width
+    reduction the cells beyond the new width are dropped instead of wrapping to
+    the next row, and on a height reduction the clipped rows are deleted rather
+    than scrolled into ``history.top``. Measured against tmux at 10 columns
+    shrunk to 5, a terminal shows ``12345 / 67890 / X`` where replay produces
+    ``12345 / X``.
+
+    What the clamp fixes is narrower and worth having: without it the cursor
+    keeps its old coordinates, so subsequent draws land in cells outside
+    ``screen.columns``/``screen.lines`` that ``_serialize_screen`` never reads
+    and the output disappears entirely.
+    """
+    screen.resize(rows, cols)
+    screen.cursor.x = min(screen.cursor.x, screen.columns)
+    screen.cursor.y = min(screen.cursor.y, screen.lines - 1)
+
+
+# Smaller snapshot intervals recover more overwritten lines at the cost of scans.
+_STITCH_CHUNK_BYTES = 8 * 1024
+
+# Bound the memory and output consumed by distinct lines from repainting TUIs.
+# _STITCH_MAX_BYTES counts UTF-8 bytes of the accumulated body, excluding the
+# truncation marker.
+_STITCH_MAX_LINES = 50_000
+_STITCH_MAX_BYTES = 8 * 1024 * 1024
+_STITCH_TRUNCATED_MARKER = "[agent-run: stitched history truncated]\n"
+
+
+def _stitch_history(
+    raw: bytes,
+    width: int = _RENDER_LOG_DEFAULT_WIDTH,
+    height: int = _RENDER_LOG_DEFAULT_HEIGHT,
+    history: int = _RENDER_LOG_DEFAULT_HISTORY,
+    resizes: "Optional[Sequence[dict]]" = None,
+    chunk_bytes: int = _STITCH_CHUNK_BYTES,
+) -> str:
+    """Replay ``raw`` and accumulate lines sampled from scrollback and viewport.
+
+    Consecutive samples are deduplicated by multiplicity, so a row printed again
+    while an identical row is still on screen is kept. The reconstruction
+    preserves first-seen order and may include partial repaints. Pyte failures
+    fall back to ANSI stripping.
+
+    Contains every nonempty line of the viewport render unless a cap truncates
+    it: empty rows are dropped, and truncation stops replay before the final
+    screen, so a truncated result omits the tail the viewport render ends with.
+    """
+    try:
+        import pyte  # type: ignore
+    except ImportError as exc:
+        raise RenderDependencyError(_RENDER_DEPENDENCY_MESSAGE) from exc
+
+    if not _bounded_int(chunk_bytes, 1, sys.maxsize):
+        raise ValueError(f"chunk_bytes must be a positive int, got {chunk_bytes!r}")
+
+    timeline = _validate_resize_timeline(resizes, len(raw))
+    geometry_at = {offset: (cols, rows) for offset, cols, rows in timeline}
+    # Sample boundaries and resize boundaries are independent; replay splits at
+    # the union so a resize still lands at its recorded offset.
+    boundaries = sorted(
+        set(geometry_at) | set(range(chunk_bytes, len(raw), chunk_bytes)) | {len(raw)}
+    )
+
+    previous: "Counter[str]" = Counter()
+    lines: List[str] = []
+    total_bytes = 0
+    position = 0
+    try:
+        screen = _new_pyte_screen(pyte, width, height, history)
+        stream = pyte.ByteStream(screen)
+        for boundary in boundaries:
+            if boundary > position:
+                _feed_pyte(stream, raw[position:boundary])
+                position = boundary
+            geometry = geometry_at.get(boundary)
+            if geometry is not None:
+                _resize_screen(screen, *geometry)
+            current: "Counter[str]" = Counter()
+            for text in _screen_lines(screen):
+                if not text:
+                    continue
+                current[text] += 1
+                # Only occurrences beyond the previous sample's count are new:
+                # the rest are the same rows observed again.
+                if current[text] <= previous[text]:
+                    continue
+                line_bytes = len(text.encode("utf-8")) + 1
+                if (
+                    len(lines) >= _STITCH_MAX_LINES
+                    or total_bytes + line_bytes > _STITCH_MAX_BYTES
+                ):
+                    return "".join(line + "\n" for line in lines) + _STITCH_TRUNCATED_MARKER
+                lines.append(text)
+                total_bytes += line_bytes
+            previous = current
+    except Exception:
+        return _strip_ansi_fallback(raw)
+
+    return "".join(line + "\n" for line in lines)
+
+
 def _render_log(
     raw: bytes,
     width: int = _RENDER_LOG_DEFAULT_WIDTH,
     height: int = _RENDER_LOG_DEFAULT_HEIGHT,
     history: int = _RENDER_LOG_DEFAULT_HISTORY,
+    resizes: Optional[Sequence[dict]] = None,
 ) -> str:
     """Render a raw PTY-captured log (with ANSI/Ink redraw artifacts) into a
     plain-text transcript by replaying the byte stream through a VT100
     emulator (pyte). Returns the deduplicated screen history + final visible
     viewport, joined with newlines.
+
+    ``resizes`` is an optional timeline of ``{"offset", "cols", "rows"}``
+    records sorted by offset -- a resize is out-of-band (TIOCSWINSZ +
+    SIGWINCH), so it never appears in ``raw`` itself, and the recorded
+    offset is the only way to know where the geometry changed. ``raw`` is
+    fed in segments split at each valid offset, calling
+    ``screen.resize(rows, cols)`` between segments -- pyte's own argument
+    order is (lines, columns), the reverse of this function's. With
+    ``resizes`` absent or empty the render is byte-identical to feeding
+    ``raw`` whole.
 
     Pyte is loaded lazily so the rest of agent-run keeps working even if the
     extra is not installed (and so we get a clear error message when it is
@@ -5683,12 +6023,307 @@ def _render_log(
 
     screen = _new_pyte_screen(pyte, width, height, history)
     stream = pyte.ByteStream(screen)
+    timeline = _validate_resize_timeline(resizes, len(raw))
     try:
-        _feed_pyte(stream, raw)
+        start = 0
+        for offset, cols, rows in timeline:
+            _feed_pyte(stream, raw[start:offset])
+            _resize_screen(screen, cols, rows)
+            start = offset
+        _feed_pyte(stream, raw[start:])
     except Exception:
         return _strip_ansi_fallback(raw)
 
     return _serialize_screen(screen)
+
+
+
+# ---------------------------------------------------------------------------
+# screen checkpoints for incremental clean rendering
+# ---------------------------------------------------------------------------
+
+# A checkpoint restores pyte's Screen but not its ByteStream, which holds the
+# escape-sequence parser state and the incremental UTF-8 decoder. Resuming with
+# a fresh stream is correct only at an offset where the original stream held no
+# pending state; mid-sequence, the remainder renders as literal text.
+#
+# The stream is asked rather than its byte grammar re-implemented. pyte accepts
+# forms a scanner is apt to miss -- three-byte commands (ESC # % ( )), C1
+# controls decoded from UTF-8 (U+009B CSI, U+009D OSC, U+009C ST), ESC within an
+# OSC payload, malformed UTF-8 consumed as U+FFFD -- and each disagreement
+# yields a silently wrong transcript rather than an error.
+
+
+def _ckpt_stream_is_grounded(stream) -> bool:
+    """True when ``stream`` holds no parser or decoder state that a fresh
+    ByteStream would lack.
+
+    Reads pyte internals: ``_taking_plain_text`` is falsy while an escape
+    sequence is being accumulated, ``utf8_decoder`` retains the bytes of an
+    incomplete character, and ``use_utf8`` -- cleared by ``ESC % @`` -- lives on
+    the stream rather than the screen. Anything unrecognised counts as pending,
+    so a pyte whose internals moved stops publishing checkpoints instead of
+    publishing unsound ones.
+    """
+    try:
+        if not stream._taking_plain_text or not stream.use_utf8:
+            return False
+        pending, _flags = stream.utf8_decoder.getstate()
+        return not pending
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+_CKPT_VERSION = 2
+
+# Bumped when the metadata layout changes: a reader must reject an older cache
+# outright rather than read absent fields as defaults that could match.
+_CLEAN_META_VERSION = 2
+
+
+def _ckpt_charsets() -> dict:
+    """Stable tags for pyte's charset tables. g0/g1 hold the mapping table
+    itself rather than a name, so a tag is needed to round-trip them."""
+    from pyte import charsets
+    return {
+        "B": charsets.LAT1_MAP,
+        "0": charsets.VT100_MAP,
+        "U": charsets.IBMPC_MAP,
+        "V": charsets.VAX42_MAP,
+    }
+
+
+def _ckpt_tag_for_charset(table) -> str:
+    for tag, known in _ckpt_charsets().items():
+        if known is table:
+            return tag
+    return "B"  # an unknown table cannot be restored; Latin-1 is pyte's default
+
+
+def _ckpt_charset_for_tag(tag: str):
+    charsets = _ckpt_charsets()
+    return charsets.get(tag, charsets["B"])
+
+
+def _ckpt_dump_row(row) -> dict:
+    """One sparse row as {column: char}; unwritten cells stay implicit."""
+    return {str(x): list(char) for x, char in row.items()}
+
+
+def _ckpt_load_row(pyte, data, default):
+    if not isinstance(data, dict):
+        raise ValueError("checkpoint row is not an object")
+    row = pyte.screens.StaticDefaultDict(default)
+    for x, values in data.items():
+        row[int(x)] = pyte.screens.Char(*values)
+    return row
+
+
+def _ckpt_dump_scrollback(row) -> str:
+    """A scrolled-off row as the text ``_serialize_screen`` would emit for it.
+
+    That serialization joins written cells in column order, so a sparse row
+    contributes no leading blanks and cell attributes are never read.
+    """
+    return "".join(row[col].data for col in sorted(row)) if row else ""
+
+
+def _ckpt_load_scrollback(pyte, line, default):
+    """Rebuild a scrolled-off row from text, one character per column.
+
+    Column indices need not match the original row: serialization joins cells in
+    column order, so any contiguous placement reproduces the same line.
+    """
+    if not isinstance(line, str):
+        raise ValueError("checkpoint scrollback line is not a string")
+    row = pyte.screens.StaticDefaultDict(default)
+    for col, char in enumerate(line):
+        row[col] = default._replace(data=char)
+    return row
+
+
+def _ckpt_dump_savepoint(pyte, sp) -> dict:
+    return {
+        "cursor": [sp.cursor.x, sp.cursor.y, sp.cursor.hidden, list(sp.cursor.attrs)],
+        "g0": _ckpt_tag_for_charset(sp.g0_charset),
+        "g1": _ckpt_tag_for_charset(sp.g1_charset),
+        "charset": sp.charset,
+        "origin": sp.origin,
+        "wrap": sp.wrap,
+    }
+
+
+def _ckpt_load_savepoint(pyte, data: dict):
+    x, y, hidden, attrs = data["cursor"]
+    cursor = pyte.screens.Cursor(x, y, pyte.screens.Char(*attrs))
+    cursor.hidden = hidden
+    return pyte.screens.Savepoint(
+        cursor,
+        _ckpt_charset_for_tag(data["g0"]),
+        _ckpt_charset_for_tag(data["g1"]),
+        data["charset"],
+        data["origin"],
+        data["wrap"],
+    )
+
+
+def _ckpt_surface_fingerprint(pyte) -> str:
+    """Hash of pyte's screen attribute surface and Char layout. Recorded in the
+    checkpoint so a pyte upgrade that reshapes either invalidates stale caches
+    instead of having them loaded into a screen they no longer describe."""
+    probe = pyte.HistoryScreen(
+        _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT,
+        history=_RENDER_LOG_DEFAULT_HISTORY, ratio=0.5,
+    )
+    parts = sorted(k for k in vars(probe) if not k.startswith("__"))
+    parts += list(pyte.screens.Char._fields)
+    try:
+        parts.append(importlib.metadata.version("pyte"))
+    except importlib.metadata.PackageNotFoundError:
+        parts.append("unknown")
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _ckpt_dump_state(pyte, screen) -> dict:
+    """Serializable screen state.
+
+    ``history.top`` is a ``deque(maxlen=history)``: once full, each scrolled-off
+    line evicts the oldest, so its length stops growing while its contents keep
+    changing, and an append-structured artifact cannot describe it. The whole
+    window is written on every tick instead, as text: ``_serialize_screen`` reads
+    only ``Char.data`` from a scrolled-off row, so cell attributes would cost
+    bytes -- 19 MB per tick for a filled window of wide content -- without ever
+    reaching the transcript.
+    """
+    return {
+        "version": _CKPT_VERSION,
+        "fingerprint": _ckpt_surface_fingerprint(pyte),
+        "columns": screen.columns,
+        "lines": screen.lines,
+        "buffer": {str(y): _ckpt_dump_row(row) for y, row in screen.buffer.items()},
+        "cursor": {
+            "x": screen.cursor.x,
+            "y": screen.cursor.y,
+            "hidden": screen.cursor.hidden,
+            "attrs": list(screen.cursor.attrs),
+        },
+        "charset": screen.charset,
+        "g0": _ckpt_tag_for_charset(screen.g0_charset),
+        "g1": _ckpt_tag_for_charset(screen.g1_charset),
+        "tabstops": sorted(screen.tabstops),
+        "savepoints": [_ckpt_dump_savepoint(pyte, sp) for sp in screen.savepoints],
+        "margins": None if screen.margins is None else list(screen.margins),
+        "mode": sorted(screen.mode),
+        "saved_columns": screen.saved_columns,
+        "title": screen.title,
+        "icon_name": screen.icon_name,
+        "history": {
+            "top": [_ckpt_dump_scrollback(row) for row in screen.history.top],
+            "bottom": [_ckpt_dump_scrollback(row) for row in screen.history.bottom],
+            "ratio": screen.history.ratio,
+            "size": screen.history.size,
+            "position": screen.history.position,
+        },
+    }
+
+
+def _ckpt_load_state(pyte, screen, state: dict) -> None:
+    """Restore ``state`` into ``screen`` in place.
+
+    Raises ValueError when the checkpoint does not describe this screen; callers
+    treat any failure as a cache miss and replay the log in full.
+    """
+    if state.get("version") != _CKPT_VERSION:
+        raise ValueError(f"unsupported checkpoint version {state.get('version')!r}")
+    if state.get("fingerprint") != _ckpt_surface_fingerprint(pyte):
+        raise ValueError("checkpoint was written against a different pyte surface")
+    if state["columns"] != screen.columns or state["lines"] != screen.lines:
+        raise ValueError("checkpoint geometry does not match screen geometry")
+
+    default = screen.default_char
+    screen.buffer.clear()
+    for y, row in state["buffer"].items():
+        screen.buffer[int(y)] = _ckpt_load_row(pyte, row, default)
+
+    cursor = state["cursor"]
+    screen.cursor.x = cursor["x"]
+    screen.cursor.y = cursor["y"]
+    screen.cursor.hidden = cursor["hidden"]
+    screen.cursor.attrs = pyte.screens.Char(*cursor["attrs"])
+
+    screen.charset = state["charset"]
+    screen.g0_charset = _ckpt_charset_for_tag(state["g0"])
+    screen.g1_charset = _ckpt_charset_for_tag(state["g1"])
+    screen.tabstops = set(state["tabstops"])
+    screen.savepoints = [_ckpt_load_savepoint(pyte, sp) for sp in state["savepoints"]]
+    screen.margins = None if state["margins"] is None else pyte.screens.Margins(*state["margins"])
+    screen.mode = set(state["mode"])
+    screen.saved_columns = state["saved_columns"]
+    screen.title = state["title"]
+    screen.icon_name = state["icon_name"]
+
+    history = state["history"]
+    screen.history.top.clear()
+    for line in history["top"]:
+        screen.history.top.append(_ckpt_load_scrollback(pyte, line, default))
+    screen.history.bottom.clear()
+    for line in history["bottom"]:
+        screen.history.bottom.append(_ckpt_load_scrollback(pyte, line, default))
+    screen.history = screen.history._replace(
+        ratio=history["ratio"], size=history["size"], position=history["position"]
+    )
+
+    screen.dirty.clear()
+    screen.dirty.update(range(screen.lines))
+
+
+def _ckpt_state_path(clean: Path) -> Path:
+    return clean.with_name(f"{clean.name}.state.json")
+
+
+def _ckpt_publish(clean: Path, pyte, screen, *, offset: int) -> None:
+    """Write the screen checkpoint covering raw-log byte ``offset``.
+
+    The state file is replaced atomically, but not atomically with respect to
+    ``log.clean`` and its metadata, so the offset is recorded here and compared
+    by the reader; a checkpoint from another tick is rejected rather than loaded
+    against mismatched metadata.
+    """
+    state = _ckpt_dump_state(pyte, screen)
+    state["offset"] = offset
+    _atomic_write_text(
+        _ckpt_state_path(clean), json.dumps(state, sort_keys=True), suffix="state",
+    )
+
+
+def _ckpt_discard(clean: Path) -> None:
+    """Remove the checkpoint. Readers fall back to a full replay, which is
+    always correct; a checkpoint that cannot be trusted must not survive."""
+    try:
+        _ckpt_state_path(clean).unlink()
+    except OSError:
+        pass
+
+
+def _ckpt_load(clean: Path, pyte, screen, *, offset: int) -> bool:
+    """Restore the checkpoint covering ``offset`` into ``screen``.
+
+    Returns False when no checkpoint applies, for any reason: absent, malformed,
+    written by a different pyte, or naming another offset. The caller then
+    replays the log in full.
+    """
+    try:
+        with _watch_open_validated_log(_ckpt_state_path(clean)) as handle:
+            if handle is None:
+                return False
+            state = json.loads(handle.read().decode("utf-8"))
+        # json.loads yields any JSON value; every access below assumes a mapping.
+        if not isinstance(state, dict) or state.get("offset") != offset:
+            return False
+        _ckpt_load_state(pyte, screen, state)
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError):
+        return False
+    return True
 
 
 def _cache_metadata_path(clean: Path) -> Path:
@@ -5708,40 +6343,216 @@ def _atomic_write_text(path: Path, text: str, *, suffix: str) -> None:
             pass
 
 
-def _publish_clean(clean: Path, rendered: str, *, stat_result, offset: int, complete: bool) -> None:
+def _publish_clean(
+    clean: Path, rendered: str, *, stat_result, offset: int, complete: bool,
+    width: int = _RENDER_LOG_DEFAULT_WIDTH, height: int = _RENDER_LOG_DEFAULT_HEIGHT,
+    resize_identity: Optional[str] = None,
+) -> None:
     """Publish transcript then metadata identifying the raw prefix it covers."""
     _atomic_write_text(clean, rendered, suffix="clean")
-    _publish_clean_metadata(clean, stat_result=stat_result, offset=offset, complete=complete)
+    _publish_clean_metadata(
+        clean, stat_result=stat_result, offset=offset, complete=complete,
+        width=width, height=height, resize_identity=resize_identity,
+    )
 
 
-def _publish_clean_metadata(clean: Path, *, stat_result, offset: int, complete: bool) -> None:
-    """Publish cache health metadata without treating diagnostic state as text."""
+def _publish_clean_metadata(
+    clean: Path, *, stat_result, offset: int, complete: bool,
+    width: int = _RENDER_LOG_DEFAULT_WIDTH, height: int = _RENDER_LOG_DEFAULT_HEIGHT,
+    resize_identity: Optional[str] = None,
+) -> None:
+    """Publish cache health metadata without treating diagnostic state as text.
+
+    ``width``/``height`` record the geometry the render actually used --
+    not necessarily the module defaults, since a run's own launch geometry
+    (run.json's ``terminal`` field) can override them. A reader must compare
+    against the geometry it would resolve for this log, not against a
+    hardcoded default, or it can hand back a render made at the wrong size.
+    """
+    if resize_identity is None:
+        # Callers omitting an identity describe the legacy default render.
+        resize_identity = _resize_timeline_digest(
+            (_RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT), ()
+        )
     metadata = {
-        "version": 1,
+        "version": _CLEAN_META_VERSION,
         "dev": stat_result.st_dev,
         "ino": stat_result.st_ino,
         "offset": offset,
         "size": stat_result.st_size,
         "complete": complete,
-        "width": _RENDER_LOG_DEFAULT_WIDTH,
-        "height": _RENDER_LOG_DEFAULT_HEIGHT,
+        "width": width,
+        "height": height,
         "history": _RENDER_LOG_DEFAULT_HISTORY,
+        # Digest of the geometry and resize timeline this render applied.
+        "resize_identity": resize_identity,
         "updated_at": time.time(),
     }
     _atomic_write_text(_cache_metadata_path(clean), json.dumps(metadata, sort_keys=True), suffix="meta")
 
 
+def _read_run_terminal_geometry(log_dir: Path) -> Optional[Tuple[int, int]]:
+    """Read the launch-time PTY geometry from run.json's ``terminal`` field.
+
+    Returns ``None`` -- meaning "use the render defaults" -- when run.json
+    is absent, unreadable, not valid JSON, or ``terminal`` is malformed;
+    every log from before this field existed falls back the same way.
+    """
+    try:
+        data = json.loads((log_dir / "run.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    terminal = data.get("terminal")
+    if not isinstance(terminal, dict):
+        return None
+    cols = terminal.get("cols")
+    rows = terminal.get("rows")
+    if not (
+        _bounded_int(cols, 1, MAX_TERMINAL_DIMENSION)
+        and _bounded_int(rows, 1, MAX_TERMINAL_DIMENSION)
+    ):
+        return None
+    return (cols, rows)
+
+
+def _read_resize_timeline(log_dir: Path) -> List[dict]:
+    """Read ``resizes.jsonl`` into a list of raw JSON-object records.
+
+    A line that fails to parse, or does not decode as a JSON object, is
+    skipped individually; a missing or unreadable file yields an empty
+    timeline. Never raises -- ``_validate_resize_timeline`` still screens
+    every field of every returned record before it is trusted.
+    """
+    try:
+        text = (log_dir / "resizes.jsonl").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    records: List[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _resize_timeline_digest(
+    geometry: Tuple[int, int], timeline: Sequence[Tuple[int, int, int]]
+) -> str:
+    """Digest of the initial ``geometry`` and the validated ``timeline`` that a
+    render applied.
+
+    A render is determined by the initial geometry plus the exact sequence of
+    (offset, cols, rows) triples, so the digest must cover all of it: a count
+    and a last offset collide across timelines with different intermediate
+    offsets or different dimensions, and a cache reader comparing only those
+    accepts a render made from another timeline.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(struct.pack(">II", *geometry))
+    for offset, cols, rows in timeline:
+        hasher.update(struct.pack(">QII", offset, cols, rows))
+    return hasher.hexdigest()[:16]
+
+
+def _current_resize_identity(log_dir: Path, raw_len: int) -> str:
+    """Digest of the geometry and resize timeline that currently apply to
+    ``raw_len`` bytes of ``log_dir``'s raw log.
+
+    Compared by ``_read_clean_cache`` against the digest a cached render
+    recorded, to reject a cache published under a different geometry or before
+    a resize was recorded.
+    """
+    timeline = _validate_resize_timeline(_read_resize_timeline(log_dir), raw_len)
+    return _resize_timeline_digest(_resolved_default_geometry(log_dir), timeline)
+
+
+def _resolved_default_geometry(log_dir: Path) -> Tuple[int, int]:
+    """The geometry a render at the module defaults actually uses for
+    ``log_dir``: run.json's ``terminal`` field when present and valid,
+    else the render defaults themselves.
+
+    This is the geometry a cache reader must compare against -- not the
+    hardcoded defaults -- since a run's own launch geometry differs from them:
+    runs are launched at ``_LAUNCH_TERMINAL_COLS``x``_LAUNCH_TERMINAL_ROWS``,
+    while the fallback applies only to logs whose run.json predates the
+    terminal field.
+    """
+    return _read_run_terminal_geometry(log_dir) or (
+        _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT
+    )
+
+
+def _render_log_dir(
+    log_dir: Path, raw: bytes, *, width: int, height: int, history: int,
+    stitched: bool = False,
+) -> str:
+    """Render ``raw`` for ``log_dir``, applying its recorded launch geometry
+    and resize timeline only when the caller asked for the render defaults.
+
+    A caller requesting a specific width/height (``clean --width``) wants a
+    render at that exact size; the recorded timeline describes a different
+    geometry (the run's own PTY) and does not apply. At the defaults, the
+    initial geometry comes from run.json's ``terminal`` field and the
+    timeline from resizes.jsonl; either absent or malformed falls back to
+    the defaults with no resizes, reproducing every pre-existing log byte
+    for byte.
+    """
+    render = _stitch_history if stitched else _render_log
+    if width != _RENDER_LOG_DEFAULT_WIDTH or height != _RENDER_LOG_DEFAULT_HEIGHT:
+        return render(raw, width=width, height=height, history=history)
+    base_width, base_height = _resolved_default_geometry(log_dir)
+    resize_records = _read_resize_timeline(log_dir)
+    return render(
+        raw, width=base_width, height=base_height, history=history,
+        resizes=resize_records,
+    )
+
+
 def _render_log_to_clean(log_dir: Path) -> None:
-    """Atomically render ``log`` to ``log.clean`` in ``log_dir``."""
+    """Atomically render ``log`` to ``log.clean`` in ``log_dir``.
+
+    Initial geometry comes from run.json's ``terminal`` field and the
+    resize timeline from resizes.jsonl; either absent or malformed falls
+    back to the render defaults, reproducing every pre-existing log byte
+    for byte.
+    """
     log = log_dir / "log"
     clean = log_dir / "log.clean"
-    raw = log.read_bytes()
-    rendered = _render_log(raw)
+    width, height = _resolved_default_geometry(log_dir)
+    resize_records = _read_resize_timeline(log_dir)
+    # Read and stat through one descriptor: a path read followed by a separate
+    # stat lets bytes land in between, and publishing the newer size would claim
+    # the transcript covers output it never saw.
     with _watch_open_validated_log(log) as f:
         if f is None:
             raise OSError("log is not a regular file")
+        raw = f.read()
         stat_result = os.fstat(f.fileno())
-    _publish_clean(clean, rendered, stat_result=stat_result, offset=stat_result.st_size, complete=True)
+    rendered = _render_log(
+        raw, width=width, height=height, history=_RENDER_LOG_DEFAULT_HISTORY,
+        resizes=resize_records,
+    )
+    # Digest the snapshot just rendered rather than re-reading resizes.jsonl,
+    # so the metadata cannot describe a timeline the transcript never used.
+    resize_identity = _resize_timeline_digest(
+        (width, height), _validate_resize_timeline(resize_records, len(raw))
+    )
+    # The offset is what was read, never the stat size: a log that grew during
+    # the read is published as an incomplete prefix, which a reader resumes from
+    # rather than trusting as exact.
+    _publish_clean(
+        clean, rendered, stat_result=stat_result, offset=len(raw),
+        complete=len(raw) == stat_result.st_size,
+        width=width, height=height, resize_identity=resize_identity,
+    )
 
 
 def _bounded_final_render(
@@ -5830,6 +6641,12 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
     published cache always identifies the exact (dev, ino, offset) prefix it
     covers via ``log.clean.meta.json``. Any parse or publication failure leaves
     that contract unpublished and is retried after discarding mutated pyte state.
+
+    A checkpoint is published only for a tick that leaves the stream grounded --
+    no pending escape sequence, no partial UTF-8 character, UTF-8 mode intact --
+    so a reader resuming at that offset starts a fresh ByteStream in the same
+    state and needs no parser state from the checkpoint. The transcript and its
+    metadata are published either way; only the checkpoint waits.
     """
     log = log_dir / "log"
     clean = log_dir / "log.clean"
@@ -5838,10 +6655,19 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
     except ImportError:
         return
 
+    # The geometry every other reader resolves for this log: run.json's
+    # terminal field, else the render fallback. Rendering at the module
+    # defaults instead would publish a transcript at a size no reader accepts.
+    width, height = _resolved_default_geometry(log_dir)
+    # This loop feeds bytes incrementally and never applies the resize
+    # timeline, so the identity it publishes names an empty timeline at that
+    # geometry. A recorded resize makes the reader's identity differ, which
+    # correctly forces a full re-render rather than a hit at the wrong size.
+    resize_identity = _resize_timeline_digest((width, height), ())
+
     def new_state():
         screen = _new_pyte_screen(
-            pyte, _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT,
-            _RENDER_LOG_DEFAULT_HISTORY,
+            pyte, width, height, _RENDER_LOG_DEFAULT_HISTORY,
         )
         return screen, pyte.ByteStream(screen)
 
@@ -5849,9 +6675,11 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
     offset = 0
     log_ino = -1
     log_dev = -1
-    # (rendered-or-None, source stat, offset) awaiting publication; retried on a
-    # publish failure. rendered None means the text is unchanged (metadata only).
-    pending: Optional[tuple[Optional[str], Any, int]] = None
+    # (rendered-or-None, source stat, offset, grounded) awaiting publication;
+    # retried on a publish failure. rendered None means the text is unchanged
+    # (metadata only). grounded records whether the stream could be checkpointed
+    # at that offset.
+    pending: Optional[tuple[Optional[str], Any, int, bool]] = None
     last_rendered: Optional[str] = None
     failures = 0
     # (dev, ino) whose byte-zero prefix deterministically fails to parse; its
@@ -5873,6 +6701,7 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
                     log_dev = current.st_dev
                     pending = None
                     failures = 0
+                    _ckpt_discard(clean)
                 if current.st_size > offset:
                     read_size = min(current.st_size - offset, ECHO_LOOP_MAX_RENDER_BYTES)
                     f.seek(offset)
@@ -5899,10 +6728,15 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
                 offset = 0
                 pending = None
                 failures += 1
+                _ckpt_discard(clean)
                 if failures >= 2:
                     blocked = identity
                     try:
-                        _publish_clean_metadata(clean, stat_result=current, offset=0, complete=False)
+                        _publish_clean_metadata(
+                            clean, stat_result=current, offset=0, complete=False,
+                            width=width, height=height,
+                            resize_identity=resize_identity,
+                        )
                     except OSError:
                         pass
                 time.sleep(interval)
@@ -5910,24 +6744,42 @@ def _echo_loop(log_dir: "Path", interval: float) -> None:
             offset += len(chunk)
             log_ino = current.st_ino
             log_dev = current.st_dev
-            pending = (rendered if rendered != last_rendered else None, current, offset)
+            pending = (rendered if rendered != last_rendered else None, current, offset,
+                       _ckpt_stream_is_grounded(stream))
             last_rendered = rendered
             failures = 0
             blocked = None
 
         if pending is not None:
-            rendered, source_stat, published_offset = pending
+            rendered, source_stat, published_offset, grounded = pending
             complete = published_offset == source_stat.st_size
             try:
                 if rendered is not None:
                     _publish_clean(clean, rendered, stat_result=source_stat,
-                                   offset=published_offset, complete=complete)
+                                   offset=published_offset, complete=complete,
+                                   width=width, height=height,
+                                   resize_identity=resize_identity)
                 else:
                     _publish_clean_metadata(clean, stat_result=source_stat,
-                                            offset=published_offset, complete=complete)
+                                            offset=published_offset, complete=complete,
+                                            width=width, height=height,
+                                            resize_identity=resize_identity)
             except OSError:
                 time.sleep(interval)
                 continue
+            if grounded:
+                try:
+                    _ckpt_publish(clean, pyte, screen, offset=published_offset)
+                except (OSError, ValueError, TypeError):
+                    # The transcript stands on its own; a missing checkpoint only
+                    # costs the next reader a full replay.
+                    _ckpt_discard(clean)
+            else:
+                # Publishing here would name an offset a fresh ByteStream cannot
+                # resume from. The stale checkpoint must go too: its offset no
+                # longer matches the metadata, and the next grounded tick
+                # republishes.
+                _ckpt_discard(clean)
             pending = None
         time.sleep(interval)
 
@@ -5938,7 +6790,13 @@ def _read_clean_cache(
     height: int,
     history: int,
 ) -> "Optional[str]":
-    """Return a compatible cache only when metadata proves it covers the raw log."""
+    """Return a rendered transcript from cache, or None to render in full.
+
+    An exact cache -- metadata covering the whole raw log -- is returned as-is.
+    Otherwise a checkpoint covering a grounded prefix is resumed: the recorded
+    screen state is restored and only the bytes appended since that offset are
+    fed. Any failure returns None; a resumed render is never a guess.
+    """
     if (
         width != _RENDER_LOG_DEFAULT_WIDTH
         or height != _RENDER_LOG_DEFAULT_HEIGHT
@@ -5959,23 +6817,90 @@ def _read_clean_cache(
             if metadata_file is None:
                 return None
             metadata = json.loads(metadata_file.read().decode("utf-8"))
+        # The geometry a render at the defaults actually resolves to for this
+        # log -- run.json's terminal field can override the defaults, so the
+        # cache is only a hit when it was published at that same resolved
+        # geometry, not merely at the (possibly different) module defaults.
+        resolved_width, resolved_height = _resolved_default_geometry(log_path.parent)
         if not (
-            metadata.get("version") == 1
+            metadata.get("version") == _CLEAN_META_VERSION
             and metadata.get("complete") is True
             and metadata.get("dev") == raw_stat.st_dev
             and metadata.get("ino") == raw_stat.st_ino
-            and metadata.get("offset") == raw_stat.st_size
-            and metadata.get("size") == raw_stat.st_size
-            and metadata.get("width") == width
-            and metadata.get("height") == height
+            and metadata.get("width") == resolved_width
+            and metadata.get("height") == resolved_height
             and metadata.get("history") == history
         ):
             return None
-        with _watch_open_validated_log(clean) as clean_file:
-            if clean_file is None:
-                return None
-            return clean_file.read().decode("utf-8", errors="replace")
+        published = metadata.get("offset")
+        if not _bounded_int(published, 0, raw_stat.st_size):
+            return None
+        if not _bounded_int(metadata.get("size"), 0, raw_stat.st_size):
+            return None
+        if published != metadata.get("size"):
+            return None
+        # A resize recorded after this cache was published, or a geometry that
+        # no longer resolves the same way, changes what the render should have
+        # been. The checkpoint in log.clean.state.json shares this gate: a
+        # mismatch here already forces a full re-render.
+        if _current_resize_identity(log_path.parent, raw_stat.st_size) != metadata.get(
+            "resize_identity"
+        ):
+            return None
+        if published == raw_stat.st_size:
+            with _watch_open_validated_log(clean) as clean_file:
+                if clean_file is None:
+                    return None
+                return clean_file.read().decode("utf-8", errors="replace")
+        return _resume_clean_cache(
+            log_path, clean, published, raw_stat,
+            width=resolved_width, height=resolved_height,
+        )
     except (OSError, ValueError, TypeError):
+        return None
+
+
+def _resume_clean_cache(
+    log_path: Path,
+    clean: Path,
+    published: int,
+    raw_stat,
+    *,
+    width: int,
+    height: int,
+) -> "Optional[str]":
+    """Render by restoring the checkpoint at ``published`` and feeding the tail.
+
+    Returns None on any failure -- unusable checkpoint, a log that changed
+    identity or length mid-read, a pyte exception -- so the caller replays in
+    full. ``_read_clean_cache`` validates ``width`` and ``height`` against the
+    metadata and current run geometry before reaching here.
+    """
+    try:
+        import pyte  # type: ignore
+    except ImportError:
+        return None
+    try:
+        screen = _new_pyte_screen(
+            pyte, width, height, _RENDER_LOG_DEFAULT_HISTORY,
+        )
+        if not _ckpt_load(clean, pyte, screen, offset=published):
+            return None
+        with _watch_open_validated_log(log_path) as log_file:
+            if log_file is None:
+                return None
+            reread = os.fstat(log_file.fileno())
+            if (reread.st_dev, reread.st_ino) != (raw_stat.st_dev, raw_stat.st_ino):
+                return None
+            log_file.seek(published)
+            tail = log_file.read(raw_stat.st_size - published)
+        if len(tail) != raw_stat.st_size - published:
+            return None
+        _feed_pyte(pyte.ByteStream(screen), tail)
+        return _serialize_screen(screen)
+    except Exception:
+        # A full replay is always correct, so every failure here is a cache miss
+        # rather than an error worth propagating.
         return None
 
 
@@ -5984,18 +6909,24 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     # Prefer log.clean, written by the --echo daemon, over re-rendering.
     # Reusing the cache saves cmd_clean the pyte replay on large logs.
-    rendered = _read_clean_cache(log, width=args.width, height=args.height, history=args.history)
+    # A stitched render is a different artifact than the one log.clean holds,
+    # so that mode always replays.
+    stitched = getattr(args, "history_mode", "viewport") == "stitched"
+    rendered = None if stitched else _read_clean_cache(
+        log, width=args.width, height=args.height, history=args.history
+    )
     if rendered is None:
         with _watch_open_validated_log(log) as f:
             if f is None:
                 sys.exit(f"agent-run: cannot open log for '{args.name}' (not a regular file)")
             raw = f.read()
         try:
-            rendered = _render_log(
-                raw,
+            rendered = _render_log_dir(
+                log.parent, raw,
                 width=args.width,
                 height=args.height,
                 history=args.history,
+                stitched=stitched,
             )
         except RenderDependencyError as exc:
             sys.exit(str(exc))
@@ -8833,6 +9764,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         "interactive": args.interactive,
         "harness": harness,
         "agent_run_version": TOOLBOX_VERSION,
+        "terminal": {"cols": _LAUNCH_TERMINAL_COLS, "rows": _LAUNCH_TERMINAL_ROWS},
     }
     if is_managed:
         launch_run_json["model"] = getattr(args, "model", None)
@@ -9684,7 +10616,9 @@ def _runner(
             # Managed claude/opencode use the same PTY path as raw runs: the
             # session id is already in argv, and the prompt is delivered through
             # the FIFO after the TUI comes up.
-            exit_code = _run_interactive(state_dir, argv, log_fd, _ready, prompt_file, submit_mode)
+            exit_code = _run_interactive(
+                state_dir, argv, log_fd, _ready, prompt_file, submit_mode, log_dir
+            )
         else:
             exit_code = _run_oneshot(state_dir, argv, log_fd, _ready, prompt_file)
         agent_exited_naturally = True
@@ -9869,19 +10803,113 @@ def _pack_resize(cols: int, rows: int) -> bytes:
     )
 
 
-def _apply_resize(master_fd: int, cols: int, rows: int) -> None:
+def _apply_resize(master_fd: int, cols: int, rows: int) -> bool:
+    """Set the PTY window size, returning whether the ioctl succeeded.
+
+    Never raises: resizing is auxiliary, and a failure here must not end a run
+    that is otherwise healthy, nor escape at launch before the child pid has
+    been published and become reapable.
+
+    The return value gates the resize timeline: recording a geometry the kernel
+    rejected would make replay change size at an offset where the live PTY never
+    did.
+    """
     try:
         fcntl.ioctl(
             master_fd,
             termios.TIOCSWINSZ,
             struct.pack("HHHH", rows, cols, 0, 0),
         )
-    except OSError as exc:
-        if exc.errno not in {errno.EBADF, errno.EIO, errno.EINVAL, errno.ENOTTY}:
-            raise
+    except OSError:
+        return False
+    return True
 
 
-def _drain_resize_records(master_fd: int, buffered: bytes, warn=None) -> bytes:
+_LOG_WRITE_FAILED_MESSAGE = (
+    "log write failed; the capture is truncated and resize offsets can no "
+    "longer locate a geometry change, so the resize timeline stops here"
+)
+
+
+def _write_all_to_log(log_fd: int, data: bytes) -> "tuple[int, bool]":
+    """Write all of ``data`` to ``log_fd``, returning (bytes written, complete).
+
+    A short write would otherwise drop the tail of a chunk, and every later
+    resize offset would name a position in a truncated capture rather than in
+    the byte stream the child emitted. EINTR retries; any other OSError stops
+    the loop and reports the write as incomplete, since the unwritten suffix has
+    already been consumed from the master and cannot be recovered.
+    """
+    written = 0
+    while written < len(data):
+        try:
+            written += os.write(log_fd, data[written:])
+        except InterruptedError:
+            continue
+        except OSError:
+            return written, False
+    return written, True
+
+
+# Ceiling on one pre-resize drain. A child writing as fast as the runner reads
+# never lets the master reach EAGAIN, and the relay is single-threaded: an
+# unbounded drain would starve the resize it is preparing for and stop
+# servicing stdin and child exit. Past this the boundary is approximate, which
+# is the same guarantee the ioctl itself gives against a concurrent writer.
+DRAIN_BEFORE_RESIZE_MAX_BYTES = 4 * 1024 * 1024
+DRAIN_BEFORE_RESIZE_MAX_SECONDS = 0.25
+
+
+def _drain_master_to_log(master_fd: int, log_fd: int) -> "tuple[int, bool]":
+    """Read the PTY master toward EAGAIN, writing to ``log_fd``.
+
+    Returns (bytes written, capture intact). Used before applying a resize so
+    output the child has already produced is logged under the geometry it was
+    drawn for.
+
+    The drain is bounded by bytes and elapsed time: reaching either leaves the
+    remaining output to the ordinary relay path, so the recorded offset lands
+    slightly early rather than the run stalling. A closed master or read error
+    ends the drain; the caller's ordinary read path handles reaping.
+
+    ``capture intact`` is False when a log write failed, meaning bytes consumed
+    from the master were lost. The caller must stop recording resize offsets:
+    they index the captured log, so a gap makes every later offset meaningless.
+    """
+    total = 0
+    deadline = time.monotonic() + DRAIN_BEFORE_RESIZE_MAX_SECONDS
+    while total < DRAIN_BEFORE_RESIZE_MAX_BYTES and time.monotonic() < deadline:
+        try:
+            data = os.read(master_fd, 65536)
+        except InterruptedError:
+            continue  # the read was interrupted, not exhausted
+        except (BlockingIOError, OSError):
+            break
+        if not data:
+            break
+        written, complete = _write_all_to_log(log_fd, data)
+        total += written
+        if not complete:
+            return total, False
+    return total, True
+
+
+def _resize_record_pending(buffered: bytes) -> bool:
+    """True when ``buffered`` holds at least one complete, valid resize record.
+
+    Lets the relay skip the pre-resize drain for a batch that carries only a
+    partial or malformed record, which applies no resize.
+    """
+    while len(buffered) >= RESIZE_RECORD_SIZE:
+        if _valid_resize_record(buffered[:RESIZE_RECORD_SIZE]):
+            return True
+        buffered = buffered[1:]
+    return False
+
+
+def _drain_resize_records(
+    master_fd: int, buffered: bytes, warn=None, on_applied=None
+) -> bytes:
     """Apply the LAST complete resize record found in ``buffered``,
     discarding earlier complete records in the same batch, and return any
     trailing partial record for the next call.
@@ -9905,7 +10933,11 @@ def _drain_resize_records(master_fd: int, buffered: bytes, warn=None) -> bytes:
     build's is reported through ``warn`` and skipped rather than decoded:
     an attach client from another release writes a different layout, and
     reading its bytes as dimensions drives the agent's terminal to a
-    garbage size."""
+    garbage size.
+
+    ``on_applied(cols, rows)``, when given, runs after ``_apply_resize``
+    succeeds, so a caller can record the resize timeline without this
+    function knowing anything about logs or offsets."""
     last_record = None
     foreign_version = None
     while len(buffered) >= RESIZE_RECORD_SIZE:
@@ -9941,7 +10973,13 @@ def _drain_resize_records(master_fd: int, buffered: bytes, warn=None) -> bytes:
         _magic, _version, cols, rows, _sum = struct.unpack(
             RESIZE_RECORD_FORMAT, last_record
         )
-        _apply_resize(master_fd, cols, rows)
+        if _apply_resize(master_fd, cols, rows):
+            if on_applied is not None:
+                on_applied(cols, rows)
+        elif warn is not None:
+            # Common during teardown once the master is closed, so this is a
+            # note rather than a fault; the timeline deliberately gets no record.
+            warn(f"terminal resize to {cols}x{rows} was refused; size unchanged")
     return buffered
 
 
@@ -10101,6 +11139,7 @@ def _run_interactive(
     ready: callable,
     prompt_file: Optional[str] = None,
     submit_mode: str = SUBMIT_MODE_CR,
+    log_dir: Optional[Path] = None,
 ) -> int:
     stdin_path = state_dir / "stdin"
     resize_path = state_dir / "resize"
@@ -10110,7 +11149,12 @@ def _run_interactive(
     with _block_handled_runner_signals():
         pty_pid, master_fd = pty.fork()
         if pty_pid != 0:
+            # Publish first: an exception before this strands a live child that
+            # teardown has no record of. Sizing the PTY afterwards still beats
+            # the child to its first TIOCGWINSZ in practice, and the ioctl
+            # raises SIGWINCH, so an agent that already read 0x0 re-queries.
             _publish_or_reap_child(state_dir, "pty_pid", pty_pid)
+            _apply_resize(master_fd, _LAUNCH_TERMINAL_COLS, _LAUNCH_TERMINAL_ROWS)
         else:
             _reset_runner_signal_handlers()
     if pty_pid == 0:
@@ -10197,6 +11241,28 @@ def _run_interactive(
         except OSError:
             pass
 
+    log_bytes_written = 0
+    # Cleared when a log write fails: recorded offsets index the captured log,
+    # so a gap makes every later offset meaningless.
+    log_capture_intact = True
+
+    def record_resize(cols: int, rows: int) -> None:
+        nonlocal log_capture_intact
+        # Resizes are out-of-band (TIOCSWINSZ + SIGWINCH): no byte of the
+        # ioctl reaches the log, so the offset it took effect at has to be
+        # recorded here, not recovered from the stream later. Bytes at or
+        # after log_bytes_written are the first the new geometry applies to.
+        if log_dir is None or not log_capture_intact:
+            return
+        record = json.dumps(
+            {"offset": log_bytes_written, "cols": cols, "rows": rows}
+        )
+        try:
+            with (log_dir / "resizes.jsonl").open("a", encoding="utf-8") as f:
+                f.write(record + "\n")
+        except OSError:
+            pass
+
     exit_code: Optional[int] = None
     buf_in = b""
     buf_resize = b""
@@ -10233,10 +11299,11 @@ def _run_interactive(
                     break
                 # master closed but child still alive? unusual — loop again.
             else:
-                try:
-                    os.write(log_fd, data)
-                except OSError:
-                    pass
+                written, complete = _write_all_to_log(log_fd, data)
+                log_bytes_written += written
+                if not complete and log_capture_intact:
+                    log_capture_intact = False
+                    warn_resize(_LOG_WRITE_FAILED_MESSAGE)
 
         if fifo_fd in r:
             try:
@@ -10261,7 +11328,22 @@ def _run_interactive(
                 chunk = b""
             if chunk:
                 buf_resize += chunk
-            buf_resize = _drain_resize_records(master_fd, buf_resize, warn_resize)
+            if _resize_record_pending(buf_resize):
+                # Everything the child has already produced belongs to the old
+                # geometry, but a single 4096-byte read leaves the rest queued
+                # on the master to be logged after the resize offset. Drain
+                # toward EAGAIN first so the recorded offset names a real
+                # boundary. Output generated concurrently between this drain
+                # and the ioctl is an unavoidable PTY race: the child writes
+                # without coordinating with the resize.
+                drained, drain_intact = _drain_master_to_log(master_fd, log_fd)
+                log_bytes_written += drained
+                if not drain_intact and log_capture_intact:
+                    log_capture_intact = False
+                    warn_resize(_LOG_WRITE_FAILED_MESSAGE)
+            buf_resize = _drain_resize_records(
+                master_fd, buf_resize, warn_resize, record_resize
+            )
 
         if master_fd in w and buf_in:
             buf_in = _drain_pty_input(master_fd, buf_in)
@@ -11516,6 +12598,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_nonnegative_int,
         default=_RENDER_LOG_DEFAULT_HISTORY,
         help=f"scrollback line budget for the emulator (default: {_RENDER_LOG_DEFAULT_HISTORY})",
+    )
+    sp_clean.add_argument(
+        "--history-mode",
+        choices=("viewport", "stitched"),
+        default="viewport",
+        help=(
+            "viewport (default): pyte's scrollback plus the final frame, which "
+            "for a TUI repainting in place is the last frame alone. stitched: "
+            "also keep every distinct line the viewport held during replay -- a "
+            "lossy reconstruction, not a transcript (repeated lines collapse, "
+            "mid-repaint frames leak, ordering is first-seen)"
+        ),
     )
     clean_slice = sp_clean.add_mutually_exclusive_group()
     clean_slice.add_argument(

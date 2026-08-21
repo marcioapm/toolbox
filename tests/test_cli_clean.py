@@ -663,11 +663,16 @@ class TestCleanCache:
             os.utime(clean_path, (clean_mtime, clean_mtime))
             log_stat = (log_d / "log").stat()
             (log_d / "log.clean.meta.json").write_text(json.dumps({
-                "version": 1, "dev": log_stat.st_dev, "ino": log_stat.st_ino,
+                "version": agent_run._CLEAN_META_VERSION,
+                "dev": log_stat.st_dev, "ino": log_stat.st_ino,
                 "offset": log_stat.st_size, "size": log_stat.st_size, "complete": True,
                 "width": agent_run._RENDER_LOG_DEFAULT_WIDTH,
                 "height": agent_run._RENDER_LOG_DEFAULT_HEIGHT,
                 "history": agent_run._RENDER_LOG_DEFAULT_HISTORY,
+                "resize_identity": agent_run._resize_timeline_digest(
+                    (agent_run._RENDER_LOG_DEFAULT_WIDTH,
+                     agent_run._RENDER_LOG_DEFAULT_HEIGHT), [],
+                ),
                 "updated_at": 0,
             }))
         return log_d

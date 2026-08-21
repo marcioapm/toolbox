@@ -200,6 +200,124 @@ class TestRenderLogSizing:
 
 
 # ---------------------------------------------------------------------------
+# Geometry-aware replay — resizes are out-of-band (TIOCSWINSZ + SIGWINCH) and
+# never appear in the byte stream, so _render_log must apply a recorded
+# offset/cols/rows timeline by resizing the emulated screen mid-replay.
+# ---------------------------------------------------------------------------
+
+class TestRenderLogResizeTimeline:
+    def test_timeline_splits_replay_and_matches_manual_resize(self):
+        import pyte
+
+        raw = (
+            b"x" * 60 + b"\r\n"
+            + b"y" * 60 + b"\r\n"
+            + b"z" * 60 + b"\r\n"
+        )
+        split_a = len(b"x" * 60 + b"\r\n")
+        split_b = split_a + len(b"y" * 60 + b"\r\n")
+        resizes = [
+            {"offset": split_a, "cols": 40, "rows": 20},
+            {"offset": split_b, "cols": 100, "rows": 30},
+        ]
+
+        out = _render_log(raw, resizes=resizes)
+
+        screen = agent_run._new_pyte_screen(
+            pyte, agent_run._RENDER_LOG_DEFAULT_WIDTH,
+            agent_run._RENDER_LOG_DEFAULT_HEIGHT, agent_run._RENDER_LOG_DEFAULT_HISTORY,
+        )
+        stream = pyte.ByteStream(screen)
+        agent_run._feed_pyte(stream, raw[:split_a])
+        screen.resize(20, 40)
+        agent_run._feed_pyte(stream, raw[split_a:split_b])
+        screen.resize(30, 100)
+        agent_run._feed_pyte(stream, raw[split_b:])
+        expected = _serialize_screen(screen)
+
+        assert out == expected
+
+    def test_pyte_resize_argument_order_is_lines_then_columns(self):
+        """Regression pin: pyte.Screen.resize(lines, columns) -- the reverse
+        of this module's own (cols, rows) convention. Getting the order
+        backwards silently swaps width and height instead of raising."""
+        raw = b"x" * 60 + b"\r\n" + b"after resize\r\n"
+        split = len(b"x" * 60 + b"\r\n")
+        # A narrow-but-tall resize (10 cols, 40 rows): if _render_log passed
+        # (cols, rows) into pyte's (lines, columns) signature, the emulator
+        # would end up 40 columns wide, so this 12-char line would survive
+        # intact instead of being cut to 10 characters.
+        out = _render_log(raw, resizes=[{"offset": split, "cols": 10, "rows": 40}])
+        assert "after resize" not in out
+        assert "after re" in out
+
+    @pytest.mark.parametrize(
+        "bad_record",
+        [
+            pytest.param("not-a-dict", id="not-a-mapping"),
+            pytest.param({"cols": 80, "rows": 24}, id="missing-offset"),
+            pytest.param({"offset": 3, "rows": 24}, id="missing-cols"),
+            pytest.param({"offset": 3, "cols": 80}, id="missing-rows"),
+            pytest.param({"offset": "3", "cols": 80, "rows": 24}, id="non-integer-offset"),
+            pytest.param({"offset": 3, "cols": "80", "rows": 24}, id="non-integer-cols"),
+            pytest.param({"offset": 3, "cols": 80, "rows": 24.5}, id="non-integer-rows"),
+            pytest.param({"offset": 3, "cols": 0, "rows": 24}, id="cols-zero"),
+            pytest.param({"offset": 3, "cols": 80, "rows": 0}, id="rows-zero"),
+            pytest.param(
+                {"offset": 3, "cols": 80, "rows": 3000}, id="rows-out-of-range"
+            ),
+            pytest.param(
+                {"offset": 3, "cols": 3000, "rows": 24}, id="cols-out-of-range"
+            ),
+            pytest.param({"offset": -1, "cols": 80, "rows": 24}, id="negative-offset"),
+            pytest.param({"offset": 999999, "cols": 80, "rows": 24}, id="offset-past-eof"),
+            pytest.param({"offset": 3, "cols": True, "rows": 24}, id="bool-cols"),
+            pytest.param({"offset": 3, "cols": 80, "rows": True}, id="bool-rows"),
+            pytest.param({"offset": True, "cols": 80, "rows": 24}, id="bool-offset"),
+        ],
+    )
+    def test_malformed_or_out_of_range_record_is_skipped_without_raising(self, bad_record):
+        raw = b"hello world\r\n"
+        # A single bad record must simply be dropped, leaving the render
+        # identical to no timeline at all -- never an exception.
+        out = _render_log(raw, resizes=[bad_record])
+        assert out == _render_log(raw)
+
+    def test_backwards_offset_is_skipped(self):
+        raw = b"a" * 20 + b"\r\n" + b"b" * 20 + b"\r\n"
+        first_split = len(b"a" * 20 + b"\r\n")
+        resizes = [
+            {"offset": first_split, "cols": 40, "rows": 20},
+            # An offset before the last accepted one cannot describe a segment
+            # boundary in a forward replay.
+            {"offset": 1, "cols": 10, "rows": 5},
+        ]
+        out = _render_log(raw, resizes=resizes)
+        expected = _render_log(raw, resizes=[{"offset": first_split, "cols": 40, "rows": 20}])
+        assert out == expected
+
+    def test_absent_timeline_reproduces_current_render(self, moon_log_bytes):
+        assert _render_log(moon_log_bytes, resizes=None) == _render_log(moon_log_bytes)
+
+    def test_empty_timeline_reproduces_current_render(self, moon_log_bytes):
+        assert _render_log(moon_log_bytes, resizes=[]) == _render_log(moon_log_bytes)
+
+    def test_validate_resize_timeline_helper_directly(self):
+        raw_len = 100
+        resizes = [
+            {"offset": 10, "cols": 80, "rows": 24},
+            {"offset": 5, "cols": 80, "rows": 24},  # non-monotonic, dropped
+            {"offset": 200, "cols": 80, "rows": 24},  # past EOF, dropped
+            "garbage",  # malformed shape, dropped
+            {"offset": 50, "cols": 80, "rows": 24},
+        ]
+        assert agent_run._validate_resize_timeline(resizes, raw_len) == [
+            (10, 80, 24),
+            (50, 80, 24),
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Incremental pyte feed — every partition must produce the same transcript as
 # a whole-file feed under the renderer's shared screen semantics.
 # ---------------------------------------------------------------------------
@@ -576,3 +694,323 @@ class TestRenderLogRecursionHardening:
         out = _render_log(blob)
         assert isinstance(out, str)
         assert "survived" in out
+
+
+class TestResizeCursorClamping:
+    """pyte's Screen.resize clips cells but leaves the cursor where it was, so
+    a resize during replay must clamp it back into the new screen."""
+
+    @staticmethod
+    def _render_at(width, height, payload):
+        return agent_run._render_log(payload, width=width, height=height)
+
+    def test_cursor_past_new_right_edge_keeps_drawing_on_screen(self):
+        """A cursor left beyond the new width would otherwise write into
+        columns _serialize_screen never emits, silently dropping output."""
+        rendered = agent_run._render_log(
+            b"1234567890X\r\n", width=10, height=4,
+            resizes=[{"offset": 10, "cols": 5, "rows": 4}],
+        )
+        assert rendered == self._render_at(5, 4, b"12345\r\nX\r\n")
+
+    def test_cursor_below_new_bottom_keeps_drawing_on_screen(self):
+        head = b"".join(f"line{i}\r\n".encode() for i in range(8))
+        rendered = agent_run._render_log(
+            head + b"AFTER\r\n", width=20, height=10,
+            resizes=[{"offset": len(head), "cols": 20, "rows": 3}],
+        )
+        assert "AFTER" in rendered
+
+    def test_growing_does_not_move_a_cursor_already_in_range(self):
+        rendered = agent_run._render_log(
+            b"abcDEF\r\n", width=10, height=4,
+            resizes=[{"offset": 3, "cols": 40, "rows": 12}],
+        )
+        assert rendered == "abcDEF\n"
+
+    def test_pending_wrap_survives_a_resize(self):
+        """cursor.x == columns is DECAWM's pending-wrap state, not an
+        out-of-range cursor, so clamping must not pull it back a column."""
+        pyte = pytest.importorskip("pyte")
+        screen = agent_run._new_pyte_screen(pyte, 5, 4, 2048)
+        agent_run._feed_pyte(pyte.ByteStream(screen), b"12345")
+        assert screen.cursor.x == screen.columns
+        agent_run._resize_screen(screen, 5, 4)
+        assert screen.cursor.x == screen.columns
+
+    def test_height_shrink_drops_clipped_rows_rather_than_scrolling_them(self):
+        """Documents pyte's model, which a terminal does not share: rows
+        clipped by a height reduction are deleted, not moved into
+        history.top, so replay across a shrink loses them."""
+        head = b"".join(f"line{i}\r\n".encode() for i in range(8))
+        rendered = agent_run._render_log(
+            head + b"AFTER\r\n", width=20, height=10,
+            resizes=[{"offset": len(head), "cols": 20, "rows": 3}],
+        )
+        assert "line0" not in rendered
+        assert rendered != self._render_at(20, 3, head + b"AFTER\r\n")
+
+
+class TestResizeTimelineCoalescing:
+    def test_records_sharing_an_offset_coalesce_to_the_last(self):
+        """TIOCSWINSZ is last-writer-wins, and several resizes can be applied
+        with no log output between them (attach startup then detach restore,
+        two clients, a drag burst)."""
+        timeline = agent_run._validate_resize_timeline(
+            [{"offset": 0, "cols": 5, "rows": 5},
+             {"offset": 0, "cols": 20, "rows": 5}], 30,
+        )
+        assert timeline == [(0, 20, 5)]
+
+    def test_a_coalesced_record_still_rejects_an_earlier_offset(self):
+        timeline = agent_run._validate_resize_timeline(
+            [{"offset": 10, "cols": 5, "rows": 5},
+             {"offset": 3, "cols": 20, "rows": 5}], 30,
+        )
+        assert timeline == [(10, 5, 5)]
+
+    def test_an_invalid_record_does_not_replace_a_valid_one_at_the_offset(self):
+        timeline = agent_run._validate_resize_timeline(
+            [{"offset": 4, "cols": 8, "rows": 6},
+             {"offset": 4, "cols": 0, "rows": 6}], 30,
+        )
+        assert timeline == [(4, 8, 6)]
+
+
+class TestStitchedHistory:
+    """Stitched mode samples the whole screen during replay to recover content a
+    repainting TUI overwrites before it can scroll into pyte's scrollback."""
+
+    # A TUI: enters the alternate screen, then repaints in place with absolute
+    # cursor moves. Nothing ever scrolls, so pyte's history stays empty.
+    @staticmethod
+    def _repainting_tui(frames):
+        out = [b"\x1b[?1049h"]
+        for frame in frames:
+            out.append(b"\x1b[2J\x1b[1;1H" + frame.encode())
+        return b"".join(out)
+
+    def test_recovers_frames_a_repainting_tui_overwrote(self):
+        """Sampling recovers frames the viewport lost, but not every frame: one
+        repainted and overwritten entirely between two samples is unrecoverable,
+        so this asserts the gain rather than any particular frame."""
+        raw = self._repainting_tui([f"frame {i}" for i in range(40)])
+        viewport = agent_run._render_log(raw)
+        stitched = agent_run._stitch_history(raw, chunk_bytes=16)
+
+        assert "frame 0" not in viewport, "the TUI overwrote it; viewport keeps the last frame"
+        assert "frame 39" in stitched, "the final frame is on screen at the last boundary"
+
+        recovered = sum(f"frame {i}" in stitched for i in range(40))
+        assert recovered > sum(f"frame {i}" in viewport for i in range(40))
+        assert recovered >= 5, f"only {recovered}/40 frames recovered"
+
+    def test_a_frame_overwritten_between_samples_is_unrecoverable(self):
+        """The bound on stitching: it samples, it does not record. A sample
+        interval wider than the repaint interval misses whole frames."""
+        raw = self._repainting_tui([f"frame {i}" for i in range(40)])
+        coarse = agent_run._stitch_history(raw, chunk_bytes=4096)
+        fine = agent_run._stitch_history(raw, chunk_bytes=16)
+        assert sum(f"frame {i}" in coarse for i in range(40)) < sum(
+            f"frame {i}" in fine for i in range(40)
+        )
+
+    def test_is_a_superset_of_the_viewport_render(self):
+        """Sampling covers scrollback and viewport together. Sampling the
+        viewport alone would drop every line that scrolled away between two
+        samples, which on line-oriented output is most of them."""
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(400))
+        viewport = {l for l in agent_run._render_log(raw).splitlines() if l.strip()}
+        stitched = {l for l in agent_run._stitch_history(raw, chunk_bytes=256).splitlines() if l.strip()}
+        assert viewport <= stitched
+
+    def test_repeats_within_one_screen_survive(self):
+        """Deduplication removes the overlap between consecutive samples, not
+        every recurrence: a line printed several times in one screenful is real
+        output, not a resampled row."""
+        raw = b"".join(b"====\r\n" for _ in range(5))
+        stitched = agent_run._stitch_history(raw, chunk_bytes=4096)
+        assert stitched.count("====") == 5
+
+    def test_overlap_between_consecutive_samples_is_removed(self):
+        """Each sample yields the whole screen, so a line still present in the
+        previous sample has already been emitted."""
+        raw = b"only line\r\n" + b"\x00" * 40_000
+        stitched = agent_run._stitch_history(raw, chunk_bytes=1024)
+        assert stitched.count("only line") == 1
+
+    def test_line_cap_truncates_and_says_so(self, monkeypatch):
+        monkeypatch.setattr(agent_run, "_STITCH_MAX_LINES", 5)
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(200))
+        stitched = agent_run._stitch_history(raw, chunk_bytes=64)
+        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
+        body = stitched[: -len(agent_run._STITCH_TRUNCATED_MARKER)]
+        assert len([l for l in body.splitlines() if l.strip()]) <= 5
+
+    def test_byte_cap_truncates_and_says_so(self, monkeypatch):
+        monkeypatch.setattr(agent_run, "_STITCH_MAX_BYTES", 64)
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(200))
+        stitched = agent_run._stitch_history(raw, chunk_bytes=64)
+        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
+
+    def test_applies_the_resize_timeline(self):
+        """A sample boundary and a resize offset are independent, so replay
+        splits at the union of both."""
+        raw = b"X" * 30 + b"\r\n"
+        stitched = agent_run._stitch_history(
+            raw, width=40, height=4, chunk_bytes=8,
+            resizes=[{"offset": 10, "cols": 10, "rows": 4}],
+        )
+        assert stitched, "a resize inside a sampled span must not abort the render"
+        assert max(len(l) for l in stitched.splitlines()) <= 10
+
+    def test_falls_back_when_pyte_raises(self, monkeypatch):
+        """A convenience artifact must never take the caller down."""
+        monkeypatch.setattr(
+            agent_run, "_feed_pyte",
+            lambda *_a, **_kw: (_ for _ in ()).throw(RecursionError("pathological")),
+        )
+        stitched = agent_run._stitch_history(b"hello\r\n", chunk_bytes=8)
+        assert "hello" in stitched
+
+    def test_viewport_remains_the_default_render(self, moon_log_bytes):
+        """Stitched mode is opt-in; the default path must be byte-identical."""
+        assert agent_run._render_log(moon_log_bytes) == agent_run._render_log(moon_log_bytes)
+
+    @pytest.mark.parametrize("chunk", [16, 64, 1024, 8192])
+    def test_stitching_recovers_a_long_run_of_identical_lines(self, chunk):
+        """Viewport is lossy for repeated output; stitching is not.
+
+        ``_serialize_screen`` drops a line equal to its predecessor, so 200
+        identical lines serialize as one. Counting occurrences per sample
+        instead of testing membership recovers every print, independently of
+        where the sample boundaries fall.
+        """
+        printed = 200
+        raw = b"".join(b"====\r\n" for _ in range(printed))
+
+        assert agent_run._render_log(raw).count("====") == 1
+        assert agent_run._stitch_history(raw, chunk_bytes=chunk).count("====") == printed
+
+    def test_stitching_may_add_partial_repaint_rows(self):
+        """The cost of sampling: a boundary landing mid-repaint keeps a partly
+        drawn row, so a stitched render can exceed the viewport line count on
+        output the viewport already captured in full."""
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(200))
+        viewport = [l for l in agent_run._render_log(raw).splitlines() if l.strip()]
+        stitched = [l for l in agent_run._stitch_history(raw, chunk_bytes=64).splitlines() if l.strip()]
+
+        assert set(viewport) <= set(stitched)
+        assert len(stitched) >= len(viewport)
+
+
+class TestStitchedHistoryBounds:
+    """The properties an adversarial review broke: multiplicity across sample
+    boundaries, the unit the byte cap is enforced in, the reach of the pyte
+    fallback, and the interval's domain."""
+
+    def test_a_repeat_printed_across_a_boundary_is_kept(self):
+        """Deduplication compares occurrence counts, not membership: a row
+        printed again while an identical row is still on screen is new output."""
+        raw = b"X\r\n12345" + b"\r\nX\r\n"
+        stitched = agent_run._stitch_history(raw, width=20, height=5, chunk_bytes=8)
+        assert stitched.splitlines().count("X") == 2
+
+    def test_a_row_static_across_many_samples_is_emitted_once(self):
+        raw = b"only line\r\n" + b"\x00" * 40_000
+        assert agent_run._stitch_history(raw, chunk_bytes=1024).count("only line") == 1
+
+    def test_the_byte_cap_counts_utf8_bytes_not_code_points(self, monkeypatch):
+        """A code-point budget lets non-ASCII output reach ~4x the named cap."""
+        monkeypatch.setattr(agent_run, "_STITCH_MAX_BYTES", 8)
+        raw = "".join(f"{i}\U0001f600\r\n" for i in range(20)).encode()
+        stitched = agent_run._stitch_history(raw, chunk_bytes=16)
+        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
+        body = stitched[: -len(agent_run._STITCH_TRUNCATED_MARKER)]
+        assert len(body.encode("utf-8")) <= 8
+
+    def test_the_byte_cap_admits_no_line_that_would_exceed_it(self, monkeypatch):
+        """The cap is checked against the prospective line, so the body cannot
+        overshoot by a full row."""
+        monkeypatch.setattr(agent_run, "_STITCH_MAX_BYTES", 20)
+        raw = b"".join(b"a" * 30 + b"\r\n" for _ in range(10))
+        stitched = agent_run._stitch_history(raw, chunk_bytes=32)
+        body = stitched[: -len(agent_run._STITCH_TRUNCATED_MARKER)]
+        assert len(body.encode("utf-8")) <= 20
+
+    def test_failure_constructing_the_screen_falls_back(self, monkeypatch):
+        """Screen and stream construction sit inside the fallback: a pyte
+        failure there must degrade like a feed failure, not propagate."""
+        monkeypatch.setattr(
+            agent_run, "_new_pyte_screen",
+            lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("construction failed")),
+        )
+        assert "hello" in agent_run._stitch_history(b"hello\r\n", chunk_bytes=8)
+
+    @pytest.mark.parametrize("chunk", [0, -1, True, 1.5, "8192"])
+    def test_a_nonpositive_or_nonint_interval_is_rejected(self, chunk):
+        """range() accepts 0 and negatives via a max() guard, silently sampling
+        every byte and making the boundary set O(len(raw))."""
+        with pytest.raises(ValueError):
+            agent_run._stitch_history(b"abc", chunk_bytes=chunk)
+
+    def test_truncated_output_says_so(self, monkeypatch):
+        """Truncation stops replay before the final screen, so the result omits
+        the tail the viewport render ends with. The marker is the only signal a
+        reader gets, and it must always be present."""
+        monkeypatch.setattr(agent_run, "_STITCH_MAX_LINES", 50)
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(400))
+        stitched = agent_run._stitch_history(raw, chunk_bytes=256)
+        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
+        viewport = {l for l in agent_run._render_log(raw).splitlines() if l.strip()}
+        assert viewport - set(stitched.splitlines()), (
+            "this test documents the loss; if truncation ever preserves the "
+            "final viewport, tighten the docstring instead of deleting this"
+        )
+
+    def test_contains_every_nonempty_viewport_line_when_untruncated(self):
+        """The superset claim holds for nonempty lines: empty rows are dropped,
+        which is why the docstring says nonempty."""
+        raw = b"top\r\n\r\nbottom\r\n"
+        viewport = {l for l in agent_run._render_log(raw).splitlines() if l.strip()}
+        stitched = set(agent_run._stitch_history(raw, chunk_bytes=4096).splitlines())
+        assert viewport <= stitched
+
+
+class TestSerializeScreenExtraction:
+    """_screen_lines was extracted from _serialize_screen and is now shared with
+    stitching. _serialize_screen feeds log.clean and the incremental echo
+    daemon, so a behaviour change there corrupts cached transcripts."""
+
+    @staticmethod
+    def _reference(screen):
+        """The algorithm as it stood before the extraction."""
+        rows = []
+        for entry in screen.history.top:
+            rows.append(
+                ("".join(entry[col].data for col in sorted(entry)) if entry else "").rstrip()
+            )
+        for row in screen.display:
+            rows.append(row.rstrip())
+        deduped = []
+        for line in rows:
+            if not deduped or deduped[-1] != line:
+                deduped.append(line)
+        while deduped and not deduped[-1]:
+            deduped.pop()
+        return "\n".join(deduped) + "\n"
+
+    @pytest.mark.parametrize("raw", [
+        b"",
+        b"plain\r\n",
+        b"   \r\n\r\n  x  \r\n",
+        "wide \u5e7f\u5473 chars\r\n".encode(),
+        "combining a\u0301e\u0301\r\n".encode(),
+        b"".join(b"scroll %d\r\n" % i for i in range(300)),
+        b"\x1b[?1049h\x1b[2J\x1b[1;1Hframe\r\n",
+    ])
+    def test_matches_the_pre_extraction_algorithm(self, raw):
+        pyte = pytest.importorskip("pyte")
+        screen = agent_run._new_pyte_screen(pyte, 40, 8, 64)
+        agent_run._feed_pyte(pyte.ByteStream(screen), raw)
+        assert agent_run._serialize_screen(screen) == self._reference(screen)
