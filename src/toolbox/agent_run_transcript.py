@@ -216,7 +216,7 @@ def _opencode_entry(part: dict, message: dict) -> Optional[TranscriptEntry]:
 
     if ptype == "text":
         text = part.get("text")
-        if not isinstance(text, str) or not text:
+        if not isinstance(text, str) or not text.strip():
             return None
         entry_type = "assistant" if role == "assistant" else "user"
         return TranscriptEntry(
@@ -224,7 +224,7 @@ def _opencode_entry(part: dict, message: dict) -> Optional[TranscriptEntry]:
         )
     if ptype == "reasoning":
         text = part.get("text")
-        if not isinstance(text, str) or not text:
+        if not isinstance(text, str) or not text.strip():
             return None
         return TranscriptEntry(
             type="reasoning", harness="opencode", time=_iso_from_epoch_ms(message_time), text=text
@@ -495,7 +495,7 @@ def _read_codex(session_id: str) -> "tuple[list[TranscriptEntry], int]":
             if role not in ("user", "assistant"):
                 continue  # "developer" role: injected environment/permissions text, not conversation
             text = _codex_message_text(payload.get("content"))
-            if text:
+            if text and not _is_codex_injected_context(text):
                 entries.append(TranscriptEntry(type=role, harness="codex", time=timestamp, text=text))
         elif ptype == "reasoning":
             text = _codex_reasoning_text(payload.get("summary"))
@@ -548,10 +548,20 @@ def _read_codex(session_id: str) -> "tuple[list[TranscriptEntry], int]":
 # Rendering
 # ---------------------------------------------------------------------------
 
+# Wrapper elements codex prepends to a session's first user turn, carrying cwd,
+# shell and permission profile rather than anything the user typed.
+_CODEX_INJECTED_CONTEXT_TAGS = ("<environment_context>", "<user_instructions>")
+
+
+def _is_codex_injected_context(text: str) -> bool:
+    """True when a codex user message is harness-injected context, not input."""
+    return text.lstrip().startswith(_CODEX_INJECTED_CONTEXT_TAGS)
+
+
 def _fallback_tool_summary(tool_name: Optional[str], tool_input: Optional[dict]) -> Optional[str]:
     if not tool_input:
         return None
-    for key in ("command", "cmd", "filePath", "path", "pattern"):
+    for key in ("command", "cmd", "filePath", "file_path", "path", "pattern"):
         value = tool_input.get(key)
         if isinstance(value, str):
             return value
