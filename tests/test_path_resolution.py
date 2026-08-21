@@ -30,12 +30,8 @@ class TestRunNameSafety:
         ("command", "args"),
         [
             (agent_run.cmd_status, argparse.Namespace(name="..")),
-            (agent_run.cmd_logs, argparse.Namespace(name="..", tail=1, head=None)),
+            (agent_run.cmd_logs, argparse.Namespace(name="..", tail=1, head=None, plain=False, clean=False)),
             (agent_run.cmd_tail, argparse.Namespace(name="..")),
-            (
-                agent_run.cmd_clean,
-                argparse.Namespace(name="..", out=None, width=80, height=24, history=0, tail=None, head=None),
-            ),
             (
                 agent_run.cmd_steer,
                 argparse.Namespace(name="..", message=["x"], raw=False, esc=False),
@@ -48,8 +44,6 @@ class TestRunNameSafety:
                     command=["true"],
                     interactive=False,
                     prompt_file=None,
-                    echo=False,
-                    echo_interval=2.0,
                 ),
             ),
         ],

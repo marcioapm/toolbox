@@ -201,7 +201,7 @@ class TestParseLaunchArgvHarness:
 
     def test_all_harness_flags_combined(self):
         r = _parse([
-            "-i", "--echo", "--harness", "opencode",
+            "-i", "--harness", "opencode",
             "--model", "sonnet-5", "--agent-mode", "build",
             "--prompt", "do the thing",
             "--harness-arg", "--auto",
@@ -209,7 +209,6 @@ class TestParseLaunchArgvHarness:
             "myrun",
         ])
         assert r.interactive is True
-        assert r.echo is True
         assert r.harness == "opencode"
         assert r.model == "sonnet-5"
         assert r.agent_mode == "build"
@@ -273,7 +272,7 @@ class TestParseLaunchArgvHarness:
         assert r.command == ["echo", "hello"]
 
     def test_raw_mode_with_all_old_flags(self):
-        r = _parse(["-i", "--echo", "-f", "/p.md", "--idle-timeout", "60", "myrun", "--", "cmd"])
+        r = _parse(["-i", "-f", "/p.md", "--idle-timeout", "60", "myrun", "--", "cmd"])
         assert r.harness is None
         assert r.interactive is True
         assert r.prompt_file == "/p.md"
@@ -993,8 +992,6 @@ def _launch_and_wait(
         command=[],
         interactive=interactive,
         prompt_file=prompt_file,
-        echo=False,
-        echo_interval=2.0,
         submit_mode=None,
         idle_timeout=None,
         harness=harness,
@@ -1157,8 +1154,6 @@ class TestManagedClaudeLaunch:
             command=[str(fake_echo)],
             interactive=False,
             prompt_file=None,
-            echo=False,
-            echo_interval=2.0,
             submit_mode=None,
             idle_timeout=None,
         )
@@ -1533,8 +1528,6 @@ class TestManagedCodexInteractiveAppServer:
             command=[],
             interactive=True,
             prompt_file=None,
-            echo=False,
-            echo_interval=2.0,
             submit_mode=None,
             idle_timeout=None,
             harness="codex",
@@ -1575,7 +1568,7 @@ class TestManagedCodexInteractiveAppServer:
         name = "codex-iact-log"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
-            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            submit_mode=None, idle_timeout=None,
             harness="codex", prompt="say hi", model=None, agent_mode=None,
             harness_args=[],
         )
@@ -1607,7 +1600,7 @@ class TestManagedCodexInteractiveAppServer:
         name = "codex-iact-steer"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
-            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            submit_mode=None, idle_timeout=None,
             harness="codex", prompt="initial prompt", model=None, agent_mode=None,
             harness_args=[],
         )
@@ -1644,7 +1637,7 @@ class TestManagedCodexInteractiveAppServer:
         name = "codex-iact-missing"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
-            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            submit_mode=None, idle_timeout=None,
             harness="codex", prompt="hi", model=None, agent_mode=None,
             harness_args=[],
         )
@@ -1944,8 +1937,6 @@ class TestRunJson:
             command=[str(fake_echo)],
             interactive=False,
             prompt_file=None,
-            echo=False,
-            echo_interval=2.0,
             submit_mode=None,
             idle_timeout=None,
         )
@@ -2596,7 +2587,7 @@ class TestAppServerTeardown:
 
         ns = argparse.Namespace(
             name=name, command=[], interactive=False, prompt_file=None,
-            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            submit_mode=None, idle_timeout=None,
             harness="codex", prompt="work hard", model=None, agent_mode=None,
             harness_args=[],
         )
@@ -2646,7 +2637,7 @@ class TestAppServerTeardown:
 
         ns = argparse.Namespace(
             name=name, command=[], interactive=False, prompt_file=None,
-            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            submit_mode=None, idle_timeout=None,
             harness="codex", prompt="work hard", model=None, agent_mode=None,
             harness_args=[],
         )
@@ -2831,7 +2822,7 @@ class TestCodexRpcEdgeCases:
         name = "null-result-test"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
-            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            submit_mode=None, idle_timeout=None,
             harness="codex", prompt="test prompt", model=None, agent_mode=None,
             harness_args=[],
         )
@@ -2870,7 +2861,7 @@ class TestCodexRpcEdgeCases:
         name = "steer-error-test"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
-            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            submit_mode=None, idle_timeout=None,
             harness="codex", prompt="initial", model=None, agent_mode=None,
             harness_args=[],
         )
@@ -2915,7 +2906,7 @@ class TestCodexRpcEdgeCases:
         name = "clear-active-tid-test"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
-            echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+            submit_mode=None, idle_timeout=None,
             harness="codex", prompt="first", model=None, agent_mode=None,
             harness_args=[],
         )

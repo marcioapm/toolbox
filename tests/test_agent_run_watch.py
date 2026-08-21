@@ -1872,8 +1872,6 @@ def _launch(name: str) -> None:
         command=["true"],
         interactive=False,
         prompt_file=None,
-        echo=False,
-        echo_interval=2.0,
         submit_mode=None,
         idle_timeout=None,
         name=name,

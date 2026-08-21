@@ -511,7 +511,7 @@ def test_runner_holds_lock_fd_until_ready_is_called(tmp_path):
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork signal inheritance")
 @pytest.mark.parametrize("forked_by", ["keeper", "pty", "prompt_helper"])
 def test_all_helper_fork_sites_reset_handler_before_unblocking(forked_by, monkeypatch):
-    """R4 was originally fixed only for echo_pid/agent_pid; keeper_pid,
+    """R4 was originally fixed only for agent_pid; keeper_pid,
     pty_pid (pty.fork), and the prompt helper fork must reset the inherited
     runner handler while still inside the blocked-signal window too, or a
     pending SIGTERM delivered right as the child exits the block re-enters
@@ -564,7 +564,7 @@ def test_source_uses_reset_before_unblock_pattern_at_every_fork_site():
 
     source = inspect.getsource(agent_run)
     # Five fork sites carry a local pid/child variable that publishes into
-    # _AUX_PID_FIELDS: echo_pid, agent_pid, keeper_pid, pty_pid, prompt_pid.
+    # _AUX_PID_FIELDS: agent_pid, keeper_pid, pty_pid, prompt_pid, watchdog_pid.
     for field in agent_run._AUX_PID_FIELDS:
         assert f'"{field}"' in source or f"'{field}'" in source
 
@@ -839,267 +839,6 @@ def test_env_split_string_direct_command_and_explicit_override_preserved(isolate
 
 
 # ---------------------------------------------------------------------------
-# R8 — final renderer lifecycle bounded and tracked; echo loop resource-capped
-# ---------------------------------------------------------------------------
-
-
-def test_bounded_final_render_reaps_within_timeout_via_wnohang_polling(tmp_path, monkeypatch):
-    """After the render deadline, the reap must be bounded WNOHANG polling,
-    never an unbounded blocking waitpid that could hang the runner forever
-    on an uninterruptible renderer."""
-    log_dir = tmp_path / "log"
-    log_dir.mkdir()
-    (log_dir / "log").write_bytes(b"hello\n")
-
-    monkeypatch.setattr(agent_run, "FINAL_RENDER_TIMEOUT_SECONDS", 0.2)
-    monkeypatch.setattr(agent_run, "FINAL_RENDER_REAP_TIMEOUT_SECONDS", 0.3)
-
-    def slow_render(_log_dir):
-        time.sleep(5)
-
-    monkeypatch.setattr(agent_run, "_render_log_to_clean", slow_render)
-
-    start = time.monotonic()
-    error = agent_run._bounded_final_render(log_dir)
-    elapsed = time.monotonic() - start
-
-    assert error is not None
-    assert elapsed < 2.0, "reap must be bounded, not an unbounded blocking wait"
-
-
-def test_bounded_final_render_respects_oversize_limit(tmp_path, monkeypatch):
-    log_dir = tmp_path / "log"
-    log_dir.mkdir()
-    (log_dir / "log").write_bytes(b"x")
-    monkeypatch.setattr(agent_run, "MAX_FINAL_RENDER_BYTES", 0)
-
-    error = agent_run._bounded_final_render(log_dir)
-
-    assert error is not None
-    assert "limit" in error
-
-
-def test_bounded_final_render_tracks_pid_via_register_callback(tmp_path):
-    log_dir = tmp_path / "log"
-    log_dir.mkdir()
-    (log_dir / "log").write_bytes(b"quick\n")
-    seen = []
-
-    def register(pid):
-        seen.append(pid)
-
-    error = agent_run._bounded_final_render(log_dir, register=register)
-
-    assert error is None or isinstance(error, str)
-    # First call is the live child pid, final call clears it back to None.
-    assert seen[0] is not None
-    assert seen[-1] is None
-
-
-def test_bounded_final_render_child_resets_inherited_signal_handler(monkeypatch, tmp_path):
-    """The renderer fork must go through the same reset-before-unblock
-    protocol as every other helper fork (R4 applies here too)."""
-    log_dir = tmp_path / "log"
-    log_dir.mkdir()
-    (log_dir / "log").write_bytes(b"x\n")
-
-    read_fd, write_fd = os.pipe()
-
-    def inherited_handler(_signum, _frame):
-        os.write(write_fd, b"inherited")
-
-    previous = signal.signal(signal.SIGTERM, inherited_handler)
-
-    def render_and_signal_self(_log_dir):
-        os.kill(os.getpid(), signal.SIGTERM)
-        time.sleep(0.05)
-
-    monkeypatch.setattr(agent_run, "_render_log_to_clean", render_and_signal_self)
-    try:
-        agent_run._bounded_final_render(log_dir)
-        os.close(write_fd)
-        write_fd = -1
-        assert os.read(read_fd, 4096) == b""
-    finally:
-        signal.signal(signal.SIGTERM, previous)
-        os.close(read_fd)
-        if write_fd >= 0:
-            os.close(write_fd)
-
-
-def test_on_signal_tears_down_untracked_render_pid(tmp_path):
-    """A signal arriving to the runner while the final renderer is running
-    must reap that renderer too, via _teardown_children's extra_pids -- this
-    covers the normal (runner-alive) signal path, which must keep working
-    the same way even though render_pid is now also published to a state
-    file for the wedged-runner case (see
-    test_force_kill_reaps_wedged_echo_render_child)."""
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-
-    pid = os.fork()
-    if pid == 0:
-        time.sleep(5)
-        os._exit(0)
-
-    try:
-        agent_run._teardown_children(state_dir, grace=0.5, extra_pids=[pid])
-        assert _wait_until(lambda: _process_gone(pid), timeout=3)
-    finally:
-        if not _process_gone(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-            except (ProcessLookupError, ChildProcessError):
-                pass
-
-
-def test_force_kill_reaps_wedged_echo_render_child(tmp_path, monkeypatch):
-    """Real-process reproduction of N1 (final-independent-rereview #2): a
-    `--echo` final-render child must not survive as an unbounded orphan when
-    the runner itself is wedged and `agent-run kill <name> KILL` falls
-    through to `_force_kill`'s external escalation path.
-
-    Forks a real runner via a direct `_runner()` call (same pattern as the
-    other real-process tests in this file), lets it run a real one-shot
-    command to completion, then hangs `_render_log_to_clean` so the
-    final-render child is alive and its pid published (`render_pid` state
-    file) when the runner is `SIGSTOP`'d -- simulating exactly the
-    wedged-supervisor scenario `_force_kill`'s escalation path exists to
-    handle (the runner can no longer run its own SIGTERM handler to reap
-    the render child via `extra_pids`). `_force_kill` must discover the
-    render child through the published `render_pid` field, verify its
-    parentage, and SIGKILL it -- not leave it reparented to init.
-    """
-    state_dir = tmp_path / "state"
-    log_dir = tmp_path / "log"
-    state_dir.mkdir()
-    log_dir.mkdir()
-    (log_dir / "log").touch()
-
-    def hang_render(_log_dir):
-        time.sleep(30)
-
-    monkeypatch.setattr(agent_run, "_render_log_to_clean", hang_render)
-    monkeypatch.setattr(agent_run, "KILL_ESCALATION_TIMEOUT_SECONDS", 0.3)
-    monkeypatch.setattr(agent_run, "KILL_POLL_INTERVAL_SECONDS", 0.05)
-    monkeypatch.setattr(agent_run, "KILL_CHILD_REAP_TIMEOUT_SECONDS", 2.0)
-
-    ready_read, ready_write = os.pipe()
-    runner_pid = os.fork()
-    if runner_pid == 0:
-        os.close(ready_read)
-        agent_run._runner(
-            state_dir,
-            log_dir,
-            [sys.executable, "-c", "print('hi')"],
-            False,
-            ready_write,
-            echo=True,
-            echo_interval=60.0,
-        )
-        os._exit(99)  # unreachable -- _runner always os._exit()s itself
-
-    os.close(ready_write)
-    render_pid = None
-    runner_reaped = False
-    try:
-        assert _wait_until(
-            lambda: (state_dir / "render_pid").exists(), timeout=10
-        ), "render child was never forked/registered via render_pid"
-        render_pid = int((state_dir / "render_pid").read_text().strip())
-        assert agent_run._pid_alive(render_pid)
-        assert agent_run._pid_parent_pid(render_pid) == runner_pid, (
-            "render child's live parent must be the runner before we rely "
-            "on _force_kill's own parentage re-verification"
-        )
-
-        # Wedge the runner mid-render: it can no longer run its own SIGTERM
-        # handler, exactly the scenario _force_kill's escalation exists for.
-        os.kill(runner_pid, signal.SIGSTOP)
-        expected_identity = (state_dir / "process_identity").read_text().strip()
-        agent_run._force_kill(
-            "render-wedge", state_dir, runner_pid, expected_identity
-        )
-        # Best-effort: if force_kill somehow left the runner merely stopped
-        # rather than dead, don't leave it permanently suspended.
-        try:
-            os.kill(runner_pid, signal.SIGCONT)
-        except ProcessLookupError:
-            pass
-
-        # We are runner_pid's real parent (a direct os.fork(), no
-        # setsid/double-fork detach), so a dead-but-unreaped runner is a
-        # zombie -- os.kill(pid, 0) would still succeed against a zombie's
-        # pid slot, so confirm death by reaping it rather than polling
-        # liveness.
-        reaped_pid, _status = os.waitpid(runner_pid, 0)
-        assert reaped_pid == runner_pid
-        runner_reaped = True
-
-        # render_pid's parent was the runner, not this test process, so the
-        # kernel reparents (and eventually reaps) it -- liveness polling is
-        # correct here.
-        assert _wait_until(
-            lambda: _process_gone(render_pid), timeout=5
-        ), "render child survived force_kill as an orphan"
-
-        # The agent itself (`print('hi')`) already finished and _finalize()
-        # published terminal state *before* the runner entered the final
-        # render step -- by design (a pathological renderer must never leave
-        # a dead agent reported as starting/running). So the pre-existing
-        # terminal state here is legitimately "done", not "failed"; what
-        # matters for N1 is that it stayed terminal (force_kill must never
-        # regress a terminal status back to a false "running") and that the
-        # render child, discovered only via the published render_pid field,
-        # did not survive as an orphan.
-        status = (state_dir / "status").read_text().strip()
-        assert status in {"done", "failed"}, f"expected terminal state, got {status!r}"
-        assert (state_dir / "exit_code").exists()
-        assert (state_dir / "ended_at").exists()
-    finally:
-        os.close(ready_read)
-        if not runner_reaped:
-            try:
-                os.kill(runner_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(runner_pid, 0)
-            except ChildProcessError:
-                pass
-        if render_pid is not None and not _process_gone(render_pid):
-            try:
-                os.kill(render_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-
-
-def test_echo_loop_processes_capped_deltas_without_publishing_partial_output(tmp_path, monkeypatch):
-    """A cap limits one parse step while later ticks retain a complete prefix."""
-    log_dir = tmp_path / "log"
-    log_dir.mkdir()
-    log = log_dir / "log"
-    log.write_bytes(b"x" * 10)
-
-    monkeypatch.setattr(agent_run, "ECHO_LOOP_MAX_RENDER_BYTES", 5)
-
-    pid = os.fork()
-    if pid == 0:
-        agent_run._echo_loop(log_dir, 0.05)
-        os._exit(0)
-    time.sleep(0.3)
-    os.kill(pid, signal.SIGKILL)
-    os.waitpid(pid, 0)
-
-    assert (log_dir / "log.clean").exists()
-    assert (log_dir / "log.clean").read_text() == agent_run._render_log(log.read_bytes())
-    metadata = json.loads((log_dir / "log.clean.meta.json").read_text())
-    assert metadata["complete"] is True
-    assert metadata["offset"] == log.stat().st_size
-
-
-# ---------------------------------------------------------------------------
 # R9 — parent-side pre-runner setup failures finalize cleanly
 # ---------------------------------------------------------------------------
 
@@ -1118,8 +857,6 @@ def test_mkfifo_failure_before_detached_runner_publishes_failed_state(
         command=[sys.executable, "-c", "pass"],
         interactive=True,
         prompt_file=None,
-        echo=False,
-        echo_interval=2.0,
     )
 
     with pytest.raises(SystemExit, match="forced mkfifo failure"):
@@ -1147,8 +884,6 @@ def test_pipe_failure_before_starting_cleans_up_fifo_and_does_not_strand_state(
         command=[sys.executable, "-c", "pass"],
         interactive=True,
         prompt_file=None,
-        echo=False,
-        echo_interval=2.0,
     )
 
     with pytest.raises(SystemExit, match="forced pipe failure"):
@@ -1180,8 +915,6 @@ def test_first_fork_failure_after_starting_publishes_terminal_failed_state(
         command=[sys.executable, "-c", "pass"],
         interactive=False,
         prompt_file=None,
-        echo=False,
-        echo_interval=2.0,
     )
 
     with pytest.raises(SystemExit, match="forced fork failure"):
@@ -1261,8 +994,6 @@ def test_real_oneshot_publication_failure_does_not_orphan_child(isolated_runs_ro
         command=[sys.executable, "-c", "import time; time.sleep(30)"],
         interactive=False,
         prompt_file=None,
-        echo=False,
-        echo_interval=2.0,
     )
 
     # cmd_launch itself may raise via the runner's crash-before-ready path,

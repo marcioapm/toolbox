@@ -2579,8 +2579,6 @@ class TestReapWorktreePublicationLock:
             command=[],
             harness=None,
             interactive=False,
-            echo=False,
-            echo_interval=2.0,
             idle_timeout=None,
             submit_mode=None,
         )

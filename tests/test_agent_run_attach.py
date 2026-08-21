@@ -400,8 +400,6 @@ def test_interactive_launch_creates_stdin_and_resize_fifos(isolated_runs_root):
         command=[sys.executable, "-c", "import time; time.sleep(30)"],
         interactive=True,
         prompt_file=None,
-        echo=False,
-        echo_interval=2.0,
         submit_mode=None,
     )
     assert agent_run.cmd_launch(args) == 0
@@ -1852,8 +1850,6 @@ def test_launch_unlinks_a_stale_fifo_before_recreating_it(
                 command=[sys.executable, "-c", "import time; time.sleep(30)"],
                 interactive=True,
                 prompt_file=None,
-                echo=False,
-                echo_interval=1.0,
                 idle_timeout=None,
                 submit_mode=None,
             )
