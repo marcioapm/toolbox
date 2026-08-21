@@ -173,9 +173,9 @@ directly (opencode: SQLite at ~/.local/share/opencode/opencode.db; claude:
 subagents/ subdirectory; codex: ~/.codex/sessions/**/rollout-*-<session_id>
 .jsonl). Managed-mode only -- a raw run (`agent-run NAME -- <cmd>`) has no
 session.json and therefore no transcript; use `logs --clean` for those.
-Every store is opened read-only. A corrupt or truncated store never aborts
-the command: unparseable records are skipped and their count is reported on
-stderr. See toolbox/agent_run_transcript.py for the reader implementations.
+Every store is opened read-only. Unparseable individual records are skipped
+and their count is reported on stderr; a missing or unusable store is an
+error. See toolbox/agent_run_transcript.py for the reader implementations.
 
 Harness hook integration. Configure these yourself; agent-run never edits a
 harness config file:
@@ -4920,15 +4920,6 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
-def _read_run_json_data(log_dir: Path) -> dict:
-    """Read run.json from log_dir, returning {} on any absence/corruption."""
-    try:
-        data = json.loads((log_dir / "run.json").read_text())
-    except (OSError, json.JSONDecodeError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def cmd_transcript(args: argparse.Namespace) -> int:
     """Print the harness's own conversation record for a managed run.
 
@@ -4958,7 +4949,11 @@ def cmd_transcript(args: argparse.Namespace) -> int:
             f"relaunch under --harness <name> for a transcript, or use 'agent-run logs {name} --clean'"
         )
 
-    cwd = _read_run_json_data(log_dir).get("cwd")
+    try:
+        run_data = json.loads((log_dir / "run.json").read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        run_data = {}
+    cwd = run_data.get("cwd") if isinstance(run_data, dict) else None
     cwd = cwd if isinstance(cwd, str) else None
     try:
         entries, skipped = transcript.read_transcript(harness, session_id, cwd)

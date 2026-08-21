@@ -1,29 +1,16 @@
 #!/usr/bin/env python3
-"""Readers for `agent-run transcript`: the harness's own conversation record.
+"""Read harness conversation stores for ``agent-run transcript``.
 
-Each managed run (``--harness claude|opencode|codex``) writes its session id
-into ``session.json`` (see ``_record_session`` in ``agent_run.py``). The
-harness itself already stores the full conversation -- user turns, assistant
-turns, tool calls with arguments and results -- in its own store, keyed by
-that session id. Reading that store directly is strictly better than
-reconstructing a transcript from the PTY log's rendered screen (see
-``_render_log``): a rendered PTY screen shows what the terminal *drew*
-(progress bars, re-wrapped paragraphs, collapsed "Click to expand" tool
-output), not what was actually said.
-
-One reader per harness, each returning a list of ``TranscriptEntry`` plus a
-count of records it could not parse. Every reader is read-only with respect
-to its store and degrades to what it can render rather than raising when a
-column or key documented here turns out to be missing -- these stores are
-maintained by the harness project, not this one, and their shape is not a
-contract this module can enforce.
+Each reader returns normalized entries plus the number of malformed records
+it skipped. Missing, unreadable, or incompatible stores raise
+``TranscriptSourceError``. Readers never modify their stores.
 """
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -71,7 +58,7 @@ class TranscriptEntry:
     text: Optional[str] = None
     tool_name: Optional[str] = None
     tool_summary: Optional[str] = None
-    tool_input: Optional[dict] = field(default=None)
+    tool_input: Optional[dict] = None
     tool_output: Optional[str] = None
     tool_status: Optional[str] = None
     subagent: Optional[str] = None
@@ -121,15 +108,9 @@ def _bound_tool_output(text: str) -> str:
     return "\n".join(kept) + "\n" + marker
 
 
-def _bound_entry_tool_output(entry: TranscriptEntry) -> TranscriptEntry:
-    if entry.tool_output:
-        entry.tool_output = _bound_tool_output(entry.tool_output)
-    return entry
-
-
 def read_transcript(
     harness: str, session_id: str, cwd: Optional[str]
-) -> "tuple[list[TranscriptEntry], int]":
+) -> tuple[list[TranscriptEntry], int]:
     """Dispatch to the reader for ``harness``. Raises ``TranscriptSourceError``
     for an unrecognised harness or a store that cannot be located/opened at
     all. Returns (entries, skipped_record_count), with every entry's
@@ -143,7 +124,8 @@ def read_transcript(
     else:
         raise TranscriptSourceError(f"unrecognised harness {harness!r} in session.json")
     for entry in entries:
-        _bound_entry_tool_output(entry)
+        if entry.tool_output:
+            entry.tool_output = _bound_tool_output(entry.tool_output)
     return entries, skipped
 
 
@@ -160,7 +142,7 @@ def _iso_from_epoch_ms(value: Any) -> Optional[str]:
 # opencode: SQLite at ~/.local/share/opencode/opencode.db
 # ---------------------------------------------------------------------------
 
-def _read_opencode(session_id: str) -> "tuple[list[TranscriptEntry], int]":
+def _read_opencode(session_id: str) -> tuple[list[TranscriptEntry], int]:
     """Read the `part`/`message` tables for one session.
 
     Opened read-only (`file:...?mode=ro`, `uri=True`): a live opencode run
@@ -176,7 +158,7 @@ def _read_opencode(session_id: str) -> "tuple[list[TranscriptEntry], int]":
     except sqlite3.OperationalError as exc:
         raise TranscriptSourceError(f"cannot open opencode session store at {OPENCODE_DB_PATH}: {exc}") from exc
 
-    entries: "list[TranscriptEntry]" = []
+    entries: list[TranscriptEntry] = []
     skipped = 0
     try:
         cursor = conn.execute(
@@ -308,25 +290,15 @@ def _claude_tool_result_text(content: Any) -> Optional[str]:
     return None
 
 
-def _read_claude_jsonl(
-    path: Path, session_id: str, subagent: Optional[str]
-) -> "tuple[list[TranscriptEntry], int]":
-    """Parse one claude project JSONL file.
-
-    ``pending`` matches a `tool_use` block to the `tool_result` block that
-    arrives in a later `user` record (claude reports tool output as a
-    synthetic follow-up user turn), so the two collapse into one
-    TranscriptEntry the same way opencode's single `tool` part does.
-    """
+def _read_jsonl_objects(path: Path) -> tuple[list[dict], int]:
     try:
-        raw_lines = path.read_text(errors="replace").splitlines()
+        lines = path.read_text(errors="replace").splitlines()
     except OSError as exc:
         raise TranscriptSourceError(f"cannot read {path}: {exc}") from exc
 
-    entries: "list[TranscriptEntry]" = []
-    pending: "dict[str, TranscriptEntry]" = {}
+    records = []
     skipped = 0
-    for line in raw_lines:
+    for line in lines:
         if not line.strip():
             continue
         try:
@@ -334,9 +306,27 @@ def _read_claude_jsonl(
         except json.JSONDecodeError:
             skipped += 1
             continue
-        if not isinstance(record, dict):
+        if isinstance(record, dict):
+            records.append(record)
+        else:
             skipped += 1
-            continue
+    return records, skipped
+
+
+def _read_claude_jsonl(
+    path: Path, session_id: str, subagent: Optional[str]
+) -> tuple[list[TranscriptEntry], int]:
+    """Parse one claude project JSONL file.
+
+    ``pending`` matches a `tool_use` block to the `tool_result` block that
+    arrives in a later `user` record (claude reports tool output as a
+    synthetic follow-up user turn), so the two collapse into one
+    TranscriptEntry the same way opencode's single `tool` part does.
+    """
+    records, skipped = _read_jsonl_objects(path)
+    entries: list[TranscriptEntry] = []
+    pending: dict[str, TranscriptEntry] = {}
+    for record in records:
         rtype = record.get("type")
         if rtype not in ("user", "assistant"):
             continue  # attachment/queue-operation/mode/permission-mode/etc: not conversation
@@ -444,7 +434,7 @@ def _codex_reasoning_text(summary: Any) -> Optional[str]:
     return text or None
 
 
-def _read_codex(session_id: str) -> "tuple[list[TranscriptEntry], int]":
+def _read_codex(session_id: str) -> tuple[list[TranscriptEntry], int]:
     """Read one codex rollout file.
 
     The reasoning `payload.summary` is near-always empty in practice --
@@ -462,25 +452,10 @@ def _read_codex(session_id: str) -> "tuple[list[TranscriptEntry], int]":
             f"no codex session transcript found for session {session_id!r} under {CODEX_SESSIONS_DIR}"
         )
     path = matches[0]
-    try:
-        raw_lines = path.read_text(errors="replace").splitlines()
-    except OSError as exc:
-        raise TranscriptSourceError(f"cannot read {path}: {exc}") from exc
-
-    entries: "list[TranscriptEntry]" = []
-    pending: "dict[str, TranscriptEntry]" = {}
-    skipped = 0
-    for line in raw_lines:
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            skipped += 1
-            continue
-        if not isinstance(record, dict):
-            skipped += 1
-            continue
+    records, skipped = _read_jsonl_objects(path)
+    entries: list[TranscriptEntry] = []
+    pending: dict[str, TranscriptEntry] = {}
+    for record in records:
         if record.get("type") != "response_item":
             continue  # session_meta/event_msg/world_state/turn_context: not conversation
         payload = record.get("payload")
@@ -538,9 +513,6 @@ def _read_codex(session_id: str) -> "tuple[list[TranscriptEntry], int]":
                 entries.append(
                     TranscriptEntry(type="tool", harness="codex", time=timestamp, tool_name=None, tool_output=output_text)
                 )
-        # other payload types observed (task_started, user_message,
-        # agent_message, token_count, task_complete) live on event_msg
-        # records, already excluded above.
     return entries, skipped
 
 
@@ -558,7 +530,7 @@ def _is_codex_injected_context(text: str) -> bool:
     return text.lstrip().startswith(_CODEX_INJECTED_CONTEXT_TAGS)
 
 
-def _fallback_tool_summary(tool_name: Optional[str], tool_input: Optional[dict]) -> Optional[str]:
+def _fallback_tool_summary(tool_input: Optional[dict]) -> Optional[str]:
     if not tool_input:
         return None
     for key in ("command", "cmd", "filePath", "file_path", "path", "pattern"):
@@ -569,11 +541,11 @@ def _fallback_tool_summary(tool_name: Optional[str], tool_input: Optional[dict])
     return rendered if len(rendered) <= 200 else rendered[:200] + "..."
 
 
-def render_text(entries: "list[TranscriptEntry]") -> str:
-    """Render entries as chronological, human- and agent-readable plain text:
+def render_text(entries: list[TranscriptEntry]) -> str:
+    """Render entries in reader order as human- and agent-readable plain text:
     who spoke, what they said, which tools ran with their arguments, and
     tool results."""
-    lines: "list[str]" = []
+    lines: list[str] = []
     for entry in entries:
         prefix = f"[{entry.time}] " if entry.time else ""
         if entry.subagent:
@@ -585,7 +557,7 @@ def render_text(entries: "list[TranscriptEntry]") -> str:
             lines.append(f"{prefix}assistant (reasoning): {entry.text or ''}")
         elif entry.type == "tool":
             name = entry.tool_name or "tool"
-            summary = entry.tool_summary or _fallback_tool_summary(entry.tool_name, entry.tool_input)
+            summary = entry.tool_summary or _fallback_tool_summary(entry.tool_input)
             header = f"{prefix}tool {name}: {summary}" if summary else f"{prefix}tool {name}"
             if entry.tool_status and entry.tool_status not in ("completed", "success"):
                 header += f" [{entry.tool_status}]"

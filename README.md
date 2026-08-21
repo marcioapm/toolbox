@@ -813,9 +813,9 @@ Every store is opened strictly read-only — a live run may hold it open, and
 **managed-mode** run (`--harness claude|opencode|codex`): a raw run
 (`agent-run NAME -- <cmd>`) has no `session.json` and therefore no
 transcript; `transcript` exits non-zero naming the two alternatives (relaunch
-under `--harness`, or use `logs --clean` on the captured PTY log). A corrupt
-or truncated store never aborts the command — unparseable records are
-skipped and their count reported on stderr. A single tool result is
+under `--harness`, or use `logs --clean` on the captured PTY log). Unparseable
+individual records are skipped and counted on stderr; a missing or unusable
+store is an error. A single tool result is
 truncated at 40 lines / 4 KiB with a marker naming how much was dropped,
 independent of `--head`/`--tail`, which slice whole entries (not bytes) using
 the same defaults as `logs`.

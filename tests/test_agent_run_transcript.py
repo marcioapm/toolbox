@@ -66,7 +66,7 @@ def _opencode_insert(
         conn.close()
 
 
-def _write_claude_jsonl(path: Path, records: list) -> None:
+def _write_jsonl(path: Path, records: list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
 
@@ -219,7 +219,7 @@ class TestClaudeReader:
         cwd = "/Users/x/proj"
         session_id = "sess-abc"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
-        _write_claude_jsonl(
+        _write_jsonl(
             path,
             [
                 {
@@ -275,7 +275,7 @@ class TestClaudeReader:
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-glob"
         path = tmp_path / "-some-other-dir" / f"{session_id}.jsonl"
-        _write_claude_jsonl(
+        _write_jsonl(
             path,
             [
                 {
@@ -299,7 +299,7 @@ class TestClaudeReader:
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-empty"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
-        _write_claude_jsonl(path, [])
+        _write_jsonl(path, [])
         entries, skipped = transcript.read_transcript("claude", session_id, "/Users/x/proj")
         assert entries == []
         assert skipped == 0
@@ -337,7 +337,7 @@ class TestClaudeReader:
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-parent"
         base = tmp_path / "-Users-x-proj"
-        _write_claude_jsonl(
+        _write_jsonl(
             base / f"{session_id}.jsonl",
             [
                 {
@@ -348,7 +348,7 @@ class TestClaudeReader:
                 }
             ],
         )
-        _write_claude_jsonl(
+        _write_jsonl(
             base / session_id / "subagents" / "agent-xyz.jsonl",
             [
                 {
@@ -367,8 +367,8 @@ class TestClaudeReader:
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-parent2"
         base = tmp_path / "-Users-x-proj"
-        _write_claude_jsonl(base / f"{session_id}.jsonl", [])
-        _write_claude_jsonl(
+        _write_jsonl(base / f"{session_id}.jsonl", [])
+        _write_jsonl(
             base / session_id / "subagents" / "agent-abc.jsonl",
             [
                 {
@@ -387,7 +387,7 @@ class TestClaudeReader:
         session_id = "sess-bigout"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
         huge = "\n".join(f"row {i}" for i in range(5000))
-        _write_claude_jsonl(
+        _write_jsonl(
             path,
             [
                 {
@@ -464,8 +464,7 @@ class TestCodexReader:
             # event_msg records duplicate response_item content and must be skipped.
             {"timestamp": "2026-08-19T00:00:04Z", "type": "event_msg", "payload": {"type": "agent_message", "message": "hi"}},
         ]
-        path.parent.mkdir(parents=True)
-        path.write_text("".join(json.dumps(r) + "\n" for r in records))
+        _write_jsonl(path, records)
 
         entries, skipped = transcript.read_transcript("codex", session_id, None)
         assert skipped == 0
@@ -491,8 +490,7 @@ class TestCodexReader:
                 "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
             },
         ]
-        path.parent.mkdir(parents=True)
-        path.write_text("".join(json.dumps(r) + "\n" for r in records))
+        _write_jsonl(path, records)
         entries, _ = transcript.read_transcript("codex", session_id, None)
         assert [e.text for e in entries] == ["hi"]
 
@@ -505,8 +503,7 @@ class TestCodexReader:
         monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
         session_id = "empty-session"
         path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
-        path.parent.mkdir(parents=True)
-        path.write_text("")
+        _write_jsonl(path, [])
         entries, skipped = transcript.read_transcript("codex", session_id, None)
         assert entries == []
         assert skipped == 0
@@ -552,8 +549,7 @@ class TestCodexReader:
                 "payload": {"type": "function_call_output", "call_id": "c1", "output": huge},
             },
         ]
-        path.parent.mkdir(parents=True)
-        path.write_text("".join(json.dumps(r) + "\n" for r in records))
+        _write_jsonl(path, records)
         entries, _ = transcript.read_transcript("codex", session_id, None)
         assert len(entries) == 1
         assert "truncated" in entries[0].tool_output
@@ -614,7 +610,7 @@ class TestCmdTranscript:
         assert "--harness" in message
 
     def test_unknown_harness_in_session_json_exits_nonzero(
-        self, isolated_runs_root, isolated_log_root, monkeypatch
+        self, isolated_runs_root, isolated_log_root
     ):
         name = "weirdharness"
         (isolated_runs_root / name).mkdir(parents=True)
@@ -647,7 +643,7 @@ class TestCmdTranscript:
         with pytest.raises(SystemExit):
             agent_run.cmd_transcript(self._args(name))
 
-    def test_renders_plain_text_and_reports_skipped_count(
+    def test_renders_plain_text(
         self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path, capsysbinary
     ):
         db = tmp_path / "opencode.db"
