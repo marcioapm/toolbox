@@ -4708,15 +4708,49 @@ _STRING_TERMINATOR = b"\x1b\\"
 
 
 def _close_unterminated_string_control(data: bytes) -> bytes:
-    """Append ST (ESC \\) to ``data`` if it ends inside an open OSC/DCS/PM/APC
-    control string, so a byte-cut string introducer cannot swallow whatever a
-    terminal reads next. Every complete control string is removed first, so an
-    introducer surviving in the remainder never reached its own terminator.
+    """Close a control string a byte cut left open, or drop a dangling
+    introducer/ESC a cut left with no evidence of its own content.
+
+    Every complete control string is removed first, so a surviving introducer
+    in the remainder never reached its own terminator. One with at least one
+    payload byte after it is known to be open -- the cut landed inside real
+    content -- and gets ST (ESC \\) appended to close it without altering
+    that content. An introducer with no payload byte after it, or a bare
+    trailing ESC, asserts nothing about what the source would have sent next;
+    appending ST there would invent an empty payload the source never wrote,
+    so both are dropped instead.
     """
     remainder = _STRING_CONTROL_TERMINATED_RE.sub(b"", data)
-    if _STRING_CONTROL_INTRODUCER_RE.search(remainder):
-        return data + _STRING_TERMINATOR
+    match = _STRING_CONTROL_INTRODUCER_RE.search(remainder)
+    if match:
+        if match.end() < len(remainder):
+            return data + _STRING_TERMINATOR
+        return data[: len(data) - (len(remainder) - match.start())]
+    if data.endswith(b"\x1b"):
+        return data[:-1]
     return data
+
+
+def _cut_with_closure(content: bytes, cap: int) -> "tuple[bytes, bool]":
+    """Cut ``content`` to at most ``cap`` bytes, accounting for a closing
+    terminator ``_close_unterminated_string_control`` may append.
+
+    A first cut at ``cap`` is closed; if that closure appended ST (ESC \\),
+    the result is ``len(_STRING_TERMINATOR)`` bytes over budget, so the cut
+    point is moved back by that many bytes and closed again -- the second
+    closure lands inside the same control string (if any) and adds the same
+    fixed-size terminator, landing exactly at or under ``cap``. Returns
+    (result, was_cut).
+    """
+    if len(content) <= cap:
+        return content, False
+    cut = content[:cap]
+    closed = _close_unterminated_string_control(cut)
+    if len(closed) > cap:
+        reserve = len(_STRING_TERMINATOR)
+        cut = content[: max(cap - reserve, 0)]
+        closed = _close_unterminated_string_control(cut)
+    return closed, True
 
 
 def _budget_bytes_lines(
@@ -4733,35 +4767,28 @@ def _budget_bytes_lines(
     for an unterminated final segment -- and LOGS_MAX_LINE_BYTES caps the
     whole segment; nothing is added.
 
-    LOGS_MAX_TOTAL_BYTES bounds every byte this function emits, including
-    synthesized newlines: a content cut leaves one byte of headroom for the
-    newline about to be appended, and reaching the total stops emission
-    before starting a line that has no headroom left, even for an empty one.
+    LOGS_MAX_TOTAL_BYTES bounds every byte this function emits: a content cut
+    leaves one byte of headroom for the synthesized newline, reaching the
+    total stops emission before starting a line with no headroom left, and
+    the per-line cap folds into the same bound via ``min(LOGS_MAX_LINE_BYTES,
+    content_room)`` so one call to ``_cut_with_closure`` accounts for both.
+    Any ST a cut needs (see ``_close_unterminated_string_control``) is billed
+    inside that same cap; it never pushes emitted bytes past either limit.
     The truncation marker the caller appends on a true return is not
-    accounted here and falls outside both caps.
-
-    A line whose content is cut gets a closing ST appended when the cut
-    left a control string open (see ``_close_unterminated_string_control``);
-    that ST is likewise outside both caps. Returns (output, truncated).
+    accounted here and falls outside both caps. Returns (output, truncated).
     """
     out_parts: "list[bytes]" = []
     total = 0
     truncated = False
     for line in lines:
-        line_cut = False
-        if len(line) > LOGS_MAX_LINE_BYTES:
-            line = line[:LOGS_MAX_LINE_BYTES]
-            line_cut = True
         remaining = LOGS_MAX_TOTAL_BYTES - total
         content_room = remaining if keep_delimiters else remaining - 1
         if content_room < 0:
             truncated = True
             break
-        if len(line) > content_room:
-            line = line[:content_room]
-            line_cut = True
-        if line_cut:
-            line = _close_unterminated_string_control(line)
+        cap = min(LOGS_MAX_LINE_BYTES, content_room)
+        line, was_cut = _cut_with_closure(line, cap)
+        if was_cut:
             truncated = True
         if keep_delimiters:
             out_parts.append(line)

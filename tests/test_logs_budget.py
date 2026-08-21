@@ -17,6 +17,7 @@ from toolbox.agent_run import (
     _close_unterminated_string_control,
     _head_bytes,
     _tail_bytes,
+    _TRUNCATION_MARKER_BYTES,
 )
 
 
@@ -97,6 +98,31 @@ class TestCloseUnterminatedStringControl:
         data = introducer + b"payload with no terminator"
         assert _close_unterminated_string_control(data) == data + b"\x1b\\"
 
+    def test_trailing_bare_esc_is_dropped_not_emitted(self):
+        # A cut landing on a lone ESC gives no evidence of what follows; ESC
+        # immediately preceding the marker's leading `[` would be read by a
+        # terminal as the start of a CSI sequence, swallowing the marker.
+        out = _close_unterminated_string_control(b"abc\x1b")
+        assert out == b"abc"
+        assert not out.endswith(b"\x1b")
+
+    @pytest.mark.parametrize("introducer", [b"\x1b]", b"\x1bP", b"\x1b^", b"\x1b_"])
+    def test_esc_with_no_introducer_byte_yet_is_dropped(self, introducer):
+        # The cut lands between ESC and its introducer byte -- e.g. after
+        # \x1b but before ], P, ^, or _. No payload byte exists yet, so
+        # appending ST would fabricate an empty control string; the whole
+        # incomplete introducer is dropped instead.
+        data = b"abc" + introducer
+        out = _close_unterminated_string_control(data)
+        assert out == b"abc"
+
+    def test_introducer_with_payload_is_closed_not_dropped(self):
+        # Contrast with the no-payload case above: once at least one payload
+        # byte follows the introducer, the string is known-open and gets
+        # ST appended rather than dropped.
+        data = b"\x1b]x"
+        assert _close_unterminated_string_control(data) == data + b"\x1b\\"
+
 
 class TestBudgetBytesLinesTotalCap:
     def test_default_mode_output_never_exceeds_total_cap(self):
@@ -141,8 +167,8 @@ class TestBudgetStrTotalCap:
 
 
 class TestTruncationInsideOscStringIsClosed:
-    """F1: a line cut inside an OSC introducer must not swallow the
-    truncation marker as OSC payload."""
+    """A line cut inside an OSC introducer must not swallow the truncation
+    marker as OSC payload."""
 
     def test_budget_bytes_lines_closes_open_osc_before_truncation_marker(self):
         line = b"\x1b]0;" + b"x" * LOGS_MAX_LINE_BYTES  # cut lands inside the OSC string
@@ -155,8 +181,6 @@ class TestTruncationInsideOscStringIsClosed:
         assert content.endswith(b"\x1b\\")
 
     def test_marker_remains_visible_after_the_appended_terminator(self):
-        from toolbox.agent_run import _TRUNCATION_MARKER_BYTES
-
         line = b"\x1b]0;" + b"x" * LOGS_MAX_LINE_BYTES
         out, truncated = _budget_bytes_lines([line])
         assert truncated
@@ -176,6 +200,94 @@ class TestTruncationInsideOscStringIsClosed:
         out, truncated = _budget_bytes_lines([line], keep_delimiters=True)
         assert truncated
         assert out.rstrip(b"\n").endswith(b"\x1b\\")
+
+
+class TestMarkerSurvivesEveryCutPosition:
+    """A cut can land at any byte offset relative to a control sequence. In
+    every case the truncation marker that follows the budgeted output must
+    read back as literal text, never as part of an escape sequence."""
+
+    @pytest.mark.parametrize("keep_delimiters", [False, True])
+    def test_cut_on_a_bare_trailing_esc(self, keep_delimiters):
+        cap = LOGS_MAX_LINE_BYTES
+        content = b"y" * (cap - 1) + b"\x1b" + b"trailing text past the cut"
+        line = content + b"\n" if keep_delimiters else content
+        out, truncated = _budget_bytes_lines([line], keep_delimiters=keep_delimiters)
+        assert truncated
+        assert not out.rstrip(b"\n").endswith(b"\x1b")
+        assert b"\x1b[agent-run" not in out + _TRUNCATION_MARKER_BYTES
+
+    @pytest.mark.parametrize("keep_delimiters", [False, True])
+    def test_cut_between_esc_and_its_introducer_byte(self, keep_delimiters):
+        # The cut lands exactly on a complete introducer (ESC ]) with no
+        # payload byte yet -- not the same case as a bare trailing ESC, but
+        # the source's next byte is equally unknown, so it must be dropped
+        # rather than turned into an empty OSC string closed with ST.
+        cap = LOGS_MAX_LINE_BYTES
+        content = b"y" * (cap - 2) + b"\x1b]" + b"more past the cut"
+        line = content + b"\n" if keep_delimiters else content
+        out, truncated = _budget_bytes_lines([line], keep_delimiters=keep_delimiters)
+        assert truncated
+        assert not out.rstrip(b"\n").endswith(b"\x1b]")
+        assert b"\x1b[agent-run" not in out + _TRUNCATION_MARKER_BYTES
+
+    @pytest.mark.parametrize("keep_delimiters", [False, True])
+    def test_cut_inside_an_open_osc_payload(self, keep_delimiters):
+        cap = LOGS_MAX_LINE_BYTES
+        content = b"\x1b]0;" + b"y" * (cap * 2)  # never terminated
+        line = content + b"\n" if keep_delimiters else content
+        out, truncated = _budget_bytes_lines([line], keep_delimiters=keep_delimiters)
+        assert truncated
+        assert out.rstrip(b"\n").endswith(b"\x1b\\")
+        assert b"\x1b[agent-run" not in out + _TRUNCATION_MARKER_BYTES
+
+    @pytest.mark.parametrize("keep_delimiters", [False, True])
+    def test_cut_exactly_on_a_complete_bel_terminated_osc(self, keep_delimiters):
+        cap = LOGS_MAX_LINE_BYTES
+        prefix, bel = b"\x1b]0;", b"\x07"
+        title = b"t" * (cap - len(prefix) - len(bel))
+        content = prefix + title + bel + b"y" * cap  # cut falls right after BEL
+        line = content + b"\n" if keep_delimiters else content
+        out, truncated = _budget_bytes_lines([line], keep_delimiters=keep_delimiters)
+        assert truncated
+        assert out.rstrip(b"\n").endswith(bel)  # already closed; nothing appended or dropped
+        assert b"\x1b[agent-run" not in out + _TRUNCATION_MARKER_BYTES
+
+
+class TestBudgetBytesLinesReservesTerminatorRoom:
+    """The ST (ESC \\) `_close_unterminated_string_control` appends must be
+    billed against LOGS_MAX_LINE_BYTES and LOGS_MAX_TOTAL_BYTES before the
+    cut is made, not appended afterward -- otherwise the terminator pushes
+    emitted bytes past the documented cap."""
+
+    def test_open_osc_cut_exactly_at_line_cap_stays_within_line_cap(self):
+        line = b"\x1b]0;" + b"x" * (LOGS_MAX_LINE_BYTES * 2)
+        out, truncated = _budget_bytes_lines([line])
+        assert truncated
+        content = out.rstrip(b"\n")
+        assert len(content) <= LOGS_MAX_LINE_BYTES
+
+    def test_open_osc_cut_exactly_at_line_cap_stays_within_line_cap_raw_mode(self):
+        line = b"\x1b]0;" + b"x" * (LOGS_MAX_LINE_BYTES * 2) + b"\n"
+        out, truncated = _budget_bytes_lines([line], keep_delimiters=True)
+        assert truncated
+        assert len(out) <= LOGS_MAX_LINE_BYTES
+
+    def test_open_osc_cut_exactly_at_total_cap_stays_within_total_cap(self):
+        filler = LOGS_MAX_TOTAL_BYTES - LOGS_MAX_LINE_BYTES
+        lines = [b"x" * LOGS_MAX_LINE_BYTES for _ in range(filler // LOGS_MAX_LINE_BYTES)]
+        lines.append(b"\x1b]0;" + b"y" * (LOGS_MAX_LINE_BYTES * 2))
+        out, truncated = _budget_bytes_lines(lines)
+        assert truncated
+        assert len(out) <= LOGS_MAX_TOTAL_BYTES
+
+    def test_open_osc_cut_exactly_at_total_cap_stays_within_total_cap_raw_mode(self):
+        filler = LOGS_MAX_TOTAL_BYTES - LOGS_MAX_LINE_BYTES
+        lines = [b"x" * LOGS_MAX_LINE_BYTES + b"\n" for _ in range(filler // LOGS_MAX_LINE_BYTES)]
+        lines.append(b"\x1b]0;" + b"y" * (LOGS_MAX_LINE_BYTES * 2) + b"\n")
+        out, truncated = _budget_bytes_lines(lines, keep_delimiters=True)
+        assert truncated
+        assert len(out) <= LOGS_MAX_TOTAL_BYTES
 
 
 class TestCmdLogsRawModeByteFidelity:
@@ -208,9 +320,9 @@ class TestCmdLogsRawModeByteFidelity:
 
 
 class TestCmdLogsCleanSurvivesCorruptResizeTimeline:
-    """F2: invalid UTF-8 in resizes.jsonl must not raise out of `logs
-    --clean` -- _read_resize_timeline degrades to an empty timeline and the
-    render falls back to the run's resolved default geometry."""
+    """Invalid UTF-8 in resizes.jsonl must not raise out of `logs --clean`
+    -- _read_resize_timeline degrades to an empty timeline and the render
+    falls back to the run's resolved default geometry."""
 
     def test_corrupt_resizes_jsonl_yields_empty_timeline_and_clean_succeeds(
         self, isolated_runs_root, isolated_log_root, capsysbinary
@@ -231,9 +343,8 @@ class TestCmdLogsCleanSurvivesCorruptResizeTimeline:
 
 
 class TestCmdLogsPlainByteIdentity:
-    """F6/F7 regression: `--plain` must stay byte-identical to the
-    pre-existing (753924d) behavior -- ANSI-stripped, `\\r`-stripped lines,
-    one `\\n` per emitted line, content capped at LOGS_MAX_TOTAL_BYTES."""
+    """`--plain` output is ANSI-stripped, `\\r`-stripped lines, one `\\n`
+    per emitted line, content capped at LOGS_MAX_TOTAL_BYTES."""
 
     def test_plain_output_matches_strip_then_budget_by_hand(
         self, isolated_runs_root, isolated_log_root, capsysbinary
@@ -264,8 +375,6 @@ class TestCmdLogsPlainByteIdentity:
     def test_plain_content_never_exceeds_total_cap_on_a_huge_log(
         self, isolated_runs_root, isolated_log_root, capsysbinary
     ):
-        from toolbox.agent_run import _TRUNCATION_MARKER_BYTES
-
         data = (b"x" * 8000 + b"\n") * 10
         log_dir = isolated_log_root / "plaincap"
         log_dir.mkdir(parents=True)
