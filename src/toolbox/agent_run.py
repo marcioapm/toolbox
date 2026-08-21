@@ -4928,6 +4928,9 @@ def cmd_transcript(args: argparse.Namespace) -> int:
     agent_run_transcript. Raw runs and any run whose session id was never
     acquired have nothing to read; exit non-zero naming the two
     alternatives rather than raising, since neither is a bug in this run.
+    An empty entry list is likewise an error, not a silent no-op: a caller
+    needs to tell "the store had nothing for this session" apart from
+    ordinary success.
     """
     from toolbox import agent_run_transcript as transcript
 
@@ -4959,6 +4962,22 @@ def cmd_transcript(args: argparse.Namespace) -> int:
         entries, skipped = transcript.read_transcript(harness, session_id, cwd)
     except transcript.TranscriptSourceError as exc:
         sys.exit(f"agent-run: {exc}")
+
+    if not entries:
+        # An empty read and a broken pipeline both print nothing and exit 0
+        # unless this is an error: a caller (including threadctl) branching
+        # on exit status needs "no transcript" distinguishable from a
+        # transcript that happens to hold zero entries.
+        store = {
+            "opencode": transcript.OPENCODE_DB_PATH,
+            "claude": transcript.CLAUDE_PROJECTS_DIR,
+            "codex": transcript.CODEX_SESSIONS_DIR,
+        }.get(harness, "?")
+        skipped_note = f", {skipped} record(s) skipped as unparseable" if skipped else ""
+        sys.exit(
+            f"agent-run: transcript for '{name}' ({harness}, session {session_id}) is empty "
+            f"(store: {store}{skipped_note})"
+        )
 
     if args.head is not None:
         entries = entries[: args.head]

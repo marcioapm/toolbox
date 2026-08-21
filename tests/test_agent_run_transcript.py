@@ -929,6 +929,12 @@ class TestCmdTranscript:
             conn.commit()
         finally:
             conn.close()
+        # A record the reader can use, alongside the unparseable one above:
+        # this run must still succeed and merely report the skip count.
+        _opencode_insert(
+            db, message_id="m2", session_id="ses_skip", role="user", time_created=2,
+            parts=[{"type": "text", "text": "still readable"}],
+        )
 
         name = "skiprun"
         (isolated_runs_root / name).mkdir(parents=True)
@@ -945,6 +951,67 @@ class TestCmdTranscript:
         captured = capsysbinary.readouterr()
         stderr = captured.err.decode("utf-8")
         assert "skipped 1" in stderr
+
+    def test_empty_but_valid_store_exits_nonzero_naming_run_and_session(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path
+    ):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+
+        name = "emptyrun"
+        (isolated_runs_root / name).mkdir(parents=True)
+        (isolated_runs_root / name / "status").write_text("done\n")
+        log_dir = isolated_log_root / name
+        log_dir.mkdir(parents=True)
+        agent_run._write_session_json(
+            log_dir,
+            {"session_id": "ses_gone", "harness": "opencode", "acquisition": "minted", "confidence": "certain"},
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.cmd_transcript(self._args(name))
+        message = str(exc_info.value)
+        assert name in message
+        assert "opencode" in message
+        assert "ses_gone" in message
+        assert str(db) in message
+
+    def test_skipped_only_store_exits_nonzero_with_skipped_count(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path
+    ):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                "insert into message (id, session_id, time_created, data) values (?, ?, ?, ?)",
+                ("m1", "ses_onlyskip", 1, json.dumps({"role": "user", "time": {"created": 1}})),
+            )
+            conn.execute(
+                "insert into part (id, message_id, session_id, time_created, data) values (?, ?, ?, ?, ?)",
+                ("p1", "m1", "ses_onlyskip", 1, "{not json"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        name = "onlyskiprun"
+        (isolated_runs_root / name).mkdir(parents=True)
+        (isolated_runs_root / name / "status").write_text("done\n")
+        log_dir = isolated_log_root / name
+        log_dir.mkdir(parents=True)
+        agent_run._write_session_json(
+            log_dir,
+            {"session_id": "ses_onlyskip", "harness": "opencode", "acquisition": "minted", "confidence": "certain"},
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run.cmd_transcript(self._args(name))
+        message = str(exc_info.value)
+        assert "1" in message
+        assert "skip" in message.lower()
 
 
 # ---------------------------------------------------------------------------
