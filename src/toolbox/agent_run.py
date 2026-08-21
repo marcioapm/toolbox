@@ -5807,6 +5807,16 @@ def _serialize_screen(screen) -> str:
     return "\n".join(deduped) + "\n"
 
 
+def _bounded_int(value, lower: int, upper: int) -> bool:
+    """True when ``value`` is an ``int`` (not a ``bool``) within the closed
+    range ``lower..upper``.
+
+    ``bool`` subclasses ``int`` and ``True == 1``, so an ``isinstance`` check
+    would admit a boolean as a one-cell dimension or a zero offset.
+    """
+    return type(value) is int and lower <= value <= upper
+
+
 def _validate_resize_timeline(
     resizes: Optional[Sequence[dict]], raw_len: int
 ) -> List[Tuple[int, int, int]]:
@@ -5831,16 +5841,11 @@ def _validate_resize_timeline(
             rows = record["rows"]
         except (TypeError, KeyError):
             continue
-        if not (isinstance(offset, int) and isinstance(cols, int) and isinstance(rows, int)):
-            continue
-        # bool is an int subclass in Python (isinstance(True, int) is True,
-        # and True == 1), so an unguarded check above would let a boolean
-        # field pass as a 1-cell dimension.
-        if isinstance(offset, bool) or isinstance(cols, bool) or isinstance(rows, bool):
-            continue
-        if not (1 <= cols <= MAX_TERMINAL_DIMENSION and 1 <= rows <= MAX_TERMINAL_DIMENSION):
-            continue
-        if offset < last_offset or offset > raw_len:
+        if not (
+            _bounded_int(offset, max(last_offset, 0), raw_len)
+            and _bounded_int(cols, 1, MAX_TERMINAL_DIMENSION)
+            and _bounded_int(rows, 1, MAX_TERMINAL_DIMENSION)
+        ):
             continue
         if accepted and offset == last_offset:
             # Several resizes can be applied with no log output between them
@@ -6305,10 +6310,9 @@ def _read_run_terminal_geometry(log_dir: Path) -> Optional[Tuple[int, int]]:
         return None
     cols = terminal.get("cols")
     rows = terminal.get("rows")
-    if (
-        not isinstance(cols, int) or isinstance(cols, bool)
-        or not isinstance(rows, int) or isinstance(rows, bool)
-        or not (1 <= cols <= MAX_TERMINAL_DIMENSION and 1 <= rows <= MAX_TERMINAL_DIMENSION)
+    if not (
+        _bounded_int(cols, 1, MAX_TERMINAL_DIMENSION)
+        and _bounded_int(rows, 1, MAX_TERMINAL_DIMENSION)
     ):
         return None
     return (cols, rows)
