@@ -201,6 +201,30 @@ class TestOpencodeReader:
             locker.rollback()
             locker.close()
 
+    def test_operational_error_without_lock_or_busy_wording_reports_unreadable_not_locked(
+        self, tmp_path, monkeypatch
+    ):
+        # A store missing the `part` table raises OperationalError with a
+        # "no such table" message -- an OperationalError that has nothing
+        # to do with a held write lock. It must not be reported as one.
+        db = tmp_path / "opencode.db"
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                "create table message (id text primary key, session_id text, "
+                "time_created integer, data text)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.read_transcript("opencode", "ses_1", None)
+        message = str(exc_info.value)
+        assert "unreadable" in message
+        assert "locked" not in message
+        assert "no such table" in message
+
     def test_large_tool_output_is_bounded(self, tmp_path, monkeypatch):
         db = tmp_path / "opencode.db"
         _make_opencode_db(db)

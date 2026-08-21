@@ -188,9 +188,18 @@ def _read_opencode(session_id: str) -> tuple[list[TranscriptEntry], int]:
             if entry is not None:
                 entries.append(entry)
     except sqlite3.OperationalError as exc:
-        raise TranscriptSourceError(
-            f"opencode session store at {OPENCODE_DB_PATH} is locked by another writer: {exc}"
-        ) from exc
+        # sqlite3 in this Python version exposes no reliable error code on
+        # OperationalError (sqlite_errorcode is CPython 3.11+ only and not
+        # guaranteed populated), so "locked"/"busy" substring matching on
+        # the lowercased message is the only portable way to tell a held
+        # write lock apart from a broken store (e.g. a missing table) --
+        # both raise this same exception class.
+        message = str(exc).lower()
+        if "locked" in message or "busy" in message:
+            raise TranscriptSourceError(
+                f"opencode session store at {OPENCODE_DB_PATH} is locked by another writer: {exc}"
+            ) from exc
+        raise TranscriptSourceError(f"opencode session store unreadable: {exc}") from exc
     except sqlite3.DatabaseError as exc:
         # A file that opens but isn't a valid/complete sqlite database (mid-
         # write copy, truncated backup): the store as a whole is unusable,
