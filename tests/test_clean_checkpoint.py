@@ -555,27 +555,28 @@ class TestLaunchGeometryIsIndependentOfTheRenderFallback:
 
 
 class TestEchoDaemonPublishesAtTheResolvedGeometry:
-    """The daemon rendered at the module defaults while _render_log_to_clean
-    rendered at the resolved geometry. They agreed only while launch geometry
-    equalled the fallback; a bump would have made every new run's cache a
-    permanent miss, and a reader that skipped the geometry gate would have been
-    handed a transcript rendered at the wrong size."""
+    """Daemon publications use the log's resolved geometry."""
 
-    def _run_one_tick(self, log_dir):
+    def _run_one_tick(self, log_dir, monkeypatch):
         pytest.importorskip("pyte")
-        ar._render_log_to_clean(log_dir)
+        monkeypatch.setattr(
+            ar.time, "sleep",
+            lambda _interval: (_ for _ in ()).throw(KeyboardInterrupt),
+        )
+        with pytest.raises(KeyboardInterrupt):
+            ar._echo_loop(log_dir, 1.0)
 
-    def test_metadata_records_the_runs_own_geometry(self, tmp_path):
+    def test_metadata_records_the_runs_own_geometry(self, tmp_path, monkeypatch):
         log_dir = tmp_path / "run"
         log_dir.mkdir()
         (log_dir / "log").write_bytes(b"x" * 160 + b"\r\n")
         _write_run_json(log_dir, {"cols": 200, "rows": 100})
-        self._run_one_tick(log_dir)
+        self._run_one_tick(log_dir, monkeypatch)
 
         meta = json.loads((log_dir / "log.clean.meta.json").read_text())
         assert (meta["width"], meta["height"]) == (200, 100)
 
-    def test_that_cache_is_a_hit_for_a_reader_at_the_defaults(self, tmp_path):
+    def test_that_cache_is_a_hit_for_a_reader_at_the_defaults(self, tmp_path, monkeypatch):
         """A reader asking for the module defaults resolves this run's 200x100
         and must accept the cache published at that geometry."""
         log_dir = tmp_path / "run"
@@ -583,7 +584,7 @@ class TestEchoDaemonPublishesAtTheResolvedGeometry:
         raw = b"x" * 160 + b"\r\n"
         (log_dir / "log").write_bytes(raw)
         _write_run_json(log_dir, {"cols": 200, "rows": 100})
-        self._run_one_tick(log_dir)
+        self._run_one_tick(log_dir, monkeypatch)
 
         cached = ar._read_clean_cache(
             log_dir / "log", ar._RENDER_LOG_DEFAULT_WIDTH,
@@ -596,13 +597,31 @@ class TestEchoDaemonPublishesAtTheResolvedGeometry:
             history=ar._RENDER_LOG_DEFAULT_HISTORY,
         )
 
-    def test_a_legacy_log_still_publishes_at_the_fallback(self, tmp_path):
+    def test_a_legacy_log_still_publishes_at_the_fallback(self, tmp_path, monkeypatch):
         log_dir = tmp_path / "legacy"
         log_dir.mkdir()
         (log_dir / "log").write_bytes(b"hello\r\n")
-        self._run_one_tick(log_dir)
+        self._run_one_tick(log_dir, monkeypatch)
 
         meta = json.loads((log_dir / "log.clean.meta.json").read_text())
         assert (meta["width"], meta["height"]) == (
             ar._RENDER_LOG_DEFAULT_WIDTH, ar._RENDER_LOG_DEFAULT_HEIGHT
         )
+
+    def test_a_growing_wide_run_resumes_the_daemon_checkpoint(self, tmp_path, monkeypatch):
+        log_dir = tmp_path / "run"
+        log_dir.mkdir()
+        log = log_dir / "log"
+        prefix = b"x" * 160 + b"\r\n"
+        tail = b"after publication\r\n"
+        log.write_bytes(prefix)
+        _write_run_json(log_dir, {"cols": 200, "rows": 100})
+        self._run_one_tick(log_dir, monkeypatch)
+
+        log.write_bytes(prefix + tail)
+        cached = ar._read_clean_cache(
+            log, ar._RENDER_LOG_DEFAULT_WIDTH,
+            ar._RENDER_LOG_DEFAULT_HEIGHT, ar._RENDER_LOG_DEFAULT_HISTORY,
+        )
+
+        assert cached == ar._render_log(prefix + tail, width=200, height=100)

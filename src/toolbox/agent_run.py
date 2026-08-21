@@ -5950,8 +5950,7 @@ def _stitch_history(
 
     previous: "Counter[str]" = Counter()
     lines: List[str] = []
-    total = 0
-    truncated = False
+    total_bytes = 0
     position = 0
     try:
         screen = _new_pyte_screen(pyte, width, height, history)
@@ -5973,19 +5972,18 @@ def _stitch_history(
                 if current[text] <= previous[text]:
                     continue
                 line_bytes = len(text.encode("utf-8")) + 1
-                if len(lines) >= _STITCH_MAX_LINES or total + line_bytes > _STITCH_MAX_BYTES:
-                    truncated = True
-                    break
+                if (
+                    len(lines) >= _STITCH_MAX_LINES
+                    or total_bytes + line_bytes > _STITCH_MAX_BYTES
+                ):
+                    return "".join(line + "\n" for line in lines) + _STITCH_TRUNCATED_MARKER
                 lines.append(text)
-                total += line_bytes
+                total_bytes += line_bytes
             previous = current
-            if truncated:
-                break
     except Exception:
         return _strip_ansi_fallback(raw)
 
-    rendered = "".join(line + "\n" for line in lines)
-    return rendered + _STITCH_TRUNCATED_MARKER if truncated else rendered
+    return "".join(line + "\n" for line in lines)
 
 
 def _render_log(
@@ -6372,10 +6370,7 @@ def _publish_clean_metadata(
     hardcoded default, or it can hand back a render made at the wrong size.
     """
     if resize_identity is None:
-        # The echo daemon renders at the module defaults with no timeline, so
-        # that is the render this identity describes. A run whose resolved
-        # geometry differs digests differently, making its cache a miss rather
-        # than a hit at the wrong geometry.
+        # Callers omitting an identity describe the legacy default render.
         resize_identity = _resize_timeline_digest(
             (_RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT), ()
         )
@@ -6857,7 +6852,10 @@ def _read_clean_cache(
                 if clean_file is None:
                     return None
                 return clean_file.read().decode("utf-8", errors="replace")
-        return _resume_clean_cache(log_path, clean, published, raw_stat)
+        return _resume_clean_cache(
+            log_path, clean, published, raw_stat,
+            width=resolved_width, height=resolved_height,
+        )
     except (OSError, ValueError, TypeError):
         return None
 
@@ -6867,13 +6865,16 @@ def _resume_clean_cache(
     clean: Path,
     published: int,
     raw_stat,
+    *,
+    width: int,
+    height: int,
 ) -> "Optional[str]":
     """Render by restoring the checkpoint at ``published`` and feeding the tail.
 
     Returns None on any failure -- unusable checkpoint, a log that changed
     identity or length mid-read, a pyte exception -- so the caller replays in
-    full. Geometry is the module default: ``_read_clean_cache`` rejects every
-    other geometry before reaching here.
+    full. ``_read_clean_cache`` validates ``width`` and ``height`` against the
+    metadata and current run geometry before reaching here.
     """
     try:
         import pyte  # type: ignore
@@ -6881,8 +6882,7 @@ def _resume_clean_cache(
         return None
     try:
         screen = _new_pyte_screen(
-            pyte, _RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT,
-            _RENDER_LOG_DEFAULT_HISTORY,
+            pyte, width, height, _RENDER_LOG_DEFAULT_HISTORY,
         )
         if not _ckpt_load(clean, pyte, screen, offset=published):
             return None
