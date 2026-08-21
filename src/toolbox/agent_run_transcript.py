@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""Readers for `agent-run transcript`: the harness's own conversation record.
+
+Each managed run (``--harness claude|opencode|codex``) writes its session id
+into ``session.json`` (see ``_record_session`` in ``agent_run.py``). The
+harness itself already stores the full conversation -- user turns, assistant
+turns, tool calls with arguments and results -- in its own store, keyed by
+that session id. Reading that store directly is strictly better than
+reconstructing a transcript from the PTY log's rendered screen (see
+``_render_log``): a rendered PTY screen shows what the terminal *drew*
+(progress bars, re-wrapped paragraphs, collapsed "Click to expand" tool
+output), not what was actually said.
+
+One reader per harness, each returning a list of ``TranscriptEntry`` plus a
+count of records it could not parse. Every reader is read-only with respect
+to its store and degrades to what it can render rather than raising when a
+column or key documented here turns out to be missing -- these stores are
+maintained by the harness project, not this one, and their shape is not a
+contract this module can enforce.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+
+# Overridable the same way agent_run.py's AGENT_RUN_STATE_DIR/AGENT_RUN_LOG_DIR
+# are: an env var read once at import, so tests can point every reader at a
+# fixture store without ever touching the real, per-machine ones.
+OPENCODE_DB_PATH = Path(
+    os.environ.get(
+        "AGENT_RUN_OPENCODE_DB", str(Path.home() / ".local" / "share" / "opencode" / "opencode.db")
+    )
+)
+CLAUDE_PROJECTS_DIR = Path(
+    os.environ.get("AGENT_RUN_CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude" / "projects"))
+)
+CODEX_SESSIONS_DIR = Path(
+    os.environ.get("AGENT_RUN_CODEX_SESSIONS_DIR", str(Path.home() / ".codex" / "sessions"))
+)
+
+
+class TranscriptSourceError(Exception):
+    """The harness store for a session could not be located or opened at
+    all -- as opposed to an individual unparseable record, which readers
+    skip and count instead of raising."""
+
+
+@dataclass
+class TranscriptEntry:
+    """One normalised conversation event, common to every harness reader.
+
+    ``type`` is one of "user", "assistant", "reasoning", "tool". Text
+    entries (user/assistant/reasoning) carry ``text``; tool entries carry
+    ``tool_name`` and any of ``tool_summary``/``tool_input``/``tool_output``/
+    ``tool_status`` the source store provided -- any of these may be
+    ``None`` when the store omitted them. ``time`` is an ISO-8601 UTC
+    string when the source recorded one, else ``None``. ``subagent`` is a
+    label (claude only) when the entry came from a subagent transcript
+    rather than the main session.
+    """
+
+    type: str
+    harness: str
+    time: Optional[str] = None
+    text: Optional[str] = None
+    tool_name: Optional[str] = None
+    tool_summary: Optional[str] = None
+    tool_input: Optional[dict] = field(default=None)
+    tool_output: Optional[str] = None
+    tool_status: Optional[str] = None
+    subagent: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "type": self.type,
+            "harness": self.harness,
+            "time": self.time,
+            "subagent": self.subagent,
+            "text": self.text,
+            "tool_name": self.tool_name,
+            "tool_summary": self.tool_summary,
+            "tool_input": self.tool_input,
+            "tool_output": self.tool_output,
+            "tool_status": self.tool_status,
+        }
+
+
+# A single tool result is bounded independently of any --head/--tail entry
+# slicing: a `read` of a 3000-line file must not paste 3000 lines into every
+# rendering of the transcript, sliced or not.
+TOOL_OUTPUT_MAX_LINES = 40
+TOOL_OUTPUT_MAX_BYTES = 4 * 1024
+
+
+def _bound_tool_output(text: str) -> str:
+    """Cap a tool result to TOOL_OUTPUT_MAX_LINES lines and
+    TOOL_OUTPUT_MAX_BYTES bytes, whichever is reached first, appending a
+    marker naming how many lines were dropped."""
+    lines = text.splitlines()
+    kept = lines[:TOOL_OUTPUT_MAX_LINES]
+    dropped_by_lines = len(lines) - len(kept)
+    truncated_by_bytes = False
+    encoded = "\n".join(kept).encode("utf-8")
+    if len(encoded) > TOOL_OUTPUT_MAX_BYTES:
+        encoded = encoded[:TOOL_OUTPUT_MAX_BYTES]
+        kept_text = encoded.decode("utf-8", errors="ignore")
+        kept = kept_text.split("\n")
+        truncated_by_bytes = True
+    if dropped_by_lines <= 0 and not truncated_by_bytes:
+        return text
+    if truncated_by_bytes:
+        marker = f"[agent-run: tool output truncated, {len(lines)} lines / {len(text.encode('utf-8'))} bytes total]"
+    else:
+        marker = f"[agent-run: tool output truncated, {dropped_by_lines} more line(s) dropped]"
+    return "\n".join(kept) + "\n" + marker
+
+
+def _bound_entry_tool_output(entry: TranscriptEntry) -> TranscriptEntry:
+    if entry.tool_output:
+        entry.tool_output = _bound_tool_output(entry.tool_output)
+    return entry
+
+
+def read_transcript(
+    harness: str, session_id: str, cwd: Optional[str]
+) -> "tuple[list[TranscriptEntry], int]":
+    """Dispatch to the reader for ``harness``. Raises ``TranscriptSourceError``
+    for an unrecognised harness or a store that cannot be located/opened at
+    all. Returns (entries, skipped_record_count), with every entry's
+    ``tool_output`` already bounded by ``_bound_tool_output``."""
+    if harness == "opencode":
+        entries, skipped = _read_opencode(session_id)
+    elif harness == "claude":
+        entries, skipped = _read_claude(session_id, cwd)
+    elif harness == "codex":
+        entries, skipped = _read_codex(session_id)
+    else:
+        raise TranscriptSourceError(f"unrecognised harness {harness!r} in session.json")
+    for entry in entries:
+        _bound_entry_tool_output(entry)
+    return entries, skipped
+
+
+def _iso_from_epoch_ms(value: Any) -> Optional[str]:
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# opencode: SQLite at ~/.local/share/opencode/opencode.db
+# ---------------------------------------------------------------------------
+
+def _read_opencode(session_id: str) -> "tuple[list[TranscriptEntry], int]":
+    """Read the `part`/`message` tables for one session.
+
+    Opened read-only (`file:...?mode=ro`, `uri=True`): a live opencode run
+    holds this database open under WAL, and this reader must never write to
+    it or trigger a checkpoint. `part.data` carries the event; the joined
+    `message.data` supplies the role (user/assistant) and fallback
+    timestamp a `text`/`reasoning` part does not itself carry.
+    """
+    if not OPENCODE_DB_PATH.exists():
+        raise TranscriptSourceError(f"opencode session store not found at {OPENCODE_DB_PATH}")
+    try:
+        conn = sqlite3.connect(f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True)
+    except sqlite3.OperationalError as exc:
+        raise TranscriptSourceError(f"cannot open opencode session store at {OPENCODE_DB_PATH}: {exc}") from exc
+
+    entries: "list[TranscriptEntry]" = []
+    skipped = 0
+    try:
+        cursor = conn.execute(
+            "select p.data, m.data from part p "
+            "join message m on p.message_id = m.id "
+            "where p.session_id = ? order by p.time_created",
+            (session_id,),
+        )
+        for part_raw, message_raw in cursor:
+            try:
+                part = json.loads(part_raw)
+                message = json.loads(message_raw)
+            except (json.JSONDecodeError, TypeError):
+                skipped += 1
+                continue
+            if not isinstance(part, dict) or not isinstance(message, dict):
+                skipped += 1
+                continue
+            entry = _opencode_entry(part, message)
+            if entry is not None:
+                entries.append(entry)
+    except sqlite3.DatabaseError as exc:
+        # A file that opens but isn't a valid/complete sqlite database (mid-
+        # write copy, truncated backup): the store as a whole is unusable,
+        # not one bad row -- surface it as a source error rather than
+        # silently returning an empty transcript.
+        raise TranscriptSourceError(f"opencode session store unreadable: {exc}") from exc
+    finally:
+        conn.close()
+    return entries, skipped
+
+
+def _opencode_entry(part: dict, message: dict) -> Optional[TranscriptEntry]:
+    ptype = part.get("type")
+    role = message.get("role")
+    message_time = (message.get("time") or {}).get("created")
+
+    if ptype == "text":
+        text = part.get("text")
+        if not isinstance(text, str) or not text:
+            return None
+        entry_type = "assistant" if role == "assistant" else "user"
+        return TranscriptEntry(
+            type=entry_type, harness="opencode", time=_iso_from_epoch_ms(message_time), text=text
+        )
+    if ptype == "reasoning":
+        text = part.get("text")
+        if not isinstance(text, str) or not text:
+            return None
+        return TranscriptEntry(
+            type="reasoning", harness="opencode", time=_iso_from_epoch_ms(message_time), text=text
+        )
+    if ptype == "tool":
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        state_time = state.get("time") if isinstance(state.get("time"), dict) else {}
+        title = state.get("title")
+        tool_input = state.get("input")
+        tool_output = state.get("output")
+        status = state.get("status")
+        when = state_time.get("start") or state_time.get("end") or message_time
+        return TranscriptEntry(
+            type="tool",
+            harness="opencode",
+            time=_iso_from_epoch_ms(when),
+            tool_name=part.get("tool") if isinstance(part.get("tool"), str) else None,
+            tool_summary=title if isinstance(title, str) else None,
+            tool_input=tool_input if isinstance(tool_input, dict) else None,
+            tool_output=tool_output if isinstance(tool_output, str) else None,
+            tool_status=status if isinstance(status, str) else None,
+        )
+    # patch/step-start/step-finish/compaction: bookkeeping, not conversation.
+    return None
+
+
+# ---------------------------------------------------------------------------
+# claude: JSONL at ~/.claude/projects/<mangled-cwd>/<session_id>.jsonl
+# ---------------------------------------------------------------------------
+
+def _mangle_cwd(cwd: str) -> str:
+    return cwd.replace("/", "-")
+
+
+def _claude_session_path(session_id: str, cwd: Optional[str]) -> Optional[Path]:
+    if cwd:
+        candidate = CLAUDE_PROJECTS_DIR / _mangle_cwd(cwd) / f"{session_id}.jsonl"
+        if candidate.is_file():
+            return candidate
+    try:
+        matches = sorted(CLAUDE_PROJECTS_DIR.glob(f"*/{session_id}.jsonl"))
+    except OSError:
+        matches = []
+    return matches[0] if matches else None
+
+
+def _read_claude(session_id: str, cwd: Optional[str]) -> "tuple[list[TranscriptEntry], int]":
+    path = _claude_session_path(session_id, cwd)
+    if path is None:
+        raise TranscriptSourceError(
+            f"no claude session transcript found for session {session_id!r} under {CLAUDE_PROJECTS_DIR}"
+        )
+    entries, skipped = _read_claude_jsonl(path, session_id, subagent=None)
+
+    # Subagent transcripts live in <session>/subagents/*.jsonl next to the
+    # main .jsonl file. Included only when each record's own sessionId
+    # matches the session we were asked for -- not inferred from directory
+    # placement alone.
+    subagents_dir = path.parent / path.stem / "subagents"
+    try:
+        sub_files = sorted(subagents_dir.glob("*.jsonl")) if subagents_dir.is_dir() else []
+    except OSError:
+        sub_files = []
+    for sub_path in sub_files:
+        sub_entries, sub_skipped = _read_claude_jsonl(sub_path, session_id, subagent=sub_path.stem)
+        entries.extend(sub_entries)
+        skipped += sub_skipped
+    return entries, skipped
+
+
+def _claude_tool_result_text(content: Any) -> Optional[str]:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block.get("text")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+        ]
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def _read_claude_jsonl(
+    path: Path, session_id: str, subagent: Optional[str]
+) -> "tuple[list[TranscriptEntry], int]":
+    """Parse one claude project JSONL file.
+
+    ``pending`` matches a `tool_use` block to the `tool_result` block that
+    arrives in a later `user` record (claude reports tool output as a
+    synthetic follow-up user turn), so the two collapse into one
+    TranscriptEntry the same way opencode's single `tool` part does.
+    """
+    try:
+        raw_lines = path.read_text(errors="replace").splitlines()
+    except OSError as exc:
+        raise TranscriptSourceError(f"cannot read {path}: {exc}") from exc
+
+    entries: "list[TranscriptEntry]" = []
+    pending: "dict[str, TranscriptEntry]" = {}
+    skipped = 0
+    for line in raw_lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if not isinstance(record, dict):
+            skipped += 1
+            continue
+        rtype = record.get("type")
+        if rtype not in ("user", "assistant"):
+            continue  # attachment/queue-operation/mode/permission-mode/etc: not conversation
+        if subagent is not None and record.get("sessionId") != session_id:
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            skipped += 1
+            continue
+        role = message.get("role")
+        timestamp = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
+        content = message.get("content")
+
+        if isinstance(content, str):
+            if content and role in ("user", "assistant"):
+                entries.append(
+                    TranscriptEntry(type=role, harness="claude", time=timestamp, text=content, subagent=subagent)
+                )
+            continue
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text and role in ("user", "assistant"):
+                    entries.append(
+                        TranscriptEntry(
+                            type=role, harness="claude", time=timestamp, text=text, subagent=subagent
+                        )
+                    )
+            elif btype == "tool_use":
+                name = block.get("name")
+                tool_input = block.get("input") if isinstance(block.get("input"), dict) else None
+                summary = None
+                if name == "Bash" and isinstance(tool_input, dict):
+                    summary = tool_input.get("description") or tool_input.get("command")
+                entry = TranscriptEntry(
+                    type="tool",
+                    harness="claude",
+                    time=timestamp,
+                    tool_name=name if isinstance(name, str) else None,
+                    tool_summary=summary if isinstance(summary, str) else None,
+                    tool_input=tool_input,
+                    subagent=subagent,
+                )
+                entries.append(entry)
+                tool_use_id = block.get("id")
+                if isinstance(tool_use_id, str):
+                    pending[tool_use_id] = entry
+            elif btype == "tool_result":
+                tool_use_id = block.get("tool_use_id")
+                output_text = _claude_tool_result_text(block.get("content"))
+                target = pending.pop(tool_use_id, None) if isinstance(tool_use_id, str) else None
+                if target is not None:
+                    target.tool_output = output_text
+                    target.tool_status = "completed"
+                elif output_text:
+                    # A result with no matching call in this file (e.g. the
+                    # call was in an earlier, unparsed record): still worth
+                    # showing rather than silently dropping the output.
+                    entries.append(
+                        TranscriptEntry(
+                            type="tool",
+                            harness="claude",
+                            time=timestamp,
+                            tool_name=None,
+                            tool_output=output_text,
+                            subagent=subagent,
+                        )
+                    )
+    return entries, skipped
+
+
+# ---------------------------------------------------------------------------
+# codex: JSONL at ~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl
+# ---------------------------------------------------------------------------
+
+def _codex_message_text(content: Any) -> Optional[str]:
+    if not isinstance(content, list):
+        return None
+    parts = [
+        block.get("text")
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") in ("input_text", "output_text")
+        and isinstance(block.get("text"), str)
+    ]
+    return "\n".join(parts) if parts else None
+
+
+def _codex_reasoning_text(summary: Any) -> Optional[str]:
+    if not isinstance(summary, list):
+        return None
+    parts = []
+    for item in summary:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    text = "\n".join(p for p in parts if p)
+    return text or None
+
+
+def _read_codex(session_id: str) -> "tuple[list[TranscriptEntry], int]":
+    """Read one codex rollout file.
+
+    The reasoning `payload.summary` is near-always empty in practice --
+    codex's actual reasoning trace is carried in `encrypted_content`, which
+    this reader has no key to decode -- so reasoning entries are rare;
+    `event_msg` records are skipped entirely because they duplicate the
+    `response_item` message/reasoning content this reader already reads.
+    """
+    try:
+        matches = sorted(CODEX_SESSIONS_DIR.glob(f"**/rollout-*-{session_id}.jsonl"))
+    except OSError:
+        matches = []
+    if not matches:
+        raise TranscriptSourceError(
+            f"no codex session transcript found for session {session_id!r} under {CODEX_SESSIONS_DIR}"
+        )
+    path = matches[0]
+    try:
+        raw_lines = path.read_text(errors="replace").splitlines()
+    except OSError as exc:
+        raise TranscriptSourceError(f"cannot read {path}: {exc}") from exc
+
+    entries: "list[TranscriptEntry]" = []
+    pending: "dict[str, TranscriptEntry]" = {}
+    skipped = 0
+    for line in raw_lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if not isinstance(record, dict):
+            skipped += 1
+            continue
+        if record.get("type") != "response_item":
+            continue  # session_meta/event_msg/world_state/turn_context: not conversation
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            skipped += 1
+            continue
+        timestamp = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
+        ptype = payload.get("type")
+
+        if ptype == "message":
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                continue  # "developer" role: injected environment/permissions text, not conversation
+            text = _codex_message_text(payload.get("content"))
+            if text:
+                entries.append(TranscriptEntry(type=role, harness="codex", time=timestamp, text=text))
+        elif ptype == "reasoning":
+            text = _codex_reasoning_text(payload.get("summary"))
+            if text:
+                entries.append(TranscriptEntry(type="reasoning", harness="codex", time=timestamp, text=text))
+        elif ptype == "function_call":
+            name = payload.get("name")
+            args_raw = payload.get("arguments")
+            tool_input = None
+            if isinstance(args_raw, str):
+                try:
+                    parsed_args = json.loads(args_raw)
+                except json.JSONDecodeError:
+                    parsed_args = None
+                tool_input = parsed_args if isinstance(parsed_args, dict) else None
+            summary = None
+            if isinstance(tool_input, dict):
+                summary = tool_input.get("cmd") or tool_input.get("command")
+            entry = TranscriptEntry(
+                type="tool",
+                harness="codex",
+                time=timestamp,
+                tool_name=name if isinstance(name, str) else None,
+                tool_summary=summary if isinstance(summary, str) else None,
+                tool_input=tool_input,
+            )
+            entries.append(entry)
+            call_id = payload.get("call_id")
+            if isinstance(call_id, str):
+                pending[call_id] = entry
+        elif ptype == "function_call_output":
+            call_id = payload.get("call_id")
+            output = payload.get("output")
+            output_text = output if isinstance(output, str) else None
+            target = pending.pop(call_id, None) if isinstance(call_id, str) else None
+            if target is not None:
+                target.tool_output = output_text
+                target.tool_status = "completed"
+            elif output_text:
+                entries.append(
+                    TranscriptEntry(type="tool", harness="codex", time=timestamp, tool_name=None, tool_output=output_text)
+                )
+        # other payload types observed (task_started, user_message,
+        # agent_message, token_count, task_complete) live on event_msg
+        # records, already excluded above.
+    return entries, skipped
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def _fallback_tool_summary(tool_name: Optional[str], tool_input: Optional[dict]) -> Optional[str]:
+    if not tool_input:
+        return None
+    for key in ("command", "cmd", "filePath", "path", "pattern"):
+        value = tool_input.get(key)
+        if isinstance(value, str):
+            return value
+    rendered = json.dumps(tool_input, sort_keys=True)
+    return rendered if len(rendered) <= 200 else rendered[:200] + "..."
+
+
+def render_text(entries: "list[TranscriptEntry]") -> str:
+    """Render entries as chronological, human- and agent-readable plain text:
+    who spoke, what they said, which tools ran with their arguments, and
+    tool results."""
+    lines: "list[str]" = []
+    for entry in entries:
+        prefix = f"[{entry.time}] " if entry.time else ""
+        if entry.subagent:
+            prefix += f"(subagent {entry.subagent}) "
+
+        if entry.type in ("user", "assistant"):
+            lines.append(f"{prefix}{entry.type}: {entry.text or ''}")
+        elif entry.type == "reasoning":
+            lines.append(f"{prefix}assistant (reasoning): {entry.text or ''}")
+        elif entry.type == "tool":
+            name = entry.tool_name or "tool"
+            summary = entry.tool_summary or _fallback_tool_summary(entry.tool_name, entry.tool_input)
+            header = f"{prefix}tool {name}: {summary}" if summary else f"{prefix}tool {name}"
+            if entry.tool_status and entry.tool_status not in ("completed", "success"):
+                header += f" [{entry.tool_status}]"
+            lines.append(header)
+            if entry.tool_output:
+                for output_line in entry.tool_output.splitlines():
+                    lines.append(f"    {output_line}")
+        else:
+            lines.append(f"{prefix}{entry.type}: {entry.text or ''}")
+    return "".join(line + "\n" for line in lines)
