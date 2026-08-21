@@ -361,7 +361,8 @@ import platform
 from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
+from collections import Counter
+from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 from toolbox import __version__ as TOOLBOX_VERSION
 
 
@@ -5790,12 +5791,8 @@ def _new_pyte_screen(pyte, width: int, height: int, history: int):
     return screen
 
 
-def _screen_lines(screen) -> "Iterator[str]":
-    """Every line the screen currently holds: scrollback, then viewport.
-
-    ``history.top`` rows are sparse cell maps rather than strings, so they are
-    joined in column order; ``display`` is already rendered.
-    """
+def _screen_lines(screen) -> "Iterable[str]":
+    """Yield scrollback's sparse cell maps, then the rendered viewport."""
     for entry in screen.history.top:
         yield ("".join(entry[col].data for col in sorted(entry)) if entry else "").rstrip()
     for row in screen.display:
@@ -5804,9 +5801,8 @@ def _screen_lines(screen) -> "Iterator[str]":
 
 def _serialize_screen(screen) -> str:
     """Serialize a pyte HistoryScreen to the transcript cache format."""
-    rows: List[str] = list(_screen_lines(screen))
     deduped: List[str] = []
-    for line in rows:
+    for line in _screen_lines(screen):
         if not deduped or deduped[-1] != line:
             deduped.append(line)
     while deduped and not deduped[-1]:
@@ -5899,13 +5895,12 @@ def _resize_screen(screen, cols: int, rows: int) -> None:
     screen.cursor.y = min(screen.cursor.y, screen.lines - 1)
 
 
-# Snapshot interval for stitched history. Smaller recovers more (measured on a
-# 9.2 MB TUI log: 64 KB -> 742 lines, 8 KB -> 1707) at a proportional cost in
-# viewport scans.
+# Smaller snapshot intervals recover more overwritten lines at the cost of scans.
 _STITCH_CHUNK_BYTES = 8 * 1024
 
-# Ceilings on a stitched transcript. A repainting TUI can emit far more distinct
-# lines than a reader wants, and the accumulator holds every one of them.
+# Bound the memory and output consumed by distinct lines from repainting TUIs.
+# _STITCH_MAX_BYTES counts UTF-8 bytes of the accumulated body, excluding the
+# truncation marker.
 _STITCH_MAX_LINES = 50_000
 _STITCH_MAX_BYTES = 8 * 1024 * 1024
 _STITCH_TRUNCATED_MARKER = "[agent-run: stitched history truncated]\n"
@@ -5919,57 +5914,41 @@ def _stitch_history(
     resizes: "Optional[Sequence[dict]]" = None,
     chunk_bytes: int = _STITCH_CHUNK_BYTES,
 ) -> str:
-    """Replay ``raw`` and accumulate every distinct line the viewport ever held.
+    """Replay ``raw`` and accumulate lines sampled from scrollback and viewport.
 
-    ``pyte.HistoryScreen`` makes a line durable only when it scrolls off the
-    top, and a TUI repainting in place never scrolls, so ``_serialize_screen``
-    returns the final frame alone -- 21 lines for a 9.2 MB log. Sampling the
-    screen every ``chunk_bytes`` and keeping first-seen lines recovers what the
-    next repaint would have overwritten.
+    Consecutive samples are deduplicated by multiplicity, so a row printed again
+    while an identical row is still on screen is kept. The reconstruction
+    preserves first-seen order and may include partial repaints. Pyte failures
+    fall back to ANSI stripping.
 
-    Each sample covers scrollback and viewport together, so the result is a
-    superset of the viewport render: sampling the viewport alone would drop
-    every line that scrolled away between two samples, which on line-oriented
-    output is most of them.
-
-    This is a lossy reconstruction, not a transcript, and the losses are
-    inherent rather than incidental:
-
-    - Deduplication removes the overlap between consecutive samples, so a line
-      that leaves the screen and is printed again later appears twice, while a
-      line still on screen across several samples appears once. Repeats within
-      one screen survive.
-    - A sample can land mid-repaint, so partially drawn rows are kept as if
-      they were real output.
-    - Order is first-seen. A pane that rescrolls old content leaves those lines
-      at their original position rather than where they reappeared.
-
-    Falls back to an ANSI-stripped render if pyte raises, matching
-    ``_render_log``: a convenience artifact must never take the caller down.
+    Contains every nonempty line of the viewport render unless a cap truncates
+    it: empty rows are dropped, and truncation stops replay before the final
+    screen, so a truncated result omits the tail the viewport render ends with.
     """
     try:
         import pyte  # type: ignore
     except ImportError as exc:
         raise RenderDependencyError(_RENDER_DEPENDENCY_MESSAGE) from exc
 
+    if not _bounded_int(chunk_bytes, 1, sys.maxsize):
+        raise ValueError(f"chunk_bytes must be a positive int, got {chunk_bytes!r}")
+
     timeline = _validate_resize_timeline(resizes, len(raw))
     geometry_at = {offset: (cols, rows) for offset, cols, rows in timeline}
     # Sample boundaries and resize boundaries are independent; replay splits at
     # the union so a resize still lands at its recorded offset.
     boundaries = sorted(
-        set(geometry_at)
-        | set(range(chunk_bytes, len(raw), max(chunk_bytes, 1)))
-        | {len(raw)}
+        set(geometry_at) | set(range(chunk_bytes, len(raw), chunk_bytes)) | {len(raw)}
     )
 
-    screen = _new_pyte_screen(pyte, width, height, history)
-    stream = pyte.ByteStream(screen)
-    previous: "set[str]" = set()
+    previous: "Counter[str]" = Counter()
     lines: List[str] = []
     total = 0
     truncated = False
     position = 0
     try:
+        screen = _new_pyte_screen(pyte, width, height, history)
+        stream = pyte.ByteStream(screen)
         for boundary in boundaries:
             if boundary > position:
                 _feed_pyte(stream, raw[position:boundary])
@@ -5977,18 +5956,21 @@ def _stitch_history(
             geometry = geometry_at.get(boundary)
             if geometry is not None:
                 _resize_screen(screen, *geometry)
-            current: "set[str]" = set()
+            current: "Counter[str]" = Counter()
             for text in _screen_lines(screen):
                 if not text:
                     continue
-                current.add(text)
-                if text in previous:
+                current[text] += 1
+                # Only occurrences beyond the previous sample's count are new:
+                # the rest are the same rows observed again.
+                if current[text] <= previous[text]:
                     continue
-                if len(lines) >= _STITCH_MAX_LINES or total >= _STITCH_MAX_BYTES:
+                line_bytes = len(text.encode("utf-8")) + 1
+                if len(lines) >= _STITCH_MAX_LINES or total + line_bytes > _STITCH_MAX_BYTES:
                     truncated = True
                     break
                 lines.append(text)
-                total += len(text) + 1
+                total += line_bytes
             previous = current
             if truncated:
                 break

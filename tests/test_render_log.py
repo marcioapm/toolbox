@@ -877,20 +877,140 @@ class TestStitchedHistory:
         """Stitched mode is opt-in; the default path must be byte-identical."""
         assert agent_run._render_log(moon_log_bytes) == agent_run._render_log(moon_log_bytes)
 
-    def test_neither_mode_reproduces_a_long_run_of_identical_lines(self):
-        """Both modes are lossy for repeated output, in different ways.
+    @pytest.mark.parametrize("chunk", [16, 64, 1024, 8192])
+    def test_stitching_recovers_a_long_run_of_identical_lines(self, chunk):
+        """Viewport is lossy for repeated output; stitching is not.
 
-        _serialize_screen drops a line equal to its predecessor, so 200
-        identical lines serialize as one. Stitching emits one per sample
-        boundary, because the rest are overlap with the previous sample.
-        Neither recovers the true count, and a caller must not read either as a
-        faithful transcript.
+        ``_serialize_screen`` drops a line equal to its predecessor, so 200
+        identical lines serialize as one. Counting occurrences per sample
+        instead of testing membership recovers every print, independently of
+        where the sample boundaries fall.
         """
         printed = 200
         raw = b"".join(b"====\r\n" for _ in range(printed))
-        viewport = agent_run._render_log(raw).count("====")
-        stitched = agent_run._stitch_history(raw, chunk_bytes=64).count("====")
 
-        assert viewport < printed
-        assert stitched < printed
-        assert stitched >= viewport
+        assert agent_run._render_log(raw).count("====") == 1
+        assert agent_run._stitch_history(raw, chunk_bytes=chunk).count("====") == printed
+
+    def test_stitching_may_add_partial_repaint_rows(self):
+        """The cost of sampling: a boundary landing mid-repaint keeps a partly
+        drawn row, so a stitched render can exceed the viewport line count on
+        output the viewport already captured in full."""
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(200))
+        viewport = [l for l in agent_run._render_log(raw).splitlines() if l.strip()]
+        stitched = [l for l in agent_run._stitch_history(raw, chunk_bytes=64).splitlines() if l.strip()]
+
+        assert set(viewport) <= set(stitched)
+        assert len(stitched) >= len(viewport)
+
+
+class TestStitchedHistoryBounds:
+    """The properties an adversarial review broke: multiplicity across sample
+    boundaries, the unit the byte cap is enforced in, the reach of the pyte
+    fallback, and the interval's domain."""
+
+    def test_a_repeat_printed_across_a_boundary_is_kept(self):
+        """Deduplication compares occurrence counts, not membership: a row
+        printed again while an identical row is still on screen is new output."""
+        raw = b"X\r\n12345" + b"\r\nX\r\n"
+        stitched = agent_run._stitch_history(raw, width=20, height=5, chunk_bytes=8)
+        assert stitched.splitlines().count("X") == 2
+
+    def test_a_row_static_across_many_samples_is_emitted_once(self):
+        raw = b"only line\r\n" + b"\x00" * 40_000
+        assert agent_run._stitch_history(raw, chunk_bytes=1024).count("only line") == 1
+
+    def test_the_byte_cap_counts_utf8_bytes_not_code_points(self, monkeypatch):
+        """A code-point budget lets non-ASCII output reach ~4x the named cap."""
+        monkeypatch.setattr(agent_run, "_STITCH_MAX_BYTES", 8)
+        raw = "".join(f"{i}\U0001f600\r\n" for i in range(20)).encode()
+        stitched = agent_run._stitch_history(raw, chunk_bytes=16)
+        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
+        body = stitched[: -len(agent_run._STITCH_TRUNCATED_MARKER)]
+        assert len(body.encode("utf-8")) <= 8
+
+    def test_the_byte_cap_admits_no_line_that_would_exceed_it(self, monkeypatch):
+        """The cap is checked against the prospective line, so the body cannot
+        overshoot by a full row."""
+        monkeypatch.setattr(agent_run, "_STITCH_MAX_BYTES", 20)
+        raw = b"".join(b"a" * 30 + b"\r\n" for _ in range(10))
+        stitched = agent_run._stitch_history(raw, chunk_bytes=32)
+        body = stitched[: -len(agent_run._STITCH_TRUNCATED_MARKER)]
+        assert len(body.encode("utf-8")) <= 20
+
+    def test_failure_constructing_the_screen_falls_back(self, monkeypatch):
+        """Screen and stream construction sit inside the fallback: a pyte
+        failure there must degrade like a feed failure, not propagate."""
+        monkeypatch.setattr(
+            agent_run, "_new_pyte_screen",
+            lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("construction failed")),
+        )
+        assert "hello" in agent_run._stitch_history(b"hello\r\n", chunk_bytes=8)
+
+    @pytest.mark.parametrize("chunk", [0, -1, True, 1.5, "8192"])
+    def test_a_nonpositive_or_nonint_interval_is_rejected(self, chunk):
+        """range() accepts 0 and negatives via a max() guard, silently sampling
+        every byte and making the boundary set O(len(raw))."""
+        with pytest.raises(ValueError):
+            agent_run._stitch_history(b"abc", chunk_bytes=chunk)
+
+    def test_truncated_output_says_so(self, monkeypatch):
+        """Truncation stops replay before the final screen, so the result omits
+        the tail the viewport render ends with. The marker is the only signal a
+        reader gets, and it must always be present."""
+        monkeypatch.setattr(agent_run, "_STITCH_MAX_LINES", 50)
+        raw = b"".join(f"line {i}\r\n".encode() for i in range(400))
+        stitched = agent_run._stitch_history(raw, chunk_bytes=256)
+        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
+        viewport = {l for l in agent_run._render_log(raw).splitlines() if l.strip()}
+        assert viewport - set(stitched.splitlines()), (
+            "this test documents the loss; if truncation ever preserves the "
+            "final viewport, tighten the docstring instead of deleting this"
+        )
+
+    def test_contains_every_nonempty_viewport_line_when_untruncated(self):
+        """The superset claim holds for nonempty lines: empty rows are dropped,
+        which is why the docstring says nonempty."""
+        raw = b"top\r\n\r\nbottom\r\n"
+        viewport = {l for l in agent_run._render_log(raw).splitlines() if l.strip()}
+        stitched = set(agent_run._stitch_history(raw, chunk_bytes=4096).splitlines())
+        assert viewport <= stitched
+
+
+class TestSerializeScreenExtraction:
+    """_screen_lines was extracted from _serialize_screen and is now shared with
+    stitching. _serialize_screen feeds log.clean and the incremental echo
+    daemon, so a behaviour change there corrupts cached transcripts."""
+
+    @staticmethod
+    def _reference(screen):
+        """The algorithm as it stood before the extraction."""
+        rows = []
+        for entry in screen.history.top:
+            rows.append(
+                ("".join(entry[col].data for col in sorted(entry)) if entry else "").rstrip()
+            )
+        for row in screen.display:
+            rows.append(row.rstrip())
+        deduped = []
+        for line in rows:
+            if not deduped or deduped[-1] != line:
+                deduped.append(line)
+        while deduped and not deduped[-1]:
+            deduped.pop()
+        return "\n".join(deduped) + "\n"
+
+    @pytest.mark.parametrize("raw", [
+        b"",
+        b"plain\r\n",
+        b"   \r\n\r\n  x  \r\n",
+        "wide \u5e7f\u5473 chars\r\n".encode(),
+        "combining a\u0301e\u0301\r\n".encode(),
+        b"".join(b"scroll %d\r\n" % i for i in range(300)),
+        b"\x1b[?1049h\x1b[2J\x1b[1;1Hframe\r\n",
+    ])
+    def test_matches_the_pre_extraction_algorithm(self, raw):
+        pyte = pytest.importorskip("pyte")
+        screen = agent_run._new_pyte_screen(pyte, 40, 8, 64)
+        agent_run._feed_pyte(pyte.ByteStream(screen), raw)
+        assert agent_run._serialize_screen(screen) == self._reference(screen)
