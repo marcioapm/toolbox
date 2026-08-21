@@ -4660,9 +4660,8 @@ _LOGS_OSC_RE = re.compile(rb"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
 _LOGS_PARTIAL_OSC_HEAD_RE = re.compile(rb"\x1b\].*\Z", re.DOTALL)
 _LOGS_PARTIAL_OSC_TAIL_RE = re.compile(rb"\A[^\x07]*(?:\x07|\x1b\\)", re.DOTALL)
 # Parameter bytes are 0x30-0x3F: digits, `;`, `:`, and the private-parameter
-# bytes `<=>?` (ECMA-48 5.4c) -- `\x1b[>4;1m` (xterm modifyOtherKeys query
-# reply) uses `>` and was previously left unmatched, leaking `>4;1m` as
-# literal text.
+# bytes `<=>?` (ECMA-48 5.4c). `\x1b[>4;1m` (xterm's modifyOtherKeys query
+# reply) is a representative sequence using `>`.
 _LOGS_CSI_RE = re.compile(rb"\x1b\[[0-9;:<=>?]*[ -/]*[@-~]")
 _LOGS_ESC_RE = re.compile(rb"\x1b.", re.DOTALL)
 
