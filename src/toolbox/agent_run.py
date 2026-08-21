@@ -5874,10 +5874,18 @@ def _resize_screen(screen, cols: int, rows: int) -> None:
     ``savepoints`` need no clamping: ``restore_cursor`` bounds the restored
     position itself.
 
-    Rows clipped by a height reduction are dropped rather than scrolled into
-    ``history.top``, so a shrink still loses the lines above the new viewport.
-    That is pyte's model of a resize, not a terminal's; replay across a height
-    reduction is approximate.
+    Replay across a resize is approximate, and this clamp does not make it
+    faithful. ``pyte.Screen.resize`` clips where a terminal reflows: on a width
+    reduction the cells beyond the new width are dropped instead of wrapping to
+    the next row, and on a height reduction the clipped rows are deleted rather
+    than scrolled into ``history.top``. Measured against tmux at 10 columns
+    shrunk to 5, a terminal shows ``12345 / 67890 / X`` where replay produces
+    ``12345 / X``.
+
+    What the clamp fixes is narrower and worth having: without it the cursor
+    keeps its old coordinates, so subsequent draws land in cells outside
+    ``screen.columns``/``screen.lines`` that ``_serialize_screen`` never reads
+    and the output disappears entirely.
     """
     screen.resize(rows, cols)
     screen.cursor.x = min(screen.cursor.x, screen.columns)
@@ -10695,6 +10703,12 @@ def _apply_resize(master_fd: int, cols: int, rows: int) -> bool:
     return True
 
 
+_LOG_WRITE_FAILED_MESSAGE = (
+    "log write failed; the capture is truncated and resize offsets can no "
+    "longer locate a geometry change, so the resize timeline stops here"
+)
+
+
 def _write_all_to_log(log_fd: int, data: bytes) -> "tuple[int, bool]":
     """Write all of ``data`` to ``log_fd``, returning (bytes written, complete).
 
@@ -10715,16 +10729,34 @@ def _write_all_to_log(log_fd: int, data: bytes) -> "tuple[int, bool]":
     return written, True
 
 
-def _drain_master_to_log(master_fd: int, log_fd: int) -> int:
-    """Read the PTY master until EAGAIN, writing to ``log_fd``.
+# Ceiling on one pre-resize drain. A child writing as fast as the runner reads
+# never lets the master reach EAGAIN, and the relay is single-threaded: an
+# unbounded drain would starve the resize it is preparing for and stop
+# servicing stdin and child exit. Past this the boundary is approximate, which
+# is the same guarantee the ioctl itself gives against a concurrent writer.
+DRAIN_BEFORE_RESIZE_MAX_BYTES = 4 * 1024 * 1024
+DRAIN_BEFORE_RESIZE_MAX_SECONDS = 0.25
 
-    Returns the bytes written. Used before applying a resize so output the
-    child has already produced is logged under the geometry it was drawn for.
-    A closed master or read error stops the drain; the caller's ordinary read
-    path handles reaping.
+
+def _drain_master_to_log(master_fd: int, log_fd: int) -> "tuple[int, bool]":
+    """Read the PTY master toward EAGAIN, writing to ``log_fd``.
+
+    Returns (bytes written, capture intact). Used before applying a resize so
+    output the child has already produced is logged under the geometry it was
+    drawn for.
+
+    The drain is bounded by bytes and elapsed time: reaching either leaves the
+    remaining output to the ordinary relay path, so the recorded offset lands
+    slightly early rather than the run stalling. A closed master or read error
+    ends the drain; the caller's ordinary read path handles reaping.
+
+    ``capture intact`` is False when a log write failed, meaning bytes consumed
+    from the master were lost. The caller must stop recording resize offsets:
+    they index the captured log, so a gap makes every later offset meaningless.
     """
     total = 0
-    while True:
+    deadline = time.monotonic() + DRAIN_BEFORE_RESIZE_MAX_SECONDS
+    while total < DRAIN_BEFORE_RESIZE_MAX_BYTES and time.monotonic() < deadline:
         try:
             data = os.read(master_fd, 65536)
         except InterruptedError:
@@ -10736,8 +10768,8 @@ def _drain_master_to_log(master_fd: int, log_fd: int) -> int:
         written, complete = _write_all_to_log(log_fd, data)
         total += written
         if not complete:
-            break
-    return total
+            return total, False
+    return total, True
 
 
 def _resize_record_pending(buffered: bytes) -> bool:
@@ -11149,11 +11181,7 @@ def _run_interactive(
                 log_bytes_written += written
                 if not complete and log_capture_intact:
                     log_capture_intact = False
-                    warn_resize(
-                        "log write failed; the capture is truncated and resize "
-                        "offsets can no longer locate a geometry change, so the "
-                        "resize timeline stops here"
-                    )
+                    warn_resize(_LOG_WRITE_FAILED_MESSAGE)
 
         if fifo_fd in r:
             try:
@@ -11181,12 +11209,16 @@ def _run_interactive(
             if _resize_record_pending(buf_resize):
                 # Everything the child has already produced belongs to the old
                 # geometry, but a single 4096-byte read leaves the rest queued
-                # on the master to be logged after the resize offset. Drain to
-                # EAGAIN first so the recorded offset names a real boundary.
-                # Output generated concurrently between this drain and the
-                # ioctl is an unavoidable PTY race: the child writes without
-                # coordinating with the resize.
-                log_bytes_written += _drain_master_to_log(master_fd, log_fd)
+                # on the master to be logged after the resize offset. Drain
+                # toward EAGAIN first so the recorded offset names a real
+                # boundary. Output generated concurrently between this drain
+                # and the ioctl is an unavoidable PTY race: the child writes
+                # without coordinating with the resize.
+                drained, drain_intact = _drain_master_to_log(master_fd, log_fd)
+                log_bytes_written += drained
+                if not drain_intact and log_capture_intact:
+                    log_capture_intact = False
+                    warn_resize(_LOG_WRITE_FAILED_MESSAGE)
             buf_resize = _drain_resize_records(
                 master_fd, buf_resize, warn_resize, record_resize
             )
