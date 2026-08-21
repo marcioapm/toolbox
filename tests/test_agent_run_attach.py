@@ -1272,67 +1272,104 @@ termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         _stop_run(state)
 
 
-def test_register_attach_presence_creates_marker_and_directory(tmp_path):
+def test_register_attach_presence_creates_a_locked_marker(tmp_path):
     state_dir = tmp_path / "state"
     state_dir.mkdir()
 
-    marker = agent_run._register_attach_presence(state_dir)
+    marker_fd = agent_run._register_attach_presence(state_dir)
+    try:
+        assert marker_fd is not None
+        assert (state_dir / "attached" / str(os.getpid())).is_file()
+    finally:
+        if marker_fd is not None:
+            os.close(marker_fd)
 
-    assert marker == state_dir / "attached" / str(os.getpid())
-    assert marker.is_file()
+
+def _presence_run(runs_root, log_root, name, terminal=None):
+    """Seed a run with a resize FIFO and optional recorded launch geometry.
+
+    Returns (state_dir, reader_fd, writer_fd); the caller closes both fds.
+    """
+    state_dir = runs_root / name
+    state_dir.mkdir()
+    log_dir = log_root / name
+    log_dir.mkdir()
+    if terminal is not None:
+        (log_dir / "run.json").write_text(json.dumps({"terminal": terminal}))
+    os.mkfifo(state_dir / "resize")
+    reader = os.open(state_dir / "resize", os.O_RDONLY | os.O_NONBLOCK)
+    writer = os.open(state_dir / "resize", os.O_WRONLY | os.O_NONBLOCK)
+    return state_dir, reader, writer
+
+
+def _hold_marker_in_child(state_dir, pid_name):
+    """Fork a child holding an exclusive lock on a presence marker.
+
+    A live peer must be a real process holding a real lock: the lock, not the
+    file, marks a client present, so a touched file cannot stand in. Returns
+    the child pid; the caller kills and reaps it.
+    """
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            marker = state_dir / "attached" / pid_name
+            marker.parent.mkdir(exist_ok=True)
+            fd = os.open(marker, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.write(write_fd, b"held")
+            time.sleep(30)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    assert os.read(read_fd, 4) == b"held"
+    os.close(read_fd)
+    return pid
 
 
 def test_last_client_to_detach_sends_a_restore_record(isolated_runs_root, isolated_log_root):
-    name = "detach-restore"
-    state_dir = isolated_runs_root / name
-    state_dir.mkdir()
-    log_dir = isolated_log_root / name
-    log_dir.mkdir()
-    (log_dir / "run.json").write_text(json.dumps({"terminal": {"cols": 80, "rows": 24}}))
-    os.mkfifo(state_dir / "resize")
-    resize_reader = os.open(state_dir / "resize", os.O_RDONLY | os.O_NONBLOCK)
-    resize_writer = os.open(state_dir / "resize", os.O_WRONLY | os.O_NONBLOCK)
+    state_dir, reader, writer = _presence_run(
+        isolated_runs_root, isolated_log_root, "detach-restore", {"cols": 80, "rows": 24}
+    )
     try:
-        marker = agent_run._register_attach_presence(state_dir)
+        marker_fd = agent_run._register_attach_presence(state_dir)
 
-        agent_run._deregister_attach_presence_and_restore(name, marker, resize_writer)
+        agent_run._deregister_attach_presence_and_restore(
+            "detach-restore", state_dir, marker_fd, writer
+        )
 
-        assert not marker.exists()
-        assert os.read(resize_reader, 4096) == agent_run._pack_resize(80, 24)
+        assert not (state_dir / "attached" / str(os.getpid())).exists()
+        assert os.read(reader, 4096) == agent_run._pack_resize(80, 24)
     finally:
-        os.close(resize_reader)
-        os.close(resize_writer)
+        os.close(reader)
+        os.close(writer)
 
 
 def test_detaching_while_another_client_remains_attached_sends_nothing(
     isolated_runs_root, isolated_log_root
 ):
-    name = "detach-shared"
-    state_dir = isolated_runs_root / name
-    state_dir.mkdir()
-    log_dir = isolated_log_root / name
-    log_dir.mkdir()
-    (log_dir / "run.json").write_text(json.dumps({"terminal": {"cols": 80, "rows": 24}}))
-    os.mkfifo(state_dir / "resize")
-    resize_reader = os.open(state_dir / "resize", os.O_RDONLY | os.O_NONBLOCK)
-    resize_writer = os.open(state_dir / "resize", os.O_WRONLY | os.O_NONBLOCK)
+    state_dir, reader, writer = _presence_run(
+        isolated_runs_root, isolated_log_root, "detach-shared", {"cols": 80, "rows": 24}
+    )
+    peer_pid = None
     try:
-        marker = agent_run._register_attach_presence(state_dir)
-        # A second, still-attached client -- simulated directly since forking
-        # a second real process just to hold a presence marker open adds
-        # nothing this pid-named file doesn't already cover.
-        other_marker = state_dir / "attached" / "999999"
-        other_marker.touch()
+        marker_fd = agent_run._register_attach_presence(state_dir)
+        peer_pid = _hold_marker_in_child(state_dir, "peer")
 
-        agent_run._deregister_attach_presence_and_restore(name, marker, resize_writer)
+        agent_run._deregister_attach_presence_and_restore(
+            "detach-shared", state_dir, marker_fd, writer
+        )
 
-        assert not marker.exists()
-        assert other_marker.exists()
-        readable, _, _ = select.select([resize_reader], [], [], 0.2)
-        assert not readable, "a restore record must not be sent while a peer is still attached"
+        assert (state_dir / "attached" / "peer").exists()
+        readable, _, _ = select.select([reader], [], [], 0.2)
+        assert not readable, "a restore must not be sent while a peer is still attached"
     finally:
-        os.close(resize_reader)
-        os.close(resize_writer)
+        if peer_pid is not None:
+            os.kill(peer_pid, signal.SIGKILL)
+            os.waitpid(peer_pid, 0)
+        os.close(reader)
+        os.close(writer)
 
 
 def test_deregister_sends_nothing_when_run_json_has_no_terminal(
@@ -1341,52 +1378,79 @@ def test_deregister_sends_nothing_when_run_json_has_no_terminal(
     """A run launched by an older build has no `terminal` field in run.json
     (or no run.json at all); the last detaching client must send nothing
     rather than guess a geometry."""
-    name = "detach-no-geometry"
-    state_dir = isolated_runs_root / name
-    state_dir.mkdir()
-    (isolated_log_root / name).mkdir()
-    os.mkfifo(state_dir / "resize")
-    resize_reader = os.open(state_dir / "resize", os.O_RDONLY | os.O_NONBLOCK)
-    resize_writer = os.open(state_dir / "resize", os.O_WRONLY | os.O_NONBLOCK)
+    state_dir, reader, writer = _presence_run(
+        isolated_runs_root, isolated_log_root, "detach-no-geometry"
+    )
     try:
-        marker = agent_run._register_attach_presence(state_dir)
+        marker_fd = agent_run._register_attach_presence(state_dir)
 
-        agent_run._deregister_attach_presence_and_restore(name, marker, resize_writer)
+        agent_run._deregister_attach_presence_and_restore(
+            "detach-no-geometry", state_dir, marker_fd, writer
+        )
 
-        assert not marker.exists()
-        readable, _, _ = select.select([resize_reader], [], [], 0.2)
+        readable, _, _ = select.select([reader], [], [], 0.2)
         assert not readable
     finally:
-        os.close(resize_reader)
-        os.close(resize_writer)
+        os.close(reader)
+        os.close(writer)
 
 
-def test_stale_entry_from_a_killed_client_skips_restore(isolated_runs_root, isolated_log_root):
-    """A leftover pid-file from a client that never cleaned up (killed, not
-    detached normally) is tolerated: the directory is non-empty from this
-    client's point of view, so the restore is simply skipped -- the current
-    behaviour before this feature existed. No liveness check, no reaping."""
-    name = "detach-stale-peer"
-    state_dir = isolated_runs_root / name
-    state_dir.mkdir()
-    log_dir = isolated_log_root / name
-    log_dir.mkdir()
-    (log_dir / "run.json").write_text(json.dumps({"terminal": {"cols": 80, "rows": 24}}))
-    os.mkfifo(state_dir / "resize")
-    resize_reader = os.open(state_dir / "resize", os.O_RDONLY | os.O_NONBLOCK)
-    resize_writer = os.open(state_dir / "resize", os.O_WRONLY | os.O_NONBLOCK)
+def test_marker_left_by_a_killed_client_does_not_suppress_the_restore(
+    isolated_runs_root, isolated_log_root
+):
+    """A client killed with SIGKILL cannot unlink its marker. Presence is held
+    by an exclusive lock the kernel drops on exit, so the marker is identified
+    as stale and reaped rather than suppressing every future restore."""
+    state_dir, reader, writer = _presence_run(
+        isolated_runs_root, isolated_log_root, "detach-stale", {"cols": 80, "rows": 24}
+    )
     try:
-        marker = agent_run._register_attach_presence(state_dir)
-        stale = state_dir / "attached" / "424242"  # pid of a long-gone client
-        stale.touch()
+        dead_pid = _hold_marker_in_child(state_dir, "dead")
+        os.kill(dead_pid, signal.SIGKILL)
+        os.waitpid(dead_pid, 0)
+        assert (state_dir / "attached" / "dead").exists()
 
-        agent_run._deregister_attach_presence_and_restore(name, marker, resize_writer)
+        marker_fd = agent_run._register_attach_presence(state_dir)
+        agent_run._deregister_attach_presence_and_restore(
+            "detach-stale", state_dir, marker_fd, writer
+        )
 
-        readable, _, _ = select.select([resize_reader], [], [], 0.2)
-        assert not readable
+        assert os.read(reader, 4096) == agent_run._pack_resize(80, 24)
+        assert not (state_dir / "attached" / "dead").exists()
     finally:
-        os.close(resize_reader)
-        os.close(resize_writer)
+        os.close(reader)
+        os.close(writer)
+
+
+def test_registration_is_ordered_against_a_concurrent_last_detach(
+    isolated_runs_root, isolated_log_root
+):
+    """Registration and the detach restore share one lock, so a client that
+    registers while another is detaching is either seen as present (no restore)
+    or registers afterwards -- never both, which would leave the PTY at launch
+    geometry while a live client believes it set its own size."""
+    state_dir, reader, writer = _presence_run(
+        isolated_runs_root, isolated_log_root, "detach-race", {"cols": 80, "rows": 24}
+    )
+    peer_pid = None
+    try:
+        marker_fd = agent_run._register_attach_presence(state_dir)
+        with agent_run._attach_presence_lock(state_dir):
+            peer_pid = _hold_marker_in_child(state_dir, "late")
+            # The detach cannot proceed while this lock is held, so the late
+            # registration is already visible when it does.
+        agent_run._deregister_attach_presence_and_restore(
+            "detach-race", state_dir, marker_fd, writer
+        )
+
+        readable, _, _ = select.select([reader], [], [], 0.2)
+        assert not readable, "a client registered before the detach must suppress it"
+    finally:
+        if peer_pid is not None:
+            os.kill(peer_pid, signal.SIGKILL)
+            os.waitpid(peer_pid, 0)
+        os.close(reader)
+        os.close(writer)
 
 
 def test_last_detach_restores_launch_geometry_end_to_end(

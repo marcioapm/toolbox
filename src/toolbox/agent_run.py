@@ -5208,67 +5208,130 @@ def _drain_fifo_write(fd: int, data: bytes) -> bytes:
     return data
 
 
-def _register_attach_presence(state_dir: Path) -> Path:
-    """Create ``<state_dir>/attached/<pid>``, creating the directory if
-    needed, and return the marker path.
+@contextmanager
+def _attach_presence_lock(state_dir: Path):
+    """Serialize presence registration, the emptiness test, and the restore
+    write for one run.
 
-    Never raises: a failure here only means this client won't be counted
-    toward "who is still attached" -- degrading, at worst, to a skipped
-    detach-restore later (see ``_deregister_attach_presence_and_restore``),
-    not a failure to attach.
+    Without it a client can register between another's unlink and its
+    directory scan, so the departing client sends the launch geometry after
+    the new client has already published its own size and the final geometry
+    becomes scheduling-dependent.
     """
-    marker = state_dir / "attached" / str(os.getpid())
+    lock_path = state_dir / "attached.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        marker.parent.mkdir(exist_ok=True)
-        marker.touch()
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield fd
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _register_attach_presence(state_dir: Path) -> Optional[int]:
+    """Create ``<state_dir>/attached/<pid>`` and hold an exclusive lock on it
+    for the lifetime of this attach, returning the open descriptor.
+
+    The lock, not the file, is what marks this client present: the kernel
+    releases it when the process exits for any reason, so a client killed with
+    SIGKILL leaves a file that other clients can identify as stale rather than
+    a marker that suppresses the detach restore forever. A PID is only a
+    filename here, so PID reuse cannot make a dead client look alive.
+
+    Returns ``None`` when the marker cannot be created or locked; the client
+    then attaches normally but is not counted, which at worst skips a restore.
+    """
+    try:
+        presence_dir = state_dir / "attached"
+        presence_dir.mkdir(exist_ok=True)
+        fd = os.open(presence_dir / str(os.getpid()), os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
-        pass
-    return marker
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _attach_presence_is_empty(state_dir: Path, own_pid: int) -> bool:
+    """True when no live client other than ``own_pid`` holds a presence marker.
+
+    A marker whose lock can be taken belongs to a process that has exited
+    without unlinking it; it is removed here rather than left to suppress every
+    future restore.
+    """
+    presence_dir = state_dir / "attached"
+    try:
+        entries = list(presence_dir.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if entry.name == str(own_pid):
+            continue
+        try:
+            fd = os.open(entry, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False  # still held: that client is alive
+        else:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+    return True
 
 
 def _deregister_attach_presence_and_restore(
-    name: str, marker: Path, resize_fd: Optional[int]
+    name: str, state_dir: Path, marker_fd: Optional[int], resize_fd: Optional[int]
 ) -> None:
-    """Remove this client's presence entry and, if it was the last one
-    attached, restore the run's PTY to its launch-time geometry.
+    """Drop this client's presence marker and, if it was the last live one,
+    restore the run's PTY to its launch-time geometry.
 
-    A resize is last-writer-wins and out-of-band (TIOCSWINSZ + SIGWINCH):
-    once every attach client has detached, the PTY otherwise stays at
-    whatever size the last one left it, and every byte the wrapped agent
-    writes afterward is at a geometry nobody recorded. Sending one final
-    resize record carrying run.json's launch-time ``terminal`` geometry
-    closes that gap; if run.json has no ``terminal`` field (a run launched
-    by an older build), nothing is sent.
+    A resize is last-writer-wins and out-of-band (TIOCSWINSZ + SIGWINCH): once
+    every client has detached, the PTY otherwise stays at whatever size the last
+    one left it, and every byte the wrapped agent writes afterward is at a
+    geometry nobody recorded. One final resize record carrying run.json's
+    ``terminal`` geometry closes that gap; a run launched by an older build has
+    no recorded geometry, so nothing is sent.
 
-    A leftover presence entry from a killed client is tolerated: it just
-    means this client cannot tell it is the last one, so the restore is
-    skipped -- today's behaviour before this feature existed. No liveness
-    check, no reaping of stale entries.
+    The whole sequence runs under ``_attach_presence_lock`` so a client
+    registering concurrently either counts as present here or publishes its own
+    size after this restore, never both.
     """
+    if marker_fd is None:
+        return
+    own_pid = os.getpid()
     try:
-        marker.unlink()
+        with _attach_presence_lock(state_dir):
+            try:
+                (state_dir / "attached" / str(own_pid)).unlink()
+            except OSError:
+                pass
+            os.close(marker_fd)
+            if resize_fd is None or not _attach_presence_is_empty(state_dir, own_pid):
+                return
+            geometry = _read_run_terminal_geometry(_log_dir(name))
+            if geometry is None:
+                return
+            try:
+                _drain_fifo_write(resize_fd, _pack_resize(*geometry))
+            except OSError:
+                pass
     except OSError:
-        return
-    if resize_fd is None:
-        return
-    try:
-        remaining = list(marker.parent.iterdir())
-    except OSError:
-        return
-    if remaining:
-        return
-    geometry = _read_run_terminal_geometry(_log_dir(name))
-    if geometry is None:
-        return
-    cols, rows = geometry
-    try:
-        record = _pack_resize(cols, rows)
-    except ValueError:
-        return
-    try:
-        _drain_fifo_write(resize_fd, record)
-    except OSError:
-        pass
+        try:
+            os.close(marker_fd)
+        except OSError:
+            pass
 
 
 def cmd_attach(args: argparse.Namespace) -> int:
@@ -5318,11 +5381,13 @@ def cmd_attach(args: argparse.Namespace) -> int:
         except OSError as exc:
             os.close(stdin_fd)
             sys.exit(f"agent-run: failed to open resize FIFO at {resize_path}: {exc}")
-    # Presence registration: once every attach client has detached, the last
-    # one restores the run's PTY to its launch geometry (see
-    # _deregister_attach_presence_and_restore). try/finally below guarantees
-    # the entry is removed on Ctrl-C, an error, and normal exit alike.
-    attach_marker = _register_attach_presence(state_dir)
+    # Presence registration: once every client has detached, the last one
+    # restores the run's PTY to its launch geometry (see
+    # _deregister_attach_presence_and_restore). Registering under the presence
+    # lock keeps it ordered against a concurrent last-detach, and the try/finally
+    # below drops the marker on Ctrl-C, an error, and normal exit alike.
+    with _attach_presence_lock(state_dir):
+        attach_marker_fd = _register_attach_presence(state_dir)
     pending_input = b""
     pending_resize = b""
     resize_requested = True
@@ -5566,8 +5631,10 @@ def cmd_attach(args: argparse.Namespace) -> int:
             )
         os.close(stdin_fd)
         # Deregister before closing resize_fd: restoring the launch geometry
-        # (when this is the last attached client) writes through it.
-        _deregister_attach_presence_and_restore(name, attach_marker, resize_fd)
+        # (when this is the last live client) writes through it.
+        _deregister_attach_presence_and_restore(
+            name, state_dir, attach_marker_fd, resize_fd
+        )
         if resize_fd is not None:
             os.close(resize_fd)
         restore_terminal()
@@ -10607,6 +10674,61 @@ def _apply_resize(master_fd: int, cols: int, rows: int) -> None:
             raise
 
 
+def _write_all_to_log(log_fd: int, data: bytes) -> int:
+    """Write all of ``data`` to ``log_fd``, returning the bytes written.
+
+    A short write would otherwise drop the tail of a chunk, and every later
+    resize offset would name a position in a truncated capture rather than in
+    the byte stream the child emitted. EINTR retries; any other OSError stops
+    the loop and returns what was written, leaving the caller's offset accurate
+    for the bytes that did land.
+    """
+    written = 0
+    while written < len(data):
+        try:
+            written += os.write(log_fd, data[written:])
+        except InterruptedError:
+            continue
+        except OSError:
+            break
+    return written
+
+
+def _drain_master_to_log(master_fd: int, log_fd: int) -> int:
+    """Read the PTY master until EAGAIN, writing to ``log_fd``.
+
+    Returns the bytes written. Used before applying a resize so output the
+    child has already produced is logged under the geometry it was drawn for.
+    A closed master or read error stops the drain; the caller's ordinary read
+    path handles reaping.
+    """
+    total = 0
+    while True:
+        try:
+            data = os.read(master_fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            break
+        except OSError:
+            break
+        if not data:
+            break
+        total += _write_all_to_log(log_fd, data)
+    return total
+
+
+def _resize_record_pending(buffered: bytes) -> bool:
+    """True when ``buffered`` holds at least one complete, valid resize record.
+
+    Lets the relay skip the pre-resize drain for a batch that carries only a
+    partial or malformed record, which applies no resize.
+    """
+    while len(buffered) >= RESIZE_RECORD_SIZE:
+        if _valid_resize_record(buffered[:RESIZE_RECORD_SIZE]):
+            return True
+        buffered = buffered[1:]
+    return False
+
+
 def _drain_resize_records(
     master_fd: int, buffered: bytes, warn=None, on_applied=None
 ) -> bytes:
@@ -10990,11 +11112,7 @@ def _run_interactive(
                     break
                 # master closed but child still alive? unusual — loop again.
             else:
-                try:
-                    written = os.write(log_fd, data)
-                except OSError:
-                    written = 0
-                log_bytes_written += written
+                log_bytes_written += _write_all_to_log(log_fd, data)
 
         if fifo_fd in r:
             try:
@@ -11019,6 +11137,15 @@ def _run_interactive(
                 chunk = b""
             if chunk:
                 buf_resize += chunk
+            if _resize_record_pending(buf_resize):
+                # Everything the child has already produced belongs to the old
+                # geometry, but a single 4096-byte read leaves the rest queued
+                # on the master to be logged after the resize offset. Drain to
+                # EAGAIN first so the recorded offset names a real boundary.
+                # Output generated concurrently between this drain and the
+                # ioctl is an unavoidable PTY race: the child writes without
+                # coordinating with the resize.
+                log_bytes_written += _drain_master_to_log(master_fd, log_fd)
             buf_resize = _drain_resize_records(
                 master_fd, buf_resize, warn_resize, record_resize
             )
