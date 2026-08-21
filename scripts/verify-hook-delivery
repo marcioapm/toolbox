@@ -297,13 +297,13 @@ def _count_in_log(run_name: str, token: str) -> int:
 def _count_in_assistant_region(run_name: str, token: str) -> int:
     """Occurrences of token in assistant output, excluding echoed input lines.
 
-    The interactive log is a raw PTY capture. `agent-run clean` renders it via pyte
-    and extracts the transcript; lines starting with the input prefix (❯ for claude,
-    ┃ for opencode) are input echoes and are excluded.
+    The interactive log is a raw PTY capture. `agent-run logs --clean` renders
+    it via pyte and extracts the transcript; lines starting with the input
+    prefix (❯ for claude, ┃ for opencode) are input echoes and are excluded.
     """
     try:
         rendered = subprocess.run(
-            [*_agent_run_bin, "clean", run_name],
+            [*_agent_run_bin, "logs", run_name, "--clean"],
             capture_output=True, text=True, timeout=15, check=False
         )
         transcript = rendered.stdout if rendered.returncode == 0 else ""

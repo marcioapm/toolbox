@@ -207,7 +207,8 @@ def _count_in_log(run_name: str, token: str) -> int:
 
 
 def _count_in_assistant_region(run_name: str, token: str) -> int:
-    """Occurrences of token outside the echoed input lines of `agent-run clean`.
+    """Occurrences of token outside the echoed input lines of `agent-run logs
+    --clean`.
 
     The interactive log is a raw PTY capture, so the prompt is echoed into it and
     ANSI sequences (ESC[27m, cursor reports) contain bare digits; only the
@@ -215,7 +216,7 @@ def _count_in_assistant_region(run_name: str, token: str) -> int:
     Claude prefixes user input with '❯', opencode with '┃'.
     """
     try:
-        rendered = _run("agent-run", "clean", run_name, timeout=15, check=False)
+        rendered = _run("agent-run", "logs", run_name, "--clean", timeout=15, check=False)
         transcript = rendered.stdout if rendered.returncode == 0 else ""
     except Exception:
         return 0
