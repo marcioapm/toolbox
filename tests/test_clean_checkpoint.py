@@ -287,10 +287,11 @@ class TestRunJsonAndResizeTimelineWiring:
         ar._render_log_to_clean(log_dir)
 
         metadata = json.loads((log_dir / "log.clean.meta.json").read_text())
-        assert metadata["resize_count"] == 1
-        assert metadata["resize_last_offset"] == split
+        assert metadata["resize_identity"] == ar._resize_timeline_digest(
+            (W, H), [(split, 40, 20)]
+        )
 
-    def test_no_timeline_records_zero_resize_identity(self, tmp_path):
+    def test_no_timeline_records_the_empty_identity(self, tmp_path):
         raw = b"plain\r\n"
         log_dir = tmp_path / "run"
         log_dir.mkdir()
@@ -299,8 +300,17 @@ class TestRunJsonAndResizeTimelineWiring:
         ar._render_log_to_clean(log_dir)
 
         metadata = json.loads((log_dir / "log.clean.meta.json").read_text())
-        assert metadata["resize_count"] == 0
-        assert metadata["resize_last_offset"] == 0
+        assert metadata["resize_identity"] == ar._resize_timeline_digest((W, H), [])
+
+    def test_identity_distinguishes_timelines_sharing_count_and_last_offset(self):
+        """A count and a last offset collide across timelines differing only in
+        an intermediate offset or in dimensions, so a reader comparing those two
+        integers accepts a render made from another timeline."""
+        first = ar._resize_timeline_digest((10, 3), [(10, 5, 3), (14, 8, 3)])
+        differing_dimension = ar._resize_timeline_digest((10, 3), [(10, 9, 3), (14, 8, 3)])
+        differing_offset = ar._resize_timeline_digest((10, 3), [(11, 5, 3), (14, 8, 3)])
+        differing_geometry = ar._resize_timeline_digest((20, 3), [(10, 5, 3), (14, 8, 3)])
+        assert len({first, differing_dimension, differing_offset, differing_geometry}) == 4
 
     def test_cache_is_a_miss_when_resize_timeline_identity_differs(self, tmp_path):
         raw = b"a" * 20 + b"\r\n" + b"b" * 20 + b"\r\n"
@@ -335,21 +345,17 @@ class TestRunJsonAndResizeTimelineWiring:
 
         assert ar._read_clean_cache(log, W, H, HIST) == cached
 
-    def test_pre_existing_metadata_without_resize_fields_is_a_hit_when_log_has_no_resizes(
-        self, tmp_path
-    ):
-        """Metadata written before this feature has no resize_count/
-        resize_last_offset fields; it must still be treated as a hit when
-        the log genuinely has no resize timeline (the (0, 0) default on
-        both sides)."""
+    def test_metadata_from_an_older_version_is_a_miss(self, tmp_path):
+        """Version 1 metadata carries no resize identity. Reading an absent
+        digest as a default risks matching a real one, so an older cache is
+        rejected and re-rendered rather than trusted."""
         raw = b"legacy content\r\n"
         log_dir = tmp_path / "run"
         log_dir.mkdir()
         log = log_dir / "log"
         log.write_bytes(raw)
         clean = log_dir / "log.clean"
-        rendered = _render(raw)
-        clean.write_text(rendered, encoding="utf-8")
+        clean.write_text(_render(raw), encoding="utf-8")
         log_stat = log.stat()
         (log_dir / "log.clean.meta.json").write_text(json.dumps({
             "version": 1, "dev": log_stat.st_dev, "ino": log_stat.st_ino,
@@ -357,7 +363,7 @@ class TestRunJsonAndResizeTimelineWiring:
             "width": W, "height": H, "history": HIST, "updated_at": 0,
         }))
 
-        assert ar._read_clean_cache(log, W, H, HIST) == rendered
+        assert ar._read_clean_cache(log, W, H, HIST) is None
 
     def test_corrupt_run_json_falls_back_without_raising(self, tmp_path):
         raw = b"hello\r\n"
@@ -450,10 +456,12 @@ class TestRunJsonAndResizeTimelineWiring:
         clean = log_dir / "log.clean"
         clean.write_text(wrong_rendered, encoding="utf-8")
         (log_dir / "log.clean.meta.json").write_text(json.dumps({
-            "version": 1, "dev": log_stat.st_dev, "ino": log_stat.st_ino,
+            "version": ar._CLEAN_META_VERSION,
+            "dev": log_stat.st_dev, "ino": log_stat.st_ino,
             "offset": log_stat.st_size, "size": log_stat.st_size, "complete": True,
             "width": W, "height": H, "history": HIST,
-            "resize_count": 0, "resize_last_offset": 0, "updated_at": 0,
+            "resize_identity": ar._resize_timeline_digest((W, H), []),
+            "updated_at": 0,
         }))
 
         assert ar._read_clean_cache(log, W, H, HIST) is None

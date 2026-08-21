@@ -5902,6 +5902,10 @@ def _ckpt_stream_is_grounded(stream) -> bool:
 
 _CKPT_VERSION = 2
 
+# Bumped when the metadata layout changes: a reader must reject an older cache
+# outright rather than read absent fields as defaults that could match.
+_CLEAN_META_VERSION = 2
+
 
 def _ckpt_charsets() -> dict:
     """Stable tags for pyte's charset tables. g0/g1 hold the mapping table
@@ -6168,7 +6172,7 @@ def _atomic_write_text(path: Path, text: str, *, suffix: str) -> None:
 def _publish_clean(
     clean: Path, rendered: str, *, stat_result, offset: int, complete: bool,
     width: int = _RENDER_LOG_DEFAULT_WIDTH, height: int = _RENDER_LOG_DEFAULT_HEIGHT,
-    resize_identity: Tuple[int, int] = (0, 0),
+    resize_identity: Optional[str] = None,
 ) -> None:
     """Publish transcript then metadata identifying the raw prefix it covers."""
     _atomic_write_text(clean, rendered, suffix="clean")
@@ -6181,7 +6185,7 @@ def _publish_clean(
 def _publish_clean_metadata(
     clean: Path, *, stat_result, offset: int, complete: bool,
     width: int = _RENDER_LOG_DEFAULT_WIDTH, height: int = _RENDER_LOG_DEFAULT_HEIGHT,
-    resize_identity: Tuple[int, int] = (0, 0),
+    resize_identity: Optional[str] = None,
 ) -> None:
     """Publish cache health metadata without treating diagnostic state as text.
 
@@ -6191,9 +6195,16 @@ def _publish_clean_metadata(
     against the geometry it would resolve for this log, not against a
     hardcoded default, or it can hand back a render made at the wrong size.
     """
-    resize_count, resize_last_offset = resize_identity
+    if resize_identity is None:
+        # The echo daemon renders at the module defaults with no timeline, so
+        # that is the render this identity describes. A run whose resolved
+        # geometry differs digests differently, making its cache a miss rather
+        # than a hit at the wrong geometry.
+        resize_identity = _resize_timeline_digest(
+            (_RENDER_LOG_DEFAULT_WIDTH, _RENDER_LOG_DEFAULT_HEIGHT), ()
+        )
     metadata = {
-        "version": 1,
+        "version": _CLEAN_META_VERSION,
         "dev": stat_result.st_dev,
         "ino": stat_result.st_ino,
         "offset": offset,
@@ -6202,11 +6213,8 @@ def _publish_clean_metadata(
         "width": width,
         "height": height,
         "history": _RENDER_LOG_DEFAULT_HISTORY,
-        # Identifies the resize timeline this render applied -- count plus
-        # last offset is enough to detect a timeline that has since grown
-        # or changed, without storing the whole thing twice.
-        "resize_count": resize_count,
-        "resize_last_offset": resize_last_offset,
+        # Digest of the geometry and resize timeline this render applied.
+        "resize_identity": resize_identity,
         "updated_at": time.time(),
     }
     _atomic_write_text(_cache_metadata_path(clean), json.dumps(metadata, sort_keys=True), suffix="meta")
@@ -6265,16 +6273,35 @@ def _read_resize_timeline(log_dir: Path) -> List[dict]:
     return records
 
 
-def _current_resize_identity(log_dir: Path, raw_len: int) -> Tuple[int, int]:
-    """(count, last offset) of the resize timeline that currently applies to
+def _resize_timeline_digest(
+    geometry: Tuple[int, int], timeline: Sequence[Tuple[int, int, int]]
+) -> str:
+    """Digest of the initial ``geometry`` and the validated ``timeline`` that a
+    render applied.
+
+    A render is determined by the initial geometry plus the exact sequence of
+    (offset, cols, rows) triples, so the digest must cover all of it: a count
+    and a last offset collide across timelines with different intermediate
+    offsets or different dimensions, and a cache reader comparing only those
+    accepts a render made from another timeline.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(struct.pack(">II", *geometry))
+    for offset, cols, rows in timeline:
+        hasher.update(struct.pack(">QII", offset, cols, rows))
+    return hasher.hexdigest()[:16]
+
+
+def _current_resize_identity(log_dir: Path, raw_len: int) -> str:
+    """Digest of the geometry and resize timeline that currently apply to
     ``raw_len`` bytes of ``log_dir``'s raw log.
 
-    Compared against a cached render's own recorded identity by
-    ``_read_clean_cache`` to detect a cache published before a resize (or a
-    further resize) was recorded.
+    Compared by ``_read_clean_cache`` against the digest a cached render
+    recorded, to reject a cache published under a different geometry or before
+    a resize was recorded.
     """
-    validated = _validate_resize_timeline(_read_resize_timeline(log_dir), raw_len)
-    return (len(validated), validated[-1][0] if validated else 0)
+    timeline = _validate_resize_timeline(_read_resize_timeline(log_dir), raw_len)
+    return _resize_timeline_digest(_resolved_default_geometry(log_dir), timeline)
 
 
 def _resolved_default_geometry(log_dir: Path) -> Tuple[int, int]:
@@ -6337,7 +6364,11 @@ def _render_log_to_clean(log_dir: Path) -> None:
         if f is None:
             raise OSError("log is not a regular file")
         stat_result = os.fstat(f.fileno())
-    resize_identity = _current_resize_identity(log_dir, len(raw))
+    # Digest the snapshot just rendered rather than re-reading resizes.jsonl,
+    # so the metadata cannot describe a timeline the transcript never used.
+    resize_identity = _resize_timeline_digest(
+        (width, height), _validate_resize_timeline(resize_records, len(raw))
+    )
     _publish_clean(
         clean, rendered, stat_result=stat_result, offset=stat_result.st_size,
         complete=True, width=width, height=height, resize_identity=resize_identity,
@@ -6595,7 +6626,7 @@ def _read_clean_cache(
         # geometry, not merely at the (possibly different) module defaults.
         resolved_width, resolved_height = _resolved_default_geometry(log_path.parent)
         if not (
-            metadata.get("version") == 1
+            metadata.get("version") == _CLEAN_META_VERSION
             and metadata.get("complete") is True
             and metadata.get("dev") == raw_stat.st_dev
             and metadata.get("ino") == raw_stat.st_ino
@@ -6607,14 +6638,12 @@ def _read_clean_cache(
         published = metadata.get("offset")
         if published != metadata.get("size") or not isinstance(published, int):
             return None
-        # A resize recorded (or further extended) after this cache was
-        # published changes what the render should have looked like; the
-        # checkpoint in log.clean.state.json shares this same gate, since a
-        # resize-identity mismatch here already forces a full re-render.
-        # Metadata predating this field defaults to (0, 0) -- "no resizes"
-        # -- so an old cache is a hit exactly when the log still has none.
-        if _current_resize_identity(log_path.parent, raw_stat.st_size) != (
-            metadata.get("resize_count", 0), metadata.get("resize_last_offset", 0)
+        # A resize recorded after this cache was published, or a geometry that
+        # no longer resolves the same way, changes what the render should have
+        # been. The checkpoint in log.clean.state.json shares this gate: a
+        # mismatch here already forces a full re-render.
+        if _current_resize_identity(log_path.parent, raw_stat.st_size) != metadata.get(
+            "resize_identity"
         ):
             return None
         if published == raw_stat.st_size:

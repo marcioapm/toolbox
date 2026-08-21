@@ -41,7 +41,7 @@ def _metadata_is_valid(log_dir: Path) -> bool:
         return False
     log_stat = (log_dir / "log").stat()
     return (
-        metadata.get("version") == 1
+        metadata.get("version") == agent_run._CLEAN_META_VERSION
         and metadata.get("complete") is True
         and metadata.get("dev") == log_stat.st_dev
         and metadata.get("ino") == log_stat.st_ino
