@@ -49,6 +49,9 @@ Usage::
     agent-run -i <name> -- <cmd...>      # interactive (PTY-wrapped, steerable)
     agent-run --idle-timeout N <name> -- <cmd...>  # self-terminate after N idle seconds
     agent-run --cwd <dir> <name> -- <cmd...>  # run the command in <dir> (managed mode too)
+    agent-run --worktree DIR --worktree-base REF <name> -- <cmd...>
+                                          # create a linked worktree at DIR, branched from
+                                          # REF, and run the command there (managed mode too)
     agent-run --harness claude|opencode|codex   # managed mode (no trailing --)
               [--prompt <text> | --prompt-file <path>]
               [-i] [--model <model>] [--agent-mode <name>]
@@ -143,6 +146,11 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     resize       FIFO for attach terminal-resize records (interactive only)
     reap_reason  set by `agent-run reap` when it changes status (died/killed)
     tmp_dir      absolute path to this run's scratch dir (see below)
+    worktree_created  absolute path of a linked worktree this launch created via
+                 `--worktree`; absent for a run launched without `--worktree`
+                 or attached to a pre-existing one via `--worktree-reuse`.
+                 Observability only -- `reap`'s removal policy does not
+                 consult this file
 
 Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs)::
 
@@ -369,7 +377,7 @@ import platform
 from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Iterable, List, NamedTuple, NoReturn, Optional, Sequence, Tuple
 from toolbox import __version__ as TOOLBOX_VERSION
 from toolbox import agent_run_transcript as _agent_run_transcript
 
@@ -2685,6 +2693,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     interactive = _read(d / "interactive", "0")
     launch_error = _read(d / "launch_error") or _read(_log_dir(name) / "launch_error")
     suffix = f" launch_error={launch_error!r}" if launch_error else ""
+    worktree_created = _read(d / "worktree_created")
+    if worktree_created:
+        suffix += f" worktree_created={worktree_created!r}"
     print(
         f"name={name} status={status} pid={pid} exit={exit_code} "
         f"started={started} ended={ended} lines={lines} interactive={interactive}"
@@ -6950,6 +6961,191 @@ def _worktree_remove(info: _WorktreeInfo, path: Path, *, force: bool) -> Optiona
     return None
 
 
+# `git worktree add` clones the base tree into a fresh checkout, so it can
+# take as long as an initial clone on a slow disk; reuse the same generous
+# budget as removal rather than the plumbing-read timeout.
+WORKTREE_ADD_TIMEOUT_SECONDS: float = 300.0
+
+
+def _worktree_usage_error(message: str) -> NoReturn:
+    """Exit 2 for a malformed ``--worktree*`` invocation.
+
+    Distinct from the plain ``sys.exit(...)`` (exit 1) used elsewhere in this
+    module for runtime/preflight failures: a bad combination of flags is a
+    usage error in the conventional Unix sense, not a failure of an
+    otherwise-valid request.
+    """
+    print(f"agent-run: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _worktree_repo_from_invocation_cwd() -> Optional[str]:
+    """Absolute toplevel of the repo containing the process's current
+    directory, or ``None`` if it is not inside a git repository.
+
+    Must be called before ``_apply_launch_cwd`` chdirs the process: this is
+    the "invocation cwd", not wherever ``--cwd``/``--worktree`` later move to.
+    """
+    outcome = _watch_run_git_checked(
+        Path.cwd(), ["rev-parse", "--path-format=absolute", "--show-toplevel"]
+    )
+    if outcome.stdout is None:
+        return None
+    toplevel = outcome.stdout.strip()
+    return toplevel or None
+
+
+class _CreatedWorktree(NamedTuple):
+    """A linked worktree (and possibly a branch) this invocation created,
+    kept only for rollback if launch fails before the run is published."""
+
+    path: Path
+    repo: Path
+    branch: str
+    branch_created: bool
+
+
+def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktree]:
+    """No-op unless ``--worktree`` is set. Otherwise validates the full
+    ``--worktree*`` flag set, creates (or attaches to) a linked worktree, and
+    points ``args.cwd`` at it so ``_apply_launch_cwd`` needs no worktree
+    awareness of its own.
+
+    Every check here runs against the owning repo via ``git -C``, never by
+    chdir'ing into ``args.worktree`` — which may not exist yet — and runs
+    before any mutation, so a rejected request leaves the filesystem
+    untouched. Returns ``None`` when nothing was created by this call: either
+    ``--worktree`` was absent, or ``--worktree-reuse`` attached to an
+    already-existing worktree directory. The non-``None`` case is exactly
+    "this invocation is the one that must clean it up on a later failure".
+    """
+    worktree_raw: Optional[str] = getattr(args, "worktree", None)
+    reuse: bool = bool(getattr(args, "worktree_reuse", False))
+    if reuse and not worktree_raw:
+        _worktree_usage_error("--worktree-reuse requires --worktree")
+    if not worktree_raw:
+        return None
+    if getattr(args, "cwd", None):
+        _worktree_usage_error("--worktree and --cwd are mutually exclusive")
+    base: Optional[str] = getattr(args, "worktree_base", None)
+    if not base:
+        _worktree_usage_error("--worktree-base is required with --worktree")
+
+    # Anchored at the invocation cwd: _apply_launch_cwd has not run yet, so
+    # a relative DIR means relative to where agent-run was actually typed.
+    worktree_dir = Path(os.path.expanduser(worktree_raw))
+    if not worktree_dir.is_absolute():
+        worktree_dir = Path.cwd() / worktree_dir
+
+    repo_raw: Optional[str] = getattr(args, "worktree_repo", None)
+    if repo_raw:
+        repo = Path(os.path.expanduser(repo_raw))
+        if not repo.is_absolute():
+            repo = Path.cwd() / repo
+        if not repo.is_dir():
+            sys.exit(f"agent-run: --worktree-repo does not exist or is not a directory: {repo_raw}")
+    else:
+        discovered = _worktree_repo_from_invocation_cwd()
+        if discovered is None:
+            _worktree_usage_error(
+                "--worktree requires --worktree-repo: the invocation directory "
+                "is not inside a git repository"
+            )
+        repo = Path(discovered)
+
+    branch: str = getattr(args, "worktree_branch", None) or args.name
+    # _validate_run_name's whitelist (alnum start, then [A-Za-z0-9._-]) admits
+    # strings git rejects as ref names outright ("..", trailing ".", trailing
+    # ".lock"), and --worktree-branch is user-supplied independent of the run
+    # name entirely — so branch legality is git's call, not re-derived here.
+    branch_check = _watch_run_git_checked(repo, ["check-ref-format", "--branch", branch])
+    if branch_check.stdout is None:
+        sys.exit(f"agent-run: --worktree-branch {branch!r} is not a valid git branch name")
+
+    base_check = _watch_run_git_checked(repo, ["rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"])
+    if base_check.stdout is None:
+        sys.exit(f"agent-run: --worktree-base {base!r} does not resolve to a commit in {repo}")
+
+    branch_ref_check = _watch_run_git_checked(repo, ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"])
+    branch_exists = branch_ref_check.stdout is not None
+    if branch_exists and not reuse:
+        sys.exit(
+            f"agent-run: branch {branch!r} already exists in {repo}; "
+            f"pass --worktree-reuse to attach to it"
+        )
+
+    dir_present = _path_entry_exists(worktree_dir)
+    if dir_present and not reuse:
+        sys.exit(f"agent-run: --worktree directory already exists: {worktree_dir}")
+
+    if dir_present:
+        # --worktree-reuse opts into attaching, but only to a worktree this
+        # exact repo already owns — never to an unrelated directory or a
+        # worktree belonging to some other repo, which would be the same
+        # class of cross-contamination bug this feature exists to prevent.
+        info = _worktree_classify(worktree_dir)
+        common_check = _watch_run_git_checked(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        owning_common = common_check.stdout.strip() if common_check.stdout is not None else None
+        if info.kind != _WORKTREE_LINKED or owning_common is None or info.common_dir != owning_common:
+            sys.exit(
+                f"agent-run: --worktree {worktree_dir} exists but is not a linked "
+                f"worktree of {repo}; refusing to attach"
+            )
+        args.cwd = str(worktree_dir)
+        return None  # attached as-is; this invocation created nothing
+
+    parent = worktree_dir.parent
+    if not parent.is_dir():
+        sys.exit(f"agent-run: --worktree parent directory does not exist: {parent}")
+    if not os.access(parent, os.W_OK):
+        sys.exit(f"agent-run: --worktree parent directory is not writable: {parent}")
+
+    if branch_exists:
+        # --worktree-reuse attaching to a pre-existing branch: check it out
+        # rather than creating it.
+        add_args = ["worktree", "add", str(worktree_dir), branch]
+    else:
+        add_args = ["worktree", "add", "-b", branch, str(worktree_dir), base]
+    outcome = _watch_run_git_checked(repo, add_args, timeout=WORKTREE_ADD_TIMEOUT_SECONDS)
+    if outcome.stdout is None:
+        sys.exit(f"agent-run: git worktree add failed for {worktree_dir}: {outcome.error_detail}")
+
+    args.cwd = str(worktree_dir)
+    # Recorded on args, not returned separately, so _cmd_launch_locked (which
+    # never sees the _CreatedWorktree rollback handle) can still write the
+    # durable state-dir marker.
+    args._worktree_created_path = str(worktree_dir)
+    return _CreatedWorktree(worktree_dir, repo, branch, branch_created=not branch_exists)
+
+
+def _rollback_launch_worktree(created: _CreatedWorktree) -> None:
+    """Best-effort teardown of a worktree (and branch, if freshly created)
+    this invocation made, called only when launch fails before the run is
+    published. Never raises: failure here must not mask the launch failure
+    that triggered it, so every problem is reported to stderr and swallowed.
+    """
+    info = _worktree_classify(created.path)
+    if info.kind != _WORKTREE_LINKED:
+        print(
+            f"agent-run: warning: cannot roll back {created.path}: "
+            f"not a linked worktree ({info.detail})",
+            file=sys.stderr,
+        )
+        return
+    reason = _worktree_remove(info, created.path, force=False)
+    if reason is not None:
+        print(f"agent-run: warning: failed to roll back worktree {created.path}: {reason}", file=sys.stderr)
+        return  # worktree still checked out; deleting its branch would fail anyway
+    if created.branch_created:
+        outcome = _watch_run_git_checked(created.repo, ["branch", "-D", created.branch])
+        if outcome.stdout is None:
+            print(
+                f"agent-run: warning: failed to remove branch {created.branch!r} "
+                f"during rollback: {outcome.error_detail}",
+                file=sys.stderr,
+            )
+
+
 class _WorktreeCandidate(NamedTuple):
     """One deduplicated worktree candidate attributed across all run state."""
 
@@ -8828,11 +9024,35 @@ def cmd_launch(args: argparse.Namespace) -> int:
     # ensures the reaper's exclusive-lock attempt blocks until this run's cwd
     # and status are both published.
     with _worktree_publication_lock(exclusive=False):
+        # Worktree creation must happen inside this same shared lock: the
+        # lock exists precisely so nothing visible to a concurrent reaper's
+        # final exclusive-lock scan is half-created, and a freshly `git
+        # worktree add`-ed directory with no run state yet is exactly that.
+        created = _create_launch_worktree(args)
         # chdir next: every path below (state, logs, git facts, the launched
         # command) must observe one single effective working directory.
         _apply_launch_cwd(args)
-        with _launch_lock(name) as lock_fd:
-            return _cmd_launch_locked(args, name, lock_fd)
+        if created is None:
+            with _launch_lock(name) as lock_fd:
+                return _cmd_launch_locked(args, name, lock_fd)
+        # Roll back a worktree this call created if anything from here on
+        # fails before the run is published. _cmd_launch_locked signals
+        # failure with sys.exit (SystemExit), not a return value, so the
+        # guard must catch BaseException to see it; the original failure is
+        # always re-raised, even if rollback itself also fails.
+        try:
+            with _launch_lock(name) as lock_fd:
+                rc = _cmd_launch_locked(args, name, lock_fd)
+        except BaseException:
+            try:
+                _rollback_launch_worktree(created)
+            except Exception as rollback_exc:  # noqa: BLE001
+                print(
+                    f"agent-run: warning: worktree rollback itself failed: {rollback_exc}",
+                    file=sys.stderr,
+                )
+            raise
+        return rc
 
 
 def _apply_launch_cwd(args: argparse.Namespace) -> None:
@@ -8908,6 +9128,12 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         _safe_rmtree(log_d, LOG_ROOT)
     d.mkdir(parents=True, exist_ok=True)
     log_d.mkdir(parents=True, exist_ok=True)
+    # Durable record of "agent-run created this worktree" (vs. a human having
+    # made it, or --worktree-reuse attaching to one that already existed),
+    # for observability only -- reap's removal policy reads none of this and
+    # its age/cleanliness gates are unchanged either way.
+    if getattr(args, "_worktree_created_path", None):
+        _write(d / "worktree_created", args._worktree_created_path + "\n")
 
     # Per-run scratch dir, on the same persistent disk as the log (not the
     # possibly-tmpfs/RAM-backed STATE_ROOT). Created eagerly, before the
@@ -11767,6 +11993,44 @@ def _build_parser() -> argparse.ArgumentParser:
         "-f/--prompt-file names a file the caller typed and stays relative to the "
         "invocation directory",
     )
+    p.add_argument(
+        "--worktree",
+        metavar="DIR",
+        default=argparse.SUPPRESS,
+        help="create a linked git worktree at DIR and launch into it, setting --cwd to "
+        "DIR; mutually exclusive with --cwd. Requires --worktree-base. DIR must not "
+        "already exist unless --worktree-reuse is given",
+    )
+    p.add_argument(
+        "--worktree-base",
+        metavar="REF",
+        default=argparse.SUPPRESS,
+        help="base ref the new branch starts from; required with --worktree. Deriving "
+        "this from the invocation checkout's HEAD is deliberately unsupported: an agent "
+        "launched from a stale or mid-work checkout would otherwise silently branch off "
+        "whatever happened to be checked out",
+    )
+    p.add_argument(
+        "--worktree-branch",
+        metavar="NAME",
+        default=argparse.SUPPRESS,
+        help="branch to create for --worktree (default: the run name)",
+    )
+    p.add_argument(
+        "--worktree-repo",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help="owning repository for --worktree (default: the repository containing the "
+        "invocation directory)",
+    )
+    p.add_argument(
+        "--worktree-reuse",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="attach to an existing worktree directory (of the same --worktree-repo) or "
+        "an existing --worktree-branch instead of failing; without this flag, an "
+        "existing DIR or branch is always a hard failure, never a silent attach",
+    )
     mg.add_argument(
         "--harness",
         metavar="claude|opencode|codex",
@@ -12288,6 +12552,15 @@ class _LaunchArgv(NamedTuple):
     subcommand_tokens: Optional[List[str]]
     # Working directory for the launched command; None means inherit.
     cwd: Optional[str] = None
+    # --worktree* fields; all None/False when --worktree is absent. Mutual
+    # exclusion with cwd and the --worktree-base requirement are enforced by
+    # _create_launch_worktree (at cmd_launch time, exit 2), not here: this
+    # parser is pure and does no filesystem/git access.
+    worktree: Optional[str] = None
+    worktree_base: Optional[str] = None
+    worktree_branch: Optional[str] = None
+    worktree_repo: Optional[str] = None
+    worktree_reuse: bool = False
     # Managed-mode fields; all None/empty for raw runs.
     harness: Optional[str] = None
     prompt: Optional[str] = None
@@ -12328,6 +12601,10 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
       --idle-timeout N / --idle-timeout=N
       the managed-mode flags in _MANAGED_VALUE_FLAGS
       --cwd <dir>  (working directory for the launched command)
+      --worktree DIR --worktree-base REF [--worktree-branch NAME]
+        [--worktree-repo PATH] [--worktree-reuse]
+        (create or attach to a linked worktree; --worktree-base required;
+        mutually exclusive with --cwd; see _create_launch_worktree)
 
     Preserves the -- separator semantics: name must precede --, everything
     after -- is taken verbatim.  Without --, a leading-dash token immediately
@@ -12353,6 +12630,11 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
     harness_args: List[str] = []
     permissions: str = _PERMISSIONS_BYPASS
     cwd: Optional[str] = None
+    worktree: Optional[str] = None
+    worktree_base: Optional[str] = None
+    worktree_branch: Optional[str] = None
+    worktree_repo: Optional[str] = None
+    worktree_reuse = False
     enable_planning = False
     enable_questions = False
 
@@ -12448,6 +12730,41 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             if not cwd:
                 raise _LaunchArgvError("agent-run: --cwd requires a directory")
             continue
+        # --worktree* flags are collected here but validated (mutual exclusion
+        # with --cwd, --worktree-base required, filesystem/git checks) by
+        # _create_launch_worktree at cmd_launch time — this parser does no
+        # filesystem or git access.
+        if tokens[0] == "--worktree-reuse":
+            worktree_reuse = True
+            tokens = tokens[1:]
+            continue
+        worktree_flag = None
+        for name_, dest in (
+            ("--worktree", "worktree"),
+            ("--worktree-base", "worktree_base"),
+            ("--worktree-branch", "worktree_branch"),
+            ("--worktree-repo", "worktree_repo"),
+        ):
+            if tokens[0] == name_:
+                if len(tokens) < 2:
+                    raise _LaunchArgvError(f"agent-run: {name_} requires a value")
+                worktree_flag, value, tokens = dest, tokens[1], tokens[2:]
+                break
+            if tokens[0].startswith(name_ + "="):
+                worktree_flag, value, tokens = dest, tokens[0].split("=", 1)[1], tokens[1:]
+                break
+        if worktree_flag is not None:
+            if not value:
+                raise _LaunchArgvError(f"agent-run: --{worktree_flag.replace('_', '-')} requires a value")
+            if worktree_flag == "worktree":
+                worktree = value
+            elif worktree_flag == "worktree_base":
+                worktree_base = value
+            elif worktree_flag == "worktree_branch":
+                worktree_branch = value
+            elif worktree_flag == "worktree_repo":
+                worktree_repo = value
+            continue
         break
 
     # After the flag loop, reject managed-only flags on raw launches.
@@ -12475,6 +12792,8 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         interactive or prompt_file or submit_mode is not None
         or idle_timeout is not None or harness is not None or prompt is not None
         or model is not None or agent_mode is not None or cwd is not None
+        or worktree is not None or worktree_base is not None
+        or worktree_branch is not None or worktree_repo is not None or worktree_reuse
         or bool(harness_args) or permissions != _PERMISSIONS_BYPASS
         or enable_planning or enable_questions
     )
@@ -12492,6 +12811,9 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             submit_mode=submit_mode,
             idle_timeout=idle_timeout, name="", command=[],
             subcommand_tokens=None, cwd=cwd,
+            worktree=worktree, worktree_base=worktree_base,
+            worktree_branch=worktree_branch, worktree_repo=worktree_repo,
+            worktree_reuse=worktree_reuse,
             harness=harness, prompt=prompt, model=model,
             agent_mode=agent_mode, harness_args=harness_args,
         )
@@ -12560,6 +12882,11 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             command=[],
             subcommand_tokens=None,
             cwd=cwd,
+            worktree=worktree,
+            worktree_base=worktree_base,
+            worktree_branch=worktree_branch,
+            worktree_repo=worktree_repo,
+            worktree_reuse=worktree_reuse,
             harness=harness,
             prompt=prompt,
             model=model,
@@ -12606,6 +12933,11 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
         command=command,
         subcommand_tokens=None,
         cwd=cwd,
+        worktree=worktree,
+        worktree_base=worktree_base,
+        worktree_branch=worktree_branch,
+        worktree_repo=worktree_repo,
+        worktree_reuse=worktree_reuse,
     )
 
 
@@ -12661,6 +12993,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         harness_args=list(parsed.harness_args),
         permissions=parsed.permissions,
         cwd=parsed.cwd,
+        worktree=parsed.worktree,
+        worktree_base=parsed.worktree_base,
+        worktree_branch=parsed.worktree_branch,
+        worktree_repo=parsed.worktree_repo,
+        worktree_reuse=parsed.worktree_reuse,
         enable_planning=parsed.enable_planning,
         enable_questions=parsed.enable_questions,
     )
