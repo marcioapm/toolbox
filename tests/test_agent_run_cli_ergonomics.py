@@ -538,8 +538,6 @@ def _run_and_read_log(
         command=[sys.executable, "-c", script],
         interactive=False,
         prompt_file=None,
-        echo=False,
-        echo_interval=2.0,
         submit_mode=None,
     )
     rc = agent_run.cmd_launch(args)
@@ -633,16 +631,6 @@ class TestParseLaunchArgv:
         r = self._parse(["--prompt-file=/path.md", "myrun", "cmd"])
         assert r.prompt_file == "/path.md"
 
-    def test_echo_bare(self):
-        r = self._parse(["--echo", "myrun", "cmd"])
-        assert r.echo is True
-        assert r.echo_interval == 2.0
-
-    def test_echo_with_interval(self):
-        r = self._parse(["--echo=5.0", "myrun", "cmd"])
-        assert r.echo is True
-        assert r.echo_interval == 5.0
-
     def test_submit_mode_cr(self):
         r = self._parse(["--submit-mode=cr", "myrun", "cmd"])
         assert r.submit_mode == "cr"
@@ -663,14 +651,12 @@ class TestParseLaunchArgv:
 
     def test_all_flags_combined_any_order(self):
         r = self._parse([
-            "--echo=3", "-i", "--submit-mode=crlf",
+            "-i", "--submit-mode=crlf",
             "-f", "/p.md", "--idle-timeout=90",
             "myrun", "--", "opencode",
         ])
         assert r.interactive is True
         assert r.prompt_file == "/p.md"
-        assert r.echo is True
-        assert r.echo_interval == 3.0
         assert r.submit_mode == "crlf"
         assert r.idle_timeout == 90.0
         assert r.name == "myrun"
@@ -709,8 +695,7 @@ class TestParseLaunchArgv:
         assert r.subcommand_tokens == [name, "--", "myrun"]
 
     def test_dashdash_flags_before_name(self):
-        r = self._parse(["--echo", "--idle-timeout", "30", "myrun", "--", "some-cmd", "--flag"])
-        assert r.echo is True
+        r = self._parse(["--idle-timeout", "30", "myrun", "--", "some-cmd", "--flag"])
         assert r.idle_timeout == 30.0
         assert r.name == "myrun"
         assert r.command == ["some-cmd", "--flag"]
@@ -799,7 +784,7 @@ class TestParseLaunchArgv:
         assert r.interactive is True
 
     def test_all_known_subcommands_dispatched(self):
-        for sub in ["status", "watch", "logs", "tail", "clean", "steer",
+        for sub in ["status", "watch", "logs", "tail", "attach", "steer",
                     "kill", "list", "reap", "du", "help"]:
             r = self._parse([sub])
             assert r.subcommand_tokens is not None, f"{sub!r} did not dispatch"
@@ -818,56 +803,56 @@ class TestParseLaunchArgv:
         (
             ["-i", "myrun", "--", "claude", "--print"],
             dict(interactive=True, name="myrun", command=["claude", "--print"],
-                 echo=False, echo_interval=2.0, submit_mode=None, idle_timeout=None,
+                 submit_mode=None, idle_timeout=None,
                  prompt_file=None),
         ),
         (
-            ["--echo", "--idle-timeout", "30", "myrun", "--", "cmd", "--flag"],
+            ["--idle-timeout", "30", "myrun", "--", "cmd", "--flag"],
             dict(interactive=False, name="myrun", command=["cmd", "--flag"],
-                 echo=True, echo_interval=2.0, submit_mode=None, idle_timeout=30.0,
+                 submit_mode=None, idle_timeout=30.0,
                  prompt_file=None),
         ),
         (
             ["-f", "/some/prompt.md", "myrun", "cmd"],
             dict(interactive=False, prompt_file="/some/prompt.md", name="myrun",
-                 command=["cmd"], echo=False, echo_interval=2.0,
+                 command=["cmd"],
                  submit_mode=None, idle_timeout=None),
         ),
         (
             ["--submit-mode=crlf", "myrun", "--", "opencode"],
             dict(interactive=False, submit_mode="crlf", name="myrun",
-                 command=["opencode"], echo=False, echo_interval=2.0,
+                 command=["opencode"],
                  idle_timeout=None, prompt_file=None),
         ),
         (
             ["myrun", "echo", "hello"],
             dict(interactive=False, name="myrun", command=["echo", "hello"],
-                 echo=False, echo_interval=2.0, submit_mode=None,
+                 submit_mode=None,
                  idle_timeout=None, prompt_file=None),
         ),
         (
             ["myrun", "--", "list", "foo"],
             dict(interactive=False, name="myrun", command=["list", "foo"],
-                 echo=False, echo_interval=2.0, submit_mode=None,
+                 submit_mode=None,
                  idle_timeout=None, prompt_file=None),
         ),
         (
             ["myrun", "--", "foo", "--", "bar"],
             dict(interactive=False, name="myrun", command=["foo", "--", "bar"],
-                 echo=False, echo_interval=2.0, submit_mode=None,
+                 submit_mode=None,
                  idle_timeout=None, prompt_file=None),
         ),
         (
             ["myrun", "--", "-not-a-flag", "--also-not"],
             dict(interactive=False, name="myrun", command=["-not-a-flag", "--also-not"],
-                 echo=False, echo_interval=2.0, submit_mode=None,
+                 submit_mode=None,
                  idle_timeout=None, prompt_file=None),
         ),
         (
             ["-i", "mytask", "--", "claude", "--permission-mode", "bypassPermissions", "--print"],
             dict(interactive=True, name="mytask",
                  command=["claude", "--permission-mode", "bypassPermissions", "--print"],
-                 echo=False, echo_interval=2.0, submit_mode=None,
+                 submit_mode=None,
                  idle_timeout=None, prompt_file=None),
         ),
     ])

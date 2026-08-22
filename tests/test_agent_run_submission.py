@@ -173,93 +173,6 @@ def test_steer_raw_is_verbatim_even_for_opencode_and_esc(isolated_runs_root, mon
         os.close(reader)
 
 
-def test_short_echo_run_gets_final_transcript_with_last_output(
-    isolated_runs_root, isolated_log_root
-):
-    final_output = "final-output-immediately-before-exit"
-    args = argparse.Namespace(
-        name="short-echo",
-        command=[sys.executable, "-c", f"print({final_output!r})"],
-        interactive=False,
-        prompt_file=None,
-        echo=True,
-        echo_interval=60.0,
-    )
-
-    assert agent_run.cmd_launch(args) == 0
-
-    state = isolated_runs_root / "short-echo"
-    assert _wait_until(lambda: (state / "status").read_text().strip() == "done")
-    clean = isolated_log_root / "short-echo" / "log.clean"
-    assert _wait_until(lambda: clean.is_file() and final_output in clean.read_text())
-
-
-def test_echo_run_finalizes_when_pyte_is_unavailable(
-    isolated_runs_root, isolated_log_root, monkeypatch
-):
-    def missing_renderer(_log_dir):
-        raise SystemExit("forced missing pyte")
-
-    monkeypatch.setattr(agent_run, "_render_log_to_clean", missing_renderer)
-    args = argparse.Namespace(
-        name="echo-without-pyte",
-        command=[sys.executable, "-c", "pass"],
-        interactive=False,
-        prompt_file=None,
-        echo=True,
-        echo_interval=60.0,
-    )
-
-    assert agent_run.cmd_launch(args) == 0
-
-    state = isolated_runs_root / "echo-without-pyte"
-    assert _wait_until(lambda: (state / "status").read_text().strip() == "done")
-    assert (state / "exit_code").read_text().strip() == "0"
-    assert (state / "ended_at").is_file()
-
-
-def test_echo_child_closes_readiness_fd_before_rendering(tmp_path, monkeypatch):
-    state_dir = tmp_path / "state"
-    log_dir = tmp_path / "log"
-    state_dir.mkdir()
-    log_dir.mkdir()
-    (log_dir / "log").touch()
-    marker = tmp_path / "ready-fd-state"
-    ready_read, ready_write = os.pipe()
-
-    def verify_ready_fd_closed(_log_dir, _interval):
-        try:
-            os.fstat(ready_write)
-        except OSError:
-            marker.write_text("closed")
-        else:
-            marker.write_text("open")
-
-    monkeypatch.setattr(agent_run, "_echo_loop", verify_ready_fd_closed)
-    pid = os.fork()
-    if pid == 0:
-        os.close(ready_read)
-        agent_run._runner(
-            state_dir,
-            log_dir,
-            [sys.executable, "-c", "pass"],
-            False,
-            ready_write,
-            echo=True,
-        )
-        os._exit(99)
-
-    os.close(ready_write)
-    try:
-        assert os.read(ready_read, 128) == b'{"status":"ok"}'
-        _waited_pid, status = os.waitpid(pid, 0)
-        assert os.WIFEXITED(status)
-        assert os.WEXITSTATUS(status) == 0
-        assert marker.read_text() == "closed"
-    finally:
-        os.close(ready_read)
-
-
 def test_unexpected_interactive_select_error_marks_run_failed(
     isolated_runs_root, monkeypatch
 ):
@@ -272,8 +185,6 @@ def test_unexpected_interactive_select_error_marks_run_failed(
         command=[sys.executable, "-c", "import time; time.sleep(30)"],
         interactive=True,
         prompt_file=None,
-        echo=False,
-        echo_interval=2.0,
     )
 
     assert agent_run.cmd_launch(args) == 0
@@ -334,8 +245,6 @@ def test_launch_fails_when_runner_setup_cannot_open_log(
         command=[sys.executable, "-c", "pass"],
         interactive=False,
         prompt_file=None,
-        echo=False,
-        echo_interval=2.0,
     )
 
     with pytest.raises(SystemExit, match="forced unwritable log"):
@@ -496,7 +405,7 @@ def test_block_handled_runner_signals_restores_exact_mask(monkeypatch):
 def test_teardown_never_signals_or_waits_for_self(tmp_path, monkeypatch):
     own_pid = os.getpid()
     (tmp_path / "keeper_pid").write_text(f"{own_pid}\n")
-    (tmp_path / "echo_pid").write_text(f"{own_pid}\n")
+    (tmp_path / "pty_pid").write_text(f"{own_pid}\n")
     killed = []
     waited = []
     monkeypatch.setattr(agent_run.os, "kill", lambda pid, sig: killed.append((pid, sig)))
@@ -515,7 +424,7 @@ def test_teardown_never_signals_or_waits_for_self(tmp_path, monkeypatch):
 def test_teardown_deduplicates_and_reaps_tracked_children(tmp_path, monkeypatch):
     child_pid = 4242
     (tmp_path / "keeper_pid").write_text(f"{child_pid}\n")
-    (tmp_path / "echo_pid").write_text(f"{child_pid}\n")
+    (tmp_path / "pty_pid").write_text(f"{child_pid}\n")
     killed = []
     wait_results = iter([(0, 0), (child_pid, 0)])
     monkeypatch.setattr(agent_run.os, "getpid", lambda: 1111)

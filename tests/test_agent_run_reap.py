@@ -1034,8 +1034,6 @@ class TestScratchDir:
             command=[sys.executable, "-c", "pass"],
             interactive=False,
             prompt_file=None,
-            echo=False,
-            echo_interval=2.0,
             submit_mode=None,
         )
         rc = agent_run.cmd_launch(args)
@@ -1053,8 +1051,6 @@ class TestScratchDir:
             command=[sys.executable, "-c", "pass"],
             interactive=False,
             prompt_file=None,
-            echo=False,
-            echo_interval=2.0,
             submit_mode=None,
         )
         agent_run.cmd_launch(args)
@@ -1072,8 +1068,6 @@ class TestScratchDir:
             command=[sys.executable, "-c", "import os, sys; sys.stdout.write(os.environ.get('TMPDIR', '<unset>'))"],
             interactive=False,
             prompt_file=None,
-            echo=False,
-            echo_interval=2.0,
             submit_mode=None,
         )
         rc = agent_run.cmd_launch(args)
@@ -1101,8 +1095,6 @@ class TestScratchDir:
             ],
             interactive=False,
             prompt_file=None,
-            echo=False,
-            echo_interval=2.0,
             submit_mode=None,
         )
         rc = agent_run.cmd_launch(args)
@@ -1126,8 +1118,6 @@ class TestScratchDir:
             command=list(argv),
             interactive=False,
             prompt_file=None,
-            echo=False,
-            echo_interval=2.0,
             submit_mode=None,
         )
         agent_run.cmd_launch(args)

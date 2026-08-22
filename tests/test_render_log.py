@@ -1,18 +1,13 @@
 """Tests for toolbox.agent_run._render_log (the PTY -> readable transcript
-renderer used by `agent-run clean` and `--echo`)."""
+renderer used by `agent-run logs --clean`)."""
 from __future__ import annotations
 
-import builtins
-import json
 import re
-import time
-from pathlib import Path
 
 import pytest
 
 from toolbox import agent_run
 from toolbox.agent_run import (
-    ECHO_LOOP_MAX_RENDER_BYTES,
     _render_log,
     _serialize_screen,
 )
@@ -317,6 +312,27 @@ class TestRenderLogResizeTimeline:
         ]
 
 
+class TestReadResizeTimelineFile:
+    """`_read_resize_timeline` reads resizes.jsonl straight off disk, so it
+    must degrade to an empty timeline rather than raise on every input a
+    concurrently-written or corrupted file can contain."""
+
+    def test_missing_file_yields_empty_timeline(self, tmp_path):
+        assert agent_run._read_resize_timeline(tmp_path) == []
+
+    def test_invalid_utf8_yields_empty_timeline(self, tmp_path):
+        (tmp_path / "resizes.jsonl").write_bytes(b"\xff\xfe")
+        assert agent_run._read_resize_timeline(tmp_path) == []
+
+    def test_valid_utf8_with_malformed_json_line_is_skipped(self, tmp_path):
+        (tmp_path / "resizes.jsonl").write_text(
+            '{"offset": 3, "cols": 80, "rows": 24}\nnot json\n'
+        )
+        assert agent_run._read_resize_timeline(tmp_path) == [
+            {"offset": 3, "cols": 80, "rows": 24}
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Incremental pyte feed — every partition must produce the same transcript as
 # a whole-file feed under the renderer's shared screen semantics.
@@ -351,273 +367,6 @@ class TestIncrementalFeed:
         stream = pyte.ByteStream(screen)
         agent_run._feed_pyte(stream, moon_log_bytes)
         assert _serialize_screen(screen) == _render_log(moon_log_bytes)
-
-
-# ---------------------------------------------------------------------------
-# _echo_loop — incremental parse, reset, quiet-tick, and cap behaviour.
-#
-# All tests drive the loop by monkeypatching time.sleep: the patched version
-# counts ticks and raises KeyboardInterrupt once the scenario is complete.
-# Log files are written directly to tmp_path so no real filesystem races occur.
-# ---------------------------------------------------------------------------
-
-def _run_echo_loop_ticks(log_dir, *, ticks, monkeypatch, extra_actions=None):
-    """Drive _echo_loop for exactly *ticks* sleep calls, then stop.
-
-    *extra_actions* is an optional callable(tick_number) invoked just before
-    each sleep, letting a test mutate the log file between ticks.
-    """
-    tick_count = 0
-
-    def controlled_sleep(_interval):
-        nonlocal tick_count
-        if extra_actions is not None:
-            extra_actions(tick_count)
-        tick_count += 1
-        if tick_count >= ticks:
-            raise KeyboardInterrupt
-
-    monkeypatch.setattr(agent_run.time, "sleep", controlled_sleep)
-    with pytest.raises(KeyboardInterrupt):
-        agent_run._echo_loop(log_dir, 1.0)
-
-
-class TestEchoLoop:
-    def test_basic_render_writes_log_clean(self, tmp_path, monkeypatch):
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        (log_dir / "log").write_bytes(b"hello\r\n")
-
-        _run_echo_loop_ticks(log_dir, ticks=1, monkeypatch=monkeypatch)
-
-        assert (log_dir / "log.clean").exists()
-        assert "hello" in (log_dir / "log.clean").read_text()
-
-    def test_quiet_tick_no_write(self, tmp_path, monkeypatch):
-        """When st_size == offset (no new bytes), log.clean is not touched."""
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        (log_dir / "log").write_bytes(b"hello\r\n")
-
-        # Tick 0: parse and write.  Ticks 1 and 2: nothing new — sleep again.
-        write_count = [0]
-        original_replace = Path.replace
-
-        def track_replace(self, target):
-            if self.name.startswith(".log.clean.") and self.name.endswith(".clean"):
-                write_count[0] += 1
-            return original_replace(self, target)
-
-        monkeypatch.setattr(Path, "replace", track_replace)
-        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch)
-
-        # Only one write: tick 0.  Ticks 1 and 2 see size == offset and
-        # skip the serialize+write path entirely.
-        assert write_count[0] == 1, f"expected 1 write; got {write_count[0]}"
-
-    def test_unchanged_render_skips_write(self, tmp_path, monkeypatch):
-        """When new bytes arrive but the serialized text is unchanged, the
-        atomic write+rename is skipped."""
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        log_file = log_dir / "log"
-        log_file.write_bytes(b"hello\r\n")
-
-        write_count = [0]
-        original_replace = Path.replace
-
-        def track_replace(self, target):
-            if self.name.startswith(".log.clean.") and self.name.endswith(".clean"):
-                write_count[0] += 1
-            return original_replace(self, target)
-
-        def append_on_tick(tick):
-            if tick == 1:
-                # ESC[0m (SGR reset) changes no screen cell content, so the
-                # serialized output is identical to the previous tick.
-                with log_file.open("ab") as f:
-                    f.write(b"\x1b[0m")
-
-        monkeypatch.setattr(Path, "replace", track_replace)
-        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch,
-                             extra_actions=append_on_tick)
-
-        # Tick 0 writes (new content).  Tick 1 parses new bytes but the
-        # serialized text is identical — no second write.
-        assert write_count[0] == 1, (
-            f"expected 1 write (second tick produces identical output); "
-            f"got {write_count[0]}"
-        )
-
-    def test_truncation_triggers_reset(self, tmp_path, monkeypatch):
-        """When st_size < offset (file truncated), screen/stream reset and the
-        new file content is re-parsed from byte zero."""
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        log_file = log_dir / "log"
-        # First write: 20 bytes so offset after tick 0 is 20.
-        log_file.write_bytes(b"first-content-here\r\n")
-
-        def mutate_on_tick(tick):
-            if tick == 1:
-                # Overwrite with 10 bytes — shorter than offset (20), so
-                # cur_size < offset fires on the next stat().
-                log_file.write_bytes(b"replaced\r\n")
-
-        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch,
-                             extra_actions=mutate_on_tick)
-
-        content = (log_dir / "log.clean").read_text()
-        assert "replaced" in content, f"expected 'replaced' in log.clean; got: {content!r}"
-        assert "first-content-here" not in content, (
-            f"'first-content-here' survived truncation reset in log.clean: {content!r}"
-        )
-
-    def test_inode_replacement_triggers_reset(self, tmp_path, monkeypatch):
-        """When st_ino/st_dev changes (file replaced), the loop resets even if
-        st_size coincidentally equals the previous offset."""
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        log_file = log_dir / "log"
-        # 10 bytes of non-printing content so tick 0 parses but produces no
-        # visible text (pyte ignores NUL bytes).
-        log_file.write_bytes(b"\x00" * 10)
-
-        def replace_on_tick(tick):
-            if tick == 1:
-                # Replace with a different inode of the same byte count.
-                # The size matches the recorded offset, so only the inode
-                # change can trigger a reset.
-                tmp_new = log_file.parent / ".log.new"
-                tmp_new.write_bytes(b"replaced!\r\n")
-                tmp_new.rename(log_file)
-
-        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch,
-                             extra_actions=replace_on_tick)
-
-        content = (log_dir / "log.clean").read_text()
-        assert "replaced" in content, (
-            f"expected 'replaced' after inode-replacement reset; got: {content!r}"
-        )
-
-    def test_failed_feed_does_not_advance_offset(self, tmp_path, monkeypatch):
-        """A transient _feed_pyte failure leaves the offset unchanged so the
-        next tick re-parses the same bytes."""
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        (log_dir / "log").write_bytes(b"data\r\n")
-
-        feed_calls: list[int] = []
-        original_feed = agent_run._feed_pyte
-
-        def flaky_feed(stream, chunk):
-            feed_calls.append(len(chunk))
-            if len(feed_calls) == 1:
-                raise OSError("simulated transient failure")
-            return original_feed(stream, chunk)
-
-        monkeypatch.setattr(agent_run, "_feed_pyte", flaky_feed)
-        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch)
-
-        # Both ticks that saw new bytes must have attempted a feed.
-        assert len(feed_calls) >= 2, f"expected ≥2 feed attempts; got {feed_calls}"
-        # Second attempt succeeded — log.clean must contain the content.
-        assert "data" in (log_dir / "log.clean").read_text()
-
-    def test_failed_feed_and_serialization_rebuild_from_zero(self, tmp_path, monkeypatch):
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        raw = b"abcdef\r\n"
-        (log_dir / "log").write_bytes(raw)
-        original_feed = agent_run._feed_pyte
-        calls = [0]
-
-        def half_feed(stream, chunk):
-            calls[0] += 1
-            if calls[0] == 1:
-                original_feed(stream, chunk[:3])
-                raise ValueError("after prefix")
-            return original_feed(stream, chunk)
-
-        monkeypatch.setattr(agent_run, "_feed_pyte", half_feed)
-        _run_echo_loop_ticks(log_dir, ticks=4, monkeypatch=monkeypatch)
-        assert (log_dir / "log.clean").read_text() == _render_log(raw)
-
-    def test_failed_serialization_rebuilds_from_zero(self, tmp_path, monkeypatch):
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        raw = b"serialize\r\n"
-        (log_dir / "log").write_bytes(raw)
-        original_serialize = agent_run._serialize_screen
-        calls = [0]
-
-        def flaky_serialize(screen):
-            calls[0] += 1
-            if calls[0] == 1:
-                raise ValueError("after feed")
-            return original_serialize(screen)
-
-        monkeypatch.setattr(agent_run, "_serialize_screen", flaky_serialize)
-        _run_echo_loop_ticks(log_dir, ticks=4, monkeypatch=monkeypatch)
-        assert (log_dir / "log.clean").read_text() == _render_log(raw)
-
-    def test_failed_publication_retries_on_quiet_log(self, tmp_path, monkeypatch):
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        (log_dir / "log").write_bytes(b"quiet\r\n")
-        original_replace = Path.replace
-        calls = [0]
-
-        def flaky_replace(self, target):
-            if self.name.startswith(".log.clean.") and self.name.endswith(".clean"):
-                calls[0] += 1
-                if calls[0] == 1:
-                    raise OSError("rename failed")
-            return original_replace(self, target)
-
-        monkeypatch.setattr(Path, "replace", flaky_replace)
-        _run_echo_loop_ticks(log_dir, ticks=3, monkeypatch=monkeypatch)
-        assert calls[0] >= 2
-        assert "quiet" in (log_dir / "log.clean").read_text()
-
-    def test_cap_then_small_append_preserves_continuous_prefix(self, tmp_path, monkeypatch):
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        log_file = log_dir / "log"
-        log_file.write_bytes(b"")
-        monkeypatch.setattr(agent_run, "ECHO_LOOP_MAX_RENDER_BYTES", 5)
-
-        def grow_on_tick(tick):
-            if tick == 0:
-                log_file.write_bytes(b"A" * 100)
-            elif tick == 1:
-                with log_file.open("ab") as f:
-                    f.write(b"NEW\r\n")
-
-        _run_echo_loop_ticks(log_dir, ticks=22, monkeypatch=monkeypatch, extra_actions=grow_on_tick)
-        assert (log_dir / "log.clean").read_text() == _render_log(log_file.read_bytes())
-        metadata = json.loads((log_dir / "log.clean.meta.json").read_text())
-        assert metadata["complete"] is True
-        assert metadata["offset"] == log_file.stat().st_size
-
-    def test_echo_loop_max_render_bytes_constant_value(self):
-        """Pin the cap value; any change must be a deliberate, test-breaking decision."""
-        assert ECHO_LOOP_MAX_RENDER_BYTES == 16 * 1024 * 1024
-
-    def test_missing_pyte_does_not_publish_unverifiable_transcript(self, tmp_path, monkeypatch):
-        log_dir = tmp_path / "run"
-        log_dir.mkdir()
-        (log_dir / "log").write_bytes(b"complete\r\n")
-        real_import = builtins.__import__
-
-        def no_pyte(name, *args, **kwargs):
-            if name == "pyte":
-                raise ImportError("forced missing pyte")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", no_pyte)
-        agent_run._echo_loop(log_dir, 1.0)
-        assert not (log_dir / "log.clean").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -777,210 +526,9 @@ class TestResizeTimelineCoalescing:
         assert timeline == [(4, 8, 6)]
 
 
-class TestStitchedHistory:
-    """Stitched mode samples the whole screen during replay to recover content a
-    repainting TUI overwrites before it can scroll into pyte's scrollback."""
-
-    # A TUI: enters the alternate screen, then repaints in place with absolute
-    # cursor moves. Nothing ever scrolls, so pyte's history stays empty.
-    @staticmethod
-    def _repainting_tui(frames):
-        out = [b"\x1b[?1049h"]
-        for frame in frames:
-            out.append(b"\x1b[2J\x1b[1;1H" + frame.encode())
-        return b"".join(out)
-
-    def test_recovers_frames_a_repainting_tui_overwrote(self):
-        """Sampling recovers frames the viewport lost, but not every frame: one
-        repainted and overwritten entirely between two samples is unrecoverable,
-        so this asserts the gain rather than any particular frame."""
-        raw = self._repainting_tui([f"frame {i}" for i in range(40)])
-        viewport = agent_run._render_log(raw)
-        stitched = agent_run._stitch_history(raw, chunk_bytes=16)
-
-        assert "frame 0" not in viewport, "the TUI overwrote it; viewport keeps the last frame"
-        assert "frame 39" in stitched, "the final frame is on screen at the last boundary"
-
-        recovered = sum(f"frame {i}" in stitched for i in range(40))
-        assert recovered > sum(f"frame {i}" in viewport for i in range(40))
-        assert recovered >= 5, f"only {recovered}/40 frames recovered"
-
-    def test_a_frame_overwritten_between_samples_is_unrecoverable(self):
-        """The bound on stitching: it samples, it does not record. A sample
-        interval wider than the repaint interval misses whole frames."""
-        raw = self._repainting_tui([f"frame {i}" for i in range(40)])
-        coarse = agent_run._stitch_history(raw, chunk_bytes=4096)
-        fine = agent_run._stitch_history(raw, chunk_bytes=16)
-        assert sum(f"frame {i}" in coarse for i in range(40)) < sum(
-            f"frame {i}" in fine for i in range(40)
-        )
-
-    def test_is_a_superset_of_the_viewport_render(self):
-        """Sampling covers scrollback and viewport together. Sampling the
-        viewport alone would drop every line that scrolled away between two
-        samples, which on line-oriented output is most of them."""
-        raw = b"".join(f"line {i}\r\n".encode() for i in range(400))
-        viewport = {l for l in agent_run._render_log(raw).splitlines() if l.strip()}
-        stitched = {l for l in agent_run._stitch_history(raw, chunk_bytes=256).splitlines() if l.strip()}
-        assert viewport <= stitched
-
-    def test_repeats_within_one_screen_survive(self):
-        """Deduplication removes the overlap between consecutive samples, not
-        every recurrence: a line printed several times in one screenful is real
-        output, not a resampled row."""
-        raw = b"".join(b"====\r\n" for _ in range(5))
-        stitched = agent_run._stitch_history(raw, chunk_bytes=4096)
-        assert stitched.count("====") == 5
-
-    def test_overlap_between_consecutive_samples_is_removed(self):
-        """Each sample yields the whole screen, so a line still present in the
-        previous sample has already been emitted."""
-        raw = b"only line\r\n" + b"\x00" * 40_000
-        stitched = agent_run._stitch_history(raw, chunk_bytes=1024)
-        assert stitched.count("only line") == 1
-
-    def test_line_cap_truncates_and_says_so(self, monkeypatch):
-        monkeypatch.setattr(agent_run, "_STITCH_MAX_LINES", 5)
-        raw = b"".join(f"line {i}\r\n".encode() for i in range(200))
-        stitched = agent_run._stitch_history(raw, chunk_bytes=64)
-        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
-        body = stitched[: -len(agent_run._STITCH_TRUNCATED_MARKER)]
-        assert len([l for l in body.splitlines() if l.strip()]) <= 5
-
-    def test_byte_cap_truncates_and_says_so(self, monkeypatch):
-        monkeypatch.setattr(agent_run, "_STITCH_MAX_BYTES", 64)
-        raw = b"".join(f"line {i}\r\n".encode() for i in range(200))
-        stitched = agent_run._stitch_history(raw, chunk_bytes=64)
-        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
-
-    def test_applies_the_resize_timeline(self):
-        """A sample boundary and a resize offset are independent, so replay
-        splits at the union of both."""
-        raw = b"X" * 30 + b"\r\n"
-        stitched = agent_run._stitch_history(
-            raw, width=40, height=4, chunk_bytes=8,
-            resizes=[{"offset": 10, "cols": 10, "rows": 4}],
-        )
-        assert stitched, "a resize inside a sampled span must not abort the render"
-        assert max(len(l) for l in stitched.splitlines()) <= 10
-
-    def test_falls_back_when_pyte_raises(self, monkeypatch):
-        """A convenience artifact must never take the caller down."""
-        monkeypatch.setattr(
-            agent_run, "_feed_pyte",
-            lambda *_a, **_kw: (_ for _ in ()).throw(RecursionError("pathological")),
-        )
-        stitched = agent_run._stitch_history(b"hello\r\n", chunk_bytes=8)
-        assert "hello" in stitched
-
-    def test_viewport_remains_the_default_render(self, moon_log_bytes):
-        """Stitched mode is opt-in; the default path must be byte-identical."""
-        assert agent_run._render_log(moon_log_bytes) == agent_run._render_log(moon_log_bytes)
-
-    @pytest.mark.parametrize("chunk", [16, 64, 1024, 8192])
-    def test_stitching_recovers_a_long_run_of_identical_lines(self, chunk):
-        """Viewport is lossy for repeated output; stitching is not.
-
-        ``_serialize_screen`` drops a line equal to its predecessor, so 200
-        identical lines serialize as one. Counting occurrences per sample
-        instead of testing membership recovers every print, independently of
-        where the sample boundaries fall.
-        """
-        printed = 200
-        raw = b"".join(b"====\r\n" for _ in range(printed))
-
-        assert agent_run._render_log(raw).count("====") == 1
-        assert agent_run._stitch_history(raw, chunk_bytes=chunk).count("====") == printed
-
-    def test_stitching_may_add_partial_repaint_rows(self):
-        """The cost of sampling: a boundary landing mid-repaint keeps a partly
-        drawn row, so a stitched render can exceed the viewport line count on
-        output the viewport already captured in full."""
-        raw = b"".join(f"line {i}\r\n".encode() for i in range(200))
-        viewport = [l for l in agent_run._render_log(raw).splitlines() if l.strip()]
-        stitched = [l for l in agent_run._stitch_history(raw, chunk_bytes=64).splitlines() if l.strip()]
-
-        assert set(viewport) <= set(stitched)
-        assert len(stitched) >= len(viewport)
-
-
-class TestStitchedHistoryBounds:
-    """The properties an adversarial review broke: multiplicity across sample
-    boundaries, the unit the byte cap is enforced in, the reach of the pyte
-    fallback, and the interval's domain."""
-
-    def test_a_repeat_printed_across_a_boundary_is_kept(self):
-        """Deduplication compares occurrence counts, not membership: a row
-        printed again while an identical row is still on screen is new output."""
-        raw = b"X\r\n12345" + b"\r\nX\r\n"
-        stitched = agent_run._stitch_history(raw, width=20, height=5, chunk_bytes=8)
-        assert stitched.splitlines().count("X") == 2
-
-    def test_a_row_static_across_many_samples_is_emitted_once(self):
-        raw = b"only line\r\n" + b"\x00" * 40_000
-        assert agent_run._stitch_history(raw, chunk_bytes=1024).count("only line") == 1
-
-    def test_the_byte_cap_counts_utf8_bytes_not_code_points(self, monkeypatch):
-        """A code-point budget lets non-ASCII output reach ~4x the named cap."""
-        monkeypatch.setattr(agent_run, "_STITCH_MAX_BYTES", 8)
-        raw = "".join(f"{i}\U0001f600\r\n" for i in range(20)).encode()
-        stitched = agent_run._stitch_history(raw, chunk_bytes=16)
-        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
-        body = stitched[: -len(agent_run._STITCH_TRUNCATED_MARKER)]
-        assert len(body.encode("utf-8")) <= 8
-
-    def test_the_byte_cap_admits_no_line_that_would_exceed_it(self, monkeypatch):
-        """The cap is checked against the prospective line, so the body cannot
-        overshoot by a full row."""
-        monkeypatch.setattr(agent_run, "_STITCH_MAX_BYTES", 20)
-        raw = b"".join(b"a" * 30 + b"\r\n" for _ in range(10))
-        stitched = agent_run._stitch_history(raw, chunk_bytes=32)
-        body = stitched[: -len(agent_run._STITCH_TRUNCATED_MARKER)]
-        assert len(body.encode("utf-8")) <= 20
-
-    def test_failure_constructing_the_screen_falls_back(self, monkeypatch):
-        """Screen and stream construction sit inside the fallback: a pyte
-        failure there must degrade like a feed failure, not propagate."""
-        monkeypatch.setattr(
-            agent_run, "_new_pyte_screen",
-            lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("construction failed")),
-        )
-        assert "hello" in agent_run._stitch_history(b"hello\r\n", chunk_bytes=8)
-
-    @pytest.mark.parametrize("chunk", [0, -1, True, 1.5, "8192"])
-    def test_a_nonpositive_or_nonint_interval_is_rejected(self, chunk):
-        """range() accepts 0 and negatives via a max() guard, silently sampling
-        every byte and making the boundary set O(len(raw))."""
-        with pytest.raises(ValueError):
-            agent_run._stitch_history(b"abc", chunk_bytes=chunk)
-
-    def test_truncated_output_says_so(self, monkeypatch):
-        """Truncation stops replay before the final screen, so the result omits
-        the tail the viewport render ends with. The marker is the only signal a
-        reader gets, and it must always be present."""
-        monkeypatch.setattr(agent_run, "_STITCH_MAX_LINES", 50)
-        raw = b"".join(f"line {i}\r\n".encode() for i in range(400))
-        stitched = agent_run._stitch_history(raw, chunk_bytes=256)
-        assert stitched.endswith(agent_run._STITCH_TRUNCATED_MARKER)
-        viewport = {l for l in agent_run._render_log(raw).splitlines() if l.strip()}
-        assert viewport - set(stitched.splitlines()), (
-            "this test documents the loss; if truncation ever preserves the "
-            "final viewport, tighten the docstring instead of deleting this"
-        )
-
-    def test_contains_every_nonempty_viewport_line_when_untruncated(self):
-        """The superset claim holds for nonempty lines: empty rows are dropped,
-        which is why the docstring says nonempty."""
-        raw = b"top\r\n\r\nbottom\r\n"
-        viewport = {l for l in agent_run._render_log(raw).splitlines() if l.strip()}
-        stitched = set(agent_run._stitch_history(raw, chunk_bytes=4096).splitlines())
-        assert viewport <= stitched
-
-
 class TestSerializeScreenExtraction:
-    """_screen_lines was extracted from _serialize_screen and is now shared with
-    stitching. _serialize_screen feeds log.clean and the incremental echo
-    daemon, so a behaviour change there corrupts cached transcripts."""
+    """_screen_lines was extracted from _serialize_screen. _serialize_screen
+    feeds the rendered transcript, so a behaviour change here corrupts it."""
 
     @staticmethod
     def _reference(screen):
