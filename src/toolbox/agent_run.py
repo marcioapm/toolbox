@@ -7113,8 +7113,11 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
     args.cwd = str(worktree_dir)
     # Recorded on args, not returned separately, so _cmd_launch_locked (which
     # never sees the _CreatedWorktree rollback handle) can still write the
-    # durable state-dir marker.
-    args._worktree_created_path = str(worktree_dir)
+    # durable state-dir marker. Resolved through realpath to match how
+    # <state_dir>/cwd is recorded post-chdir (Path.cwd() after os.chdir
+    # resolves symlinks), so the two files agree on macOS's /var -> /private/var
+    # and similar cases.
+    args._worktree_created_path = os.path.realpath(worktree_dir)
     return _CreatedWorktree(worktree_dir, repo, branch, branch_created=not branch_exists)
 
 
