@@ -59,6 +59,8 @@ Usage::
     agent-run logs <name> [--tail N | --head N]  # last/first N lines (default --tail 50)
     agent-run logs <name> --plain        # ANSI-stripped (default is raw bytes)
     agent-run logs <name> --clean        # pyte-rendered transcript, slow on large logs
+    agent-run transcript <name> [--tail N | --head N] [--json]  # harness's own conversation record
+                                          # (managed-mode runs only; see "Transcripts" below)
     agent-run status <name>              # one-line status
     agent-run watch <name> [--json] [--repo PATH]  # stateless fact snapshot for pollers
     agent-run steer <name> <msg...>      # send text to agent stdin (needs -i)
@@ -162,6 +164,18 @@ Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs):
     tmp/         per-run scratch dir exported as TMPDIR and BUN_TMPDIR (see
                  above); removed only by `agent-run reap`, never on normal
                  run exit
+
+Transcripts. `agent-run transcript <name>` reads the harness's own
+conversation record instead of reconstructing one from the PTY log: it looks
+up session_id + harness in session.json and reads the matching store
+directly (opencode: SQLite at ~/.local/share/opencode/opencode.db; claude:
+~/.claude/projects/<mangled-cwd>/<session_id>.jsonl, including its
+subagents/ subdirectory; codex: ~/.codex/sessions/**/rollout-*-<session_id>
+.jsonl). Managed-mode only -- a raw run (`agent-run NAME -- <cmd>`) has no
+session.json and therefore no transcript; use `logs --clean` for those.
+Every store is opened read-only. Unparseable individual records are skipped
+and their count is reported on stderr; a missing or unusable store is an
+error. See toolbox/agent_run_transcript.py for the reader implementations.
 
 Harness hook integration. Configure these yourself; agent-run never edits a
 harness config file:
@@ -4903,6 +4917,91 @@ def cmd_logs(args: argparse.Namespace) -> int:
             pass
     finally:
         _reset_terminal_modes()
+    return 0
+
+
+def cmd_transcript(args: argparse.Namespace) -> int:
+    """Print the harness's own conversation record for a managed run.
+
+    Reads session.json for session_id/harness (written at launch by
+    _record_session) and dispatches to the matching reader in
+    agent_run_transcript. Raw runs and any run whose session id was never
+    acquired have nothing to read; exit non-zero naming the two
+    alternatives rather than raising, since neither is a bug in this run.
+    An empty entry list is likewise an error, not a silent no-op: a caller
+    needs to tell "the store had nothing for this session" apart from
+    ordinary success.
+    """
+    from toolbox import agent_run_transcript as transcript
+
+    name = _validate_run_name(args.name)
+    log_dir = _log_dir(name)
+    if not _known(name):
+        sys.exit(f"agent-run: no run named '{name}' in {STATE_ROOT} or {LOG_ROOT}")
+    session = _read_session_json(log_dir)
+    if session is None:
+        sys.exit(
+            f"agent-run: no transcript for '{name}' (raw run, no session.json) -- "
+            f"relaunch under --harness <name> for a transcript, or use 'agent-run logs {name} --clean'"
+        )
+    session_id = session.get("session_id")
+    harness = session.get("harness")
+    if not isinstance(session_id, str) or not session_id or not isinstance(harness, str):
+        sys.exit(
+            f"agent-run: no transcript for '{name}' (session id was never acquired) -- "
+            f"relaunch under --harness <name> for a transcript, or use 'agent-run logs {name} --clean'"
+        )
+
+    try:
+        run_data = json.loads((log_dir / "run.json").read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        run_data = {}
+    cwd = run_data.get("cwd") if isinstance(run_data, dict) else None
+    cwd = cwd if isinstance(cwd, str) else None
+    try:
+        entries, skipped = transcript.read_transcript(harness, session_id, cwd)
+    except transcript.TranscriptSourceError as exc:
+        sys.exit(f"agent-run: {exc}")
+
+    if not entries:
+        # An empty read and a broken pipeline both print nothing and exit 0
+        # unless this is an error: a caller (including threadctl) branching
+        # on exit status needs "no transcript" distinguishable from a
+        # transcript that happens to hold zero entries.
+        store = {
+            "opencode": transcript.OPENCODE_DB_PATH,
+            "claude": transcript.CLAUDE_PROJECTS_DIR,
+            "codex": transcript.CODEX_SESSIONS_DIR,
+        }.get(harness, "?")
+        skipped_note = f", {skipped} record(s) skipped as unparseable" if skipped else ""
+        sys.exit(
+            f"agent-run: transcript for '{name}' ({harness}, session {session_id}) is empty "
+            f"(store: {store}{skipped_note})"
+        )
+
+    if args.head is not None:
+        entries = entries[: args.head]
+    else:
+        entries = entries[-(args.tail if args.tail is not None else 50):]
+
+    if getattr(args, "json", False):
+        out = "".join(json.dumps(e.to_dict()) + "\n" for e in entries)
+        try:
+            sys.stdout.buffer.write(out.encode("utf-8"))
+        except BrokenPipeError:
+            pass
+    else:
+        rendered = transcript.render_text(entries)
+        budgeted, truncated = _budget_str(rendered)
+        if truncated:
+            budgeted += _TRUNCATION_MARKER_STR
+        try:
+            sys.stdout.buffer.write(budgeted.encode("utf-8"))
+        except BrokenPipeError:
+            pass
+
+    if skipped:
+        print(f"agent-run: transcript: skipped {skipped} unparseable record(s)", file=sys.stderr)
     return 0
 
 
@@ -11514,7 +11613,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "agent-run [flags] NAME -- <cmd...>\n"
             "       agent-run [flags] NAME <cmd...>\n"
             "       agent-run --harness claude|opencode|codex [options] NAME\n"
-            "       agent-run {status,watch,logs,tail,attach,steer,kill,list,reap,du,help} ..."
+            "       agent-run {status,watch,logs,transcript,tail,attach,steer,kill,list,reap,du,help} ..."
         ),
     )
     sub = p.add_subparsers(dest="sub")
@@ -11660,6 +11759,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="render the log through pyte and print the transcript; slow on a large log",
     )
     sp_logs.set_defaults(func=cmd_logs)
+
+    sp_transcript = sub.add_parser(
+        "transcript",
+        help="print the harness's own conversation record (needs --harness at launch)",
+        allow_abbrev=False,
+    )
+    sp_transcript.add_argument("name")
+    transcript_slice = sp_transcript.add_mutually_exclusive_group()
+    transcript_slice.add_argument(
+        "--tail",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="print the last N entries (default when neither flag is given: 50)",
+    )
+    transcript_slice.add_argument(
+        "--head",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="print the first N entries",
+    )
+    sp_transcript.add_argument(
+        "--json",
+        action="store_true",
+        help="emit one JSON object per entry instead of plain text",
+    )
+    sp_transcript.set_defaults(func=cmd_transcript)
 
     sp_tail = sub.add_parser("tail", help="follow log in real time (tail -f)")
     sp_tail.add_argument("name")
@@ -12048,7 +12175,7 @@ class _LaunchArgv(NamedTuple):
 
 
 _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset({
-    "status", "watch", "logs", "tail", "attach", "steer", "kill",
+    "status", "watch", "logs", "transcript", "tail", "attach", "steer", "kill",
     "list", "reap", "du", "hook", "help",
 })
 

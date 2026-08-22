@@ -788,6 +788,42 @@ pre-existing key (`status`, `terminal`, `elapsed_s`, `log.*`, `git.*`,
 the run's persistent log dir, `session` is the parsed object; otherwise it is
 `null`.
 
+#### `transcript` — the harness's own conversation record
+
+```bash
+agent-run transcript <name> [--tail N | --head N]  # last/first N entries (default --tail 50)
+agent-run transcript <name> --json                 # one JSON object per entry
+```
+
+Rendering a PTY log through pyte (`logs --clean`) reconstructs what the
+terminal *drew*: progress bars and status chrome, paragraphs re-wrapped at
+different widths, tool output collapsed to `Click to expand`. Every managed
+harness already stores the real conversation — user turns, assistant turns,
+tool calls with arguments and results — keyed by the session id in
+`session.json`. `transcript` reads that store directly instead:
+
+| Harness | Store |
+|---------|-------|
+| `opencode` | SQLite at `~/.local/share/opencode/opencode.db` (read-only, `mode=ro`), `part`/`message` rows for the session |
+| `claude` | `~/.claude/projects/<mangled-cwd>/<session_id>.jsonl`, plus any matching `subagents/*.jsonl` |
+| `codex` | `~/.codex/sessions/**/rollout-*-<session_id>.jsonl` |
+
+Every store is opened strictly read-only — a live run may hold it open, and
+`transcript` never writes, migrates, or checkpoints it. Requires a
+**managed-mode** run (`--harness claude|opencode|codex`): a raw run
+(`agent-run NAME -- <cmd>`) has no `session.json` and therefore no
+transcript; `transcript` exits non-zero naming the two alternatives (relaunch
+under `--harness`, or use `logs --clean` on the captured PTY log). Unparseable
+individual records are skipped and counted on stderr; a missing or unusable
+store is an error, and so is a store that opens and reads cleanly but yields
+zero entries for the session — both exit non-zero, so a caller can tell "no
+transcript" apart from ordinary success. A single tool result is
+truncated at 40 lines / 4 KiB with a marker naming how much was dropped,
+independent of `--head`/`--tail`, which slice whole entries (not bytes) using
+the same defaults as `logs`. For `claude`, entries from the main session and
+any subagent transcripts are merged by timestamp, not concatenated per file.
+
+
 ```json
 {
   "schema": "agent-run.watch.v2",
@@ -818,6 +854,7 @@ agent-run status <name>                   # one-line status
 agent-run logs <name> [--tail N | --head N]    # last/first N lines (default --tail 50)
 agent-run logs <name> --plain                  # ANSI-stripped, for grepping/piping
 agent-run logs <name> --clean                  # pyte-rendered transcript; slow on a large log
+agent-run transcript <name> [--tail N | --head N] [--json]  # harness's own conversation record
 agent-run tail <name>                     # follow log (exits when agent dies)
 agent-run steer <name> '<message>'        # write to agent stdin (needs -i)
 agent-run attach <name>                   # attach interactively (Ctrl-C detaches)
@@ -1244,7 +1281,7 @@ Persistent, under `$AGENT_RUN_LOG_DIR/<name>/` (default `/var/tmp/agent-runs`):
 
 | File | Contents |
 |------|----------|
-| `log` | combined stdout+stderr (PTY-captured in interactive mode); `agent-run logs --clean` renders it into a readable transcript on demand |
+| `log` | combined stdout+stderr (PTY-captured in interactive mode); `agent-run logs --clean` renders it into a readable transcript on demand, and `agent-run transcript` reads the harness's own conversation record instead (managed mode only; see [`transcript`](#transcript--the-harnesss-own-conversation-record)) |
 | `prompt` | copy of the `-f`/`--prompt-file` input, if one was given |
 | `session.json` | session attribution (managed mode only): `session_id`, `harness`, `acquisition`, `confidence`, `observed_at`; absent for raw runs |
 | `run.json` | launch and terminal facts (all modes): `name`, `argv`, `command`, `cwd`, `started_at`, `harness`, `interactive`, `model`, `agent_mode`; augmented with `ended_at`, `exit_code`, `status` at exit |
