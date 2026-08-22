@@ -685,20 +685,26 @@ def _is_codex_injected_context(text: str) -> bool:
     entire message; a wrapper followed by genuine text, or text that
     merely starts with, quotes, or mentions a tag without closing it,
     leaves something behind and survives."""
-    remaining = text.strip()
+    stripped = text.strip()
+    cursor = 0
+    end = len(stripped)
     consumed_any = False
     progressed = True
-    while progressed:
+    # An integer cursor instead of slicing: re-slicing the suffix per wrapper
+    # makes a long run of wrappers quadratic in total bytes.
+    while progressed and cursor < end:
         progressed = False
         for open_tag, close_tag in _CODEX_INJECTED_CONTEXT_TAGS:
-            if remaining.startswith(open_tag):
-                close_index = remaining.find(close_tag)
+            if stripped.startswith(open_tag, cursor):
+                close_index = stripped.find(close_tag, cursor)
                 if close_index != -1:
-                    remaining = remaining[close_index + len(close_tag):].lstrip()
+                    cursor = close_index + len(close_tag)
+                    while cursor < end and stripped[cursor].isspace():
+                        cursor += 1
                     consumed_any = True
                     progressed = True
                     break
-    return consumed_any and not remaining
+    return consumed_any and cursor >= end
 
 
 def _fallback_tool_summary(tool_input: Optional[dict]) -> Optional[str]:

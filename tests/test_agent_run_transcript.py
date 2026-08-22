@@ -790,9 +790,8 @@ class TestCodexReader:
 
         # Real codex sessions can put both wrappers in one message: it
         # starts with <environment_context> and ends with
-        # </user_instructions>, so neither wrapper's own tag pair spans
-        # the whole message -- the single-pair check in U2's regression
-        # test misses this case entirely.
+        # </user_instructions>, so a check requiring one tag pair to span
+        # the whole message misses this case.
         double_wrapper = (
             "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>\n"
             "<user_instructions>\nBe concise.\n</user_instructions>"
