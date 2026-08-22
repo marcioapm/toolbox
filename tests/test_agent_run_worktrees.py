@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -135,6 +136,61 @@ def _reap_args(**kw) -> argparse.Namespace:
 
 def _row(out: str, key: str) -> list[str]:
     return next(ln for ln in out.splitlines() if ln.split() and ln.split()[0] == key).split()
+
+
+def _kill_run_pid(state_dir: Path) -> None:
+    """Terminate the runner recorded in state_dir; no-op if already gone."""
+    import signal
+    try:
+        pid = int((state_dir / "pid").read_text().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return
+    if pid <= 0:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        if sig == signal.SIGTERM:
+            time.sleep(0.3)
+
+
+def _wait_terminal(state_dir: Path, timeout: float = 15.0) -> str:
+    """Poll <state_dir>/status until terminal; kill the runner on timeout."""
+    deadline = time.monotonic() + timeout
+    status = "starting"
+    while time.monotonic() < deadline:
+        try:
+            status = (state_dir / "status").read_text().strip()
+        except FileNotFoundError:
+            status = "starting"
+        if status in agent_run.TERMINAL_STATUSES:
+            break
+        time.sleep(0.05)
+    if status not in agent_run.TERMINAL_STATUSES:
+        _kill_run_pid(state_dir)
+    return status
+
+
+def _launch_args(**kw) -> argparse.Namespace:
+    """A full cmd_launch-shaped Namespace, defaulted for a raw one-shot run.
+
+    Every field cmd_launch/_create_launch_worktree can read via getattr is
+    present so a hand-built call never falls through to a getattr default
+    that would mask a bug.
+    """
+    base = dict(
+        name="wt-test", command=[sys.executable, "-c", "pass"], interactive=False,
+        prompt_file=None, submit_mode=None, idle_timeout=None,
+        harness=None, prompt=None, model=None, agent_mode=None, harness_args=[],
+        permissions="bypass", cwd=None,
+        worktree=None, worktree_base=None, worktree_branch=None,
+        worktree_repo=None, worktree_reuse=False,
+        enable_planning=False, enable_questions=False,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
 
 
 @pytest.fixture
@@ -3654,3 +3710,288 @@ class TestReapWorktreeUndefendedGuards:
         assert wt.is_dir(), "worktree must not be deleted with malformed rev-list count"
         assert "unparseable unpushed commit count" in out
         assert "worktrees_removed=0 worktrees_skipped=1" in out
+
+
+# ---------------------------------------------------------------------------
+# launch --worktree: creating (or attaching to) the linked worktree a run
+# launches into.
+# ---------------------------------------------------------------------------
+
+class TestLaunchCreatesWorktree:
+    """`agent-run launch --worktree DIR --worktree-base REF` creates a linked
+    worktree and points the launch at it, via cmd_launch's real code path —
+    no mocked git, no asserting on internal call arguments."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_cwd(self):
+        # _create_launch_worktree's invocation-cwd discovery, and
+        # _apply_launch_cwd, both chdir the test process; put it back so
+        # later tests in the same session aren't affected.
+        origin = os.getcwd()
+        yield
+        os.chdir(origin)
+
+    def test_happy_path_creates_worktree_branch_and_launches(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-happy"
+        name = "wt-happy"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+
+        state_dir = isolated_runs_root / name
+        status = _wait_terminal(state_dir)
+        assert status == "done"
+
+        resolved = str(wt_dir.resolve())
+        assert (state_dir / "cwd").read_text().strip() == resolved
+        assert (state_dir / "worktree_created").read_text().strip() == resolved
+
+        branch_list = _git(repo, "branch", "--list", name)
+        assert name in branch_list
+
+        # The integration this feature exists for: the real classifier must
+        # recognise the created directory as a linked worktree, exactly as
+        # `reap --include-worktrees` and `du` would.
+        info = agent_run._worktree_classify(wt_dir)
+        assert info.kind == agent_run._WORKTREE_LINKED
+        assert info.common_dir is not None
+        assert Path(info.common_dir).samefile(repo / ".git")
+
+    def test_worktree_and_cwd_are_mutually_exclusive(
+        self, isolated_runs_root, isolated_log_root, git_root, tmp_path
+    ):
+        repo = _make_repo(git_root)
+        args = _launch_args(
+            name="both", worktree=str(git_root / "wt"), worktree_base="main",
+            worktree_repo=str(repo), cwd=str(tmp_path),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.cmd_launch(args)
+
+        assert exc.value.code == 2
+        assert not (git_root / "wt").exists()
+
+    def test_worktree_without_base_is_usage_error(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-no-base"
+        args = _launch_args(name="no-base", worktree=str(wt_dir), worktree_repo=str(repo))
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.cmd_launch(args)
+
+        assert exc.value.code == 2
+        assert not wt_dir.exists()
+
+    def test_worktree_reuse_without_worktree_is_usage_error(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        args = _launch_args(name="reuse-alone", worktree_reuse=True)
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.cmd_launch(args)
+
+        assert exc.value.code == 2
+
+    def test_existing_directory_without_reuse_fails_and_is_untouched(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """A DIR that is already a *valid* linked worktree of the same repo
+        (the one case --worktree-reuse would accept) must still be refused
+        without --worktree-reuse: existence alone is disqualifying."""
+        repo = _make_repo(git_root)
+        existing = _add_worktree(repo, git_root / "already-here", "pre-existing-branch")
+        marker = existing / "tracked.txt"
+        before = marker.read_text()
+        args = _launch_args(
+            name="existing-dir", worktree=str(existing), worktree_base="main",
+            worktree_branch="a-brand-new-branch", worktree_repo=str(repo),
+        )
+
+        with pytest.raises(SystemExit, match="already exists"):
+            agent_run.cmd_launch(args)
+
+        assert marker.read_text() == before
+        assert agent_run._worktree_classify(existing).kind == agent_run._WORKTREE_LINKED
+        assert not (isolated_runs_root / "existing-dir").exists()
+
+    def test_existing_branch_without_reuse_fails_and_leaves_no_worktree(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        repo = _make_repo(git_root)
+        _git(repo, "branch", "taken-branch", "main")
+        wt_dir = git_root / "wt-taken-branch"
+        args = _launch_args(
+            name="existing-branch", worktree=str(wt_dir), worktree_base="main",
+            worktree_branch="taken-branch", worktree_repo=str(repo),
+        )
+
+        with pytest.raises(SystemExit):
+            agent_run.cmd_launch(args)
+
+        assert not wt_dir.exists()
+        assert not (isolated_runs_root / "existing-branch").exists()
+
+    def test_reuse_attaches_to_existing_worktree_without_marking_it_created(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """--worktree-reuse attaches without creating anything: a successful
+        run must not write the worktree_created ownership marker."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt-preexisting", "feature")
+        name = "reuse-run"
+        args = _launch_args(
+            name=name, worktree=str(wt), worktree_base="main",
+            worktree_branch="feature", worktree_repo=str(repo), worktree_reuse=True,
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+
+        state_dir = isolated_runs_root / name
+        assert _wait_terminal(state_dir) == "done"
+        assert (state_dir / "cwd").read_text().strip() == str(wt.resolve())
+        assert not (state_dir / "worktree_created").exists()
+
+    def test_reuse_rollback_on_launch_failure_never_removes_the_worktree(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """A launch failure after attaching via --worktree-reuse must never
+        trigger rollback removal: this invocation created nothing."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt-preexisting-2", "feature2")
+        # An empty raw command makes _cmd_launch_locked fail with
+        # sys.exit("missing command") after _create_launch_worktree has
+        # already returned None (nothing to roll back) for the reuse case.
+        args = _launch_args(
+            name="reuse-run-fails", command=[], worktree=str(wt), worktree_base="main",
+            worktree_branch="feature2", worktree_repo=str(repo), worktree_reuse=True,
+        )
+
+        with pytest.raises(SystemExit, match="missing command"):
+            agent_run.cmd_launch(args)
+
+        assert wt.is_dir()
+        assert agent_run._worktree_classify(wt).kind == agent_run._WORKTREE_LINKED
+        assert not (isolated_runs_root / "reuse-run-fails").exists()
+
+    def test_unresolvable_base_fails_before_any_mutation(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-bad-base"
+        args = _launch_args(
+            name="bad-base", worktree=str(wt_dir), worktree_base="no-such-ref",
+            worktree_repo=str(repo),
+        )
+
+        with pytest.raises(SystemExit, match="does not resolve to a commit"):
+            agent_run.cmd_launch(args)
+
+        assert not wt_dir.exists()
+        assert not (isolated_runs_root / "bad-base").exists()
+        assert _git(repo, "worktree", "list").count("\n") == 1  # only the main worktree
+
+    def test_launch_failure_after_creation_removes_worktree_and_branch(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-rollback"
+        name = "rollback-run"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo),
+        )
+
+        with pytest.raises(SystemExit, match="missing command"):
+            agent_run.cmd_launch(args)
+
+        assert not wt_dir.exists()
+        assert name not in _git(repo, "branch", "--list", name)
+        assert not (isolated_runs_root / name).exists()
+
+    def test_rollback_failure_does_not_mask_original_error(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-rollback-fails"
+        name = "rollback-fails"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo),
+        )
+        monkeypatch.setattr(
+            agent_run, "_worktree_remove", lambda info, path, force: "forced rollback failure"
+        )
+
+        with pytest.raises(SystemExit, match="missing command") as exc:
+            agent_run.cmd_launch(args)
+
+        assert "missing command" in str(exc.value)
+        err = capsys.readouterr().err
+        assert "forced rollback failure" in err
+        # The forced-failing _worktree_remove never actually removed anything.
+        assert wt_dir.is_dir()
+
+    def test_invocation_cwd_outside_repo_without_worktree_repo_is_usage_error(
+        self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch, capsys
+    ):
+        plain = tmp_path / "not-a-repo"
+        plain.mkdir()
+        monkeypatch.chdir(plain)
+        args = _launch_args(
+            name="outside-repo", worktree=str(git_root / "wt"), worktree_base="main",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.cmd_launch(args)
+
+        assert exc.value.code == 2
+        assert "not inside a git repository" in capsys.readouterr().err
+        assert not (git_root / "wt").exists()
+
+    def test_invalid_worktree_branch_name_is_rejected_before_any_mutation(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """A git-illegal --worktree-branch (leading '-') must be rejected by
+        git's own check-ref-format, not silently passed through to `git
+        worktree add -b`, which would otherwise fail confusingly or, worse,
+        be misinterpreted as another flag."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-bad-branch"
+        args = _launch_args(
+            name="bad-branch", worktree=str(wt_dir), worktree_base="main",
+            worktree_branch="-not-a-valid-branch", worktree_repo=str(repo),
+        )
+
+        with pytest.raises(SystemExit, match="not a valid git branch name"):
+            agent_run.cmd_launch(args)
+
+        assert not wt_dir.exists()
+        assert _git(repo, "worktree", "list").count("\n") == 1  # only the main worktree
+
+    def test_explicit_worktree_branch_overrides_run_name_default(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-explicit-branch"
+        args = _launch_args(
+            name="run-name-not-branch", worktree=str(wt_dir), worktree_base="main",
+            worktree_branch="explicit-branch-name", worktree_repo=str(repo),
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+        _wait_terminal(isolated_runs_root / "run-name-not-branch")
+
+        branches = _git(repo, "branch", "--list")
+        assert "explicit-branch-name" in branches
+        assert "run-name-not-branch" not in branches
