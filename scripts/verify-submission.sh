@@ -468,7 +468,12 @@ run_harness_cells() {
         --prompt "Reply with exactly this word and nothing else: ${sentinel1}_neg" \
         ${model_args[@]+"${model_args[@]}"} "$c3_run" >/dev/null 2>&1; then
       LAUNCHED_RUNS+=("$c3_run")
-      sleep 6
+      # No AGENT_RUN_SUBMIT_VERIFY_TIMEOUT override here (an unreadable
+      # rollout store fails a codex launch regardless of the deadline), so
+      # the single submission attempt still polls out the full default
+      # SUBMISSION_VERIFY_TIMEOUT_SECONDS before giving up.
+      wait_for 20 0.5 "prompt_submitted or prompt_unverified appears" \
+        bash -c "[ -f '${c3_state}/prompt_submitted' ] || [ -f '${c3_state}/prompt_unverified' ]" || true
     else
       log "C3 FAIL: launch itself failed"
     fi
