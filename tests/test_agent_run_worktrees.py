@@ -3961,6 +3961,33 @@ class TestLaunchCreatesWorktree:
         # The forced-failing _worktree_remove never actually removed anything.
         assert wt_dir.is_dir()
 
+    def test_rollback_raising_base_exception_does_not_mask_original_error(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A second BaseException (e.g. another SIGINT) during rollback must
+        not replace the original launch failure that triggered rollback."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-rollback-raises"
+        name = "rollback-raises"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo),
+        )
+
+        def _boom(created):
+            raise KeyboardInterrupt("second interrupt during rollback")
+
+        monkeypatch.setattr(agent_run, "_rollback_launch_worktree", _boom)
+
+        with pytest.raises(SystemExit, match="missing command") as exc:
+            agent_run.cmd_launch(args)
+
+        assert "missing command" in str(exc.value)
+        err = capsys.readouterr().err
+        assert "second interrupt during rollback" in err
+        # Rollback never ran, so the worktree it would have removed survives.
+        assert wt_dir.is_dir()
+
     def test_invocation_cwd_outside_repo_without_worktree_repo_is_usage_error(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch, capsys
     ):

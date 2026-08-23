@@ -9059,7 +9059,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
         except BaseException:
             try:
                 _rollback_launch_worktree(created)
-            except Exception as rollback_exc:  # noqa: BLE001
+            except BaseException as rollback_exc:  # noqa: BLE001
                 print(
                     f"agent-run: warning: worktree rollback itself failed: {rollback_exc}",
                     file=sys.stderr,
