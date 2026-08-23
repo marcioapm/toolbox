@@ -7282,9 +7282,10 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
 
 def _rollback_launch_worktree(created: _CreatedWorktree) -> None:
     """Best-effort teardown of a worktree (and branch, if freshly created)
-    this invocation made, called only when launch fails before the run is
-    published. Never raises: failure here must not mask the launch failure
-    that triggered it, so every problem is reported to stderr and swallowed.
+    this invocation made, called only when launch fails before ``os.fork()``
+    -- no runner process exists yet, so nothing can own the tree. Never
+    raises: failure here must not mask the launch failure that triggered it,
+    so every problem is reported to stderr and swallowed.
     """
     info = _worktree_classify(created.path)
     if info.kind != _WORKTREE_LINKED:
@@ -9171,76 +9172,6 @@ def cmd_kill(args: argparse.Namespace) -> int:
 # launch + runner
 # ---------------------------------------------------------------------------
 
-# Bounds for terminating a runner before its readiness ack is observed.
-# IDENTITY_POLL covers the pid+identity write racing this call: identity may
-# shell out (a `ps` subprocess on Darwin, see _process_identity) and take up
-# to a couple of seconds. TERM_GRACE and KILL_VERIFY bound escalation so an
-# interrupted launch cannot hang indefinitely.
-_UNPUBLISHED_RUNNER_IDENTITY_POLL_SECONDS = 3.0
-_UNPUBLISHED_RUNNER_TERM_GRACE_SECONDS = 3.0
-_UNPUBLISHED_RUNNER_KILL_VERIFY_SECONDS = 2.0
-
-
-def _terminate_unpublished_runner(state_dir: Path) -> bool:
-    """Best-effort termination of a runner whose launcher was interrupted
-    before readiness resolved (before ``status=running`` is published).
-
-    Called only from the window between forking the runner and observing
-    its readiness acknowledgement: an interruption there means a live
-    runner may already exist with nothing yet marking it "running", and the
-    caller is about to decide whether the worktree it owns can be rolled
-    back. That decision must never race a live process still writing into
-    the directory `git worktree remove` is about to delete.
-
-    Returns True only once the exact process this launch forked is
-    positively confirmed dead (or never came alive at all). Every other
-    outcome -- no pid/identity within the poll window, an unsignalable
-    process, a signal that could not be identity-verified, a process that
-    outlives SIGKILL -- returns False. The caller must treat False as unsafe
-    to roll back, not as "nothing to terminate".
-    """
-    deadline = time.monotonic() + _UNPUBLISHED_RUNNER_IDENTITY_POLL_SECONDS
-    pid_raw = ""
-    identity = ""
-    while time.monotonic() < deadline:
-        pid_raw = _read(state_dir / "pid")
-        identity = _read(state_dir / "process_identity")
-        if pid_raw and identity:
-            break
-        time.sleep(0.05)
-    pid = _safe_int(pid_raw)
-    if pid is None or pid <= 0:
-        return False
-    if not _pid_alive(pid):
-        return True
-    if not identity:
-        # A pid with no identity yet is unsignalable through the verified
-        # path; signaling a bare pid risks hitting a reused pid instead.
-        return False
-    try:
-        _send_signal_to_verified_pid(pid, signal.SIGTERM, identity)
-    except ProcessLookupError:
-        return True
-    except (PermissionError, RuntimeError):
-        return False
-    term_deadline = time.monotonic() + _UNPUBLISHED_RUNNER_TERM_GRACE_SECONDS
-    while time.monotonic() < term_deadline and _pid_alive(pid):
-        time.sleep(0.1)
-    if not _pid_alive(pid):
-        return True
-    try:
-        _send_signal_to_verified_pid(pid, signal.SIGKILL, identity)
-    except ProcessLookupError:
-        return True
-    except (PermissionError, RuntimeError):
-        return False
-    kill_deadline = time.monotonic() + _UNPUBLISHED_RUNNER_KILL_VERIFY_SECONDS
-    while time.monotonic() < kill_deadline:
-        if not _pid_alive(pid) or _process_identity(pid) != identity:
-            return True
-        time.sleep(0.05)
-    return False
-
 
 def cmd_launch(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
@@ -9270,40 +9201,36 @@ def cmd_launch(args: argparse.Namespace) -> int:
         if created is None:
             with _launch_lock(name) as lock_fd:
                 return _cmd_launch_locked(args, name, lock_fd)
-        # Roll back a worktree this call created if anything from here on
-        # fails before the run is published. _cmd_launch_locked signals
-        # failure with sys.exit (SystemExit), not a return value, so the
-        # guard must catch BaseException to see it; the original failure is
-        # always re-raised, even if rollback itself also fails. Once
-        # _cmd_launch_locked has observed a successful readiness
-        # acknowledgement it marks args._worktree_launch_published, and from
-        # that point on a live runner owns the worktree: rollback must never
-        # run, no matter what fails afterward (pid parsing, the print calls).
-        # Two earlier states are also refused: args._worktree_rollback_unsafe
-        # (an interruption before readiness left the runner's termination
-        # unconfirmed) and args._worktree_ack_uncertain (an interruption
-        # after the readiness ack was read but before it could be classified
-        # as success or failure) both mean the runner's true state cannot be
-        # proven, so rollback is refused in both cases too.
+        # Roll back a worktree this call created only for a pre-fork failure.
+        # _cmd_launch_locked sets args._worktree_forked immediately before
+        # os.fork(), as its last statement before forking, so any failure
+        # with that flag unset happened while nothing but this launcher
+        # process existed -- rollback is unconditionally safe. Once forked,
+        # this process can no longer prove the child (or whatever it has
+        # itself forked) is dead: an interrupt, a signal race, or a wedged
+        # child can all survive any check made from here. Rather than adding
+        # verification machinery that itself has a window, a live runner's
+        # worktree is simply never deleted -- a leaked worktree is a `git
+        # worktree remove` away from cleanup; a deleted one under a live
+        # process is not recoverable. _cmd_launch_locked signals failure with
+        # sys.exit (SystemExit), not a return value, so the guard must catch
+        # BaseException to see it; the original failure is always re-raised,
+        # even when rollback runs and itself fails.
         try:
             with _launch_lock(name) as lock_fd:
                 rc = _cmd_launch_locked(args, name, lock_fd)
         except BaseException:
-            if getattr(args, "_worktree_launch_published", False):
-                raise
-            if getattr(args, "_worktree_rollback_unsafe", False):
+            if getattr(args, "_worktree_forked", False):
                 print(
-                    f"agent-run: warning: could not confirm the runner for '{name}' "
-                    f"is terminated; leaving worktree {created.path} in place "
-                    f"(possible orphaned launch, inspect and clean up manually)",
-                    file=sys.stderr,
-                )
-                raise
-            if getattr(args, "_worktree_ack_uncertain", False):
-                print(
-                    f"agent-run: warning: interrupted while classifying the runner "
-                    f"readiness ack for '{name}'; leaving worktree {created.path} "
-                    f"in place (possible orphaned launch, inspect and clean up manually)",
+                    f"agent-run: warning: launch for '{name}' failed after starting "
+                    f"the runner; leaving worktree in place: {created.path} "
+                    f"(branch {created.branch!r}). Once you have confirmed no "
+                    f"process is still using it, clean up by hand: "
+                    f"git worktree remove {created.path}  # run from {created.repo}"
+                    + (
+                        f"; git branch -D {created.branch}  # run from {created.repo}"
+                        if created.branch_created else ""
+                    ),
                     file=sys.stderr,
                 )
                 raise
@@ -9628,6 +9555,17 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     # Double-fork to detach from the terminal and become our own session
     # leader. The grandchild runs the actual agent.
     parent_pid = os.getpid()
+    # Marks the point past which cmd_launch must never roll back this
+    # worktree. Proving that no process -- runner, its already-forked
+    # workload, or a helper child -- still owns the tree is not something
+    # this launcher can do from out here: any liveness check races the very
+    # process it is trying to rule out, and every prior attempt at such a
+    # check (terminate-and-verify, ack classification) turned out to have
+    # its own window. Once a runner may exist, a failure here only warns and
+    # leaves the worktree for manual `git worktree remove`; a leaked
+    # worktree is recoverable, a deleted live one is not. Set as the last
+    # statement before the fork so no failure path can skip it.
+    args._worktree_forked = True
     try:
         child_pid = os.fork()
     except OSError as exc:
@@ -9643,66 +9581,29 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     if child_pid != 0:
         # Parent: wait for the grandchild to publish its pid, then return.
         os.close(w_ack)
+        os.waitpid(child_pid, 0)  # reap the intermediate forker
+        # Read the structured readiness result. EOF, malformed data, and an
+        # explicit setup error all mean launch failed. None of these outcomes
+        # -- nor an interrupt anywhere in this block -- triggers rollback:
+        # the fork already happened, so failure here is reported (and, for a
+        # worktree this launch created, warned about) but the tree is left
+        # in place.
         try:
-            os.waitpid(child_pid, 0)  # reap the intermediate forker
-            # Read the structured readiness result. EOF, malformed data, and an
-            # explicit setup error all mean launch failed.
-            try:
-                ack_raw = os.read(r_ack, 65536)
-                if ack_raw:
-                    # The runner wrote *something* to the pipe: it reached
-                    # _ready() or its own error handler, either of which
-                    # means status=running is already on disk and the
-                    # runner may already own the worktree. Whether the ack
-                    # is success or failure is not yet known -- decoding
-                    # and classifying it happens below, outside any
-                    # exception guard -- so this is marked provisionally
-                    # unsafe to roll back until that classification
-                    # completes one way or the other.
-                    args._worktree_ack_uncertain = True
-            except OSError:
-                ack_raw = b""
-        except BaseException:
-            # Interrupted before readiness could be confirmed: a runner may
-            # already be live and about to publish "running". Terminate it
-            # here, before this call's caller is allowed to roll back the
-            # worktree -- otherwise a live agent process could be orphaned
-            # in a directory `git worktree remove` has just deleted. A
-            # second BaseException from the termination attempt itself
-            # (e.g. a second interrupt) is caught and folded into the same
-            # not-confirmed-dead outcome rather than replacing the original
-            # exception.
-            os.close(r_ack)
-            try:
-                confirmed_dead = _terminate_unpublished_runner(d)
-            except BaseException:  # noqa: BLE001
-                confirmed_dead = False
-            if not confirmed_dead:
-                args._worktree_rollback_unsafe = True
-            raise
+            ack_raw = os.read(r_ack, 65536)
+        except OSError:
+            ack_raw = b""
         os.close(r_ack)
         try:
             ack = json.loads(ack_raw.decode()) if ack_raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError):
             ack = {}
         if ack.get("status") != "ok":
-            # Classified as a genuine failure, not an interrupted read: the
-            # runner reported its own setup error before ever reaching
-            # _ready(), so nothing owns the worktree and normal rollback
-            # must proceed rather than being blocked by the provisional
-            # mark above.
-            args._worktree_ack_uncertain = False
             error = str(ack.get("error") or "runner exited before readiness")
             if not (d / "exit_code").exists():
                 _write(d / "exit_code", "1\n")
                 _write(d / "ended_at", _now_iso() + "\n")
                 _write(d / "status", "failed\n")
             sys.exit(f"agent-run: failed to start agent: {error}")
-        # From here on the run is published: status=running is on disk and a
-        # live runner owns this worktree. An interruption further down (pid
-        # parsing, the print calls below) must never cause the caller to
-        # roll back and remove the worktree out from under it.
-        args._worktree_launch_published = True
         bg_pid_raw = _read(d / "pid")
         if not bg_pid_raw:
             sys.exit("agent-run: failed to start agent (no pid recorded)")
