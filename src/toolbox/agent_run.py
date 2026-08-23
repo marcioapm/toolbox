@@ -4213,15 +4213,7 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
 
 
 def _transcript_unknown(code: str, submitted_age_s: Optional[float] = None) -> dict:
-    """Transcript facts saying "unavailable, because *code*".
-
-    Modeled on ``_scratch_unknown``: every decision field is null rather
-    than 0 so a poller cannot read a failed count as an observed empty
-    transcript. ``entries == 0`` must only ever mean "the store was
-    queried and holds no records for this session" -- never "the query
-    failed". ``submitted_age_s`` is accepted separately because it is
-    computed from the run's state dir, not the store read that failed.
-    """
+    """Return unavailable facts; an unknown entry count is never zero."""
     return {
         "available": False,
         "entries": None,
@@ -4232,16 +4224,7 @@ def _transcript_unknown(code: str, submitted_age_s: Optional[float] = None) -> d
 
 
 def _read_prompt_submitted_sentinel(path: Path) -> Optional[tuple[str, float]]:
-    """Open *path* once and return (stripped content, mtime) read from
-    that single descriptor, or ``None`` if it cannot be opened, is not a
-    regular file, or exceeds the bound. Reading content and mtime off one
-    fd -- rather than a separate ``read_text()`` followed by a
-    pathname-based ``stat()`` -- means a concurrent replacement of the
-    file cannot pair one version's content with a different version's
-    mtime; our own writer replaces this file atomically, so this is
-    hardening against a hypothetical future non-atomic writer, not an
-    observed failure.
-    """
+    """Read bounded regular-file content and mtime from one descriptor."""
     max_bytes = 256  # generous for either on-disk format: an ISO-8601 timestamp or the bare "1" sentinel
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -4263,19 +4246,7 @@ def _read_prompt_submitted_sentinel(path: Path) -> Optional[tuple[str, float]]:
 
 
 def _watch_prompt_submitted_age_s(state_dir: Optional[Path], interactive: Optional[bool]) -> Optional[float]:
-    """Seconds since ``state_dir/prompt_submitted`` was written -- the
-    anchor a consumer should measure "empty transcript" against instead of
-    process start (``elapsed_s``), which conflates harness boot, session
-    mint and TUI readiness with actual prompt delivery.
-
-    Two on-disk formats exist: an ISO-8601 ``_now_iso()`` timestamp (current
-    writers) and a bare ``1`` sentinel (older writers), whose age falls
-    back to the file's mtime. Null whenever the age cannot be trusted --
-    the run is not interactive (no PTY-delivery gap to measure), the file
-    is absent/unreadable/not a regular file, or its content is neither
-    format -- never a guessed value. Clock skew (a timestamp or mtime in
-    the future) clamps to 0.0 rather than going negative.
-    """
+    """Return interactive prompt age from ISO content or legacy sentinel mtime."""
     if interactive is not True or state_dir is None:
         return None
     read = _read_prompt_submitted_sentinel(state_dir / "prompt_submitted")
@@ -4299,24 +4270,7 @@ def _watch_transcript_facts(
     state_dir: Optional[Path] = None,
     interactive: Optional[bool] = None,
 ) -> dict:
-    """Count records in the harness's own conversation store for the run's
-    session, without materializing entries (see ``count_transcript``), plus
-    ``submitted_age_s`` (see ``_watch_prompt_submitted_age_s``) -- computed
-    independently of the store read, so it is populated even when the
-    store itself is unavailable.
-
-    Absence of ``session.json`` (raw run) or an incomplete/invalid
-    ``session_id``/``harness`` pair is routine, not a warning -- most runs
-    launched without ``--harness`` never acquire a session at all. Every
-    other failure -- unknown harness, missing/locked/corrupt store, a
-    malformed return value from the count call, an unparseable timestamp,
-    or any other unexpected exception -- degrades to the unavailable form
-    with a short discriminator. The whole count-through-result-construction
-    sequence runs under one exception guard so nothing downstream of a
-    malformed return can raise past it and wipe the rest of the watch
-    contract; nothing from this function may raise past
-    ``_cmd_watch_observe``'s caller.
-    """
+    """Return transcript facts, degrading every store failure to unavailable."""
     submitted_age_s = _watch_prompt_submitted_age_s(state_dir, interactive)
 
     if not isinstance(session_data, dict):
@@ -4346,10 +4300,6 @@ def _watch_transcript_facts(
     except _agent_run_transcript.TranscriptSourceError as exc:
         return _transcript_unknown(exc.code, submitted_age_s)
     except Exception:
-        # A reader bug, a type error from an unexpected store shape, or a
-        # malformed (count, newest_iso) return -- all degrade the
-        # transcript block rather than escape and wipe the rest of the
-        # watch contract.
         return _transcript_unknown("store_unreadable", submitted_age_s)
 
 
@@ -4445,13 +4395,7 @@ def _cmd_watch_observe(
             "git_error": git_error,
             "signals": signals,
             "scratch": _watch_scratch_facts(cwd),
-            # run.json's cwd, not the state dir's: run.json survives the
-            # state dir's disappearance (see WATCH_STATUS_LOG_PRESERVED
-            # below) and is what cmd_transcript itself reads for the
-            # claude project-directory lookup. state_dir may itself be gone
-            # by the time this runs (missing-state-dir branch below), in
-            # which case prompt_submitted is unreadable and submitted_age_s
-            # is null along with everything else in that branch.
+            # Match cmd_transcript's persistent cwd source for Claude lookup.
             "transcript": _watch_transcript_facts(
                 session_data, _run_json_cwd(log_dir), state_dir, interactive
             ),
@@ -5081,26 +5025,13 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 
 def cmd_transcript(args: argparse.Namespace) -> int:
-    """Print the harness's own conversation record for a managed run.
+    """Print a run's harness transcript.
 
-    Reads session.json for session_id/harness (written at launch by
-    _record_session) and dispatches to the matching reader in
-    agent_run_transcript. Raw runs and any run whose session id was never
-    acquired have nothing to read; exit non-zero naming the two
-    alternatives rather than raising, since neither is a bug in this run.
-
-    Exit status discriminates *availability*, not emptiness: a store that
-    was located, opened and queried successfully exits 0 whether or not it
-    holds any entries for this session, printing nothing on stdout and an
-    explanatory note on stderr when it holds none. Emptiness is carried by
-    the absence of stdout output, not by the exit code -- a caller
-    (threadctl's drift tier) needs "the store is fine, this session just
-    has no records" (rc=0, blank stdout) distinguishable from "there is no
-    transcript to read at all" (rc!=0: raw run, unacquired session id,
-    unreadable/missing store), and those are different situations that a
-    single non-zero exit code could not tell apart.
+    A readable empty store exits zero with blank stdout. Missing session
+    metadata or an unavailable store exits nonzero.
     """
-    from toolbox import agent_run_transcript as transcript
+
+    transcript = _agent_run_transcript
 
     name = _validate_run_name(args.name)
     log_dir = _log_dir(name)
@@ -5127,10 +5058,6 @@ def cmd_transcript(args: argparse.Namespace) -> int:
         sys.exit(f"agent-run: {exc}")
 
     if not entries:
-        # The store was read successfully and holds nothing for this
-        # session: a legitimate, common outcome (e.g. the harness never
-        # received a prompt), not a caller-visible error. Note kept on
-        # stderr so blank stdout + rc=0 is unambiguous to a script.
         store = {
             "opencode": transcript.OPENCODE_DB_PATH,
             "claude": transcript.CLAUDE_PROJECTS_DIR,

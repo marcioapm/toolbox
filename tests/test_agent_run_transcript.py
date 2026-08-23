@@ -299,10 +299,6 @@ class TestOpencodeReader:
 
 class TestCountTranscript:
     def test_opencode_count_query_uses_the_session_index_not_a_full_scan(self, tmp_path, monkeypatch):
-        """Regression guard for the index this counter relies on: fixtures
-        must carry `part_session_idx` so a scan-plan regression fails this
-        test instead of silently degrading to an unbounded per-poll table
-        scan against opencode.db (shared by every session on the machine)."""
         db = tmp_path / "opencode.db"
         _make_opencode_db(db)
         monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
@@ -444,10 +440,6 @@ class TestCountTranscript:
         assert newest == "2026-08-16T00:00:01Z"
 
     def test_claude_count_converts_non_utc_offset_to_true_utc_instant(self, tmp_path, monkeypatch):
-        """A record timestamp carrying a non-UTC offset must be converted,
-        not relabeled: `+14:00`'s wall-clock digits are 14 hours ahead of
-        the same instant in UTC, so naively appending `Z` would report a
-        newest time 14 hours in the future."""
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         cwd = "/Users/x/proj"
         session_id = "sess-offset"
@@ -561,10 +553,6 @@ class TestCountTranscript:
         assert exc_info.value.__cause__ is not None
 
     def test_claude_skipped_only_file_raises_store_unreadable_not_zero(self, tmp_path, monkeypatch):
-        """Every record in the file is a user/assistant record with a
-        non-dict `message` -- wholly malformed, not merely a session with
-        no conversation. `count_transcript` must not report this as a
-        trustworthy 0."""
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-all-skipped"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
@@ -582,8 +570,6 @@ class TestCountTranscript:
     def test_claude_partially_skipped_file_still_counts_the_readable_records(
         self, tmp_path, monkeypatch
     ):
-        """skipped > 0 alongside a nonzero count is a normal partial-parse
-        outcome, not a store failure."""
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-partial-skip"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
@@ -604,9 +590,6 @@ class TestCountTranscript:
     def test_claude_direct_path_all_mismatched_records_raises_store_unreadable(
         self, tmp_path, monkeypatch
     ):
-        """(a) A direct-path (cwd-derived) candidate whose every record
-        names a different session is a conflicting candidate, not a
-        verified empty store -- must not report a false `entries: 0`."""
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-direct-all-mismatched"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
@@ -632,10 +615,6 @@ class TestCountTranscript:
     def test_claude_direct_path_mismatched_plus_ignorable_metadata_raises_store_unreadable(
         self, tmp_path, monkeypatch
     ):
-        """(b) Mismatched conversation records plus otherwise-ignorable
-        non-conversation metadata (a record type this reader always
-        skips) is still a conflicting candidate, not a valid empty
-        store."""
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-direct-mismatched-plus-meta"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
@@ -657,10 +636,6 @@ class TestCountTranscript:
     def test_claude_direct_path_one_match_among_mismatched_records_counts_the_match(
         self, tmp_path, monkeypatch
     ):
-        """(c) A direct-path candidate carrying one genuine record for this
-        session alongside records for other sessions returns the matching
-        count -- the file is this session's transcript, just not the only
-        one that ever wrote to this location."""
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-direct-one-match"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
@@ -684,9 +659,6 @@ class TestCountTranscript:
         assert newest == "2026-08-16T00:00:01Z"
 
     def test_claude_direct_path_empty_file_is_a_valid_zero(self, tmp_path, monkeypatch):
-        """A genuinely empty direct-path file (no records at all) is a
-        trustworthy zero, not a conflict -- distinguishes 'nothing here
-        yet' from 'something else is here'."""
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-direct-empty"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
@@ -696,9 +668,6 @@ class TestCountTranscript:
         assert newest is None
 
     def test_claude_direct_path_metadata_only_file_is_a_valid_zero(self, tmp_path, monkeypatch):
-        """A direct-path file holding only recognized non-conversation
-        metadata (no user/assistant records at all) is a valid zero, not
-        a conflict."""
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-direct-metadata-only"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
@@ -714,8 +683,6 @@ class TestCountTranscript:
         assert newest is None
 
     def test_codex_skipped_only_file_raises_store_unreadable_not_zero(self, tmp_path, monkeypatch):
-        """Every `response_item` in the file has a non-dict `payload` --
-        wholly malformed, not merely an empty session."""
         monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
         session_id = "sess-codex-all-skipped"
         path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
@@ -762,12 +729,6 @@ class TestCountersStream:
     def test_claude_count_peak_memory_bounded_by_largest_line_not_file_size(
         self, tmp_path, monkeypatch
     ):
-        """A counter that materializes every parsed record before
-        classifying it (the old `_read_jsonl_objects`-backed
-        implementation) has peak traced memory that scales with file
-        size. One that streams and discards each record after
-        classification does not: peak memory stays close to one line's
-        size regardless of how many lines the file holds."""
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-streaming-claude"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
@@ -795,9 +756,6 @@ class TestCountersStream:
             tracemalloc.stop()
 
         assert count == record_count
-        # Bounded by a small constant multiple of one line's size, not by
-        # file size: a materializing implementation would peak near
-        # file_size; a streaming one stays orders of magnitude below it.
         assert peak < file_size // 4, (
             f"peak traced memory {peak} bytes is too close to file size {file_size} bytes "
             "-- counter appears to materialize the whole file rather than stream it"
