@@ -11324,32 +11324,40 @@ def _opencode_prefork_mint(
 
     def _mint_cleanup_handler(signum, frame):
         p = _mint_proc_ref[0]
-        if p is not None:
-            try:
-                p.terminate()
-            except OSError:
-                pass
-            try:
-                p.wait(timeout=3.0)
-            except Exception:  # noqa: BLE001
+        try:
+            if p is not None:
                 try:
-                    p.kill()
+                    p.terminate()
                 except OSError:
                     pass
-                else:
+                try:
+                    p.wait(timeout=3.0)
+                except Exception:  # noqa: BLE001
                     try:
-                        p.wait(timeout=3.0)
-                    except BaseException:
+                        p.kill()
+                    except OSError:
                         pass
-        if state_dir is not None:
-            try:
-                _write(state_dir / "exit_code", "1\n")
-                _write(state_dir / "ended_at", _now_iso() + "\n")
-                _write(state_dir / "status", "failed\n")
-            except OSError:
-                pass
+                    else:
+                        # Only ordinary reap failures (timeout, OS error)
+                        # are suppressed here; a KeyboardInterrupt or
+                        # SystemExit from the operator sending a second
+                        # signal is left to propagate rather than being
+                        # discarded, taking priority over this handler's
+                        # own re-delivery below.
+                        try:
+                            p.wait(timeout=3.0)
+                        except (subprocess.TimeoutExpired, OSError, ValueError):
+                            pass
+        finally:
+            if state_dir is not None:
+                try:
+                    _write(state_dir / "exit_code", "1\n")
+                    _write(state_dir / "ended_at", _now_iso() + "\n")
+                    _write(state_dir / "status", "failed\n")
+                except OSError:
+                    pass
+            _restore_handlers()
         # Re-raise so the caller's normal signal handling takes over.
-        _restore_handlers()
         os.kill(os.getpid(), signum)
 
     try:
@@ -11358,33 +11366,62 @@ def _opencode_prefork_mint(
 
         if not _opencode_health_poll(port, _OPENCODE_HEALTH_TIMEOUT, acquire_log):
             _acquire_log_write(acquire_log, "opencode server did not become healthy for mint")
-            return None
-        return _opencode_mint_session(port, run_name, cwd, acquire_log)
-    finally:
+            result = None
+        else:
+            result = _opencode_mint_session(port, run_name, cwd, acquire_log)
+    except BaseException as body_exc:
         _restore_handlers()
         _mint_proc_ref[0] = None
-        # Health polling or minting can already be unwinding with exception
-        # A when terminate()/wait() below raises B; a bare `raise` would
-        # propagate B and leave A reachable only via __context__. Capture A
-        # up front so a cleanup failure re-raises the causal exception
-        # itself, not whatever cleanup happened to fail with.
-        active_exc = sys.exc_info()[1]
+        # The mint body's own failure is the caller's real cause: it always
+        # wins over a cleanup failure below, which is chained on as
+        # __cause__ so it stays inspectable rather than being discarded.
         try:
-            proc.terminate()
-            proc.wait(timeout=5.0)
-        except BaseException:
+            _mint_terminate_and_reap(proc, timeout=5.0)
+        except BaseException as cleanup_exc:
+            raise body_exc from cleanup_exc
+        raise
+    else:
+        _restore_handlers()
+        _mint_proc_ref[0] = None
+        # No causal exception is active on this path: a cleanup failure is
+        # the sole failure the caller can observe, so it propagates as
+        # itself rather than being masked by a normal return.
+        _mint_terminate_and_reap(proc, timeout=5.0)
+        return result
+
+
+def _mint_terminate_and_reap(proc: subprocess.Popen, timeout: float) -> None:
+    """Terminate a mint child and block until it exits, escalating to
+    SIGKILL if it is still alive after ``timeout``.
+
+    A failure at the first wait -- timeout, OS error, or interrupt --
+    triggers the SIGKILL escalation and, absent a fresh failure at the
+    second wait, is what this function re-raises. If the second, post-kill
+    wait itself raises KeyboardInterrupt or SystemExit, that interrupt is
+    not discarded: it is chained as the cause of the re-raised first
+    failure so it stays reachable via ``__cause__``. Ordinary reap failures
+    at the second wait (``TimeoutExpired``, ``OSError``, ``ValueError``)
+    are suppressed -- kill() was already attempted; nothing further to do.
+    """
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=timeout)
+    except BaseException as first_exc:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        else:
             try:
-                proc.kill()
-            except BaseException:
+                proc.wait(timeout=timeout)
+            except (subprocess.TimeoutExpired, OSError, ValueError):
                 pass
-            else:
-                try:
-                    proc.wait(timeout=5.0)
-                except BaseException:
-                    pass
-            if active_exc is not None:
-                raise active_exc
-            raise
+            except BaseException as second_exc:
+                raise first_exc from second_exc
+        raise first_exc
 
 
 def _acquire_log_write(path: Path, message: str) -> None:

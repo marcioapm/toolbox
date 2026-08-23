@@ -2870,6 +2870,112 @@ class TestPreforkMintKillEscalationReapsChild:
             os.kill(proc.pid, 0)
 
 
+class TestPreforkMintCleanupNotScopedToCallerException:
+    """sys.exc_info() reflects process-wide active-exception state, not the
+    lexical try/except of _opencode_prefork_mint itself: a caller invoking
+    it while already handling its own exception must not have that
+    exception substituted for a real cleanup failure."""
+
+    def test_cleanup_failure_during_normal_return_propagates_by_identity_not_callers_exception(
+        self, tmp_path, monkeypatch
+    ):
+        cleanup_exc = RuntimeError("cleanup wait failure")
+
+        class _FakeProc:
+            pid = 4242
+            returncode = None
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise cleanup_exc
+                return 0
+
+            def kill(self):
+                pass
+
+        def _fake_popen(cmd, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", lambda *a, **k: True)
+        monkeypatch.setattr(
+            agent_run, "_opencode_mint_session", lambda *a, **k: "sess-normal-return"
+        )
+
+        try:
+            raise ValueError("the caller's own, unrelated active exception")
+        except ValueError:
+            with pytest.raises(RuntimeError) as exc_info:
+                agent_run._opencode_prefork_mint(
+                    12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+                )
+
+        assert exc_info.value is cleanup_exc, (
+            "cleanup failure during a normal mint-body return must propagate "
+            "by identity, not be replaced by the caller's active exception"
+        )
+
+
+class TestPreforkMintPostKillWaitInterrupt:
+    """A KeyboardInterrupt/SystemExit at the post-kill wait -- the operator
+    asking again after the first wait already failed -- must be observable,
+    not silently discarded like an ordinary reap failure."""
+
+    def test_post_kill_wait_keyboard_interrupt_is_observable_and_mark_stays_set(
+        self, tmp_path, monkeypatch
+    ):
+        interrupt = KeyboardInterrupt("second interrupt during post-kill wait")
+
+        class _FakeProc:
+            pid = 4242
+            returncode = None
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="opencode", timeout=timeout)
+                raise interrupt
+
+            def kill(self):
+                pass
+
+        def _fake_popen(cmd, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", lambda *a, **k: True)
+        monkeypatch.setattr(
+            agent_run, "_opencode_mint_session", lambda *a, **k: "sess-normal-return"
+        )
+
+        launch_args = argparse.Namespace(_worktree_process_started=False)
+
+        with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+            agent_run._opencode_prefork_mint(
+                12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+                launch_args=launch_args,
+            )
+
+        assert exc_info.value.__cause__ is interrupt, (
+            "the post-kill wait's KeyboardInterrupt must remain reachable "
+            "via __cause__, not be swallowed by a bare except-pass"
+        )
+        assert launch_args._worktree_process_started is True
+
+
 # ---------------------------------------------------------------------------
 # Teardown tests: no app-server process must survive kill or signal
 # ---------------------------------------------------------------------------
