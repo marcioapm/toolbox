@@ -11391,12 +11391,12 @@ def _opencode_prefork_mint(
         try:
             _mint_terminate_and_reap(proc, timeout=5.0)
         except (KeyboardInterrupt, SystemExit) as interrupt_exc:
-            interrupt_exc.add_note(f"mint body also failed: {body_exc!r}")
+            _add_exception_note(interrupt_exc, f"mint body also failed: {body_exc!r}")
             raise
         except BaseException as cleanup_exc:
             if body_exc.__cause__ is None:
                 raise body_exc from cleanup_exc
-            body_exc.add_note(f"mint cleanup also failed: {cleanup_exc!r}")
+            _add_exception_note(body_exc, f"mint cleanup also failed: {cleanup_exc!r}")
             raise body_exc
         raise
     else:
@@ -11407,6 +11407,20 @@ def _opencode_prefork_mint(
         # itself rather than being masked by a normal return.
         _mint_terminate_and_reap(proc, timeout=5.0)
         return result
+
+
+def _add_exception_note(exc: BaseException, note: str) -> None:
+    """Attach a diagnostic note to ``exc``, never altering control flow.
+
+    ``add_note`` is dynamically dispatched: a subclass can override it, and the
+    built-in raises TypeError when ``__notes__`` has been set to a non-list. A
+    diagnostic annotation must never displace the exception already selected
+    for propagation, so every failure here is discarded.
+    """
+    try:
+        exc.add_note(note)
+    except BaseException:  # noqa: BLE001
+        pass
 
 
 def _mint_terminate_and_reap(proc: subprocess.Popen, timeout: float) -> None:
