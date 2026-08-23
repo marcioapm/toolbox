@@ -4618,15 +4618,15 @@ class TestLaunchCreatesWorktree:
     ):
         """Both existing pre-fork rollback tests fail at the very first
         statement of _cmd_launch_locked (command=[]), before the state dir,
-        marker, status=starting, or args._worktree_forked exist. This forces
-        a failure *after* all of that is on disk: os.fork() itself raising
-        (reached deterministically by monkeypatching it) happens after
-        args._worktree_forked is set, since that flag is the statement
-        immediately preceding the call -- so this is a post-fork failure by
-        definition, even though no child process actually came into being.
-        The worktree and branch must survive with an actionable warning, and
-        the state dir is left behind with status=failed naming the
-        still-existing directory."""
+        marker, status=starting, or args._worktree_process_started exist.
+        This forces a failure *after* all of that is on disk: os.fork()
+        itself raising (reached deterministically by monkeypatching it)
+        happens after args._worktree_process_started is set, since that flag
+        is the statement immediately preceding the call -- so this is a
+        post-fork failure by definition, even though no child process
+        actually came into being. The worktree and branch must survive with
+        an actionable warning, and the state dir is left behind with
+        status=failed naming the still-existing directory."""
         repo = _make_repo(git_root)
         wt_dir = git_root / "wt-rollback-post-publish"
         name = "rollback-post-publish"
@@ -4697,14 +4697,11 @@ class TestLaunchCreatesWorktree:
     ):
         """A runner that reaches its own error handler and sends
         {"status": "error"} over the ack pipe is a post-fork failure: the
-        fork that produced it already ran, so args._worktree_forked was set
-        before cmd_launch's except clause can ever see the SystemExit this
-        raises. The worktree and branch this invocation created must
-        survive, with an actionable warning telling the operator how to
-        clean up by hand. This is the single most important behavioural
-        test in this design: it is the exact shape every prior rollback
-        race was found in, and the fix here is to never attempt the
-        decision at all rather than get it right under pressure."""
+        fork that produced it already ran, so args._worktree_process_started
+        was set before cmd_launch's except clause can ever see the
+        SystemExit this raises. The worktree and branch this invocation
+        created must survive, with an actionable warning telling the
+        operator how to clean up by hand."""
         repo = _make_repo(git_root)
         wt_dir = git_root / "wt-failed-ack"
         name = "failed-ack-run"
@@ -4785,9 +4782,9 @@ class TestLaunchCreatesWorktree:
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
         """An interrupt landing at any point after os.fork() has returned
-        must never trigger rollback: args._worktree_forked was set as the
-        last statement before that call, so nothing past this point can
-        prove the forked process (or whatever it has itself forked) is
+        must never trigger rollback: args._worktree_process_started was set
+        as the last statement before that call, so nothing past this point
+        can prove the forked process (or whatever it has itself forked) is
         dead. Interrupting os.waitpid's reap of the intermediate forker --
         the parent's very next statement once fork() returns -- exercises
         the earliest possible post-fork interruption point."""
@@ -4839,6 +4836,71 @@ class TestLaunchCreatesWorktree:
         assert name in _git(repo, "branch", "--list", name)
         err = capsys.readouterr().err
         assert "git worktree remove" in err
+
+    def test_mint_cleanup_baseexception_with_live_child_refuses_rollback(
+        self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch
+    ):
+        """A managed opencode launch starts the temporary mint process with
+        the worktree as its cwd before args._worktree_process_started is
+        set. If that process is still alive when a BaseException escapes
+        _opencode_prefork_mint's cleanup, the worktree must survive: the
+        mark was set before Popen, and cleanup failure must not clear it."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-mint-interrupt"
+        name = "mint-interrupt-run"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo), harness="opencode", prompt="hi",
+        )
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_opencode = bin_dir / "opencode"
+        fake_opencode.write_text("#!/bin/sh\nexec sleep 60\n")
+        fake_opencode.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir) + ":" + os.environ.get("PATH", ""))
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", lambda *a, **k: False)
+
+        real_popen = subprocess.Popen
+        state = {"proc": None}
+
+        def _no_signal(*_a, **_k):
+            # Cleanup's terminate()/kill() calls are neutered so the real
+            # child is never actually signaled -- the test proves rollback
+            # is refused without depending on whether cleanup's own
+            # best-effort kill happens to succeed.
+            pass
+
+        def _wait_raises(*_a, **_k):
+            raise KeyboardInterrupt("interrupt during mint cleanup")
+
+        def _popen_tracking_opencode(argv, *a, **kw):
+            proc = real_popen(argv, *a, **kw)
+            if argv and argv[0] == "opencode":
+                state["proc"] = proc
+                proc.terminate = _no_signal
+                proc.kill = _no_signal
+                proc.wait = _wait_raises
+            return proc
+
+        monkeypatch.setattr(subprocess, "Popen", _popen_tracking_opencode)
+
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                agent_run.cmd_launch(args)
+
+            proc = state["proc"]
+            assert proc is not None, "the temporary opencode process must have started"
+            assert proc.poll() is None, "the temporary process must still be alive"
+            assert wt_dir.is_dir(), "worktree must survive an interrupted mint cleanup"
+            assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+            assert name in _git(repo, "branch", "--list", name)
+        finally:
+            proc = state["proc"]
+            if proc is not None:
+                real_popen.kill(proc)
+                real_popen.wait(proc, timeout=5)
+            _wait_terminal(isolated_runs_root / name)
 
     def test_invocation_cwd_outside_repo_without_worktree_repo_is_usage_error(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch, capsys

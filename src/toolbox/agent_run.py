@@ -9201,26 +9201,21 @@ def cmd_launch(args: argparse.Namespace) -> int:
         if created is None:
             with _launch_lock(name) as lock_fd:
                 return _cmd_launch_locked(args, name, lock_fd)
-        # Roll back a worktree this call created only for a pre-fork failure.
-        # _cmd_launch_locked sets args._worktree_forked immediately before
-        # os.fork(), as its last statement before forking, so any failure
-        # with that flag unset happened while nothing but this launcher
-        # process existed -- rollback is unconditionally safe. Once forked,
-        # this process can no longer prove the child (or whatever it has
-        # itself forked) is dead: an interrupt, a signal race, or a wedged
-        # child can all survive any check made from here. Rather than adding
-        # verification machinery that itself has a window, a live runner's
-        # worktree is simply never deleted -- a leaked worktree is a `git
-        # worktree remove` away from cleanup; a deleted one under a live
-        # process is not recoverable. _cmd_launch_locked signals failure with
-        # sys.exit (SystemExit), not a return value, so the guard must catch
-        # BaseException to see it; the original failure is always re-raised,
-        # even when rollback runs and itself fails.
+        # Roll back a worktree this call created only while args has no
+        # record of a process that could hold it as cwd.
+        # _worktree_process_started is set immediately before the first
+        # such process is created; once set, this process can no longer
+        # prove that process (or whatever it has itself forked) is dead,
+        # so rollback is refused rather than raced. _cmd_launch_locked
+        # signals failure with sys.exit (SystemExit), not a return value,
+        # so the guard must catch BaseException to see it; the original
+        # failure is always re-raised, even when rollback runs and itself
+        # fails.
         try:
             with _launch_lock(name) as lock_fd:
                 rc = _cmd_launch_locked(args, name, lock_fd)
         except BaseException:
-            if getattr(args, "_worktree_forked", False):
+            if getattr(args, "_worktree_process_started", False):
                 print(
                     f"agent-run: warning: launch for '{name}' failed after starting "
                     f"the runner; leaving worktree in place: {created.path} "
@@ -9484,6 +9479,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                     enable_questions=enable_questions,
                     opencode_agent_mode=managed_agent_mode,
                     extra_agent_names=opencode_extra_agent_names,
+                    launch_args=args,
                 )
                 if managed_session_id:
                     _record_session(log_d, acquire_log, "opencode", managed_session_id,
@@ -9555,17 +9551,9 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     # Double-fork to detach from the terminal and become our own session
     # leader. The grandchild runs the actual agent.
     parent_pid = os.getpid()
-    # Marks the point past which cmd_launch must never roll back this
-    # worktree. Proving that no process -- runner, its already-forked
-    # workload, or a helper child -- still owns the tree is not something
-    # this launcher can do from out here: any liveness check races the very
-    # process it is trying to rule out, and every prior attempt at such a
-    # check (terminate-and-verify, ack classification) turned out to have
-    # its own window. Once a runner may exist, a failure here only warns and
-    # leaves the worktree for manual `git worktree remove`; a leaked
-    # worktree is recoverable, a deleted live one is not. Set as the last
-    # statement before the fork so no failure path can skip it.
-    args._worktree_forked = True
+    # Set immediately before the first process that can hold this worktree
+    # as cwd; cmd_launch never rolls back once this is set.
+    args._worktree_process_started = True
     try:
         child_pid = os.fork()
     except OSError as exc:
@@ -11273,6 +11261,7 @@ def _opencode_prefork_mint(
     enable_questions: bool = False,
     opencode_agent_mode: Optional[str] = None,
     extra_agent_names: Optional[Iterable[str]] = None,
+    launch_args: Optional[argparse.Namespace] = None,
 ) -> Optional[str]:
     """Start a temporary opencode process, mint a session, return the session id.
 
@@ -11284,7 +11273,16 @@ def _opencode_prefork_mint(
 
     state_dir lets the signal handler resolve the phantom status=starting run
     that would otherwise be left behind if the launcher is killed mid-poll.
+
+    launch_args, when given, is the same Namespace cmd_launch reads for
+    ``_worktree_process_started``. It is set immediately before the
+    ``Popen`` below -- the temporary process's cwd is the launch worktree --
+    and cleared only once that exact process is positively reaped, and only
+    if it was not already set on entry.
     """
+    mark_was_set = bool(getattr(launch_args, "_worktree_process_started", False))
+    if launch_args is not None:
+        launch_args._worktree_process_started = True
     mint_env = dict(os.environ)
     mint_env["OPENCODE_CONFIG_CONTENT"] = _opencode_policy_config(
         mint_env.get("OPENCODE_CONFIG_CONTENT"),
@@ -11303,6 +11301,8 @@ def _opencode_prefork_mint(
         )
     except OSError as exc:
         _acquire_log_write(acquire_log, f"could not start opencode for mint: {exc}")
+        if launch_args is not None and not mark_was_set:
+            launch_args._worktree_process_started = False
         return None
 
     # SIGTERM/SIGINT/SIGHUP (the same set _runner's _on_signal handles) must kill
@@ -11356,11 +11356,14 @@ def _opencode_prefork_mint(
         try:
             proc.terminate()
             proc.wait(timeout=5.0)
-        except Exception:  # noqa: BLE001
+        except BaseException:
             try:
                 proc.kill()
-            except Exception:  # noqa: BLE001
+            except BaseException:
                 pass
+            raise
+        if launch_args is not None and not mark_was_set:
+            launch_args._worktree_process_started = False
 
 
 def _acquire_log_write(path: Path, message: str) -> None:
