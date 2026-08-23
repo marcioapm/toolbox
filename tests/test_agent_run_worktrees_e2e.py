@@ -27,6 +27,8 @@ E2E6 -- `du` and `reap --include-worktrees` against a real linked worktree.
 """
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import signal
 import subprocess
@@ -542,3 +544,247 @@ class TestE2E4LeakedWorktreeCleanupCommandsWork:
                 launcher.wait(timeout=10)
             _kill_and_reap(agent_pid)
             _kill_and_reap(runner_pid)
+
+
+# ---------------------------------------------------------------------------
+# E2E5: collision and reuse shapes
+# ---------------------------------------------------------------------------
+
+@live_only
+class TestE2E5CollisionAndReuseShapes:
+    """Every refusal path through the real CLI leaves pre-existing state on
+    disk exactly as it was: no partial worktree, no partial branch, no
+    state dir for the rejected run name."""
+
+    def test_existing_nonempty_directory_without_reuse_is_refused_and_untouched(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        repo = _make_repo(tmp_path, "repo-nonempty")
+        target = tmp_path / "already-here"
+        target.mkdir()
+        marker = target / "f.txt"
+        marker.write_text("pre-existing content\n")
+        name = "e2e5-nonempty"
+        argv = _launch_argv(
+            name=name, worktree=target, worktree_base="main", worktree_repo=repo,
+            command=["true"],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.main(argv)
+        assert _exit_status(exc.value.code) == 1
+        assert "already exists" in str(exc.value)
+
+        assert marker.read_text() == "pre-existing content\n"
+        assert not (isolated_runs_root / name).exists()
+
+    def test_existing_registered_worktree_without_reuse_is_refused(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        repo = _make_repo(tmp_path, "repo-registered")
+        existing = tmp_path / "existing-wt"
+        _git(repo, "worktree", "add", "-q", str(existing), "-b", "existing-branch", "main")
+        head_before = _git(existing, "rev-parse", "HEAD").strip()
+        name = "e2e5-registered-no-reuse"
+        argv = _launch_argv(
+            name=name, worktree=existing, worktree_base="main", worktree_repo=repo,
+            worktree_branch="a-different-branch", command=["true"],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.main(argv)
+        assert _exit_status(exc.value.code) == 1
+        assert "already exists" in str(exc.value)
+
+        assert _git(existing, "rev-parse", "HEAD").strip() == head_before
+        porcelain = _git(repo, "worktree", "list", "--porcelain")
+        assert str(existing.resolve()) in porcelain
+        assert not (isolated_runs_root / name).exists()
+
+    def test_existing_registered_worktree_with_reuse_attaches_and_launches(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        repo = _make_repo(tmp_path, "repo-reuse")
+        existing = tmp_path / "reuse-wt"
+        _git(repo, "worktree", "add", "-q", str(existing), "-b", "reuse-branch", "main")
+        name = "e2e5-reuse-attach"
+        argv = _launch_argv(
+            name=name, worktree=existing, worktree_base="main", worktree_repo=repo,
+            worktree_branch="reuse-branch", worktree_reuse=True, command=["true"],
+        )
+
+        assert agent_run.main(argv) == 0
+        state_dir = isolated_runs_root / name
+        assert _wait_terminal(state_dir) == "done"
+        assert (state_dir / "cwd").read_text().strip() == str(existing.resolve())
+        # Attaching to a pre-existing worktree creates nothing new.
+        assert not (state_dir / "worktree_created").exists()
+
+    def test_branch_checked_out_elsewhere_is_refused_and_leaves_no_new_worktree(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        repo = _make_repo(tmp_path, "repo-branch-collision")
+        other = tmp_path / "other-wt"
+        _git(repo, "worktree", "add", "-q", str(other), "-b", "shared-branch", "main")
+        new_dir = tmp_path / "new-wt"
+        name = "e2e5-branch-collision"
+        argv = _launch_argv(
+            name=name, worktree=new_dir, worktree_base="main", worktree_repo=repo,
+            worktree_branch="shared-branch", worktree_reuse=True, command=["true"],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.main(argv)
+        assert _exit_status(exc.value.code) == 1
+
+        assert not new_dir.exists()
+        porcelain = _git(repo, "worktree", "list", "--porcelain")
+        assert str(other.resolve()) in porcelain
+        assert str(new_dir.resolve()) not in porcelain
+        assert not (isolated_runs_root / name).exists()
+
+    def test_worktree_and_cwd_together_is_a_usage_error_before_any_mutation(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        repo = _make_repo(tmp_path, "repo-cwd-conflict")
+        wt = tmp_path / "wt-cwd-conflict"
+        name = "e2e5-cwd-conflict"
+        argv = [
+            "--cwd", str(tmp_path),
+            "--worktree", str(wt), "--worktree-base", "main",
+            "--worktree-repo", str(repo),
+            name, "--", "true",
+        ]
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.main(argv)
+        assert exc.value.code == 2
+
+        assert not wt.exists()
+        assert not (isolated_runs_root / name).exists()
+
+
+# ---------------------------------------------------------------------------
+# E2E6: du and reap account for a real worktree
+# ---------------------------------------------------------------------------
+
+@live_only
+class TestE2E6DuAndReapAccountForRealWorktree:
+    """`du` charges a real linked worktree's bytes; `reap --include-worktrees`
+    predicts and then really removes it once the run is terminal, and never
+    while the run is still live."""
+
+    def test_du_charges_the_linked_worktree_bytes(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = _make_repo(tmp_path, "repo-du")
+        wt = tmp_path / "wt-du"
+        name = "e2e6-du"
+        argv = _launch_argv(
+            name=name, worktree=wt, worktree_base="main", worktree_repo=repo,
+            command=["true"],
+        )
+        assert agent_run.main(argv) == 0
+        state_dir = isolated_runs_root / name
+        assert _wait_terminal(state_dir) == "done"
+
+        # A real file of known size inside the worktree, beyond what git
+        # itself puts there, so the byte count is unambiguous.
+        payload = wt / "payload.bin"
+        payload.write_bytes(b"x" * 65536)
+
+        capsys.readouterr()
+        rc = agent_run.cmd_du(argparse.Namespace(by_run=True, top=None, bytes=False, json=True))
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        run_row = next(r for r in out["runs"] if r["name"] == name)
+        assert run_row["worktree_bytes"] >= 65536
+
+    def test_reap_include_worktrees_dry_run_predicts_then_real_run_removes(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = _make_repo(tmp_path, "repo-reap")
+        wt = tmp_path / "wt-reap"
+        name = "e2e6-reap"
+        argv = _launch_argv(
+            name=name, worktree=wt, worktree_base="main", worktree_repo=repo,
+            command=["true"],
+        )
+        assert agent_run.main(argv) == 0
+        state_dir = isolated_runs_root / name
+        assert _wait_terminal(state_dir) == "done"
+
+        reap_kwargs = dict(
+            dry_run=True, idle_hours=None, min_age_hours=None, log_min_age_hours=None,
+            name=None, force_unknown=False, include_logs=False, orphan_processes=False,
+            orphan_min_age_hours=None, max_seconds=None, include_worktrees=True,
+            worktree_min_age_hours=0.0, force_dirty=False, all=False,
+        )
+        capsys.readouterr()
+        rc = agent_run.cmd_reap(argparse.Namespace(**reap_kwargs))
+        assert rc == 0
+        dry_out = capsys.readouterr().out
+        assert "worktrees_removed=1 worktrees_skipped=0" in dry_out
+        assert wt.is_dir(), "dry-run must not remove anything"
+
+        real_kwargs = dict(reap_kwargs, dry_run=False)
+        rc = agent_run.cmd_reap(argparse.Namespace(**real_kwargs))
+        assert rc == 0
+        real_out = capsys.readouterr().out
+        assert "worktrees_removed=1 worktrees_skipped=0" in real_out
+
+        assert not wt.exists()
+        porcelain = _git(repo, "worktree", "list", "--porcelain")
+        assert str(wt.resolve()) not in porcelain
+
+    def test_reap_include_worktrees_never_removes_a_still_live_run(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys
+    ):
+        repo = _make_repo(tmp_path, "repo-reap-live")
+        wt = tmp_path / "wt-reap-live"
+        name = "e2e6-reap-live"
+        argv = [
+            sys.executable, "-m", "toolbox.agent_run",
+            *_launch_argv(
+                name=name, worktree=wt, worktree_base="main", worktree_repo=repo,
+                command=[sys.executable, "-c", "import time; time.sleep(30)"],
+            ),
+        ]
+        env = dict(os.environ)
+        env["AGENT_RUN_STATE_DIR"] = str(isolated_runs_root)
+        env["AGENT_RUN_LOG_DIR"] = str(isolated_log_root)
+
+        launcher = subprocess.Popen(argv, env=env)
+        agent_pid: Optional[int] = None
+        try:
+            launcher.wait(timeout=15)
+            state_dir = isolated_runs_root / name
+            _wait_for(
+                lambda: (state_dir / "status").exists()
+                and (state_dir / "status").read_text().strip() == "running",
+                10.0, "status=running",
+            )
+            agent_pid = int((state_dir / "agent_pid").read_text().strip())
+            assert agent_run._pid_alive(agent_pid)
+
+            reap_kwargs = dict(
+                dry_run=False, idle_hours=None, min_age_hours=None, log_min_age_hours=None,
+                name=None, force_unknown=False, include_logs=False, orphan_processes=False,
+                orphan_min_age_hours=None, max_seconds=None, include_worktrees=True,
+                worktree_min_age_hours=0.0, force_dirty=False, all=False,
+            )
+            capsys.readouterr()
+            rc = agent_run.cmd_reap(argparse.Namespace(**reap_kwargs))
+            assert rc == 0
+            out = capsys.readouterr().out
+            assert "worktrees_removed=0" in out
+
+            assert wt.is_dir(), "a still-live run's worktree must never be reaped"
+            porcelain = _git(repo, "worktree", "list", "--porcelain")
+            assert str(wt.resolve()) in porcelain
+        finally:
+            _kill_and_reap(agent_pid)
+            launcher.poll()
+            if launcher.returncode is None:
+                launcher.kill()
+                launcher.wait(timeout=10)
