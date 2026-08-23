@@ -9217,16 +9217,17 @@ def cmd_launch(args: argparse.Namespace) -> int:
         except BaseException:
             if getattr(args, "_worktree_process_started", False):
                 try:
+                    repo_q = shlex.quote(str(created.repo))
+                    cleanup_cmds = f"git -C {repo_q} worktree remove {shlex.quote(str(created.path))}"
+                    if created.branch_created:
+                        cleanup_cmds += (
+                            f" ; git -C {repo_q} branch -D -- {shlex.quote(created.branch)}"
+                        )
                     print(
                         f"agent-run: warning: launch for '{name}' failed after starting "
                         f"the runner; leaving worktree in place: {created.path} "
                         f"(branch {created.branch!r}). Once you have confirmed no "
-                        f"process is still using it, clean up by hand: "
-                        f"git worktree remove {created.path}  # run from {created.repo}"
-                        + (
-                            f"; git branch -D {created.branch}  # run from {created.repo}"
-                            if created.branch_created else ""
-                        ),
+                        f"process is still using it, clean up by hand: {cleanup_cmds}",
                         file=sys.stderr,
                     )
                 except BaseException:

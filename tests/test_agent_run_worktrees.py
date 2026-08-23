@@ -23,6 +23,7 @@ import argparse
 import inspect
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -55,6 +56,27 @@ def _git(cwd: Path, *args: str) -> str:
         capture_output=True, text=True, check=True, env=env,
     )
     return result.stdout
+
+
+def _cleanup_argv_lists(err: str) -> list[list[str]]:
+    """Parse the semicolon-separated cleanup commands from a rollback
+    warning into argv lists, the way a shell would after word-splitting.
+
+    shlex.split on the whole line first, honoring quotes, so a literal
+    ``;`` inside a quoted path is not mistaken for a command separator;
+    the resulting tokens are then split on the unquoted ``;`` separator.
+    """
+    marker = "clean up by hand: "
+    idx = err.index(marker) + len(marker)
+    tail = err[idx:].splitlines()[0]
+    tokens = shlex.split(tail)
+    commands: list[list[str]] = [[]]
+    for tok in tokens:
+        if tok == ";":
+            commands.append([])
+        else:
+            commands[-1].append(tok)
+    return commands
 
 
 def _make_repo(root: Path, name: str = "main") -> Path:
@@ -4651,8 +4673,9 @@ class TestLaunchCreatesWorktree:
         assert agent_run._read(state_dir / "cwd") == str(wt_dir.resolve())
         err = capsys.readouterr().err
         assert str(wt_dir) in err
-        assert "git worktree remove" in err
-        assert f"git branch -D {name}" in err
+        cmds = _cleanup_argv_lists(err)
+        assert cmds[0] == ["git", "-C", str(repo), "worktree", "remove", str(wt_dir)]
+        assert cmds[1] == ["git", "-C", str(repo), "branch", "-D", "--", name]
 
     def test_interrupt_after_readiness_published_never_rolls_back(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
@@ -4722,8 +4745,9 @@ class TestLaunchCreatesWorktree:
         assert name in _git(repo, "branch", "--list", name)
         err = capsys.readouterr().err
         assert str(wt_dir) in err
-        assert "git worktree remove" in err
-        assert f"git branch -D {name}" in err
+        cmds = _cleanup_argv_lists(err)
+        assert cmds[0] == ["git", "-C", str(repo), "worktree", "remove", str(wt_dir)]
+        assert cmds[1] == ["git", "-C", str(repo), "branch", "-D", "--", name]
 
     def test_post_fork_oserror_leaves_worktree_and_branch_intact_with_warning(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
@@ -4775,8 +4799,9 @@ class TestLaunchCreatesWorktree:
         assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
         assert name in _git(repo, "branch", "--list", name)
         err = capsys.readouterr().err
-        assert "git worktree remove" in err
-        assert f"git branch -D {name}" in err
+        cmds = _cleanup_argv_lists(err)
+        assert cmds[0] == ["git", "-C", str(repo), "worktree", "remove", str(wt_dir)]
+        assert cmds[1] == ["git", "-C", str(repo), "branch", "-D", "--", name]
 
     def test_interrupt_after_fork_leaves_worktree_intact(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
@@ -4835,7 +4860,9 @@ class TestLaunchCreatesWorktree:
         assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
         assert name in _git(repo, "branch", "--list", name)
         err = capsys.readouterr().err
-        assert "git worktree remove" in err
+        cmds = _cleanup_argv_lists(err)
+        assert cmds[0] == ["git", "-C", str(repo), "worktree", "remove", str(wt_dir)]
+        assert cmds[1] == ["git", "-C", str(repo), "branch", "-D", "--", name]
 
     def test_post_fork_warning_write_failure_does_not_mask_original_exception(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
@@ -4870,6 +4897,47 @@ class TestLaunchCreatesWorktree:
         assert wt_dir.is_dir()
         assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
         assert name in _git(repo, "branch", "--list", name)
+
+    def test_cleanup_commands_are_shell_safe_for_spaces_and_branch_metacharacters(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        """The printed cleanup commands must be independently runnable: a
+        space in the repo or worktree path, and a Git-valid branch name
+        containing a shell metacharacter, must round-trip through the
+        printed argv unchanged rather than being split or reinterpreted."""
+        git_root = tmp_path / "git roots"
+        git_root.mkdir()
+        repo = _make_repo(git_root, name="main repo")
+        wt_dir = git_root / "wt dir; rm -rf /tmp/x"
+        branch = "feature;touch-pwned"
+        name = "spacey-run"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+            worktree_branch=branch,
+        )
+
+        def _fork_always_fails():
+            raise OSError("simulated fork failure")
+
+        monkeypatch.setattr(os, "fork", _fork_always_fails)
+
+        with pytest.raises(SystemExit, match="failed to start agent"):
+            agent_run.cmd_launch(args)
+
+        assert wt_dir.is_dir()
+        assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+        assert branch in _git(repo, "branch", "--list", branch)
+        err = capsys.readouterr().err
+        cmds = _cleanup_argv_lists(err)
+        assert cmds[0] == ["git", "-C", str(repo), "worktree", "remove", str(wt_dir)]
+        assert cmds[1] == ["git", "-C", str(repo), "branch", "-D", "--", branch]
+
+        remove_proc = subprocess.run(cmds[0], capture_output=True, text=True)
+        assert remove_proc.returncode == 0, remove_proc.stderr
+        assert not wt_dir.exists()
+        branch_proc = subprocess.run(cmds[1], capture_output=True, text=True)
+        assert branch_proc.returncode == 0, branch_proc.stderr
+        assert branch not in _git(repo, "branch", "--list", branch)
 
     def test_mint_cleanup_baseexception_with_live_child_refuses_rollback(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch
