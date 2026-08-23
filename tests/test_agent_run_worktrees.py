@@ -3801,6 +3801,26 @@ class TestLaunchCreatesWorktree:
 
         assert exc.value.code == 2
 
+    @pytest.mark.parametrize(
+        "kw", [
+            dict(worktree_base="main"),
+            dict(worktree_branch="feature"),
+            dict(worktree_repo="/tmp/some-repo"),
+        ],
+    )
+    def test_worktree_only_flag_without_worktree_is_usage_error(
+        self, isolated_runs_root, isolated_log_root, kw
+    ):
+        """A typo omitting --worktree DIR must not silently launch in the
+        invocation cwd despite apparently-configured worktree flags."""
+        args = _launch_args(name="worktree-flag-alone", **kw)
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.cmd_launch(args)
+
+        assert exc.value.code == 2
+        assert not (isolated_runs_root / "worktree-flag-alone").exists()
+
     def test_existing_directory_without_reuse_fails_and_is_untouched(
         self, isolated_runs_root, isolated_log_root, git_root
     ):

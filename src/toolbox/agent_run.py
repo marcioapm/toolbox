@@ -7024,6 +7024,16 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
     if reuse and not worktree_raw:
         _worktree_usage_error("--worktree-reuse requires --worktree")
     if not worktree_raw:
+        # --worktree-base/-branch/-repo are meaningless without --worktree;
+        # accepting them silently would launch in the invocation cwd despite
+        # apparently-configured worktree flags, masking a missing --worktree.
+        for flag, dest in (
+            ("--worktree-base", "worktree_base"),
+            ("--worktree-branch", "worktree_branch"),
+            ("--worktree-repo", "worktree_repo"),
+        ):
+            if getattr(args, dest, None):
+                _worktree_usage_error(f"{flag} requires --worktree")
         return None
     if getattr(args, "cwd", None):
         _worktree_usage_error("--worktree and --cwd are mutually exclusive")
