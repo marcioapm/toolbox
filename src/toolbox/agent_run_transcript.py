@@ -164,11 +164,18 @@ def count_transcript(
       "definitely something renderable".
     - claude/codex are file-backed JSONL with no index to count against
       independently of parsing; counting cheaply would mean re-implementing
-      the readers' record-selection logic in parallel, so this calls the
-      existing reader and returns len(entries) directly. This is exact,
-      not an over-count, unlike opencode's raw count. Acceptable only
-      because these stores are per-session files, not a single store
-      shared by every run on the machine.
+      the readers' record-selection logic in parallel, so this streams
+      each file through the same per-record classification `read_transcript`
+      uses (see `_count_claude_jsonl`/`_count_codex`) without ever building
+      a `TranscriptEntry` or merging subagent streams by timestamp,
+      tracking the newest timestamp incrementally instead of a second pass
+      over materialized entries. The resulting count is exact, not an
+      over-count, unlike opencode's raw count -- acceptable only because
+      these stores are per-session files, not a single store shared by
+      every run on the machine. A file that is wholly malformed (every
+      record unparseable or session-mismatched into `skipped`, zero
+      counted) raises `store_unreadable` rather than returning 0: an
+      unreadable store is not evidence the session is empty.
     """
     if harness == "opencode":
         return _count_opencode(session_id)
@@ -358,11 +365,11 @@ def _claude_file_matches_session(path: Path, session_id: str) -> bool:
     """True if `path` holds at least one user/assistant record whose own
     `sessionId` equals `session_id` -- the only basis for trusting a
     filename match, since two project directories can each hold a
-    `<session_id>.jsonl` left by unrelated runs."""
-    try:
-        records, _ = _read_jsonl_objects(path)
-    except TranscriptSourceError:
-        return False
+    `<session_id>.jsonl` left by unrelated runs. Raises
+    ``TranscriptSourceError`` if `path` cannot be read at all -- an
+    unreadable candidate is not evidence that it doesn't match, so the
+    caller must not treat this the same as a clean non-match."""
+    records, _ = _read_jsonl_objects(path)
     return any(
         record.get("type") in ("user", "assistant") and record.get("sessionId") == session_id
         for record in records
@@ -372,12 +379,21 @@ def _claude_file_matches_session(path: Path, session_id: str) -> bool:
 def _claude_session_path(session_id: str, cwd: Optional[str]) -> Path:
     if cwd:
         candidate = CLAUDE_PROJECTS_DIR / _mangle_cwd(cwd) / f"{session_id}.jsonl"
-        if candidate.is_file():
+        try:
+            candidate_is_file = candidate.is_file()
+        except OSError as exc:
+            raise TranscriptSourceError(
+                f"cannot check claude session candidate {candidate}: {exc}", code="store_unreadable"
+            ) from exc
+        if candidate_is_file:
             return candidate
     try:
         matches = sorted(CLAUDE_PROJECTS_DIR.glob(f"*/{session_id}.jsonl"))
-    except OSError:
-        matches = []
+    except OSError as exc:
+        raise TranscriptSourceError(
+            f"cannot search for claude session transcript under {CLAUDE_PROJECTS_DIR}: {exc}",
+            code="store_unreadable",
+        ) from exc
     if not matches:
         raise TranscriptSourceError(
             f"no claude session transcript found for session {session_id!r} under {CLAUDE_PROJECTS_DIR}",
@@ -385,9 +401,25 @@ def _claude_session_path(session_id: str, cwd: Optional[str]) -> Path:
         )
     # The cwd-derived path missed (wrong or unknown cwd), so the filename
     # alone is the only lead -- and a filename collision across project
-    # directories is possible. Content, not pathname order, decides.
-    verified = [path for path in matches if _claude_file_matches_session(path, session_id)]
+    # directories is possible. Content, not pathname order, decides. A
+    # candidate that cannot be read is neither a match nor a clean miss;
+    # it only stands in for "nothing found" once every candidate that
+    # *could* be checked has been, and none matched.
+    verified: list[Path] = []
+    unreadable: list[Path] = []
+    for path in matches:
+        try:
+            if _claude_file_matches_session(path, session_id):
+                verified.append(path)
+        except TranscriptSourceError:
+            unreadable.append(path)
     if not verified:
+        if unreadable:
+            joined = ", ".join(str(path) for path in unreadable)
+            raise TranscriptSourceError(
+                f"cannot verify claude session transcript candidate(s) for session {session_id!r}: {joined}",
+                code="store_unreadable",
+            )
         raise TranscriptSourceError(
             f"no claude session transcript found for session {session_id!r} under {CLAUDE_PROJECTS_DIR}",
             code="store_missing",
@@ -402,6 +434,29 @@ def _claude_session_path(session_id: str, cwd: Optional[str]) -> Path:
     return verified[0]
 
 
+def _claude_subagent_files(main_path: Path) -> list[Path]:
+    """List `<session>/subagents/*.jsonl` next to the main transcript file,
+    or an empty list when no subagent directory exists. Raises
+    ``TranscriptSourceError`` on an unreadable directory rather than
+    treating it as "no subagents ran": silently dropping it would
+    under-report a count that claims to have succeeded."""
+    subagents_dir = main_path.parent / main_path.stem / "subagents"
+    try:
+        subagents_present = subagents_dir.is_dir()
+    except OSError as exc:
+        raise TranscriptSourceError(
+            f"cannot check claude subagent directory {subagents_dir}: {exc}", code="store_unreadable"
+        ) from exc
+    if not subagents_present:
+        return []
+    try:
+        return sorted(subagents_dir.glob("*.jsonl"))
+    except OSError as exc:
+        raise TranscriptSourceError(
+            f"cannot list claude subagent directory {subagents_dir}: {exc}", code="store_unreadable"
+        ) from exc
+
+
 def _read_claude(session_id: str, cwd: Optional[str]) -> "tuple[list[TranscriptEntry], int]":
     path = _claude_session_path(session_id, cwd)
     main_entries, skipped = _read_claude_jsonl(path, session_id, subagent=None)
@@ -411,42 +466,120 @@ def _read_claude(session_id: str, cwd: Optional[str]) -> "tuple[list[TranscriptE
     # main .jsonl file. Included only when each record's own sessionId
     # matches the session we were asked for -- not inferred from directory
     # placement alone.
-    subagents_dir = path.parent / path.stem / "subagents"
-    try:
-        sub_files = sorted(subagents_dir.glob("*.jsonl")) if subagents_dir.is_dir() else []
-    except OSError:
-        sub_files = []
-    for sub_path in sub_files:
+    for sub_path in _claude_subagent_files(path):
         sub_entries, sub_skipped = _read_claude_jsonl(sub_path, session_id, subagent=sub_path.stem)
         sources.append(sub_entries)
         skipped += sub_skipped
     return _merge_claude_entries(sources), skipped
 
 
-def _newest_entry_timestamp(entries: list[TranscriptEntry]) -> Optional[str]:
-    """Latest of the entries' own timestamps, reformatted to the same
-    ``%Y-%m-%dT%H:%M:%SZ`` shape ``_iso_from_epoch_ms`` produces, so a
-    caller comparing ages across harnesses gets a uniform format."""
-    parsed = [_parse_iso_timestamp(entry.time) for entry in entries]
-    present = [p for p in parsed if p is not None]
-    if not present:
-        return None
-    return max(present).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _track_newer(current: Optional[datetime], candidate: Optional[str]) -> Optional[datetime]:
+    """Fold one more record timestamp into a running newest-seen value,
+    so a counting pass tracks freshness in the same sweep that counts
+    records instead of a second full pass over materialized entries."""
+    parsed = _parse_iso_timestamp(candidate)
+    if parsed is None:
+        return current
+    if current is None or parsed > current:
+        return parsed
+    return current
+
+
+def _count_claude_jsonl(path: Path, session_id: str) -> tuple[int, int, Optional[datetime]]:
+    """Count renderable entries in one claude JSONL file without building
+    `TranscriptEntry` objects, mirroring `_read_claude_jsonl`'s branching so
+    the count stays exact rather than an approximation. Returns (count,
+    skipped, newest_timestamp)."""
+    records, skipped = _read_jsonl_objects(path)
+    count = 0
+    newest: Optional[datetime] = None
+    pending_tool_use_ids: set[str] = set()
+    for record in records:
+        rtype = record.get("type")
+        if rtype not in ("user", "assistant"):
+            continue
+        record_session_id = record.get("sessionId")
+        if record_session_id is not None and record_session_id != session_id:
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            skipped += 1
+            continue
+        role = message.get("role")
+        timestamp = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
+        content = message.get("content")
+
+        if isinstance(content, str):
+            if content and role in ("user", "assistant"):
+                count += 1
+                newest = _track_newer(newest, timestamp)
+            continue
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text and role in ("user", "assistant"):
+                    count += 1
+                    newest = _track_newer(newest, timestamp)
+            elif btype == "tool_use":
+                count += 1
+                newest = _track_newer(newest, timestamp)
+                tool_use_id = block.get("id")
+                if isinstance(tool_use_id, str):
+                    pending_tool_use_ids.add(tool_use_id)
+            elif btype == "tool_result":
+                tool_use_id = block.get("tool_use_id")
+                output_text = _claude_tool_result_text(block.get("content"))
+                if isinstance(tool_use_id, str) and tool_use_id in pending_tool_use_ids:
+                    # Fills in an already-counted tool_use entry's output;
+                    # not a new record.
+                    pending_tool_use_ids.discard(tool_use_id)
+                elif output_text:
+                    count += 1
+                    newest = _track_newer(newest, timestamp)
+    return count, skipped, newest
 
 
 def _count_claude(session_id: str, cwd: Optional[str]) -> tuple[int, Optional[str]]:
-    """Count claude transcript entries.
-
-    No index exists to count JSONL records without parsing them, and this
-    store is a per-session file rather than a store shared by every run on
-    the machine, so re-using the full reader and taking len(entries) is
-    cheap enough: calling the existing reader's locating logic
-    (_claude_session_path) plus its parse is the whole cost of a normal
-    `transcript` read, bounded by one session's file size, not the whole
-    store.
+    """Count claude transcript entries by streaming each JSONL file once,
+    reusing `_claude_session_path`/`_claude_subagent_files` for discovery
+    without materializing `TranscriptEntry` objects or merging streams by
+    timestamp -- the count and newest timestamp are order-independent, so
+    the merge that `read_transcript` needs for display is unnecessary work
+    here. A file where every record was unparseable or session-mismatched
+    (`skipped > 0` and nothing counted) raises `store_unreadable`: a
+    malformed store must not be reported as a trustworthy empty session.
     """
-    entries, _skipped = _read_claude(session_id, cwd)
-    return len(entries), _newest_entry_timestamp(entries)
+    path = _claude_session_path(session_id, cwd)
+    total = 0
+    total_skipped = 0
+    newest: Optional[datetime] = None
+
+    count, skipped, file_newest = _count_claude_jsonl(path, session_id)
+    total += count
+    total_skipped += skipped
+    if file_newest is not None and (newest is None or file_newest > newest):
+        newest = file_newest
+
+    for sub_path in _claude_subagent_files(path):
+        count, skipped, file_newest = _count_claude_jsonl(sub_path, session_id)
+        total += count
+        total_skipped += skipped
+        if file_newest is not None and (newest is None or file_newest > newest):
+            newest = file_newest
+
+    if total_skipped > 0 and total == 0:
+        raise TranscriptSourceError(
+            f"claude session transcript for {session_id!r} at {path} is unreadable: "
+            f"{total_skipped} record(s) unparseable or unusable, 0 counted",
+            code="store_unreadable",
+        )
+    return total, newest.strftime("%Y-%m-%dT%H:%M:%SZ") if newest is not None else None
 
 
 def _parse_iso_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -700,6 +833,27 @@ def _codex_reasoning_text(summary: Any) -> Optional[str]:
     return text or None
 
 
+def _codex_session_path(session_id: str) -> Path:
+    """Locate one session's rollout file under the fixed `YYYY/MM/DD`
+    layout -- a three-level glob, not `**`, so discovery cost is bounded
+    by one day's worth of rollouts rather than the whole session history
+    on the machine. An unglobbable tree (permission-denied component,
+    I/O error) is a read failure, not evidence the file is absent."""
+    try:
+        matches = sorted(CODEX_SESSIONS_DIR.glob(f"*/*/*/rollout-*-{session_id}.jsonl"))
+    except OSError as exc:
+        raise TranscriptSourceError(
+            f"cannot search for codex session transcript under {CODEX_SESSIONS_DIR}: {exc}",
+            code="store_unreadable",
+        ) from exc
+    if not matches:
+        raise TranscriptSourceError(
+            f"no codex session transcript found for session {session_id!r} under {CODEX_SESSIONS_DIR}",
+            code="store_missing",
+        )
+    return matches[0]
+
+
 def _read_codex(session_id: str) -> tuple[list[TranscriptEntry], int]:
     """Read one codex rollout file.
 
@@ -709,16 +863,7 @@ def _read_codex(session_id: str) -> tuple[list[TranscriptEntry], int]:
     `event_msg` records are skipped entirely because they duplicate the
     `response_item` message/reasoning content this reader already reads.
     """
-    try:
-        matches = sorted(CODEX_SESSIONS_DIR.glob(f"**/rollout-*-{session_id}.jsonl"))
-    except OSError:
-        matches = []
-    if not matches:
-        raise TranscriptSourceError(
-            f"no codex session transcript found for session {session_id!r} under {CODEX_SESSIONS_DIR}",
-            code="store_missing",
-        )
-    path = matches[0]
+    path = _codex_session_path(session_id)
     records, skipped = _read_jsonl_objects(path)
     entries: list[TranscriptEntry] = []
     pending: dict[str, TranscriptEntry] = {}
@@ -784,16 +929,67 @@ def _read_codex(session_id: str) -> tuple[list[TranscriptEntry], int]:
 
 
 def _count_codex(session_id: str) -> tuple[int, Optional[str]]:
-    """Count codex transcript entries.
-
-    Codex rollout files have no index and no cheap way to count records
-    without parsing the file, so this locates the file exactly as
-    `_read_codex` does and returns len(entries) from the full read. A
-    session's rollout file is bounded by that session's own history, not
-    by every run on the machine.
+    """Count codex transcript entries by streaming the rollout file once,
+    mirroring `_read_codex`'s branching without materializing
+    `TranscriptEntry` objects. Discovery is bounded to the fixed
+    `YYYY/MM/DD` layout (`_codex_session_path`), not a recursive `**` scan
+    of the whole session history. A file where every record was
+    unparseable (`skipped > 0` and nothing counted) raises
+    `store_unreadable` rather than a trustworthy-looking 0.
     """
-    entries, _skipped = _read_codex(session_id)
-    return len(entries), _newest_entry_timestamp(entries)
+    path = _codex_session_path(session_id)
+    records, skipped = _read_jsonl_objects(path)
+    count = 0
+    newest: Optional[datetime] = None
+    pending_call_ids: set[str] = set()
+    for record in records:
+        if record.get("type") != "response_item":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            skipped += 1
+            continue
+        timestamp = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
+        ptype = payload.get("type")
+
+        if ptype == "message":
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            text = _codex_message_text(payload.get("content"))
+            if text and not _is_codex_injected_context(text):
+                count += 1
+                newest = _track_newer(newest, timestamp)
+        elif ptype == "reasoning":
+            text = _codex_reasoning_text(payload.get("summary"))
+            if text:
+                count += 1
+                newest = _track_newer(newest, timestamp)
+        elif ptype == "function_call":
+            count += 1
+            newest = _track_newer(newest, timestamp)
+            call_id = payload.get("call_id")
+            if isinstance(call_id, str):
+                pending_call_ids.add(call_id)
+        elif ptype == "function_call_output":
+            call_id = payload.get("call_id")
+            output = payload.get("output")
+            output_text = output if isinstance(output, str) else None
+            if isinstance(call_id, str) and call_id in pending_call_ids:
+                # Fills in an already-counted function_call's output; not a
+                # new record.
+                pending_call_ids.discard(call_id)
+            elif output_text:
+                count += 1
+                newest = _track_newer(newest, timestamp)
+
+    if skipped > 0 and count == 0:
+        raise TranscriptSourceError(
+            f"codex session transcript for {session_id!r} at {path} is unreadable: "
+            f"{skipped} record(s) unparseable, 0 counted",
+            code="store_unreadable",
+        )
+    return count, newest.strftime("%Y-%m-%dT%H:%M:%SZ") if newest is not None else None
 
 
 # ---------------------------------------------------------------------------

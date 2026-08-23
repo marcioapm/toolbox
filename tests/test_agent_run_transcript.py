@@ -14,6 +14,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -27,7 +28,8 @@ from toolbox import agent_run_transcript as transcript
 
 def _make_opencode_db(path: Path) -> None:
     """Minimal `part`/`message` tables matching the real opencode schema
-    (only the columns this reader touches)."""
+    (only the columns this reader touches), including the `part_session_idx`
+    index `_count_opencode` relies on to avoid a full table scan."""
     conn = sqlite3.connect(path)
     try:
         conn.execute(
@@ -38,6 +40,7 @@ def _make_opencode_db(path: Path) -> None:
             "create table part (id text primary key, message_id text, "
             "session_id text, time_created integer, data text)"
         )
+        conn.execute("create index part_session_idx on part (session_id)")
         conn.commit()
     finally:
         conn.close()
@@ -70,6 +73,24 @@ def _opencode_insert(
 def _write_jsonl(path: Path, records: list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
+
+
+def _raise_oserror_on(monkeypatch, method_name: str, matches: Optional[Path] = None) -> None:
+    """Monkeypatch one `pathlib.Path` method to raise `OSError` -- standing
+    in for a permission-denied component or I/O error mid-glob/stat, which
+    the real filesystem calls here cannot easily be made to produce.
+    When `matches` is given, only calls on that exact path raise; every
+    other path (e.g. an unrelated glob during test teardown) behaves
+    normally.
+    """
+    real = getattr(Path, method_name)
+
+    def _hooked(self, *args, **kwargs):
+        if matches is None or self == matches:
+            raise OSError(f"synthetic {method_name} failure")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method_name, _hooked)
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +276,29 @@ class TestOpencodeReader:
 # ---------------------------------------------------------------------------
 
 class TestCountTranscript:
+    def test_opencode_count_query_uses_the_session_index_not_a_full_scan(self, tmp_path, monkeypatch):
+        """Regression guard for the index this counter relies on: fixtures
+        must carry `part_session_idx` so a scan-plan regression fails this
+        test instead of silently degrading to an unbounded per-poll table
+        scan against opencode.db (shared by every session on the machine)."""
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
+            parts=[{"type": "text", "text": "hi"}],
+        )
+        conn = sqlite3.connect(db)
+        try:
+            plan = conn.execute(
+                "explain query plan select count(*), max(time_created) from part where session_id = ?",
+                ("ses_1",),
+            ).fetchall()
+        finally:
+            conn.close()
+        plan_text = " ".join(str(cell) for row in plan for cell in row).lower()
+        assert "using index part_session_idx" in plan_text, f"expected an index scan, got plan: {plan}"
+
     def test_opencode_counts_raw_part_rows_and_finds_newest_time(self, tmp_path, monkeypatch):
         db = tmp_path / "opencode.db"
         _make_opencode_db(db)
@@ -373,6 +417,102 @@ class TestCountTranscript:
         with pytest.raises(transcript.TranscriptSourceError) as exc_info:
             transcript.count_transcript("codex", "no-such-session", None)
         assert exc_info.value.code == "store_missing"
+
+    def test_claude_unreadable_glob_directory_raises_store_unreadable_not_missing(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        _raise_oserror_on(monkeypatch, "glob", matches=tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("claude", "some-session", "/nonexistent/cwd")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_codex_unreadable_sessions_dir_raises_store_unreadable_not_missing(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        _raise_oserror_on(monkeypatch, "glob", matches=tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("codex", "some-session", None)
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_claude_skipped_only_file_raises_store_unreadable_not_zero(self, tmp_path, monkeypatch):
+        """Every record in the file is a user/assistant record with a
+        non-dict `message` -- wholly malformed, not merely a session with
+        no conversation. `count_transcript` must not report this as a
+        trustworthy 0."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-all-skipped"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {"type": "user", "sessionId": session_id, "message": "not-a-dict"},
+                {"type": "assistant", "sessionId": session_id, "message": None},
+            ],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("claude", session_id, "/Users/x/proj")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_claude_partially_skipped_file_still_counts_the_readable_records(
+        self, tmp_path, monkeypatch
+    ):
+        """skipped > 0 alongside a nonzero count is a normal partial-parse
+        outcome, not a store failure."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-partial-skip"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {"type": "user", "sessionId": session_id, "message": "not-a-dict"},
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "hi"},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("claude", session_id, "/Users/x/proj")
+        assert count == 1
+        assert newest == "2026-08-16T00:00:00Z"
+
+    def test_codex_skipped_only_file_raises_store_unreadable_not_zero(self, tmp_path, monkeypatch):
+        """Every `response_item` in the file has a non-dict `payload` --
+        wholly malformed, not merely an empty session."""
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "sess-codex-all-skipped"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {"timestamp": "2026-08-19T00:00:00Z", "type": "response_item", "payload": "not-a-dict"},
+                {"timestamp": "2026-08-19T00:00:01Z", "type": "response_item", "payload": None},
+            ],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("codex", session_id, None)
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_codex_partially_skipped_file_still_counts_the_readable_records(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "sess-codex-partial-skip"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {"timestamp": "2026-08-19T00:00:00Z", "type": "response_item", "payload": "not-a-dict"},
+                {
+                    "timestamp": "2026-08-19T00:00:01Z", "type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("codex", session_id, None)
+        assert count == 1
+        assert newest == "2026-08-19T00:00:01Z"
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +672,73 @@ class TestClaudeReader:
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         with pytest.raises(transcript.TranscriptSourceError):
             transcript.read_transcript("claude", "no-such-session", "/nowhere")
+
+    def test_unreadable_cwd_candidate_check_raises_store_unreadable(self, tmp_path, monkeypatch):
+        """`is_file()` on the cwd-derived candidate raising OSError (e.g. a
+        permission-denied path component) must surface as a read failure,
+        not fall through to the glob path and possibly report absence."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-unreadable-candidate"
+        candidate = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _raise_oserror_on(monkeypatch, "is_file", matches=candidate)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.read_transcript("claude", session_id, "/Users/x/proj")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_unreadable_glob_directory_raises_store_unreadable_not_missing(self, tmp_path, monkeypatch):
+        """A glob() OSError (unreadable CLAUDE_PROJECTS_DIR component) is
+        not evidence the session is absent -- it must not collapse into
+        store_missing."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-unreadable-glob"
+        _raise_oserror_on(monkeypatch, "glob", matches=tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.read_transcript("claude", session_id, "/nonexistent/cwd")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_unreadable_subagents_dir_check_raises_store_unreadable(self, tmp_path, monkeypatch):
+        """A readable main file with an unreadable subagents/ directory
+        must not silently report only the main file's entries -- the
+        subagent tree is part of this session's transcript."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-unreadable-subagents"
+        cwd = "/Users/x/proj"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "main turn"},
+                }
+            ],
+        )
+        subagents_dir = path.parent / path.stem / "subagents"
+        _raise_oserror_on(monkeypatch, "is_dir", matches=subagents_dir)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.read_transcript("claude", session_id, cwd)
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_unreadable_subagents_glob_raises_store_unreadable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-unreadable-subagents-glob"
+        cwd = "/Users/x/proj"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "main turn"},
+                }
+            ],
+        )
+        subagents_dir = path.parent / path.stem / "subagents"
+        subagents_dir.mkdir(parents=True)
+        _raise_oserror_on(monkeypatch, "glob", matches=subagents_dir)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.read_transcript("claude", session_id, cwd)
+        assert exc_info.value.code == "store_unreadable"
 
     def test_empty_session_file_returns_no_entries(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
@@ -934,6 +1141,15 @@ class TestCodexReader:
         monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
         with pytest.raises(transcript.TranscriptSourceError):
             transcript.read_transcript("codex", "no-such-session", None)
+
+    def test_unreadable_sessions_dir_raises_store_unreadable_not_missing(self, tmp_path, monkeypatch):
+        """A glob() OSError under CODEX_SESSIONS_DIR (permission-denied
+        component, I/O error) is not evidence the session is absent."""
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        _raise_oserror_on(monkeypatch, "glob", matches=tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.read_transcript("codex", "some-session", None)
+        assert exc_info.value.code == "store_unreadable"
 
     def test_empty_session_file_returns_no_entries(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
