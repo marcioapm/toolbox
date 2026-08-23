@@ -10282,13 +10282,17 @@ def _runner(
         os.environ.setdefault("AGENT_RUN_LOG_DIR", str(LOG_ROOT))
 
         runner_pgid = os.getpgid(my_pid)
-        identity = _process_identity(my_pid)
-        if identity is None:
-            raise RuntimeError("cannot record runner process identity")
+        # pid is written before process identity is computed: identity may
+        # shell out (a `ps` subprocess on Darwin, see _process_identity) and
+        # take up to a couple of seconds, and a launcher racing to terminate
+        # this runner before it owns the worktree can only find it via pid.
         _write(state_dir / "pid", f"{my_pid}\n")
         # _cmd_launch_locked called setsid() before entering _runner, so
         # pid == pgid here (this process is the session and group leader).
         _write(state_dir / "pgid", f"{runner_pgid}\n")
+        identity = _process_identity(my_pid)
+        if identity is None:
+            raise RuntimeError("cannot record runner process identity")
         _write(state_dir / "process_identity", identity + "\n")
 
         # Redirect stdio to /dev/null to fully detach (we write the log ourselves).
