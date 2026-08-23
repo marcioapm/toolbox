@@ -4944,9 +4944,11 @@ class TestLaunchCreatesWorktree:
     ):
         """A managed opencode launch starts the temporary mint process with
         the worktree as its cwd before args._worktree_process_started is
-        set. If that process is still alive when a BaseException escapes
-        _opencode_prefork_mint's cleanup, the worktree must survive: the
-        mark was set before Popen, and cleanup failure must not clear it."""
+        set. If a KeyboardInterrupt escapes _opencode_prefork_mint's cleanup
+        wait(), the worktree must survive (the mark was set before Popen and
+        cleanup failure must not clear it), and cleanup must still attempt
+        proc.kill() as a best-effort escalation -- proving the interrupt is
+        caught by ``except BaseException``, not just ``except Exception``."""
         repo = _make_repo(git_root)
         wt_dir = git_root / "wt-mint-interrupt"
         name = "mint-interrupt-run"
@@ -4964,25 +4966,27 @@ class TestLaunchCreatesWorktree:
         monkeypatch.setattr(agent_run, "_opencode_health_poll", lambda *a, **k: False)
 
         real_popen = subprocess.Popen
-        state = {"proc": None}
+        state = {"proc": None, "kill_called": False, "wait_raised": False}
 
-        def _no_signal(*_a, **_k):
-            # Cleanup's terminate()/kill() calls are neutered so the real
-            # child is never actually signaled -- the test proves rollback
-            # is refused without depending on whether cleanup's own
-            # best-effort kill happens to succeed.
+        def _no_terminate(*_a, **_k):
             pass
 
-        def _wait_raises(*_a, **_k):
-            raise KeyboardInterrupt("interrupt during mint cleanup")
+        def _tracking_kill(*_a, **_k):
+            state["kill_called"] = True
+
+        def _wait_raises_once(*_a, **_k):
+            if not state["wait_raised"]:
+                state["wait_raised"] = True
+                raise KeyboardInterrupt("interrupt during mint cleanup")
+            return None
 
         def _popen_tracking_opencode(argv, *a, **kw):
             proc = real_popen(argv, *a, **kw)
             if argv and argv[0] == "opencode":
                 state["proc"] = proc
-                proc.terminate = _no_signal
-                proc.kill = _no_signal
-                proc.wait = _wait_raises
+                proc.terminate = _no_terminate
+                proc.kill = _tracking_kill
+                proc.wait = _wait_raises_once
             return proc
 
         monkeypatch.setattr(subprocess, "Popen", _popen_tracking_opencode)
@@ -4994,6 +4998,11 @@ class TestLaunchCreatesWorktree:
             proc = state["proc"]
             assert proc is not None, "the temporary opencode process must have started"
             assert proc.poll() is None, "the temporary process must still be alive"
+            assert state["kill_called"], (
+                "cleanup must attempt proc.kill() after the interrupt escapes "
+                "proc.wait() -- only true if the except clause catches "
+                "BaseException, not just Exception"
+            )
             assert wt_dir.is_dir(), "worktree must survive an interrupted mint cleanup"
             assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
             assert name in _git(repo, "branch", "--list", name)
