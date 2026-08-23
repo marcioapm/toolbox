@@ -10810,7 +10810,9 @@ def _run_interactive(
                 # trailing newline from the file content first so the agent
                 # does not see two Enters in a row.
                 outcome = _submit_and_verify(
-                    state_dir, log_dir, data.rstrip(b"\r\n"), submit_mode=submit_mode
+                    state_dir, log_dir, data.rstrip(b"\r\n"), submit_mode=submit_mode,
+                    deadline_s=_submission_verify_timeout_seconds(),
+                    max_attempts=_submission_max_attempts(),
                 )
                 if outcome.verified:
                     # Marks delivery for `_finalize`; absence means the agent

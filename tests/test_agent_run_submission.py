@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from toolbox import agent_run
+from toolbox import agent_run_transcript
 
 
 @pytest.mark.parametrize(
@@ -469,3 +470,399 @@ def test_teardown_deduplicates_and_reaps_tracked_children(tmp_path, monkeypatch)
     agent_run._teardown_children(tmp_path, grace=0.1)
 
     assert killed == [(child_pid, signal.SIGTERM)]
+
+
+# ---------------------------------------------------------------------------
+# _submit_and_verify: the verified-submission witness + retry helper
+# ---------------------------------------------------------------------------
+
+def _witness_sequence(monkeypatch, counts: list) -> list:
+    """Patch _submission_witness_count to return successive values from
+    *counts* (repeating the last value once exhausted) and return the list
+    of (state_dir, log_dir) argument pairs it was called with, for callers
+    that want to assert call counts."""
+    calls: list = []
+
+    def fake(state_dir, log_dir):
+        calls.append((state_dir, log_dir))
+        index = min(len(calls) - 1, len(counts) - 1)
+        return counts[index]
+
+    monkeypatch.setattr(agent_run, "_submission_witness_count", fake)
+    return calls
+
+
+def _no_transport_side_effects(monkeypatch) -> list:
+    """Stub both transports as no-ops that just record how many times they
+    were invoked, and force keystroke transport (no opencode HTTP endpoint)."""
+    submissions: list = []
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+    monkeypatch.setattr(
+        agent_run, "_submit_via_keystroke",
+        lambda *_a, **_k: submissions.append(1),
+    )
+    return submissions
+
+
+def test_submit_and_verify_swallowed_input_exhausts_attempts(tmp_path, monkeypatch):
+    """Reproduces the production bug: transport accepts every write but the
+    witness never rises. Exactly max_attempts submissions are made and the
+    outcome reports unverified with a timeout reason."""
+    submissions = _no_transport_side_effects(monkeypatch)
+    _witness_sequence(monkeypatch, [0])  # baseline 0, every later read also 0
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.05, max_attempts=3,
+    )
+
+    assert outcome.verified is False
+    assert outcome.attempts == 3
+    assert outcome.transport == "keystroke"
+    assert outcome.detail == "timeout"
+    assert len(submissions) == 3
+
+
+def test_submit_and_verify_verified_on_first_attempt(tmp_path, monkeypatch):
+    """A witness that rises on the very first poll stops immediately: exactly
+    one submission, verified True, attempts == 1."""
+    submissions = _no_transport_side_effects(monkeypatch)
+    _witness_sequence(monkeypatch, [0, 1])  # baseline 0, first poll sees 1
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=5.0, max_attempts=2,
+    )
+
+    assert outcome.verified is True
+    assert outcome.attempts == 1
+    assert outcome.detail is None
+    assert len(submissions) == 1
+
+
+def test_submit_and_verify_verified_on_retry(tmp_path, monkeypatch):
+    """Flat through the entire first attempt's poll window, then rises during
+    the second attempt: two submissions, verified True, attempts == 2."""
+    submissions = _no_transport_side_effects(monkeypatch)
+    # baseline=0; attempt 1 polls stay at 0 through its deadline and its
+    # post-timeout re-check; attempt 2's first poll rises to 1.
+    _witness_sequence(monkeypatch, [0, 0, 0, 1])
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.05, max_attempts=2,
+    )
+
+    assert outcome.verified is True
+    assert outcome.attempts == 2
+    assert len(submissions) == 2
+
+
+def test_submit_and_verify_late_lander_skips_second_submission(tmp_path, monkeypatch):
+    """The witness rises exactly during the post-timeout re-check, not during
+    any poll iteration: the outcome is verified and no second submission
+    happens -- the duplicate-message race the re-check exists to close."""
+    submissions = _no_transport_side_effects(monkeypatch)
+    poll_calls = {"n": 0}
+
+    def fake_witness(_state_dir, _log_dir):
+        poll_calls["n"] += 1
+        if poll_calls["n"] == 1:
+            return 0  # baseline
+        if poll_calls["n"] == 2:
+            return 0  # the only poll iteration before the deadline elapses
+        return 1  # the post-timeout re-check
+
+    monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.05, max_attempts=3,
+    )
+
+    assert outcome.verified is True
+    assert outcome.attempts == 1
+    assert len(submissions) == 1
+
+
+def test_submit_and_verify_witness_unreadable_never_crashes(tmp_path, monkeypatch):
+    """count_transcript raising TranscriptSourceError (via
+    _submission_witness_count's real implementation) must degrade to
+    verified=False with detail=witness_unreadable, never propagate."""
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+    monkeypatch.setattr(
+        agent_run, "_read_session_json",
+        lambda _log_dir: {"session_id": "s1", "harness": "codex"},
+    )
+
+    def raise_source_error(_harness, _session_id, _cwd):
+        raise agent_run_transcript.TranscriptSourceError("boom", code="store_missing")
+
+    monkeypatch.setattr(
+        agent_run._agent_run_transcript, "count_transcript", raise_source_error
+    )
+    submissions = []
+    monkeypatch.setattr(
+        agent_run, "_submit_via_keystroke",
+        lambda *_a, **_k: submissions.append(1),
+    )
+    os.mkfifo(tmp_path / "stdin")
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=1.0, max_attempts=2,
+    )
+
+    assert outcome.verified is False
+    assert outcome.detail == "witness_unreadable"
+    # No basis for verification means no basis for a blind retry either.
+    assert outcome.attempts == 1
+    assert len(submissions) == 1
+
+
+@pytest.mark.parametrize(
+    ("opencode_endpoint", "expected_transport"),
+    [
+        ((41234, "ses_1"), "http"),
+        (None, "keystroke"),
+    ],
+)
+def test_submit_and_verify_transport_selection(
+    tmp_path, monkeypatch, opencode_endpoint, expected_transport
+):
+    """opencode with a known port uses HTTP; anything else (claude, or
+    opencode without a resolvable port/session) uses the keystroke FIFO."""
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: opencode_endpoint)
+    monkeypatch.setattr(agent_run, "_submit_via_http", lambda *_a, **_k: None)
+    monkeypatch.setattr(agent_run, "_submit_via_keystroke", lambda *_a, **_k: None)
+    _witness_sequence(monkeypatch, [0, 1])
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=5.0, max_attempts=1,
+    )
+
+    assert outcome.transport == expected_transport
+
+
+def test_submit_via_http_is_fire_and_forget(monkeypatch):
+    """The HTTP transport must never block reading the response: it writes
+    the request and returns as soon as sendall completes, without calling
+    recv/makefile/read on the socket."""
+    import socket as socket_module
+
+    sent = {}
+
+    class _FakeSocket:
+        def sendall(self, data):
+            sent["data"] = data
+
+        def close(self):
+            sent["closed"] = True
+
+        def recv(self, *_a, **_k):
+            raise AssertionError("must not read the HTTP response")
+
+        def makefile(self, *_a, **_k):
+            raise AssertionError("must not read the HTTP response")
+
+    monkeypatch.setattr(
+        socket_module, "create_connection", lambda *_a, **_k: _FakeSocket()
+    )
+
+    agent_run._submit_via_http(41234, "ses_1", "hello there")
+
+    assert sent.get("closed") is True
+    assert b"POST /session/ses_1/message" in sent["data"]
+    assert b"hello there" in sent["data"]
+
+
+# ---------------------------------------------------------------------------
+# steer exit codes (verified / unverified / --raw)
+# ---------------------------------------------------------------------------
+
+def test_steer_verified_prints_verified_and_exits_zero(isolated_runs_root, monkeypatch):
+    _fifo, reader = _seed_live_interactive_run(
+        isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
+    )
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
+    _witness_sequence(monkeypatch, [0, 1])
+    try:
+        rc = agent_run.cmd_steer(_steer_args("run"))
+        assert rc == 0
+        os.read(reader, 4096)
+    finally:
+        os.close(reader)
+
+
+def test_steer_unverified_exits_one_with_reason_on_stderr(
+    isolated_runs_root, monkeypatch, capsys
+):
+    _fifo, reader = _seed_live_interactive_run(
+        isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
+    )
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
+    _witness_sequence(monkeypatch, [0])  # baseline 0, never rises
+    try:
+        rc = agent_run.cmd_steer(_steer_args("run"))
+        assert rc == 1
+        os.read(reader, 4096)
+    finally:
+        os.close(reader)
+    captured = capsys.readouterr()
+    assert "could not be verified" in captured.err
+
+
+def test_steer_raw_skips_witness_polling_entirely(isolated_runs_root, monkeypatch):
+    """--raw must never call the witness: raw bytes have no transcript
+    record to observe, and the brief requires zero polling for this path."""
+    _fifo, reader = _seed_live_interactive_run(
+        isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
+    )
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
+
+    def fail_if_called(*_a, **_k):
+        raise AssertionError("--raw must not poll the witness")
+
+    monkeypatch.setattr(agent_run, "_submission_witness_count", fail_if_called)
+    try:
+        rc = agent_run.cmd_steer(_steer_args("run", raw=True))
+        assert rc == 0
+        assert os.read(reader, 4096) == b"hello"
+    finally:
+        os.close(reader)
+
+
+# ---------------------------------------------------------------------------
+# Env override parsing: AGENT_RUN_SUBMIT_VERIFY_TIMEOUT / _ATTEMPTS
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("5", 5.0),
+        ("2.5", 2.5),
+        (None, agent_run.SUBMISSION_VERIFY_TIMEOUT_SECONDS),
+        ("not-a-number", agent_run.SUBMISSION_VERIFY_TIMEOUT_SECONDS),
+        ("0", agent_run.SUBMISSION_VERIFY_TIMEOUT_SECONDS),
+        ("-1", agent_run.SUBMISSION_VERIFY_TIMEOUT_SECONDS),
+        ("nan", agent_run.SUBMISSION_VERIFY_TIMEOUT_SECONDS),
+        ("inf", agent_run.SUBMISSION_VERIFY_TIMEOUT_SECONDS),
+    ],
+)
+def test_submission_verify_timeout_env_parsing(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", raw)
+    assert agent_run._submission_verify_timeout_seconds() == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("5", 5),
+        (None, agent_run.SUBMISSION_MAX_ATTEMPTS),
+        ("not-a-number", agent_run.SUBMISSION_MAX_ATTEMPTS),
+        ("0", agent_run.SUBMISSION_MAX_ATTEMPTS),
+        ("-1", agent_run.SUBMISSION_MAX_ATTEMPTS),
+        ("1.5", agent_run.SUBMISSION_MAX_ATTEMPTS),
+    ],
+)
+def test_submission_max_attempts_env_parsing(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("AGENT_RUN_SUBMIT_ATTEMPTS", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_RUN_SUBMIT_ATTEMPTS", raw)
+    assert agent_run._submission_max_attempts() == expected
+
+
+# ---------------------------------------------------------------------------
+# opencode_port persistence + argv fallback for pre-existing runs
+# ---------------------------------------------------------------------------
+
+def test_opencode_http_endpoint_reads_persisted_port_file(tmp_path):
+    (tmp_path / "opencode_port").write_text("41234\n")
+    (tmp_path / "session.json").write_text(
+        json.dumps({"session_id": "ses_1", "harness": "opencode"})
+    )
+
+    endpoint = agent_run._opencode_http_endpoint(tmp_path, tmp_path)
+
+    assert endpoint == (41234, "ses_1")
+
+
+def test_opencode_http_endpoint_falls_back_to_argv_port_for_legacy_state_dir(tmp_path):
+    """A state dir predating opencode_port (only argv on disk) must still
+    resolve the port by parsing --port out of the persisted argv."""
+    (tmp_path / "argv").write_text(
+        json.dumps(["opencode", "--port", "55001", "--session", "ses_2"])
+    )
+    (tmp_path / "session.json").write_text(
+        json.dumps({"session_id": "ses_2", "harness": "opencode"})
+    )
+    assert not (tmp_path / "opencode_port").exists()
+
+    endpoint = agent_run._opencode_http_endpoint(tmp_path, tmp_path)
+
+    assert endpoint == (55001, "ses_2")
+
+
+def test_opencode_http_endpoint_none_for_non_opencode_harness(tmp_path):
+    (tmp_path / "opencode_port").write_text("41234\n")
+    (tmp_path / "session.json").write_text(
+        json.dumps({"session_id": "ses_1", "harness": "claude"})
+    )
+
+    assert agent_run._opencode_http_endpoint(tmp_path, tmp_path) is None
+
+
+def test_opencode_http_endpoint_none_when_port_unresolvable(tmp_path):
+    (tmp_path / "session.json").write_text(
+        json.dumps({"session_id": "ses_1", "harness": "opencode"})
+    )
+    # No opencode_port file and no --port in argv.
+    (tmp_path / "argv").write_text(json.dumps(["opencode", "--session", "ses_1"]))
+
+    assert agent_run._opencode_http_endpoint(tmp_path, tmp_path) is None
+
+
+def test_launch_persists_opencode_port_file(isolated_runs_root, isolated_log_root, monkeypatch):
+    """cmd_launch writes state_dir/opencode_port for a managed interactive
+    opencode run whose port was selected, so a later steer/verification can
+    resolve it without re-parsing argv."""
+    monkeypatch.setattr(agent_run, "_find_free_port", lambda: 47001)
+    monkeypatch.setattr(
+        agent_run, "_opencode_prefork_mint",
+        lambda *a, **k: "ses_launched",
+    )
+    fake_dir = isolated_runs_root.parent / "bin"
+    fake_dir.mkdir(exist_ok=True)
+    fake = fake_dir / "opencode"
+    fake.write_text("#!/bin/sh\nsleep 30\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+
+    name = "oc-port-persist"
+    ns = argparse.Namespace(
+        name=name, command=[], interactive=True, prompt_file=None,
+        submit_mode=None, idle_timeout=None,
+        harness="opencode", prompt=None, model=None, agent_mode=None,
+        harness_args=[], permissions="bypass",
+    )
+    rc = agent_run.cmd_launch(ns)
+    assert rc == 0
+    state = isolated_runs_root / name
+    try:
+        assert _wait_until(lambda: (state / "opencode_port").exists())
+        assert (state / "opencode_port").read_text().strip() == "47001"
+    finally:
+        pid_path = state / "pid"
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
