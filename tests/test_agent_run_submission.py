@@ -650,6 +650,96 @@ def test_submit_and_verify_transport_selection(
     assert outcome.transport == expected_transport
 
 
+# ---------------------------------------------------------------------------
+# _submit_and_verify: submit= seam (codex's JSON-RPC transport)
+# ---------------------------------------------------------------------------
+
+def test_submit_and_verify_custom_submit_defaults_transport_to_rpc(tmp_path, monkeypatch):
+    """A caller-supplied submit callable bypasses HTTP/keystroke entirely and
+    reports transport="rpc" by default."""
+    calls = []
+    _witness_sequence(monkeypatch, [0, 1])
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello",
+        deadline_s=5.0, max_attempts=1,
+        submit=lambda text: calls.append(text),
+    )
+
+    assert outcome.verified is True
+    assert outcome.transport == "rpc"
+    assert calls == [b"hello"]
+
+
+def test_submit_and_verify_custom_submit_witness_gated(tmp_path, monkeypatch):
+    """A submit callable that always succeeds but whose witness never rises
+    must not be reported as verified -- codex's turn/start ack is not proof
+    of delivery, exactly like the FIFO/HTTP transports."""
+    calls = []
+    _witness_sequence(monkeypatch, [0])  # flat forever
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello",
+        deadline_s=0.05, max_attempts=2,
+        submit=lambda text: calls.append(text),
+    )
+
+    assert outcome.verified is False
+    assert outcome.transport == "rpc"
+    assert outcome.detail == "timeout"
+    assert len(calls) == 2  # readable-but-flat witness still retries
+
+
+def test_submit_and_verify_custom_submit_rejected_is_fast_and_non_retryable(
+    tmp_path, monkeypatch
+):
+    """_SubmissionRejected from the submit callable (codex's turn_start_error
+    fast-fail) returns immediately, without waiting out deadline_s or
+    consuming a second attempt."""
+    calls = []
+
+    def rejecting_submit(text):
+        calls.append(text)
+        raise agent_run._SubmissionRejected("bad turn params")
+
+    start = time.monotonic()
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello",
+        deadline_s=30.0, max_attempts=3,
+        submit=rejecting_submit,
+    )
+    elapsed = time.monotonic() - start
+
+    assert outcome.verified is False
+    assert outcome.attempts == 1
+    assert outcome.detail == "rejected: bad turn params"
+    assert len(calls) == 1
+    assert elapsed < 5.0, f"rejection took {elapsed:.1f}s, expected an immediate return"
+
+
+def test_submit_and_verify_custom_submit_transport_error_retries(tmp_path, monkeypatch):
+    """A plain OSError from the submit callable is treated like a built-in
+    transport failure: retried on the next attempt, not fatal."""
+    calls = {"n": 0}
+
+    def flaky_submit(_text):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("connection reset")
+
+    _witness_sequence(monkeypatch, [0, 1])
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello",
+        deadline_s=1.0, max_attempts=2,
+        submit=flaky_submit,
+    )
+
+    assert outcome.verified is True
+    assert outcome.attempts == 2
+    assert calls["n"] == 2
+
+
 def test_submit_via_http_is_fire_and_forget(monkeypatch):
     """The HTTP transport must never block reading the response: it writes
     the request and returns as soon as sendall completes, without calling

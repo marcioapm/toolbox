@@ -974,6 +974,23 @@ def _wait_terminal(state_dir: Path, timeout: float = 15.0) -> str:
     return status
 
 
+def _mock_witness_rises_after_baseline(monkeypatch) -> None:
+    """Patch _submission_witness_count with a strictly increasing counter, so
+    every _submit_and_verify call observes its very first post-submit poll
+    as a rise over whatever baseline it captured. Fake codex/claude/opencode
+    binaries in this file have no real transcript store to witness against,
+    so tests exercising launch/steer dispatch (not verification itself) use
+    this to clear the witness gate on both the launch and any later steer in
+    the same test, without burning the poll/retry budget."""
+    calls = {"n": 0}
+
+    def fake_witness(_state_dir, _log_dir):
+        calls["n"] += 1
+        return calls["n"]
+
+    monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
+
+
 
 def _launch_and_wait(
     state_root: Path,
@@ -1359,6 +1376,30 @@ class TestManagedCodexOneShotAppServer:
         )
         params = json.loads(params_file.read_text())
         assert params["model"] == "gpt-5.6-luna"
+
+    def test_codex_oneshot_prompt_submitted_ignores_witness(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """One-shot codex stamps prompt_submitted from turn_start_error alone,
+        never consulting the transcript witness -- unlike the interactive
+        launch path, a one-shot run already blocks on turn/completed before
+        returning, so a witness poll would be redundant."""
+        bin_dir = self._make_fake_codex_suite(tmp_path, thread_id="oneshot-witness-tid")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+
+        def fail_if_called(*_a, **_k):
+            raise AssertionError("one-shot codex must not poll the transcript witness")
+
+        monkeypatch.setattr(agent_run, "_submission_witness_count", fail_if_called)
+        name = "codex-oneshot-witness"
+        status, session = _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="codex",
+            interactive=False,
+            prompt="what is 6*7",
+        )
+        assert session is not None
+        assert session["confidence"] == "certain"
 
     def test_codex_log_contains_readable_output_not_jsonl(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
@@ -1939,6 +1980,10 @@ class TestManagedCodexInteractiveAppServer:
             tmp_path, thread_id="iact-thread-0002", steer_wait_seconds=0.5
         )
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        # The fake app-server has no real codex rollout store to witness
+        # against; simulate one rising right after turn/start so the launch
+        # path's witness gate does not burn its full verify/retry budget.
+        _mock_witness_rises_after_baseline(monkeypatch)
         name = "codex-iact-log"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
@@ -1971,6 +2016,12 @@ class TestManagedCodexInteractiveAppServer:
             tmp_path, thread_id="iact-thread-0003", steer_wait_seconds=5.0
         )
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        # The fake app-server has no real codex rollout store to witness
+        # against; simulate one rising right after each submit so neither the
+        # launch turn/start nor the steer burns the full verify/retry budget
+        # -- the transport behavior under test (dispatch and response landing
+        # in the log) is independent of which store backs the witness.
+        _mock_witness_rises_after_baseline(monkeypatch)
         name = "codex-iact-steer"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
@@ -1988,18 +2039,6 @@ class TestManagedCodexInteractiveAppServer:
         assert reached, "Run must reach running before steer"
         time.sleep(0.8)  # let initial turn complete so the agent is idle
 
-        # Send steer via cmd_steer. The fake app-server has no real codex
-        # rollout file to witness against, so simulate one rising right after
-        # the FIFO write -- the transport behavior under test (turn/steer
-        # dispatch and the response landing in the log) is independent of
-        # which store backs the witness.
-        witness_calls = {"n": 0}
-
-        def fake_witness(_state_dir, _log_dir):
-            witness_calls["n"] += 1
-            return 0 if witness_calls["n"] == 1 else 1
-
-        monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
         steer_ns = argparse.Namespace(name=name, message=["STEER_MSG"], raw=False, esc=False)
         rc = agent_run.cmd_steer(steer_ns)
         assert rc == 0, "steer must exit 0 on an interactive run"
@@ -2012,6 +2051,123 @@ class TestManagedCodexInteractiveAppServer:
         assert "steered response" in log_content, (
             f"Log must contain the steered response, got: {log_content!r}"
         )
+
+    def test_interactive_codex_launch_witness_never_rises_leaves_prompt_unverified(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """A witness that never rises must leave prompt_submitted absent and
+        prompt_unverified present, exactly like opencode/claude -- codex's
+        launch marker is gated by the transcript witness, not merely by
+        turn/start returning without an RPC error."""
+        bin_dir = self._make_fake_codex_interactive(
+            tmp_path, thread_id="iact-unverified", steer_wait_seconds=0.5
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        monkeypatch.setattr(agent_run, "_submission_witness_count", lambda *_a: 0)
+        monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "0.05")
+        monkeypatch.setenv("AGENT_RUN_SUBMIT_ATTEMPTS", "1")
+        name = "codex-iact-unverified"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="say hi", model=None, agent_mode=None,
+            harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+
+        self._wait_for_terminal(state_dir, timeout=10.0)
+
+        assert not (state_dir / "prompt_submitted").exists()
+        unverified = state_dir / "prompt_unverified"
+        assert unverified.exists()
+        assert unverified.read_text().strip() == "timeout"
+
+    def test_interactive_codex_launch_verified_on_rising_witness(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """A witness that rises after turn/start stamps prompt_submitted with
+        transport recorded as rpc, not http/keystroke."""
+        bin_dir = self._make_fake_codex_interactive(
+            tmp_path, thread_id="iact-verified", steer_wait_seconds=0.5
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        _mock_witness_rises_after_baseline(monkeypatch)
+        name = "codex-iact-verified"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="say hi", model=None, agent_mode=None,
+            harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+
+        self._wait_for_running(state_dir, timeout=10.0)
+        assert self._wait_for(
+            lambda: (state_dir / "prompt_submitted").exists(), timeout=10.0
+        ), "prompt_submitted must be stamped once the witness rises"
+        assert not (state_dir / "prompt_unverified").exists()
+
+        self._wait_for_terminal(state_dir, timeout=10.0)
+
+    def test_interactive_codex_turn_start_rejection_fails_fast_without_witness_wait(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """turn/start rejected by the app-server must fail the launch
+        immediately, without waiting out the full verify window."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'thread': {'id': 'rej-tid', 'sessionId': 'rej-tid', 'path': 'r.jsonl'}}})\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'error': {'code': -32602, 'message': 'bad turn params'}})\n"
+            "import time; time.sleep(30)\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "30")
+        name = "codex-iact-turn-reject"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="say hi", model=None, agent_mode=None,
+            harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+
+        start = time.monotonic()
+        status = self._wait_for_terminal(state_dir, timeout=15.0)
+        elapsed = time.monotonic() - start
+
+        assert status == "launch_failed"
+        assert not (state_dir / "prompt_submitted").exists()
+        assert elapsed < 15.0, (
+            f"turn/start rejection took {elapsed:.1f}s, expected an immediate "
+            f"failure well under the 30s verify window"
+        )
+
+    def _wait_for(self, predicate, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
 
     def test_interactive_codex_fallback_to_missing_when_appserver_fails(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
@@ -3211,6 +3367,9 @@ class TestCodexRpcEdgeCases:
         """
         bin_dir = self._make_null_result_codex(tmp_path)
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        # The fake app-server has no real codex rollout store to witness
+        # against; simulate one rising right after turn/start.
+        _mock_witness_rises_after_baseline(monkeypatch)
         name = "null-result-test"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
@@ -3250,6 +3409,11 @@ class TestCodexRpcEdgeCases:
         """
         bin_dir = self._make_active_turn_steer_rejecting_codex(tmp_path)
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        # No real codex rollout file exists for the fake server to witness
+        # against; simulate one rising after every submit so neither the
+        # launch nor the steer burns its full verify/retry budget on an
+        # assertion that only cares about the acquire log content.
+        _mock_witness_rises_after_baseline(monkeypatch)
         name = "steer-error-test"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
@@ -3268,17 +3432,6 @@ class TestCodexRpcEdgeCases:
 
         # The turn is still active (server sent active-turn-1 id). The steer
         # dispatches as turn/steer. The server rejects it with an rpc error.
-        # No real codex rollout file exists for the fake server to witness
-        # against; force an immediate witness rise so cmd_steer doesn't burn
-        # its full verify/retry budget on an assertion that only cares about
-        # the acquire log content.
-        witness_calls = {"n": 0}
-
-        def fake_witness(_state_dir, _log_dir):
-            witness_calls["n"] += 1
-            return 0 if witness_calls["n"] == 1 else 1
-
-        monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
         steer_ns = argparse.Namespace(name=name, message=["DO SOMETHING"], raw=False, esc=False)
         agent_run.cmd_steer(steer_ns)
 
@@ -3306,6 +3459,11 @@ class TestCodexRpcEdgeCases:
         # the adapter sends turn/start (the idle path) and the server can respond normally.
         bin_dir = self._make_steer_error_codex(tmp_path, thread_id="clear-active-tid")
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        # No real codex rollout file exists for the fake server; simulate one
+        # rising after every submit so neither the launch nor the steer burns
+        # its verify/retry budget on an assertion that only cares about the
+        # dispatch method.
+        _mock_witness_rises_after_baseline(monkeypatch)
         name = "clear-active-tid-test"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
@@ -3323,16 +3481,6 @@ class TestCodexRpcEdgeCases:
         time.sleep(0.8)
 
         # Send steer: if active_turn_id was cleared correctly, this becomes turn/start.
-        # No real codex rollout file exists for the fake server; force an
-        # immediate witness rise so cmd_steer doesn't burn its verify/retry
-        # budget on an assertion that only cares about the dispatch method.
-        witness_calls = {"n": 0}
-
-        def fake_witness(_state_dir, _log_dir):
-            witness_calls["n"] += 1
-            return 0 if witness_calls["n"] == 1 else 1
-
-        monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
         steer_ns = argparse.Namespace(name=name, message=["after-turn"], raw=False, esc=False)
         agent_run.cmd_steer(steer_ns)
         self._wait_terminal(state_dir, timeout=12.0)

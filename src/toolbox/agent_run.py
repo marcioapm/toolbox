@@ -383,7 +383,7 @@ from dataclasses import dataclass
 from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Callable, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 from toolbox import __version__ as TOOLBOX_VERSION
 from toolbox import agent_run_transcript as _agent_run_transcript
 
@@ -4464,11 +4464,20 @@ def _submission_witness_count(state_dir: Path, log_dir: Optional[Path]) -> Optio
 @dataclass(frozen=True)
 class SubmissionOutcome:
     """Result of one _submit_and_verify call. verified=False always carries
-    a human-readable reason in detail."""
+    a human-readable reason in detail. A detail beginning "rejected: " means
+    the transport itself refused the submission (e.g. a JSON-RPC error
+    response) -- a fast, non-retryable failure, not a verification timeout."""
     verified: bool
     attempts: int
-    transport: str          # "http" | "keystroke"
+    transport: str          # "http" | "keystroke" | "rpc"
     detail: Optional[str]   # why unverified; None when verified
+
+
+class _SubmissionRejected(Exception):
+    """Raised by a submit callable when the transport rejected the
+    submission outright, distinct from a low-level transport failure.
+    _submit_and_verify treats this as immediate and non-retryable: an
+    explicit rejection is not evidence a resend might succeed."""
 
 
 def _submit_via_http(port: int, session_id: str, text: str) -> None:
@@ -4511,12 +4520,26 @@ def _submit_and_verify(
     log_dir: Optional[Path],
     text: bytes,
     *,
-    submit_mode: str,
+    submit_mode: str = SUBMIT_MODE_CR,
     deadline_s: float = SUBMISSION_VERIFY_TIMEOUT_SECONDS,
     max_attempts: int = SUBMISSION_MAX_ATTEMPTS,
+    submit: Optional[Callable[[bytes], None]] = None,
+    transport: Optional[str] = None,
 ) -> SubmissionOutcome:
     """Submit *text* and confirm it reached the agent via the transcript
     witness, resubmitting up to max_attempts times on a verified timeout.
+
+    *submit*, when given, replaces the built-in HTTP/keystroke transports
+    entirely -- callers with a non-file, non-HTTP channel (codex's
+    JSON-RPC ``turn/start``) supply their own send function instead of a
+    third transport branch here. It may raise ``_SubmissionRejected`` for
+    an outright, non-retryable refusal (e.g. an RPC error response),
+    returned immediately as ``detail="rejected: ..."`` without waiting out
+    deadline_s or consuming further attempts, or ``OSError`` for a
+    transport failure treated like the built-in transports' own failures
+    (retried on the next attempt). *transport* names the resulting
+    SubmissionOutcome.transport; defaults to "rpc" when *submit* is given.
+    submit_mode is ignored when *submit* is given.
 
     A witness that stays unreadable for an entire attempt stops the loop at
     one submission regardless of max_attempts: an unreadable store carries
@@ -4533,8 +4556,11 @@ def _submit_and_verify(
     submit_mode's Enter sequence itself, HTTP submits text verbatim as the
     message body.
     """
-    endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
-    transport = "http" if endpoint is not None else "keystroke"
+    if submit is not None:
+        transport = transport or "rpc"
+    else:
+        endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
+        transport = "http" if endpoint is not None else "keystroke"
     baseline = _submission_witness_count(state_dir, log_dir)
     # A None baseline is genuinely common, not exceptional: claude's session
     # transcript file does not exist until claude finishes its own startup
@@ -4564,11 +4590,15 @@ def _submit_and_verify(
     for attempt in range(1, max_attempts + 1):
         attempts = attempt
         try:
-            if transport == "http":
+            if submit is not None:
+                submit(text)
+            elif transport == "http":
                 port, session_id = endpoint
                 _submit_via_http(port, session_id, text.decode("utf-8", errors="replace"))
             else:
                 _submit_via_keystroke(state_dir, text, submit_mode)
+        except _SubmissionRejected as exc:
+            return SubmissionOutcome(False, attempts, transport, f"rejected: {exc}")
         except OSError as exc:
             detail = f"transport_error: {exc}"
             continue
@@ -11684,6 +11714,12 @@ def _run_managed_oneshot_codex_appserver(
     Agent text from item/agentMessage/delta is written to log_fd so tail, watch
     and the idle timeout observe incremental progress. session.json is written
     after thread/start, before the first model call.
+
+    prompt_submitted here is gated only by turn_start_error, not by the
+    transcript witness _submit_and_verify uses for the interactive codex
+    launch path: a one-shot run's single turn already blocks this function
+    until turn/completed, so the witness would add a redundant poll around
+    a call that is about to be awaited in full regardless.
     """
     server = _CodexAppServer(state_dir, log_dir, acquire_log, "codex app-server")
     if not server.start(harness_args, cwd, ready):
@@ -11811,21 +11847,49 @@ def _run_managed_interactive_codex_appserver(
             ready()
             return 1
 
-        turn_rpc_id = server.start_turn(_managed_prompt_text(prompt, prompt_file))
-
         _write(state_dir / "status", "running\n")
         ready()
-        # turn/start has no other matcher for its response frame; check for
-        # a fast server-side rejection before claiming the prompt landed.
-        early_error = server.turn_start_error(turn_rpc_id)
-        if early_error is not None:
-            server.log(f"turn/start rejected immediately: {early_error}")
+
+        # Publishing running/ready happens before the turn is sent, exactly
+        # like the PTY runners publish readiness before their async prompt
+        # helper submits: the run is controllable as soon as the app-server
+        # process exists, independent of whether its first turn ever lands.
+        turn_rpc_id_holder: List[Optional[int]] = [None]
+
+        def _send_initial_turn(payload: bytes) -> None:
+            rpc_id = server.start_turn(payload.decode("utf-8", errors="replace"))
+            turn_rpc_id_holder[0] = rpc_id
+            # turn/start has no other matcher for its response frame; a
+            # server-side rejection must fail this attempt immediately
+            # rather than wait out the witness poll window.
+            early_error = server.turn_start_error(rpc_id)
+            if early_error is not None:
+                raise _SubmissionRejected(early_error)
+
+        outcome = _submit_and_verify(
+            state_dir, log_dir, _managed_prompt_text(prompt, prompt_file).encode("utf-8"),
+            deadline_s=_submission_verify_timeout_seconds(),
+            max_attempts=_submission_max_attempts(),
+            submit=_send_initial_turn,
+        )
+        turn_rpc_id = turn_rpc_id_holder[0] if turn_rpc_id_holder[0] is not None else -1
+        if outcome.detail is not None and outcome.detail.startswith("rejected: "):
+            server.log(f"turn/start rejected immediately: {outcome.detail[len('rejected: '):]}")
             return 1
-        # The prompt went out via turn/start and was not rejected outright;
-        # mark it so _finalize does not misclassify a later failure as
-        # launch_failed. Transcript verification of the turn's actual
-        # content still happens uniformly through `watch`/`transcript`.
-        _write(state_dir / "prompt_submitted", "1\n")
+        if outcome.verified:
+            _write(state_dir / "prompt_submitted", _now_iso() + "\n")
+        else:
+            # The turn was sent and never rejected outright, but the
+            # transcript witness never confirmed delivery; the run keeps
+            # going -- `watch`/`transcript` still verify the turn's actual
+            # content uniformly -- but _finalize must not misclassify a
+            # later failure as launch_failed on a turn that plausibly did
+            # not land.
+            _write(state_dir / "prompt_unverified", f"{outcome.detail}\n")
+            server.log(
+                f"turn/start could not be verified as delivered "
+                f"({outcome.detail}, {outcome.attempts} attempt(s))"
+            )
 
         steer_buf = b""
         # Distinguishes a clean app-server exit from a mid-session transport failure.

@@ -429,73 +429,49 @@ run_harness_cells() {
 
   # --- C3: anti-vacuity negative control ------------------------------------
   # Proves the verification marker is gated by real delivery, not by "bytes
-  # handed to a transport". Which marker C3 tests, and how the control is
-  # engineered, differs per harness because a uniform approach is
-  # architecturally impossible across all three transports:
+  # handed to a transport". Which technique C3 uses to break the witness
+  # differs per harness because a uniform approach is architecturally
+  # impossible across all three transports:
   #
-  # opencode: tests the launch marker (prompt_submitted). Its HTTP
-  #   message-count witness (GET /session/<id>/message) lands in single-digit
-  #   milliseconds (measured live: ~8ms), so no AGENT_RUN_SUBMIT_VERIFY_TIMEOUT
-  #   short enough to be "impossible" exists for that transport --
-  #   _submit_and_verify's own post-timeout re-check would still observe the
-  #   already-landed witness and report verified. Instead corrupt
-  #   state_dir/opencode_port to an unreachable port immediately after
-  #   launch, before the prompt-submission helper's fixed
+  # opencode: its HTTP message-count witness (GET /session/<id>/message)
+  #   lands in single-digit milliseconds (measured live: ~8ms), so no
+  #   AGENT_RUN_SUBMIT_VERIFY_TIMEOUT short enough to be "impossible" exists
+  #   for that transport -- _submit_and_verify's own post-timeout re-check
+  #   would still observe the already-landed witness and report verified.
+  #   Instead corrupt state_dir/opencode_port to an unreachable port
+  #   immediately after launch, before the prompt-submission helper's fixed
   #   PROMPT_SUBMISSION_DELAY_SECONDS pre-write delay elapses, so every HTTP
   #   submission attempt hits a real connection failure.
   #
-  # claude: tests the launch marker (prompt_submitted), gated by
-  #   _submit_and_verify exactly like opencode's. Transcript-store landing
-  #   latency is seconds (measured live: ~4.3s), so
-  #   AGENT_RUN_SUBMIT_VERIFY_TIMEOUT=0.01 genuinely cannot be satisfied by
-  #   either the poll loop or the single post-timeout re-check.
+  # claude: transcript-store landing latency is seconds (measured live:
+  #   ~4.3s), so AGENT_RUN_SUBMIT_VERIFY_TIMEOUT=0.01 genuinely cannot be
+  #   satisfied by either the poll loop or the single post-timeout re-check.
   #
-  # codex: tests the STEER marker instead of the launch marker. codex's
-  #   launch-time prompt_submitted is gated only by turn_start_error (an
-  #   RPC-level ack that the turn started), never by the transcript witness
-  #   -- _submit_and_verify is wired into the interactive codex runner's
-  #   steer path only, not its initial turn/start. AGENT_RUN_SUBMIT_VERIFY_TIMEOUT
-  #   therefore has no effect on codex's launch marker; testing it there
-  #   would silently no-op rather than prove anything. Redirecting
-  #   AGENT_RUN_CODEX_SESSIONS_DIR to an empty directory makes the rollout
-  #   witness unreadable for every submission attempt, so a steer's
-  #   verification cannot succeed regardless of any timeout.
+  # codex: its rollout-file witness lands in under a second (measured live:
+  #   ~0.8s, the fastest of the three), too close to a short timeout to trust
+  #   a timing-based control. Redirecting AGENT_RUN_CODEX_SESSIONS_DIR to an
+  #   empty directory for the launch itself makes the rollout witness
+  #   unreadable regardless of timing, so no submission attempt can ever be
+  #   verified.
   #
-  # Whichever marker/technique applies, if this control ever reports
+  # Every branch tests the launch marker (prompt_submitted/prompt_unverified)
+  # so C3 exercises the same marker C1 does. If this control ever reports
   # PASS-verification, that marker is not actually gated by the witness and
   # the whole feature is vacuous for it -- treat that as a hard failure, not
   # a mere anomaly.
   local c3_run="${run_name}-neg"
   local c3_state="${STATE_DIR}/${c3_run}"
   if [ "$harness" = "codex" ]; then
-    log "C3: negative control via an unreadable codex rollout store (steer marker; codex's launch marker is not witness-gated)"
-    if agent_run --cwd "$repo_dir" --harness "$harness" -i \
+    log "C3: negative control via an unreadable codex rollout store (launch marker)"
+    if AGENT_RUN_CODEX_SESSIONS_DIR="${WORK_DIR}/empty-codex-sessions" \
+        agent_run --cwd "$repo_dir" --harness "$harness" -i \
         --prompt "Reply with exactly this word and nothing else: ${sentinel1}_neg" \
         ${model_args[@]+"${model_args[@]}"} "$c3_run" >/dev/null 2>&1; then
       LAUNCHED_RUNS+=("$c3_run")
-      wait_for 10 0.5 "run reaches running" \
-        bash -c "grep -qx running '${c3_state}/status' 2>/dev/null" || true
-      local c3_steer_out c3_steer_rc=0
-      c3_steer_out="$(AGENT_RUN_CODEX_SESSIONS_DIR="${WORK_DIR}/empty-codex-sessions" \
-        agent_run steer "$c3_run" "Reply with exactly this word and nothing else: ${sentinel1}_neg_steer" 2>&1)" \
-        || c3_steer_rc=$?
-      if [ "$c3_steer_rc" -eq 1 ] && echo "$c3_steer_out" | grep -q "could not be verified"; then
-        c3="PASS"
-      else
-        c3="FAIL"
-        if [ "$c3_steer_rc" -eq 0 ]; then
-          log "C3 FAIL (VACUOUS): steer reported verified despite an unreadable rollout store -- verification is not gating the steer marker"
-        else
-          log "C3 FAIL: rc=${c3_steer_rc} out=${c3_steer_out}"
-        fi
-      fi
+      sleep 6
     else
-      c3="FAIL"
       log "C3 FAIL: launch itself failed"
     fi
-    agent_run kill "$c3_run" >/dev/null 2>&1 || true
-    sleep 0.3
-    count_check "$c3"
   elif [ "$harness" = "opencode" ]; then
     log "C3: negative control via an unreachable opencode_port (HTTP witness lands too fast for a timing control)"
     if agent_run --cwd "$repo_dir" --harness "$harness" -i \
@@ -527,23 +503,21 @@ run_harness_cells() {
       log "C3 FAIL: launch itself failed"
     fi
   fi
-  if [ "$harness" != "codex" ]; then
-    if [ -f "${c3_state}/prompt_submitted" ]; then
-      c3="FAIL"
-      log "C3 FAIL (VACUOUS): prompt_submitted was stamped despite the negative control -- verification is not gating the marker"
-    elif [ ! -f "${c3_state}/prompt_unverified" ]; then
-      c3="FAIL"
-      log "C3 FAIL: neither prompt_submitted nor prompt_unverified is present"
-    elif [ ! -s "${c3_state}/prompt_unverified" ]; then
-      c3="FAIL"
-      log "C3 FAIL: prompt_unverified exists but carries no reason"
-    else
-      c3="PASS"
-    fi
-    agent_run kill "$c3_run" >/dev/null 2>&1 || true
-    sleep 0.3
-    count_check "$c3"
+  if [ -f "${c3_state}/prompt_submitted" ]; then
+    c3="FAIL"
+    log "C3 FAIL (VACUOUS): prompt_submitted was stamped despite the negative control -- verification is not gating the marker"
+  elif [ ! -f "${c3_state}/prompt_unverified" ]; then
+    c3="FAIL"
+    log "C3 FAIL: neither prompt_submitted nor prompt_unverified is present"
+  elif [ ! -s "${c3_state}/prompt_unverified" ]; then
+    c3="FAIL"
+    log "C3 FAIL: prompt_unverified exists but carries no reason"
+  else
+    c3="PASS"
   fi
+  agent_run kill "$c3_run" >/dev/null 2>&1 || true
+  sleep 0.3
+  count_check "$c3"
 
   # --- C4: --raw steer is exempt from verification --------------------------
   local c4_run="${run_name}-raw"
