@@ -7146,10 +7146,52 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
         info = _worktree_classify(worktree_dir)
         common_check = _watch_run_git_checked(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
         owning_common = common_check.stdout.strip() if common_check.stdout is not None else None
-        if info.kind != _WORKTREE_LINKED or owning_common is None or info.common_dir != owning_common:
+        owning_identity = _dir_identity(Path(owning_common)) if owning_common else None
+        candidate_identity = _dir_identity(Path(info.common_dir)) if info.common_dir else None
+        if (
+            info.kind != _WORKTREE_LINKED
+            or owning_identity is None
+            or candidate_identity is None
+            or owning_identity != candidate_identity
+        ):
             sys.exit(
                 f"agent-run: --worktree {worktree_dir} exists but is not a linked "
                 f"worktree of {repo}; refusing to attach"
+            )
+        # A recursively copied worktree keeps a .git file pointing at the
+        # original repo, so the checks above still pass, but the copy is not
+        # registered and `git worktree remove` would refuse it. Require DIR's
+        # filesystem identity to match one of the repo's registered roots —
+        # the same guard `reap` already applies before touching a worktree it
+        # did not itself create (see _worktree_registered_roots).
+        registered_roots, reg_error = _worktree_registered_roots(info)
+        if reg_error is not None:
+            sys.exit(
+                f"agent-run: cannot verify --worktree {worktree_dir} is a registered "
+                f"worktree of {repo}: {reg_error}"
+            )
+        assert registered_roots is not None
+        dir_identity = _dir_identity(worktree_dir)
+        if not any(_dir_identity(root) == dir_identity for root in registered_roots):
+            sys.exit(
+                f"agent-run: --worktree {worktree_dir} is not a registered worktree "
+                f"of {repo}; refusing to attach"
+            )
+        # The reuse target must already be on the requested branch: attaching
+        # while silently running on whatever branch happens to be checked out
+        # is exactly the cross-contamination this feature exists to prevent.
+        # A detached HEAD is rejected outright rather than guessed at.
+        branch_probe = _watch_run_git_checked(worktree_dir, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+        current_branch = branch_probe.stdout.strip() if branch_probe.stdout is not None else None
+        if current_branch is None:
+            sys.exit(
+                f"agent-run: --worktree {worktree_dir} has a detached HEAD; "
+                f"refusing to attach with --worktree-reuse"
+            )
+        if current_branch != branch:
+            sys.exit(
+                f"agent-run: --worktree {worktree_dir} is on branch {current_branch!r}, "
+                f"not {branch!r}; refusing to attach with --worktree-reuse"
             )
         args.cwd = str(worktree_dir)
         return None  # attached as-is; this invocation created nothing

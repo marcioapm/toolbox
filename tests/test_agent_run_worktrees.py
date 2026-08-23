@@ -3921,6 +3921,112 @@ class TestLaunchCreatesWorktree:
         assert agent_run._worktree_classify(wt).kind == agent_run._WORKTREE_LINKED
         assert not (isolated_runs_root / "reuse-run-fails").exists()
 
+    def test_reuse_refuses_linked_worktree_of_a_different_repo(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """--worktree-reuse pointed at a linked worktree of a different repo
+        (named via --worktree-repo of the *first* repo) must be refused, and
+        the other repo's worktree must be untouched: this is the exact
+        cross-contamination hazard the feature exists to prevent."""
+        repo_a = _make_repo(git_root, "repo-a")
+        repo_b = _make_repo(git_root, "repo-b")
+        wt_b = _add_worktree(repo_b, git_root / "wt-b", "feature-b")
+        marker = wt_b / "tracked.txt"
+        before = marker.read_text()
+        args = _launch_args(
+            name="cross-repo-reuse", worktree=str(wt_b), worktree_base="main",
+            worktree_branch="feature-b", worktree_repo=str(repo_a), worktree_reuse=True,
+        )
+
+        with pytest.raises(SystemExit, match="not a linked worktree of"):
+            agent_run.cmd_launch(args)
+
+        assert marker.read_text() == before
+        assert agent_run._worktree_classify(wt_b).kind == agent_run._WORKTREE_LINKED
+        assert not (isolated_runs_root / "cross-repo-reuse").exists()
+
+    def test_reuse_refuses_the_main_worktree(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """--worktree-reuse pointed at the repo's own main worktree must be
+        refused, not silently attached."""
+        repo = _make_repo(git_root)
+        marker = repo / "tracked.txt"
+        before = marker.read_text()
+        args = _launch_args(
+            name="main-worktree-reuse", worktree=str(repo), worktree_base="main",
+            worktree_repo=str(repo), worktree_reuse=True,
+        )
+
+        with pytest.raises(SystemExit, match="not a linked worktree of"):
+            agent_run.cmd_launch(args)
+
+        assert marker.read_text() == before
+        assert not (isolated_runs_root / "main-worktree-reuse").exists()
+
+    def test_reuse_refuses_a_copied_unregistered_worktree(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """A recursive copy of a linked worktree keeps a .git file pointing at
+        the original repo's admin dir, so _worktree_classify reports LINKED
+        and the common-dir matches -- but `git worktree list` does not
+        register the copy, and `git worktree remove` would refuse it."""
+        import shutil
+
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt-original", "feature")
+        wt_copy = git_root / "wt-copy"
+        shutil.copytree(wt, wt_copy, symlinks=True)
+        assert (wt_copy / ".git").exists()
+
+        args = _launch_args(
+            name="copied-worktree-reuse", worktree=str(wt_copy), worktree_base="main",
+            worktree_branch="feature", worktree_repo=str(repo), worktree_reuse=True,
+        )
+
+        with pytest.raises(SystemExit, match="not a registered worktree"):
+            agent_run.cmd_launch(args)
+
+        assert wt_copy.is_dir()  # untouched, not removed or mutated
+        assert not (isolated_runs_root / "copied-worktree-reuse").exists()
+
+    def test_reuse_refuses_branch_mismatch(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """--worktree-branch requested --worktree-reuse pointed at a registered
+        worktree sitting on a *different* branch must be refused rather than
+        silently running on whichever branch happens to be checked out."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt-actual-branch", "actual")
+        args = _launch_args(
+            name="branch-mismatch-reuse", worktree=str(wt), worktree_base="main",
+            worktree_branch="requested", worktree_repo=str(repo), worktree_reuse=True,
+        )
+
+        with pytest.raises(SystemExit, match="is on branch 'actual'"):
+            agent_run.cmd_launch(args)
+
+        assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "actual"
+        assert not (isolated_runs_root / "branch-mismatch-reuse").exists()
+
+    def test_reuse_refuses_detached_head(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """A registered worktree with a detached HEAD is rejected explicitly,
+        rather than guessed at or silently attached."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt-detached", "detached-src")
+        _git(wt, "checkout", "--detach", "-q")
+        args = _launch_args(
+            name="detached-reuse", worktree=str(wt), worktree_base="main",
+            worktree_branch="detached-src", worktree_repo=str(repo), worktree_reuse=True,
+        )
+
+        with pytest.raises(SystemExit, match="detached HEAD"):
+            agent_run.cmd_launch(args)
+
+        assert not (isolated_runs_root / "detached-reuse").exists()
+
     def test_unresolvable_base_fails_before_any_mutation(
         self, isolated_runs_root, isolated_log_root, git_root
     ):
