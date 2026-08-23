@@ -7003,6 +7003,51 @@ class _CreatedWorktree(NamedTuple):
     repo: Path
     branch: str
     branch_created: bool
+    # OID the branch was created at, when branch_created is True. Rollback
+    # deletes the branch only if it still points here, so a branch moved by
+    # the workload (or by anything else) in the interim is never discarded.
+    branch_oid: Optional[str] = None
+
+
+def _worktree_branch_checked_out(repo: Path, branch: str) -> Tuple[Optional[bool], Optional[str]]:
+    """Whether ``refs/heads/<branch>`` is checked out in any worktree
+    registered to ``repo``. Returns ``(None, error)`` when this cannot be
+    determined; callers must treat that as "assume checked out" and refuse
+    to delete, since ``git update-ref -d`` — unlike ``git branch -D`` — does
+    not itself refuse to delete a branch some worktree has checked out.
+    """
+    outcome = _watch_run_git_checked(repo, ["worktree", "list", "--porcelain", "-z"])
+    if outcome.stdout is None:
+        return None, f"cannot enumerate worktrees ({outcome.error_detail})"
+    target_ref = f"refs/heads/{branch}"
+    for field in outcome.stdout.split("\0"):
+        if field.startswith("branch ") and field[len("branch "):] == target_ref:
+            return True, None
+    return False, None
+
+
+def _worktree_delete_branch_if_unchanged(repo: Path, branch: str, expected_oid: str) -> Optional[str]:
+    """Delete ``refs/heads/<branch>`` iff it still points at ``expected_oid``
+    and no registered worktree has it checked out. Returns ``None`` on
+    success or if the branch is already gone, else the reason it was left in
+    place. The delete itself is an atomic expected-old-value ``update-ref``,
+    so a branch that moved between the check above and this call is still
+    refused rather than silently discarded.
+    """
+    current = _watch_run_git_checked(repo, ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"])
+    if current.stdout is None:
+        return None  # already gone: nothing left to roll back
+    if current.stdout.strip() != expected_oid:
+        return f"branch {branch!r} no longer points at the commit this invocation created; leaving it in place"
+    checked_out, err = _worktree_branch_checked_out(repo, branch)
+    if err is not None:
+        return f"cannot confirm branch {branch!r} is unused: {err}"
+    if checked_out:
+        return f"branch {branch!r} is checked out in a worktree; refusing to delete"
+    outcome = _watch_run_git_checked(repo, ["update-ref", "-d", f"refs/heads/{branch}", expected_oid])
+    if outcome.stdout is None:
+        return outcome.error_detail or "update-ref failed"
+    return None
 
 
 def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktree]:
@@ -7075,6 +7120,11 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
     base_check = _watch_run_git_checked(repo, ["rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"])
     if base_check.stdout is None:
         sys.exit(f"agent-run: --worktree-base {base!r} does not resolve to a commit in {repo}")
+    # Frozen to the OID resolved here, not the symbolic ref: a concurrent ref
+    # update between this check and worktree creation must not silently
+    # change which commit the new branch is built on, and rollback needs an
+    # exact OID to attribute a branch to this invocation (see below).
+    base_oid = base_check.stdout.strip()
 
     branch_ref_check = _watch_run_git_checked(repo, ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"])
     branch_exists = branch_ref_check.stdout is not None
@@ -7108,11 +7158,33 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
         # --worktree-reuse attaching to a pre-existing branch: check it out
         # rather than creating it.
         add_args = ["worktree", "add", str(worktree_dir), branch]
+        outcome = _watch_run_git_checked(repo, add_args, timeout=WORKTREE_ADD_TIMEOUT_SECONDS)
+        if outcome.stdout is None:
+            sys.exit(f"agent-run: git worktree add failed for {worktree_dir}: {outcome.error_detail}")
+        branch_created = False
     else:
-        add_args = ["worktree", "add", "-b", branch, str(worktree_dir), base]
-    outcome = _watch_run_git_checked(repo, add_args, timeout=WORKTREE_ADD_TIMEOUT_SECONDS)
-    if outcome.stdout is None:
-        sys.exit(f"agent-run: git worktree add failed for {worktree_dir}: {outcome.error_detail}")
+        # Branch creation and worktree creation are split into two operations
+        # instead of one `git worktree add -b`, whose partial result cannot
+        # be attributed: `worktree add -b` can create the branch and then
+        # fail preparing the directory, permanently orphaning that branch.
+        # `git branch <name> <oid>` is atomic (creates exactly refs/heads/
+        # <name> = <oid>, or fails outright), so a subsequent worktree-add
+        # failure can be attributed and rolled back precisely.
+        branch_create = _watch_run_git_checked(repo, ["branch", branch, base_oid])
+        if branch_create.stdout is None:
+            sys.exit(f"agent-run: failed to create branch {branch!r}: {branch_create.error_detail}")
+        add_args = ["worktree", "add", str(worktree_dir), branch]
+        outcome = _watch_run_git_checked(repo, add_args, timeout=WORKTREE_ADD_TIMEOUT_SECONDS)
+        if outcome.stdout is None:
+            reason = _worktree_delete_branch_if_unchanged(repo, branch, base_oid)
+            if reason is not None:
+                print(
+                    f"agent-run: warning: git worktree add failed and branch "
+                    f"{branch!r} could not be rolled back: {reason}",
+                    file=sys.stderr,
+                )
+            sys.exit(f"agent-run: git worktree add failed for {worktree_dir}: {outcome.error_detail}")
+        branch_created = True
 
     args.cwd = str(worktree_dir)
     # Recorded on args, not returned separately, so _cmd_launch_locked (which
@@ -7122,7 +7194,10 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
     # resolves symlinks), so the two files agree on macOS's /var -> /private/var
     # and similar cases.
     args._worktree_created_path = os.path.realpath(worktree_dir)
-    return _CreatedWorktree(worktree_dir, repo, branch, branch_created=not branch_exists)
+    return _CreatedWorktree(
+        worktree_dir, repo, branch, branch_created=branch_created,
+        branch_oid=base_oid if branch_created else None,
+    )
 
 
 def _rollback_launch_worktree(created: _CreatedWorktree) -> None:
@@ -7144,11 +7219,13 @@ def _rollback_launch_worktree(created: _CreatedWorktree) -> None:
         print(f"agent-run: warning: failed to roll back worktree {created.path}: {reason}", file=sys.stderr)
         return  # worktree still checked out; deleting its branch would fail anyway
     if created.branch_created:
-        outcome = _watch_run_git_checked(created.repo, ["branch", "-D", created.branch])
-        if outcome.stdout is None:
+        reason = _worktree_delete_branch_if_unchanged(
+            created.repo, created.branch, created.branch_oid or ""
+        )
+        if reason is not None:
             print(
                 f"agent-run: warning: failed to remove branch {created.branch!r} "
-                f"during rollback: {outcome.error_detail}",
+                f"during rollback: {reason}",
                 file=sys.stderr,
             )
 

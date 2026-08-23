@@ -3956,6 +3956,104 @@ class TestLaunchCreatesWorktree:
         assert name not in _git(repo, "branch", "--list", name)
         assert not (isolated_runs_root / name).exists()
 
+    def test_worktree_base_is_frozen_to_the_requested_ref_not_invocation_head(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """--worktree-base is the entire reason this feature exists: the new
+        worktree's HEAD must be the requested ref's commit, never whatever
+        the invocation repo's own HEAD happens to be pointed at."""
+        repo = _make_repo(git_root)
+        base_head_oid = _git(repo, "rev-parse", "HEAD").strip()
+        (repo / "tracked.txt").write_text("second commit content\n")
+        _git(repo, "add", "tracked.txt")
+        _git(repo, "commit", "-qm", "second commit")
+        _git(repo, "push", "-q", "origin", "main")
+        invocation_head_oid = _git(repo, "rev-parse", "HEAD").strip()
+        assert base_head_oid != invocation_head_oid
+
+        base_ref = "base-ref"
+        _git(repo, "branch", base_ref, base_head_oid)
+        wt_dir = git_root / "wt-base-oid"
+        name = "wt-base-oid"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base=base_ref, worktree_repo=str(repo),
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+        _wait_terminal(isolated_runs_root / name)
+
+        assert _git(wt_dir, "rev-parse", "HEAD").strip() == base_head_oid
+        assert _git(wt_dir, "rev-parse", "HEAD").strip() != invocation_head_oid
+
+    def test_worktree_base_ref_moved_between_validation_and_creation_is_not_followed(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
+    ):
+        """--worktree-base is resolved to a commit OID once; a concurrent
+        ref update between validation and `worktree add` must not change
+        which commit the new branch is built on."""
+        repo = _make_repo(git_root)
+        first_oid = _git(repo, "rev-parse", "HEAD").strip()
+        _git(repo, "branch", "moving-base", first_oid)
+        (repo / "tracked.txt").write_text("moved-base content\n")
+        _git(repo, "add", "tracked.txt")
+        _git(repo, "commit", "-qm", "moved-base commit")
+        second_oid = _git(repo, "rev-parse", "HEAD").strip()
+        assert first_oid != second_oid
+
+        real_git_checked = agent_run._watch_run_git_checked
+        moved = {"done": False}
+
+        def _racing_git_checked(path, git_args, timeout=agent_run.WATCH_GIT_SUBPROCESS_TIMEOUT_SECONDS):
+            outcome = real_git_checked(path, git_args, timeout)
+            if (
+                not moved["done"]
+                and list(git_args[:3]) == ["rev-parse", "--verify", "--quiet"]
+                and git_args[3] == "moving-base^{commit}"
+            ):
+                moved["done"] = True
+                real_git_checked(path, ["branch", "-f", "moving-base", second_oid])
+            return outcome
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", _racing_git_checked)
+
+        wt_dir = git_root / "wt-moving-base"
+        name = "wt-moving-base"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="moving-base", worktree_repo=str(repo),
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+        _wait_terminal(isolated_runs_root / name)
+
+        assert _git(wt_dir, "rev-parse", "HEAD").strip() == first_oid
+
+    def test_worktree_add_failure_after_branch_creation_does_not_orphan_branch(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """Branch creation and worktree creation are two operations: a
+        `git worktree add` failure occurring after the branch already exists
+        must not leave that branch permanently orphaned."""
+        repo = _make_repo(git_root)
+        unwritable_parent = git_root / "noperm"
+        unwritable_parent.mkdir()
+        wt_dir = unwritable_parent / "wt-add-fails"
+        os.chmod(unwritable_parent, 0o555)
+        name = "add-fails-run"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+        )
+
+        try:
+            with pytest.raises(SystemExit, match="git worktree add failed"):
+                agent_run.cmd_launch(args)
+        finally:
+            os.chmod(unwritable_parent, 0o755)
+
+        assert name not in _git(repo, "branch", "--list", name)
+        assert not (isolated_runs_root / name).exists()
+
     def test_rollback_failure_does_not_mask_original_error(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
