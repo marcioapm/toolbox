@@ -4353,19 +4353,35 @@ def _submission_max_attempts() -> int:
     return value
 
 
+def _effective_argv_port(argv: Sequence[str]) -> Optional[int]:
+    """Return the ``--port`` an argv actually takes effect with.
+
+    The last occurrence wins, matching how the harness CLIs parse repeated
+    flags: agent-run's managed ``--port`` is appended before harness_args, so
+    ``--harness-arg=--port --harness-arg=48002`` overrides it and the run
+    listens on 48002. Both ``--port N`` and ``--port=N`` spellings are read.
+    """
+    port: Optional[int] = None
+    for i, token in enumerate(argv):
+        if not isinstance(token, str):
+            continue
+        if token == "--port" and i + 1 < len(argv):
+            port = _safe_int(argv[i + 1]) or port
+        elif token.startswith("--port="):
+            port = _safe_int(token[len("--port="):]) or port
+    return port
+
+
 def _opencode_argv_port(state_dir: Path) -> Optional[int]:
-    """Recover --port from the persisted argv, for a run launched before
-    opencode_port was written directly."""
+    """Recover the effective --port from the persisted argv, for a run
+    launched before opencode_port was written directly."""
     try:
         argv = json.loads((state_dir / "argv").read_text())
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(argv, list):
         return None
-    for i, token in enumerate(argv):
-        if token == "--port" and i + 1 < len(argv):
-            return _safe_int(argv[i + 1])
-    return None
+    return _effective_argv_port(argv)
 
 
 def _opencode_http_endpoint(state_dir: Path, log_dir: Path) -> Optional[tuple[int, str]]:
@@ -4492,13 +4508,23 @@ def _submission_witness_count(state_dir: Path, log_dir: Optional[Path]) -> Optio
 @dataclass(frozen=True)
 class SubmissionOutcome:
     """Result of one _submit_and_verify call. verified=False always carries
-    a human-readable reason in detail. A detail beginning "rejected: " means
-    the transport itself refused the submission (e.g. a JSON-RPC error
-    response) -- a fast, non-retryable failure, not a verification timeout."""
+    a human-readable reason in detail:
+
+    ``rejected: ...``   the transport itself refused the submission (e.g. a
+                        JSON-RPC error response) -- fast and non-retryable,
+                        not a verification timeout.
+    ``unwitnessed``     the run is unmanaged, so no harness session exists to
+                        witness against. delivered still reports whether the
+                        bytes were written.
+    ``witness_unreadable`` / ``timeout`` / ``transport_error: ...``
+    """
     verified: bool
     attempts: int
     transport: str          # "http" | "keystroke" | "rpc"
     detail: Optional[str]   # why unverified; None when verified
+    # Whether the transport accepted the last submission without raising.
+    # Weaker than verified: proof the bytes left, not that they arrived.
+    delivered: bool = False
 
 
 class _SubmissionRejected(Exception):
@@ -4506,6 +4532,13 @@ class _SubmissionRejected(Exception):
     submission outright, distinct from a low-level transport failure.
     _submit_and_verify treats this as immediate and non-retryable: an
     explicit rejection is not evidence a resend might succeed."""
+
+
+def _run_is_managed(log_dir: Optional[Path]) -> bool:
+    """True when the run was launched under --harness and therefore has a
+    harness session, and so a transcript store, to witness against. A raw
+    run (`agent-run NAME -- <cmd>`) never produces session.json."""
+    return log_dir is not None and _read_session_json(log_dir) is not None
 
 
 def _submit_via_http(port: int, session_id: str, text: str) -> None:
@@ -4611,7 +4644,9 @@ def _submit_and_verify(
     The witness source is resolved once, before the baseline, and pinned for
     the whole call; only user-role records are counted, so an assistant
     reply or a tool call in the current turn can never be mistaken for a
-    delivered prompt.
+    delivered prompt. An unmanaged run has no session to witness against and
+    returns ``detail="unwitnessed"`` with ``delivered=True`` after one
+    successful write.
 
     *fresh_session* declares that this session was minted by this launch and
     held no records before this submission. Only then can an unreadable
@@ -4677,6 +4712,7 @@ def _submit_and_verify(
 
     detail: Optional[str] = None
     attempts = 0
+    delivered = False
 
     for attempt in range(1, max_attempts + 1):
         attempts = attempt
@@ -4692,7 +4728,7 @@ def _submit_and_verify(
             # immediately before sending so a witness that rose in between is
             # not answered with a duplicate submission.
             if _witness_rose():
-                return SubmissionOutcome(True, attempts, transport, None)
+                return SubmissionOutcome(True, attempts, transport, None, delivered=True)
         try:
             if submit is not None:
                 submit(text)
@@ -4701,6 +4737,7 @@ def _submit_and_verify(
                 _submit_via_http(port, session_id, text.decode("utf-8", errors="replace"))
             else:
                 _submit_via_keystroke(state_dir, _keystroke_payload(attempt, text, submit_mode))
+            delivered = True
         except _SubmissionRejected as exc:
             return SubmissionOutcome(False, attempts, transport, f"rejected: {exc}")
         except TimeoutError:
@@ -4717,11 +4754,20 @@ def _submit_and_verify(
             # normal window before deciding a resend is warranted.
             detail = f"transport_error: {exc}"
             if _poll_witness(_witness_rose, deadline_s):
-                return SubmissionOutcome(True, attempts, transport, None)
+                return SubmissionOutcome(True, attempts, transport, None, delivered=True)
             continue
 
+        if witness is None:
+            # An unmanaged run has no harness session to witness against.
+            # This is not a verification failure -- there is nothing to
+            # verify -- so it reports delivered without a retry, and callers
+            # distinguish it from a managed run whose witness failed.
+            return SubmissionOutcome(
+                False, attempts, transport, "unwitnessed", delivered=True
+            )
+
         if _poll_witness(_witness_rose, deadline_s):
-            return SubmissionOutcome(True, attempts, transport, None)
+            return SubmissionOutcome(True, attempts, transport, None, delivered=True)
 
         detail = "timeout" if readable_this_attempt else "witness_unreadable"
 
@@ -4731,7 +4777,7 @@ def _submit_and_verify(
         if not readable_this_attempt:
             break
 
-    return SubmissionOutcome(False, attempts, transport, detail)
+    return SubmissionOutcome(False, attempts, transport, detail, delivered=delivered)
 
 
 def _poll_witness(witness_rose: Callable[[], bool], deadline_s: float) -> bool:
@@ -8883,6 +8929,11 @@ def cmd_steer(args: argparse.Namespace) -> int:
     if outcome.verified:
         print(f"agent-run: steered '{args.name}' ({sent} bytes, verified)")
         return 0
+    if outcome.detail == "unwitnessed" and outcome.delivered:
+        # A raw run has no harness session to witness against, so "written"
+        # is all the evidence this mode has ever offered. Not a failure.
+        print(f"agent-run: steered '{args.name}' ({sent} bytes, unwitnessed — raw run)")
+        return 0
     print(
         f"agent-run: steer to '{args.name}' could not be verified as delivered "
         f"({outcome.detail}, {outcome.attempts} attempt(s) via {outcome.transport})",
@@ -9578,10 +9629,32 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     submit_mode = _persist_submit_mode(
         d, argv, getattr(args, "submit_mode", None)
     )
+
+    def _fail_launch_after_starting(message: str) -> None:
+        """Resolve a run that has already published "starting" but has no
+        runner behind it to a terminal state, so it is never a phantom
+        active run."""
+        for fd in (r_ack, w_ack):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        _write(d / "exit_code", "1\n")
+        _write(d / "ended_at", _now_iso() + "\n")
+        _write(d / "status", "failed\n")
+        sys.exit(message)
+
     if opencode_port is not None:
-        # Read by the submission witness to reach opencode's own HTTP
-        # message endpoint instead of falling back to the transcript store.
-        _write(d / "opencode_port", f"{opencode_port}\n")
+        # The submission witness reads this to reach opencode's own HTTP
+        # message endpoint. Persist the port the harness will actually listen
+        # on: a caller's --harness-arg=--port overrides the managed one.
+        effective_port = _effective_argv_port(argv) or opencode_port
+        try:
+            _write(d / "opencode_port", f"{effective_port}\n")
+        except OSError as exc:
+            _fail_launch_after_starting(
+                f"agent-run: failed to record opencode port: {exc}"
+            )
 
     # Copy the launch facts into the persistent log dir so postmortem survives a
     # reboot that wipes the ephemeral /tmp state. Never a liveness signal.
@@ -9615,12 +9688,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         # "starting" is already published with no runner behind it: unlike
         # the fifo/pipe failures above, this must explicitly resolve to a
         # terminal state rather than leaving a phantom active run.
-        os.close(r_ack)
-        os.close(w_ack)
-        _write(d / "exit_code", "1\n")
-        _write(d / "ended_at", _now_iso() + "\n")
-        _write(d / "status", "failed\n")
-        sys.exit(f"agent-run: failed to start agent: {exc}")
+        _fail_launch_after_starting(f"agent-run: failed to start agent: {exc}")
     if child_pid != 0:
         # Parent: wait for the grandchild to publish its pid, then return.
         os.close(w_ack)
@@ -10986,6 +11054,12 @@ def _run_interactive(
                     # Marks delivery for `_finalize`; absence means the agent
                     # never actually received its task.
                     _write(state_dir / "prompt_submitted", _now_iso() + "\n")
+                elif outcome.detail == "unwitnessed" and outcome.delivered:
+                    # A raw interactive run has no harness session, so the
+                    # marker keeps the weaker meaning it always had for this
+                    # mode: the prompt bytes were written. Distinct from a
+                    # managed run whose witness failed, which stays unverified.
+                    _write(state_dir / "prompt_submitted", _now_iso() + "\n")
                 else:
                     _write(state_dir / "prompt_unverified", f"{outcome.detail}\n")
                     _log_write(
@@ -11734,33 +11808,52 @@ class _CodexAppServer:
             "input": [{"type": "text", "text": text}],
         }, rpc_id=rpc_id)
 
-    def turn_start_error(self, rpc_id: int, timeout_s: float = _TURN_START_ERROR_POLL_SECONDS) -> Optional[str]:
-        """Poll briefly for a turn/start response matching rpc_id, returning
-        its error message if the server rejected the turn, or None if it
-        succeeded, is still pending, or the process already exited.
+    def turn_start_result(
+        self, rpc_id: int, timeout_s: float = _TURN_START_ERROR_POLL_SECONDS
+    ) -> "tuple[str, Optional[str]]":
+        """Poll briefly for the turn/start response matching rpc_id.
+
+        Returns one of:
+        ``("accepted", None)``   the server answered with a result.
+        ``("rejected", msg)``    the server answered with an error.
+        ``("pending", None)``    no answer within timeout_s, or the process
+                                 exited / hit EOF first.
+
+        "pending" must not be read as acceptance: a rejection arriving after
+        this window would otherwise stamp a prompt as delivered that the
+        server went on to refuse.
 
         turn/start otherwise has no matcher for its response frame: nothing
         else notices a server-side rejection, so a lost turn looks identical
         to one that is merely slow. Every frame read here -- including the
-        matching one, on a success -- is requeued onto self._pending_frames
-        so the caller's own frame loop still processes it (e.g. to capture
-        the turn id from a successful result) on its next read_frames call;
-        nothing is dropped.
+        matching one -- is requeued onto self._pending_frames so the caller's
+        own frame loop still processes it (e.g. to capture the turn id from a
+        successful result) on its next read_frames call; nothing is dropped.
         """
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if self.proc is not None and self.proc.poll() is not None:
-                return None
+                return "pending", None
             frames, _, eof = self.read_frames(0.05)
             self._pending_frames.extend(frames)
             for msg in frames:
-                if msg.get("id") == rpc_id and "error" in msg:
-                    return str(msg["error"])
-            if any(msg.get("id") == rpc_id for msg in frames):
-                return None
+                if msg.get("id") != rpc_id:
+                    continue
+                if "error" in msg:
+                    return "rejected", str(msg["error"])
+                if "result" in msg:
+                    return "accepted", None
             if eof:
-                return None
-        return None
+                return "pending", None
+        return "pending", None
+
+    def turn_start_error(self, rpc_id: int, timeout_s: float = _TURN_START_ERROR_POLL_SECONDS) -> Optional[str]:
+        """The rejection message for a turn/start response matching rpc_id,
+        or None when it was accepted, is still pending, or the process
+        already exited. Callers that must distinguish acceptance from a
+        pending answer use turn_start_result instead."""
+        status, message = self.turn_start_result(rpc_id, timeout_s)
+        return message if status == "rejected" else None
 
     def steer_turn(self, text: str, expected_turn_id: str, rpc_id: Optional[int] = None) -> int:
         return self.call("turn/steer", {
@@ -11836,11 +11929,14 @@ def _run_managed_oneshot_codex_appserver(
     and the idle timeout observe incremental progress. session.json is written
     after thread/start, before the first model call.
 
-    prompt_submitted here is gated only by turn_start_error, not by the
-    transcript witness _submit_and_verify uses for the interactive codex
-    launch path: a one-shot run's single turn already blocks this function
-    until turn/completed, so the witness would add a redundant poll around
-    a call that is about to be awaited in full regardless.
+    prompt_submitted here is gated on the app-server's own turn/start ack
+    rather than the transcript witness _submit_and_verify uses for the
+    interactive codex launch path: a one-shot run's single turn already blocks
+    this function until turn/completed, so the witness would add a redundant
+    poll around a call that is about to be awaited in full regardless. The ack
+    must be positive -- a response that has not arrived yet is not acceptance,
+    and stamping on it would mark a prompt delivered that the server goes on
+    to reject.
     """
     server = _CodexAppServer(state_dir, log_dir, acquire_log, "codex app-server")
     if not server.start(harness_args, cwd, ready):
@@ -11856,13 +11952,19 @@ def _run_managed_oneshot_codex_appserver(
             return 1
 
         turn_rpc_id = server.start_turn(_managed_prompt_text(prompt, prompt_file))
-        # Fail fast on an immediate turn/start rejection.
-        early_error = server.turn_start_error(turn_rpc_id)
-        if early_error is not None:
+        turn_start_status, early_error = server.turn_start_result(turn_rpc_id)
+        if turn_start_status == "rejected":
             server.log(f"turn/start rejected immediately: {early_error}")
             return 1
-        # Prevent a later failure from being misclassified as launch_failed.
-        _write(state_dir / "prompt_submitted", "1\n")
+
+        def _stamp_prompt_submitted() -> None:
+            # Prevents a later failure from being misclassified as
+            # launch_failed. Written only once turn/start is acknowledged.
+            _write(state_dir / "prompt_submitted", _now_iso() + "\n")
+
+        prompt_stamped = turn_start_status == "accepted"
+        if prompt_stamped:
+            _stamp_prompt_submitted()
 
         turn_done = False
         deadline = time.monotonic() + 600  # hard cap for a one-shot turn
@@ -11882,6 +11984,11 @@ def _run_managed_oneshot_codex_appserver(
                     server.log(f"turn/start error: {msg['error']}")
                     turn_done = True
                     exit_code = 1
+                elif msg.get("id") == turn_rpc_id and "result" in msg and not prompt_stamped:
+                    # The ack that had not arrived within turn_start_result's
+                    # window; the prompt is delivered only now.
+                    prompt_stamped = True
+                    _stamp_prompt_submitted()
             # Drain before checking process exit, otherwise frames still buffered
             # in the pipe after the app-server exits are discarded.
             if eof or (not saw_lines and server.proc.poll() is not None):
@@ -11970,8 +12077,16 @@ def _run_managed_interactive_codex_appserver(
         # helper submits: the run is controllable as soon as the app-server
         # process exists, independent of whether its first turn ever lands.
         turn_rpc_id_holder: List[Optional[int]] = [None]
+        # rpc ids of initial-turn attempts a retry superseded. A late response
+        # for one of these names an abandoned turn: its turn id must not
+        # become active_turn_id, or the next steer would carry a stale
+        # expectedTurnId.
+        superseded_turn_rpc_ids: set = set()
 
         def _send_initial_turn(payload: bytes) -> None:
+            previous = turn_rpc_id_holder[0]
+            if previous is not None:
+                superseded_turn_rpc_ids.add(previous)
             rpc_id = server.start_turn(payload.decode("utf-8", errors="replace"))
             turn_rpc_id_holder[0] = rpc_id
             # Fail fast on an immediate turn/start rejection.
@@ -12049,6 +12164,14 @@ def _run_managed_interactive_codex_appserver(
                             exit_code = 0
                             had_completed_turn = True
                         _log_write(log_fd, b"\n")
+
+                    elif msg_id is not None and msg_id in superseded_turn_rpc_ids:
+                        # A late response for an initial-turn attempt a retry
+                        # abandoned. Its turn id names a turn nothing is
+                        # tracking, so adopting it would misattribute every
+                        # later steer.
+                        superseded_turn_rpc_ids.discard(msg_id)
+                        server.log(f"discarding response for superseded turn/start id={msg_id}")
 
                     elif "error" in msg and msg_id is not None:
                         server.log(f"rpc error id={msg_id} error={msg['error']!r}")

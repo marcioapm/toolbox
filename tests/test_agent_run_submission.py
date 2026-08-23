@@ -194,6 +194,59 @@ def test_steer_unverified_exits_nonzero_and_writes_no_marker(
         os.close(reader)
 
 
+def test_raw_interactive_launch_still_stamps_prompt_submitted(
+    isolated_runs_root, isolated_log_root, tmp_path
+):
+    """A raw interactive run (`agent-run -i -f prompt.txt name -- <cmd>`) has
+    no session.json and so no witness. Verification must not turn a
+    documented mode into one whose prompt is never marked delivered: the
+    marker keeps its original "bytes written" meaning here."""
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("hello from a raw run\n")
+    name = "raw-prompt-marker"
+    args = argparse.Namespace(
+        name=name,
+        command=[sys.executable, "-c", "import sys; sys.stdin.read(1); import time; time.sleep(30)"],
+        interactive=True,
+        prompt_file=str(prompt),
+    )
+
+    assert agent_run.cmd_launch(args) == 0
+
+    state = isolated_runs_root / name
+    try:
+        assert not (isolated_log_root / name / "session.json").exists()
+        assert _wait_until(lambda: (state / "prompt_submitted").exists(), timeout=20.0), (
+            "a raw run's prompt must still be marked submitted"
+        )
+        assert not (state / "prompt_unverified").exists()
+    finally:
+        pid_path = state / "pid"
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+
+
+def test_steer_on_a_raw_run_reports_unwitnessed_and_exits_zero(
+    isolated_runs_root, monkeypatch
+):
+    """A raw run has never had a verifiable steer; verification must not
+    start failing one."""
+    _fifo, reader = _seed_live_interactive_run(
+        isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
+    )
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
+    try:
+        rc = agent_run.cmd_steer(_steer_args("run"))
+        assert rc == 0
+        assert os.read(reader, 4096) == b"hello\r"
+    finally:
+        os.close(reader)
+
+
 def test_unexpected_interactive_select_error_marks_run_failed(
     isolated_runs_root, monkeypatch
 ):
@@ -802,6 +855,39 @@ def test_resolve_witness_source_is_none_for_an_unmanaged_run(tmp_path):
     assert agent_run._resolve_witness_source(tmp_path, None) is None
 
 
+def test_unmanaged_run_reports_unwitnessed_after_one_delivered_write(tmp_path, monkeypatch):
+    """A raw run has no harness session, so there is nothing to verify. That
+    is not a verification failure: report the write and do not retry."""
+    submissions = _no_transport_side_effects(monkeypatch)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=5.0, max_attempts=3,
+    )
+
+    assert outcome.verified is False
+    assert outcome.detail == "unwitnessed"
+    assert outcome.delivered is True
+    assert len(submissions) == 1
+
+
+def test_managed_run_with_a_failing_witness_is_not_reported_as_unwitnessed(
+    tmp_path, monkeypatch
+):
+    """A managed run whose witness cannot be read must stay unverified and
+    must not borrow the raw-run exemption."""
+    _no_transport_side_effects(monkeypatch)
+    _witness_unreadable(monkeypatch)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.05, max_attempts=2,
+    )
+
+    assert outcome.verified is False
+    assert outcome.detail == "witness_unreadable"
+
+
 # ---------------------------------------------------------------------------
 # Retry safety: attempt scoping, transport errors, keystroke framing
 # ---------------------------------------------------------------------------
@@ -1357,3 +1443,104 @@ def test_launch_persists_opencode_port_file(isolated_runs_root, isolated_log_roo
                 os.kill(int(pid_path.read_text()), signal.SIGTERM)
             except (ProcessLookupError, ValueError):
                 pass
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["opencode", "--port", "47001"], 47001),
+        (["opencode", "--port=47001"], 47001),
+        # harness_args are appended after the managed --port, so a caller's
+        # override is what opencode actually binds: last one wins.
+        (["opencode", "--port", "47001", "--port", "48002"], 48002),
+        (["opencode", "--port", "47001", "--port=48002"], 48002),
+        (["opencode", "--session", "ses_1"], None),
+        (["opencode", "--port"], None),  # value missing entirely
+        (["opencode", "--port", "not-a-number"], None),
+    ],
+)
+def test_effective_argv_port_takes_the_last_port_flag(argv, expected):
+    assert agent_run._effective_argv_port(argv) == expected
+
+
+def test_launch_persists_the_effective_port_under_a_harness_arg_override(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    """--harness-arg=--port makes opencode listen elsewhere; persisting the
+    managed port would point the witness at a server nothing is running on."""
+    monkeypatch.setattr(agent_run, "_find_free_port", lambda: 47001)
+    monkeypatch.setattr(
+        agent_run, "_opencode_prefork_mint",
+        lambda *a, **k: "ses_override",
+    )
+    fake_dir = isolated_runs_root.parent / "bin"
+    fake_dir.mkdir(exist_ok=True)
+    fake = fake_dir / "opencode"
+    fake.write_text("#!/bin/sh\nsleep 30\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+
+    name = "oc-port-override"
+    ns = argparse.Namespace(
+        name=name, command=[], interactive=True, prompt_file=None,
+        submit_mode=None, idle_timeout=None,
+        harness="opencode", prompt=None, model=None, agent_mode=None,
+        harness_args=["--port", "48002"], permissions="bypass",
+    )
+    rc = agent_run.cmd_launch(ns)
+    assert rc == 0
+    state = isolated_runs_root / name
+    try:
+        assert _wait_until(lambda: (state / "opencode_port").exists())
+        assert (state / "opencode_port").read_text().strip() == "48002"
+    finally:
+        pid_path = state / "pid"
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+
+
+def test_launch_resolves_to_failed_when_the_port_file_cannot_be_written(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    """The opencode_port write happens after status=starting but before the
+    fork, so a failure there must reach the same terminal-state cleanup a
+    fork failure does rather than stranding the run in starting."""
+    monkeypatch.setattr(agent_run, "_find_free_port", lambda: 47001)
+    monkeypatch.setattr(
+        agent_run, "_opencode_prefork_mint",
+        lambda *a, **k: "ses_enospc",
+    )
+    fake_dir = isolated_runs_root.parent / "bin"
+    fake_dir.mkdir(exist_ok=True)
+    fake = fake_dir / "opencode"
+    fake.write_text("#!/bin/sh\nsleep 30\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+
+    name = "oc-port-enospc"
+    real_write = agent_run._write
+
+    def fail_port_write(path, text):
+        if path.name == "opencode_port":
+            raise OSError(errno.ENOSPC, "no space left on device")
+        return real_write(path, text)
+
+    monkeypatch.setattr(agent_run, "_write", fail_port_write)
+
+    ns = argparse.Namespace(
+        name=name, command=[], interactive=True, prompt_file=None,
+        submit_mode=None, idle_timeout=None,
+        harness="opencode", prompt=None, model=None, agent_mode=None,
+        harness_args=[], permissions="bypass",
+    )
+    with pytest.raises(SystemExit, match="failed to record opencode port"):
+        agent_run.cmd_launch(ns)
+
+    state = isolated_runs_root / name
+    assert (state / "status").read_text().strip() == "failed"
+    assert (state / "exit_code").read_text().strip() == "1"
+    assert (state / "ended_at").is_file()
+    assert not (state / "pid").exists()
