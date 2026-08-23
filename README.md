@@ -978,9 +978,13 @@ transcript store), not merely by a successful FIFO/HTTP write. `steer`
 prints `verified` and exits 0 only once the record count has risen above
 its pre-submit baseline; a submission that cannot be verified within
 `SUBMISSION_VERIFY_TIMEOUT_SECONDS` (default 10s) is retried once
-(`SUBMISSION_MAX_ATTEMPTS`, default 2) and, if still unverified, `steer`
-exits 1 with the reason on stderr and a launch prompt writes
-`state_dir/prompt_unverified` instead of stamping `prompt_submitted`.
+(`SUBMISSION_MAX_ATTEMPTS`, default 2) when the witness was readable but
+stayed flat -- proof the prompt did not land. A witness that never became
+readable through the whole attempt is left at a single submission: it
+carries no evidence the prompt failed to land, so a retry could only
+duplicate it (messageID is not idempotent). Either way an unverified
+submission has `steer` exit 1 with the reason on stderr and a launch prompt
+write `state_dir/prompt_unverified` instead of stamping `prompt_submitted`.
 Override the timeout/attempt count with `AGENT_RUN_SUBMIT_VERIFY_TIMEOUT`
 and `AGENT_RUN_SUBMIT_ATTEMPTS`; `--raw` steer skips verification entirely
 (arbitrary bytes leave nothing in the transcript to witness). `opencode_port`

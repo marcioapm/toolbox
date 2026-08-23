@@ -121,10 +121,11 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
                  reached the agent (transcript record count rose above its
                  pre-submit baseline) -- NOT written merely because the bytes
                  were handed to the FIFO/HTTP transport; see prompt_unverified
-    prompt_unverified  written instead of prompt_submitted when every
-                 submission attempt exhausted SUBMISSION_MAX_ATTEMPTS without
-                 the transcript witness confirming delivery; one line naming
-                 the reason (see _submit_and_verify)
+    prompt_unverified  written instead of prompt_submitted when submission
+                 attempts were exhausted (a readable, flat witness retries up
+                 to SUBMISSION_MAX_ATTEMPTS) or stopped after one submission
+                 (a witness that stayed unreadable the whole attempt); one
+                 line naming the reason (see _submit_and_verify)
     opencode_port  TCP port of a managed interactive opencode run's HTTP API,
                  used by the submission witness to query
                  /session/<id>/message directly instead of the transcript
@@ -4517,6 +4518,13 @@ def _submit_and_verify(
     """Submit *text* and confirm it reached the agent via the transcript
     witness, resubmitting up to max_attempts times on a verified timeout.
 
+    A witness that stays unreadable for an entire attempt stops the loop at
+    one submission regardless of max_attempts: an unreadable store carries
+    no evidence the submission failed, so retrying cannot add information
+    and risks a real duplicate prompt (messageID is not idempotent). Only a
+    witness that is readable but flat -- proof the record count truly did
+    not rise -- earns a retry.
+
     Never raises: an unreadable witness, a transport failure, or exhausted
     attempts all surface as SubmissionOutcome.verified=False with a reason in
     .detail -- a verification bug must not kill an otherwise working run.
@@ -4578,6 +4586,12 @@ def _submit_and_verify(
             return SubmissionOutcome(True, attempts, transport, None)
 
         detail = "timeout" if ever_readable else "witness_unreadable"
+
+        # No evidence to justify a resend: the witness never proved readable
+        # this attempt, so a second submission could only duplicate the
+        # prompt, never confirm or refute the first one.
+        if not ever_readable:
+            break
 
     return SubmissionOutcome(False, attempts, transport, detail)
 
