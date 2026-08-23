@@ -9264,10 +9264,12 @@ def cmd_launch(args: argparse.Namespace) -> int:
         # acknowledgement it marks args._worktree_launch_published, and from
         # that point on a live runner owns the worktree: rollback must never
         # run, no matter what fails afterward (pid parsing, the print calls).
-        # If an interruption before that point left the runner's termination
-        # unconfirmed, args._worktree_rollback_unsafe is set instead: the
-        # runner might still be alive with no proof either way, so rollback
-        # is refused there too.
+        # Two earlier states are also refused: args._worktree_rollback_unsafe
+        # (an interruption before readiness left the runner's termination
+        # unconfirmed) and args._worktree_ack_uncertain (an interruption
+        # after the readiness ack was read but before it could be classified
+        # as success or failure) both mean the runner's true state cannot be
+        # proven, so rollback is refused in both cases too.
         try:
             with _launch_lock(name) as lock_fd:
                 rc = _cmd_launch_locked(args, name, lock_fd)
@@ -9279,6 +9281,14 @@ def cmd_launch(args: argparse.Namespace) -> int:
                     f"agent-run: warning: could not confirm the runner for '{name}' "
                     f"is terminated; leaving worktree {created.path} in place "
                     f"(possible orphaned launch, inspect and clean up manually)",
+                    file=sys.stderr,
+                )
+                raise
+            if getattr(args, "_worktree_ack_uncertain", False):
+                print(
+                    f"agent-run: warning: interrupted while classifying the runner "
+                    f"readiness ack for '{name}'; leaving worktree {created.path} "
+                    f"in place (possible orphaned launch, inspect and clean up manually)",
                     file=sys.stderr,
                 )
                 raise
@@ -9624,6 +9634,17 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             # explicit setup error all mean launch failed.
             try:
                 ack_raw = os.read(r_ack, 65536)
+                if ack_raw:
+                    # The runner wrote *something* to the pipe: it reached
+                    # _ready() or its own error handler, either of which
+                    # means status=running is already on disk and the
+                    # runner may already own the worktree. Whether the ack
+                    # is success or failure is not yet known -- decoding
+                    # and classifying it happens below, outside any
+                    # exception guard -- so this is marked provisionally
+                    # unsafe to roll back until that classification
+                    # completes one way or the other.
+                    args._worktree_ack_uncertain = True
             except OSError:
                 ack_raw = b""
         except BaseException:
@@ -9650,6 +9671,12 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         except (UnicodeDecodeError, json.JSONDecodeError):
             ack = {}
         if ack.get("status") != "ok":
+            # Classified as a genuine failure, not an interrupted read: the
+            # runner reported its own setup error before ever reaching
+            # _ready(), so nothing owns the worktree and normal rollback
+            # must proceed rather than being blocked by the provisional
+            # mark above.
+            args._worktree_ack_uncertain = False
             error = str(ack.get("error") or "runner exited before readiness")
             if not (d / "exit_code").exists():
                 _write(d / "exit_code", "1\n")

@@ -4676,6 +4676,99 @@ class TestLaunchCreatesWorktree:
         assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
         assert name in _git(repo, "branch", "--list", name)
 
+    def test_failed_readiness_ack_still_rolls_back(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
+    ):
+        """A runner that reaches its own error handler and sends
+        {"status": "error"} over the ack pipe never became live -- the
+        worktree and branch this invocation created must still be rolled
+        back. This is the test that keeps the ack-uncertain classification
+        honest: the provisional "possibly published" mark set right after
+        the pipe read must be cleared once the ack decodes as a failure,
+        not left standing in the caller's way."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-failed-ack"
+        name = "failed-ack-run"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+        )
+
+        def _run_oneshot_raises(*_a, **_k):
+            raise RuntimeError("simulated setup failure")
+
+        monkeypatch.setattr(agent_run, "_run_oneshot", _run_oneshot_raises)
+
+        with pytest.raises(SystemExit, match="simulated setup failure"):
+            agent_run.cmd_launch(args)
+
+        assert not wt_dir.exists()
+        assert name not in _git(repo, "branch", "--list", name)
+
+    def test_interrupt_during_ack_classification_refuses_rollback(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """H3: an interruption that lands after os.read() successfully
+        returns the ack bytes but before json.loads/the status check
+        classifies them must not be treated as an unpublished launch. The
+        runner may already be live (it sent a successful ack), so rollback
+        must be refused rather than deleting a live runner's worktree."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-interrupt-during-classify"
+        name = "interrupt-during-classify"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+        )
+
+        real_loads = agent_run.json.loads
+
+        def _loads_raises_once(*a, **kw):
+            agent_run.json.loads = real_loads
+            raise KeyboardInterrupt("interrupted during ack classification")
+
+        # os.read is used for many things during worktree/state setup
+        # before the ack pipe read (git subprocess output capture, etc.),
+        # so the trap on json.loads is armed only once os.waitpid has
+        # reaped the exact intermediate forker pid this launch's own
+        # fork() produced -- the ack pipe read is the parent's next step
+        # right after that reap.
+        real_fork = os.fork
+        real_waitpid = os.waitpid
+        main_pid = os.getpid()
+        state = {"child_pid": None, "reaped": False}
+
+        def _fork_recording():
+            pid = real_fork()
+            if pid != 0 and state["child_pid"] is None:
+                state["child_pid"] = pid
+            return pid
+
+        def _waitpid_then_arm(pid, options):
+            result = real_waitpid(pid, options)
+            if (
+                os.getpid() == main_pid
+                and pid == state["child_pid"]
+                and not state["reaped"]
+            ):
+                state["reaped"] = True
+                agent_run.json.loads = _loads_raises_once
+            return result
+
+        monkeypatch.setattr(os, "fork", _fork_recording)
+        monkeypatch.setattr(os, "waitpid", _waitpid_then_arm)
+
+        try:
+            with pytest.raises(KeyboardInterrupt, match="interrupted during ack classification"):
+                agent_run.cmd_launch(args)
+        finally:
+            agent_run.json.loads = real_loads
+            state_dir = isolated_runs_root / name
+            _wait_terminal(state_dir)
+
+        assert wt_dir.is_dir()
+        assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+        assert name in _git(repo, "branch", "--list", name)
+        assert "ack" in capsys.readouterr().err
+
     def test_interrupt_before_readiness_terminates_runner_before_rollback(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
     ):
