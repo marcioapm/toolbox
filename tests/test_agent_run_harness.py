@@ -3038,8 +3038,9 @@ class TestPreforkMintCleanupNotScopedToCallerException:
 
 class TestPreforkMintPostKillWaitInterrupt:
     """A KeyboardInterrupt/SystemExit at the post-kill wait -- the operator
-    asking again after the first wait already failed -- must be observable,
-    not silently discarded like an ordinary reap failure."""
+    asking again after the first wait already failed -- takes priority and
+    propagates as the outer exception, rather than being discarded like an
+    ordinary reap failure or demoted to __cause__."""
 
     def test_post_kill_wait_keyboard_interrupt_is_observable_and_mark_stays_set(
         self, tmp_path, monkeypatch
@@ -3076,15 +3077,63 @@ class TestPreforkMintPostKillWaitInterrupt:
 
         launch_args = argparse.Namespace(_worktree_process_started=False)
 
-        with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        with pytest.raises(KeyboardInterrupt) as exc_info:
             agent_run._opencode_prefork_mint(
                 12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
                 launch_args=launch_args,
             )
 
-        assert exc_info.value.__cause__ is interrupt, (
-            "the post-kill wait's KeyboardInterrupt must remain reachable "
-            "via __cause__, not be swallowed by a bare except-pass"
+        assert exc_info.value is interrupt, (
+            "the post-kill wait's KeyboardInterrupt must propagate as the outer "
+            "exception so `except KeyboardInterrupt` observes it"
+        )
+        assert isinstance(exc_info.value.__cause__, subprocess.TimeoutExpired), (
+            "the first wait's failure stays reachable as __cause__"
+        )
+        assert launch_args._worktree_process_started is True
+
+    def test_post_kill_wait_system_exit_propagates_with_its_code(
+        self, tmp_path, monkeypatch
+    ):
+        exit_request = SystemExit(37)
+
+        class _FakeProc:
+            pid = 4343
+            returncode = None
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="opencode", timeout=timeout)
+                raise exit_request
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: _FakeProc())
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", lambda *a, **k: True)
+        monkeypatch.setattr(
+            agent_run, "_opencode_mint_session", lambda *a, **k: "sess-normal-return"
+        )
+
+        launch_args = argparse.Namespace(_worktree_process_started=False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run._opencode_prefork_mint(
+                12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+                launch_args=launch_args,
+            )
+
+        assert exc_info.value is exit_request
+        assert exc_info.value.code == 37, (
+            "a SystemExit at the post-kill wait must keep its exit code rather "
+            "than being demoted to __cause__ of an ordinary reap failure"
         )
         assert launch_args._worktree_process_started is True
 

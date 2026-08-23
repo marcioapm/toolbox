@@ -11382,13 +11382,18 @@ def _opencode_prefork_mint(
     except BaseException as body_exc:
         _restore_handlers()
         _mint_proc_ref[0] = None
-        # The mint body's own failure is the caller's real cause: it always
-        # wins over a cleanup failure below, which is chained on as
-        # __cause__ so it stays inspectable rather than being discarded.
+        # The mint body's own failure is the caller's real cause and wins
+        # over a cleanup failure. A cleanup failure is chained on as
+        # __cause__ only when the body exception has none of its own: an
+        # explicit cause the body raised is real causal information and must
+        # not be displaced, so it is recorded as a note instead.
         try:
             _mint_terminate_and_reap(proc, timeout=5.0)
         except BaseException as cleanup_exc:
-            raise body_exc from cleanup_exc
+            if body_exc.__cause__ is None:
+                raise body_exc from cleanup_exc
+            _add_exception_note(body_exc, f"mint cleanup also failed: {cleanup_exc!r}")
+            raise
         raise
     else:
         _restore_handlers()
@@ -11400,16 +11405,31 @@ def _opencode_prefork_mint(
         return result
 
 
+def _add_exception_note(exc: BaseException, note: str) -> None:
+    """Attach a diagnostic note to ``exc`` where the runtime supports it.
+
+    ``BaseException.add_note`` is 3.11+; on older runtimes the note is
+    dropped rather than raising, since it is diagnostic only.
+    """
+    add_note = getattr(exc, "add_note", None)
+    if add_note is not None:
+        try:
+            add_note(note)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _mint_terminate_and_reap(proc: subprocess.Popen, timeout: float) -> None:
     """Terminate a mint child and block until it exits, escalating to
     SIGKILL if it is still alive after ``timeout``.
 
     A failure at the first wait -- timeout, OS error, or interrupt --
     triggers the SIGKILL escalation and, absent a fresh failure at the
-    second wait, is what this function re-raises. If the second, post-kill
-    wait itself raises KeyboardInterrupt or SystemExit, that interrupt is
-    not discarded: it is chained as the cause of the re-raised first
-    failure so it stays reachable via ``__cause__``. Ordinary reap failures
+    second wait, is what this function re-raises. A KeyboardInterrupt or
+    SystemExit at the second, post-kill wait is the operator asking again
+    and takes priority: it propagates as the outer exception so ``except
+    KeyboardInterrupt`` observes it and ``SystemExit`` keeps its code, with
+    the first failure chained on as ``__cause__``. Ordinary reap failures
     at the second wait (``TimeoutExpired``, ``OSError``, ``ValueError``)
     are suppressed -- kill() was already attempted; nothing further to do.
     """
@@ -11429,8 +11449,8 @@ def _mint_terminate_and_reap(proc: subprocess.Popen, timeout: float) -> None:
                 proc.wait(timeout=timeout)
             except (subprocess.TimeoutExpired, OSError, ValueError):
                 pass
-            except BaseException as second_exc:
-                raise first_exc from second_exc
+            except (KeyboardInterrupt, SystemExit) as second_exc:
+                raise second_exc from first_exc
         raise first_exc
 
 
