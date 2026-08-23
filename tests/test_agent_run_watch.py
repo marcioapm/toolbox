@@ -3655,3 +3655,62 @@ class TestTranscriptFacts:
             assert t["available"] is False
             assert t["entries"] is None
             assert t["error"] == "store_unreadable"
+
+    def test_every_unavailable_path_never_yields_entries_zero(self, tmp_path, monkeypatch):
+        """A failed read must never be mistaken for an observed empty
+        transcript: `entries` stays None on every unavailable path."""
+        cases = [
+            agent_run._watch_transcript_facts(None, None),
+            agent_run._watch_transcript_facts({"session_id": None, "harness": "opencode"}, None),
+            agent_run._watch_transcript_facts(
+                {"session_id": "ses_1", "harness": "no-such-harness"}, None
+            ),
+        ]
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", tmp_path / "absent.db")
+        cases.append(
+            agent_run._watch_transcript_facts({"session_id": "ses_1", "harness": "opencode"}, None)
+        )
+
+        for result in cases:
+            assert result["available"] is False
+            assert result["entries"] is None, (
+                f"unavailable transcript facts must carry entries=None, got {result!r}"
+            )
+
+    def test_malformed_return_tuple_degrades_transcript_without_wiping_other_facts(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """A counter returning a wrong-shape tuple, e.g. (0, object()), must not
+        raise past the whole-block exception guard in `_watch_transcript_facts`:
+        the resulting TypeError degrades only the transcript block."""
+        sd, ld = _make_run(
+            isolated_runs_root,
+            isolated_log_root,
+            "tr5m",
+            status="running",
+            pid=111,
+            log_age_secs=1,
+        )
+        agent_run._write_session_json(
+            ld,
+            {
+                "session_id": "ses_y",
+                "harness": "opencode",
+                "acquisition": "minted",
+                "confidence": "certain",
+            },
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(transcript, "count_transcript", lambda *_a, **_kw: (0, object()))
+
+        agent_run.cmd_watch(_watch_args("tr5m"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert payload["observation_error"] is None
+        assert payload["log"] is not None
+        assert payload["git"] is not None or payload["git_error"] is not None
+        assert payload["scratch"] is not None
+        t = payload["transcript"]
+        assert t["available"] is False
+        assert t["entries"] is None
+        assert t["error"] == "store_unreadable"
