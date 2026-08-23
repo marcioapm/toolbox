@@ -4528,23 +4528,26 @@ def _submit_and_verify(
     endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
     transport = "http" if endpoint is not None else "keystroke"
     baseline = _submission_witness_count(state_dir, log_dir)
-
-    if baseline is None:
-        # Nothing to compare a post-submit count against. Still deliver the
-        # text once (best effort — the agent may well receive it), but there
-        # is no basis to claim verification or to justify a blind retry.
-        try:
-            if transport == "http":
-                port, session_id = endpoint
-                _submit_via_http(port, session_id, text.decode("utf-8", errors="replace"))
-            else:
-                _submit_via_keystroke(state_dir, text, submit_mode)
-        except OSError:
-            pass
-        return SubmissionOutcome(False, 1, transport, "witness_unreadable")
+    # A None baseline is genuinely common, not exceptional: claude's session
+    # transcript file does not exist until claude finishes its own startup
+    # (trust check, config load), which routinely lands a few hundred
+    # milliseconds after this helper's pre-write delay elapses -- measured
+    # live, the file appears at ~4.2-4.3s against a 4.0s delay. Giving up
+    # immediately here would fail verification on nearly every real launch.
+    # Instead of comparing against a magnitude that was never established,
+    # treat any witness read that is readable and nonzero as delivery proof:
+    # sound because state_dir's session id is always freshly minted, so a
+    # store that could not be read before submission cannot hold unrelated
+    # pre-existing records once it becomes readable.
+    ever_readable = baseline is not None
 
     def _witness_rose() -> bool:
+        nonlocal ever_readable
         current = _submission_witness_count(state_dir, log_dir)
+        if current is not None:
+            ever_readable = True
+        if baseline is None:
+            return current is not None and current > 0
         return current is not None and current > baseline
 
     detail: Optional[str] = None
@@ -4574,7 +4577,7 @@ def _submit_and_verify(
         if _witness_rose():
             return SubmissionOutcome(True, attempts, transport, None)
 
-        detail = "timeout"
+        detail = "timeout" if ever_readable else "witness_unreadable"
 
     return SubmissionOutcome(False, attempts, transport, detail)
 

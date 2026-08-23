@@ -193,18 +193,20 @@ def test_steer_unverified_exits_nonzero_and_writes_no_marker(
     isolated_runs_root, monkeypatch
 ):
     """The bug this feature closes: a steer that never lands must not report
-    success. With no witness (unreadable session/transcript), verification
-    can never succeed, exactly one submission is attempted, and the CLI
-    reports failure."""
+    success. A permanently unreadable witness retries up to max_attempts
+    (since None is indistinguishable from "not yet readable" until the
+    deadline elapses) and the CLI reports failure once attempts are
+    exhausted."""
     _fifo, reader = _seed_live_interactive_run(
         isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
     )
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
     monkeypatch.setattr(agent_run, "_submission_witness_count", lambda *_a: None)
+    monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "0.05")
     try:
         assert agent_run.cmd_steer(_steer_args("run")) == 1
-        assert os.read(reader, 4096) == b"hello\r"
+        assert os.read(reader, 4096) == b"hello\rhello\r"
     finally:
         os.close(reader)
 
@@ -615,9 +617,14 @@ def test_submit_and_verify_witness_unreadable_never_crashes(tmp_path, monkeypatc
 
     assert outcome.verified is False
     assert outcome.detail == "witness_unreadable"
-    # No basis for verification means no basis for a blind retry either.
-    assert outcome.attempts == 1
-    assert len(submissions) == 1
+    # A witness that never becomes readable is indistinguishable, at baseline
+    # time, from one that will become readable a moment later (the exact
+    # race real claude launches hit -- the session file is not created until
+    # claude finishes its own startup). Retrying is correct: a persistently
+    # broken store still exhausts every attempt, it just does so via retries
+    # rather than a single early give-up.
+    assert outcome.attempts == 2
+    assert len(submissions) == 2
 
 
 @pytest.mark.parametrize(
