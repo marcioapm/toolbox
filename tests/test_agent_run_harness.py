@@ -2761,6 +2761,60 @@ class TestPreforkMintEnvDelivery:
         )
 
 
+class TestPreforkMintCleanupPreservesCausalException:
+    """When the mint body is already unwinding with exception A and the
+    finally block's terminate()/wait() raises a different exception B, the
+    caller must see A -- not B -- so the launch failure's real cause is
+    never hidden by an unrelated cleanup failure."""
+
+    def test_original_exception_identity_and_traceback_survive_cleanup_failure(
+        self, tmp_path, monkeypatch
+    ):
+        class _FakeProc:
+            pid = 4242
+            returncode = None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                raise KeyError("cleanup wait failure")
+
+            def kill(self):
+                pass
+
+        def _fake_popen(cmd, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+
+        raised_in_body: list[BaseException] = []
+
+        def _health_poll_raises(*_a, **_k):
+            exc = ValueError("mint body failure")
+            raised_in_body.append(exc)
+            raise exc
+
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", _health_poll_raises)
+
+        with pytest.raises(ValueError) as exc_info:
+            agent_run._opencode_prefork_mint(
+                12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+            )
+
+        raised = exc_info.value
+        assert raised is raised_in_body[0], (
+            "the caller must see the exact exception object raised in the "
+            "mint body, not an equal-looking copy or the cleanup failure"
+        )
+        assert raised.__traceback__ is not None
+        frame_names = {f.name for f in exc_info.traceback}
+        assert "_health_poll_raises" in frame_names, (
+            "the propagated exception's traceback must still include the "
+            "frame where it was originally raised"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Teardown tests: no app-server process must survive kill or signal
 # ---------------------------------------------------------------------------

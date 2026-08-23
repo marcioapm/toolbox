@@ -11359,6 +11359,12 @@ def _opencode_prefork_mint(
     finally:
         _restore_handlers()
         _mint_proc_ref[0] = None
+        # Health polling or minting can already be unwinding with exception
+        # A when terminate()/wait() below raises B; a bare `raise` would
+        # propagate B and leave A reachable only via __context__. Capture A
+        # up front so a cleanup failure re-raises the causal exception
+        # itself, not whatever cleanup happened to fail with.
+        active_exc = sys.exc_info()[1]
         try:
             proc.terminate()
             proc.wait(timeout=5.0)
@@ -11367,6 +11373,8 @@ def _opencode_prefork_mint(
                 proc.kill()
             except BaseException:
                 pass
+            if active_exc is not None:
+                raise active_exc
             raise
 
 
