@@ -105,6 +105,11 @@ class TestParseLaunchArgvHarness:
         r = _parse(["--harness", "claude", "--model=claude-haiku-4-5", "--prompt", "hi", "myrun"])
         assert r.model == "claude-haiku-4-5"
 
+    def test_model_flag_accepted_for_codex(self):
+        r = _parse(["--harness", "codex", "--model", "o4-mini", "--prompt", "hi", "myrun"])
+        assert r.harness == "codex"
+        assert r.model == "o4-mini"
+
     def test_agent_mode_flag(self):
         r = _parse(["--harness", "opencode", "--agent-mode", "build", "--prompt", "hi", "myrun"])
         assert r.agent_mode == "build"
@@ -1184,6 +1189,7 @@ class TestManagedCodexOneShotAppServer:
         *,
         thread_id: str = "test-thread-uuid-0001",
         appserver_works: bool = True,
+        params_out: Optional[Path] = None,
     ) -> str:
         """Write a fake `codex` Python script that handles app-server JSON-RPC.
 
@@ -1192,12 +1198,18 @@ class TestManagedCodexOneShotAppServer:
         item/agentMessage/delta events → turn/completed.
 
         When app-server fails (appserver_works=False), exits immediately.
+        When params_out is set, the received thread/start params are written
+        to that path as JSON before the fake responds.
         """
         fake_dir = tmp_path / "bin"
         fake_dir.mkdir(parents=True, exist_ok=True)
         fake = fake_dir / "codex"
 
         if appserver_works:
+            params_dump = (
+                f"open({str(params_out)!r}, 'w').write(json.dumps(msg['params']))\n"
+                if params_out is not None else ""
+            )
             # Full JSON-RPC app-server implemented in Python for reliability.
             fake.write_text(
                 "#!/usr/bin/env python3\n"
@@ -1234,6 +1246,7 @@ class TestManagedCodexOneShotAppServer:
                 "msg = recv()\n"
                 "if not msg or msg.get('method') != 'thread/start':\n"
                 "    sys.exit(1)\n"
+                f"{params_dump}"
                 "send({'id': msg['id'], 'result': {'thread': {\n"
                 "    'id': THREAD_ID, 'sessionId': THREAD_ID,\n"
                 "    'path': f'~/.codex/sessions/rollout-{THREAD_ID}.jsonl',\n"
@@ -1327,6 +1340,26 @@ class TestManagedCodexOneShotAppServer:
         assert (isolated_log_root / name / "session.json").exists()
         assert not (isolated_runs_root / name / "session.json").exists()
 
+    def test_codex_oneshot_model_reaches_thread_start(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """--model on a one-shot codex launch lands in thread/start's params."""
+        params_file = tmp_path / "thread_start_params.json"
+        bin_dir = self._make_fake_codex_suite(
+            tmp_path, thread_id="oneshot-tid", params_out=params_file
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "codex-oneshot-model"
+        _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="codex",
+            interactive=False,
+            prompt="hi",
+            model="gpt-5.6-luna",
+        )
+        params = json.loads(params_file.read_text())
+        assert params["model"] == "gpt-5.6-luna"
+
     def test_codex_log_contains_readable_output_not_jsonl(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
@@ -1358,6 +1391,194 @@ class TestManagedCodexOneShotAppServer:
         )
 
 
+class TestMintThreadModelParam:
+    """Unit tests for _CodexAppServer.mint_thread's model parameter."""
+
+    def _make_fake_codex_capture(self, tmp_path: Path) -> tuple[str, Path]:
+        """Fake app-server that dumps thread/start's params to a file, then mints."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        params_file = tmp_path / "thread_start_params.json"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()  # initialized\n"
+            "msg = recv()\n"
+            f"open({str(params_file)!r}, 'w').write(json.dumps(msg['params']))\n"
+            "send({'id': msg['id'], 'result': {'thread': {"
+            "'id': 'tid', 'sessionId': 'tid', 'path': 'r.jsonl'}}})\n"
+        )
+        fake.chmod(0o755)
+        return str(fake_dir), params_file
+
+    def _mint(self, tmp_path: Path, monkeypatch, *, model: Optional[str]) -> dict:
+        bin_dir, params_file = self._make_fake_codex_capture(tmp_path)
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        state_dir = tmp_path / "state"
+        log_dir = tmp_path / "log"
+        state_dir.mkdir()
+        log_dir.mkdir()
+        server = agent_run._CodexAppServer(state_dir, log_dir, log_dir / "acquire.log", "test")
+        assert server.start([], str(tmp_path), lambda: None)
+        try:
+            thread_id = server.mint_thread(str(tmp_path), model=model)
+        finally:
+            server.close()
+        assert thread_id == "tid"
+        return json.loads(params_file.read_text())
+
+    def test_mint_thread_includes_model_when_given(self, tmp_path, monkeypatch):
+        params = self._mint(tmp_path, monkeypatch, model="gpt-5.6-luna")
+        assert params["model"] == "gpt-5.6-luna"
+
+    def test_mint_thread_omits_model_key_when_not_given(self, tmp_path, monkeypatch):
+        """Regression guard: the default path must not send model:null."""
+        params = self._mint(tmp_path, monkeypatch, model=None)
+        assert "model" not in params
+
+    def test_mint_thread_error_fails_fast_with_diagnostic(self, tmp_path, monkeypatch):
+        """A thread/start error must return promptly, not wait out the full timeout,
+        and session.json's reason must carry the concrete JSON-RPC error text."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()  # initialized\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'error': {'code': -32602, "
+            "'message': 'unknown model: gpt-nonexistent'}})\n"
+            "# Stay alive: the app-server does not exit merely because a request\n"
+            "# it rejected, so mint_thread must not rely on EOF or process exit.\n"
+            "time.sleep(30)\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        state_dir = tmp_path / "state"
+        log_dir = tmp_path / "log"
+        state_dir.mkdir()
+        log_dir.mkdir()
+        server = agent_run._CodexAppServer(state_dir, log_dir, log_dir / "acquire.log", "test")
+        assert server.start([], str(tmp_path), lambda: None)
+        start = time.monotonic()
+        try:
+            thread_id = server.mint_thread(str(tmp_path), model="gpt-nonexistent")
+        finally:
+            server.close()
+        elapsed = time.monotonic() - start
+        assert thread_id is None
+        assert elapsed < 5.0, f"mint_thread took {elapsed:.1f}s, expected well under 5s"
+        session = agent_run._read_session_json(log_dir)
+        assert session is not None
+        assert "unknown model: gpt-nonexistent" in session["reason"]
+
+    def test_mint_thread_result_wins_over_same_batch_error(self, tmp_path, monkeypatch):
+        """A minted thread is not undone by a same-id error frame in the same read
+        batch: the mint succeeds and no failure reason is recorded."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "sys.stdout.flush()\n"
+            "recv()\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'result': {'thread': {'id': 'batch-tid', "
+            "'sessionId': 'batch-tid', 'path': 'r.jsonl'}}})\n"
+            "send({'id': msg['id'], 'error': {'code': -32602, 'message': 'late error'}})\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        state_dir = tmp_path / "state"
+        log_dir = tmp_path / "log"
+        state_dir.mkdir()
+        log_dir.mkdir()
+        server = agent_run._CodexAppServer(state_dir, log_dir, log_dir / "acquire.log", "test")
+        assert server.start([], str(tmp_path), lambda: None)
+        try:
+            thread_id = server.mint_thread(str(tmp_path))
+        finally:
+            server.close()
+        assert thread_id == "batch-tid"
+        session = agent_run._read_session_json(log_dir)
+        assert session is not None
+        assert session["acquisition"] == "minted"
+        assert session.get("reason") is None
+
+    def test_mint_thread_error_reason_stays_within_bound(self, tmp_path, monkeypatch):
+        """An oversized multi-line error payload is stored single-line and within
+        _THREAD_START_ERROR_REASON_MAX, truncation marker included."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'error': {'code': -32602, "
+            "'message': 'boom\\n' + 'x' * 4000}})\n"
+            "time.sleep(30)\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        state_dir = tmp_path / "state"
+        log_dir = tmp_path / "log"
+        state_dir.mkdir()
+        log_dir.mkdir()
+        server = agent_run._CodexAppServer(state_dir, log_dir, log_dir / "acquire.log", "test")
+        assert server.start([], str(tmp_path), lambda: None)
+        try:
+            assert server.mint_thread(str(tmp_path), model="huge") is None
+        finally:
+            server.close()
+        session = agent_run._read_session_json(log_dir)
+        reason = session["reason"]
+        assert len(reason) <= agent_run._THREAD_START_ERROR_REASON_MAX
+        assert "\n" not in reason
+        assert reason.endswith("...")
+
+
 # ---------------------------------------------------------------------------
 # Codex interactive: app-server JSON-RPC mint + turn/steer
 # ---------------------------------------------------------------------------
@@ -1372,6 +1593,7 @@ class TestManagedCodexInteractiveAppServer:
         thread_id: str = "interactive-thread-0001",
         appserver_works: bool = True,
         steer_wait_seconds: float = 3.0,
+        params_out: Optional[Path] = None,
     ) -> str:
         """Write a fake codex app-server that handles interactive protocol.
 
@@ -1379,12 +1601,18 @@ class TestManagedCodexInteractiveAppServer:
         item/agentMessage/delta → turn/completed → wait up to steer_wait_seconds
         for a steer (turn/steer or turn/start) → if received, emit steered response
         → exit.  If the steer wait times out or stdin closes, exit immediately.
+        When params_out is set, the received thread/start params are written to
+        that path as JSON before the fake responds.
         """
         fake_dir = tmp_path / "bin"
         fake_dir.mkdir(parents=True, exist_ok=True)
         fake = fake_dir / "codex"
 
         if appserver_works:
+            params_dump = (
+                f"open({str(params_out)!r}, 'w').write(json.dumps(msg['params']))\n"
+                if params_out is not None else ""
+            )
             fake.write_text(
                 "#!/usr/bin/env python3\n"
                 "import sys, json, time, select\n"
@@ -1425,6 +1653,7 @@ class TestManagedCodexInteractiveAppServer:
                 "msg = recv()\n"
                 "if not msg or msg.get('method') != 'thread/start':\n"
                 "    sys.exit(1)\n"
+                f"{params_dump}"
                 "send({'id': msg['id'], 'result': {'thread': {\n"
                 "    'id': THREAD_ID, 'sessionId': THREAD_ID,\n"
                 "    'path': f'~/.codex/sessions/rollout-{THREAD_ID}.jsonl',\n"
@@ -1512,6 +1741,32 @@ class TestManagedCodexInteractiveAppServer:
         if status not in agent_run.TERMINAL_STATUSES:
             _kill_run_pid(state_dir)
         return status
+
+    def test_interactive_codex_model_reaches_thread_start(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """--model on an interactive codex launch lands in thread/start's params."""
+        params_file = tmp_path / "thread_start_params.json"
+        # steer_wait_seconds=0.5: fake exits quickly after initial turn completes.
+        bin_dir = self._make_fake_codex_interactive(
+            tmp_path, thread_id="iact-model-tid", steer_wait_seconds=0.5,
+            params_out=params_file,
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "codex-iact-model"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="hi", model="gpt-5.6-luna", agent_mode=None,
+            harness_args=[],
+        )
+        rc = agent_run.cmd_launch(ns)
+        assert rc == 0
+        state_dir = isolated_runs_root / name
+        self._wait_for_running(state_dir, timeout=10.0)
+        self._wait_for_terminal(state_dir, timeout=10.0)
+        params = json.loads(params_file.read_text())
+        assert params["model"] == "gpt-5.6-luna"
 
     def test_interactive_codex_minted_session_json(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
@@ -2160,14 +2415,21 @@ class TestEndToEndThroughMain:
         )
 
 
-    def test_main_model_rejected_for_codex(self, isolated_runs_root, isolated_log_root, monkeypatch):
-        """main() with --model and --harness codex exits non-zero before creating state."""
-        name = "main-codex-model-reject"
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run.main(["--harness", "codex", "--model", "gpt-5", "--prompt", "hi", name])
-        assert exc_info.value.code != 0
-        # No state dir should have been created.
-        assert not (isolated_runs_root / name).exists()
+    def test_main_model_accepted_for_codex(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """main() accepts --model with --harness codex and the launch completes."""
+        bin_dir = self._make_fake_codex_oneshot(tmp_path, thread_id="model-accept-tid")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "main-codex-model-accept"
+        rc = agent_run.main([
+            "--harness", "codex", "--model", "gpt-5", "--prompt", "hi", name,
+        ])
+        assert rc == 0
+        self._wait_terminal(isolated_runs_root / name)
+        session = agent_run._read_session_json(isolated_log_root / name)
+        assert session is not None
+        assert session["session_id"] == "model-accept-tid"
 
     def test_main_session_id_flag_no_longer_accepted(
         self, isolated_runs_root, isolated_log_root, monkeypatch
