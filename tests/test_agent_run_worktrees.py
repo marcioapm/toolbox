@@ -5013,6 +5013,92 @@ class TestLaunchCreatesWorktree:
                 real_popen.wait(proc, timeout=5)
             _wait_terminal(isolated_runs_root / name)
 
+    def test_reaped_mint_child_with_live_descendant_refuses_rollback(
+        self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch
+    ):
+        """A successfully reaped mint child proves only that exact direct
+        process is dead. It can fork a descendant that inherits the
+        worktree as its cwd before receiving SIGTERM, and that descendant
+        outlives the direct child's reap. A launch failure afterward must
+        still refuse rollback: the worktree, its branch, and the live
+        descendant must all survive."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-mint-descendant"
+        name = "mint-descendant-run"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo), harness="opencode", prompt="hi",
+        )
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        pidfile = tmp_path / "descendant.pid"
+        fake_opencode = bin_dir / "opencode"
+        fake_opencode.write_text(
+            "#!/bin/sh\n"
+            "trap 'exit 0' TERM\n"
+            "sleep 60 &\n"
+            f"echo $! > {shlex.quote(str(pidfile))}\n"
+            "wait\n"
+        )
+        fake_opencode.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir) + ":" + os.environ.get("PATH", ""))
+
+        def _health_poll_wait_for_fork(*_a, **_k):
+            # Block until the fake opencode's descendant has actually
+            # forked and recorded its pid, so the cleanup below reaps a
+            # direct child that has already produced a live descendant --
+            # not a shell still mid-startup with no fork behind it yet.
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if pidfile.exists() and pidfile.read_text().strip():
+                    return False
+                time.sleep(0.02)
+            return False
+
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", _health_poll_wait_for_fork)
+
+        # Fail between mint's return (child reaped, mark left set) and
+        # os.fork() (where the mark is set again unconditionally): a
+        # failure at os.fork() itself would not distinguish this path from
+        # any other post-fork rollback refusal already covered elsewhere.
+        def _build_managed_argv_always_fails(*_a, **_k):
+            raise RuntimeError("simulated post-mint launch failure")
+
+        monkeypatch.setattr(
+            agent_run, "_build_managed_argv", _build_managed_argv_always_fails
+        )
+
+        descendant_pid: Optional[int] = None
+        try:
+            with pytest.raises(RuntimeError, match="simulated post-mint launch failure"):
+                agent_run.cmd_launch(args)
+
+            assert pidfile.exists(), "the fake opencode must have forked its descendant"
+            descendant_pid = int(pidfile.read_text().strip())
+            assert descendant_pid > 0
+            try:
+                os.kill(descendant_pid, 0)
+            except ProcessLookupError:
+                pytest.fail(f"descendant pid {descendant_pid} is not alive")
+
+            assert wt_dir.is_dir(), "live mint descendant must prevent rollback"
+            assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+            assert name in _git(repo, "branch", "--list", name)
+        finally:
+            if descendant_pid is not None:
+                try:
+                    os.kill(descendant_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(descendant_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
+
     def test_invocation_cwd_outside_repo_without_worktree_repo_is_usage_error(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch, capsys
     ):
