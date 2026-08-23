@@ -4837,6 +4837,40 @@ class TestLaunchCreatesWorktree:
         err = capsys.readouterr().err
         assert "git worktree remove" in err
 
+    def test_post_fork_warning_write_failure_does_not_mask_original_exception(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A write error while emitting the post-fork cleanup warning (a
+        broken stderr, a second interrupt) must not replace the original
+        launch failure that triggered rollback."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-warning-write-fails"
+        name = "warning-write-fails"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+        )
+
+        def _fork_always_fails():
+            raise OSError("simulated fork failure")
+
+        monkeypatch.setattr(os, "fork", _fork_always_fails)
+
+        real_print = print
+
+        def _print_raises_for_warning(*p_args, **p_kwargs):
+            if p_kwargs.get("file") is sys.stderr:
+                raise BrokenPipeError("stderr write failed")
+            return real_print(*p_args, **p_kwargs)
+
+        monkeypatch.setattr("builtins.print", _print_raises_for_warning)
+
+        with pytest.raises(SystemExit, match="failed to start agent"):
+            agent_run.cmd_launch(args)
+
+        assert wt_dir.is_dir()
+        assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+        assert name in _git(repo, "branch", "--list", name)
+
     def test_mint_cleanup_baseexception_with_live_child_refuses_rollback(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch
     ):

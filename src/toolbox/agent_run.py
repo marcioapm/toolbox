@@ -9216,18 +9216,21 @@ def cmd_launch(args: argparse.Namespace) -> int:
                 rc = _cmd_launch_locked(args, name, lock_fd)
         except BaseException:
             if getattr(args, "_worktree_process_started", False):
-                print(
-                    f"agent-run: warning: launch for '{name}' failed after starting "
-                    f"the runner; leaving worktree in place: {created.path} "
-                    f"(branch {created.branch!r}). Once you have confirmed no "
-                    f"process is still using it, clean up by hand: "
-                    f"git worktree remove {created.path}  # run from {created.repo}"
-                    + (
-                        f"; git branch -D {created.branch}  # run from {created.repo}"
-                        if created.branch_created else ""
-                    ),
-                    file=sys.stderr,
-                )
+                try:
+                    print(
+                        f"agent-run: warning: launch for '{name}' failed after starting "
+                        f"the runner; leaving worktree in place: {created.path} "
+                        f"(branch {created.branch!r}). Once you have confirmed no "
+                        f"process is still using it, clean up by hand: "
+                        f"git worktree remove {created.path}  # run from {created.repo}"
+                        + (
+                            f"; git branch -D {created.branch}  # run from {created.repo}"
+                            if created.branch_created else ""
+                        ),
+                        file=sys.stderr,
+                    )
+                except BaseException:
+                    pass
                 raise
             try:
                 _rollback_launch_worktree(created)
