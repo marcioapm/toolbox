@@ -20,6 +20,7 @@ tests/test_agent_run_reap.py and tests/conftest.py.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import subprocess
@@ -4644,3 +4645,36 @@ class TestLaunchCreatesWorktree:
 
         assert _exit_status(exc.value.code) == 1
         assert not wt_dir.exists()
+
+    def test_worktree_creation_happens_inside_the_publication_lock(self):
+        """`_create_launch_worktree(args)` must be called from within
+        `cmd_launch`'s `with _worktree_publication_lock(...)` block: a
+        freshly `git worktree add`-ed directory with no run state yet is
+        exactly the half-created state that lock exists to hide from a
+        concurrent reaper's exclusive-lock final scan. A real concurrency
+        test would need two processes and would be flaky; this pins the
+        ordering structurally instead, in the spirit of
+        test_agent_run_watch.py's WATCH_CONTRACT_KEYS invariant."""
+        lines = inspect.getsource(agent_run.cmd_launch).splitlines()
+        with_line_idx = next(
+            i for i, ln in enumerate(lines) if "_worktree_publication_lock(" in ln and ln.lstrip().startswith("with ")
+        )
+        with_indent = len(lines[with_line_idx]) - len(lines[with_line_idx].lstrip())
+        # The block ends at the first later line, non-blank, indented at or
+        # below the `with` statement's own indentation.
+        block_end_idx = len(lines)
+        for i in range(with_line_idx + 1, len(lines)):
+            stripped = lines[i].strip()
+            if not stripped:
+                continue
+            indent = len(lines[i]) - len(lines[i].lstrip())
+            if indent <= with_indent:
+                block_end_idx = i
+                break
+        block_lines = lines[with_line_idx + 1:block_end_idx]
+        assert any("_create_launch_worktree(args)" in ln for ln in block_lines), (
+            "_create_launch_worktree must be called inside the "
+            "_worktree_publication_lock block"
+        )
+
+
