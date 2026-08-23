@@ -3249,6 +3249,7 @@ def _make_opencode_db(path: Path) -> None:
             "create table part (id text primary key, message_id text, "
             "session_id text, time_created integer, data text)"
         )
+        conn.execute("create index part_session_idx on part (session_id)")
         conn.commit()
     finally:
         conn.close()
@@ -3594,9 +3595,11 @@ class TestTranscriptFacts:
     def test_watch_never_raises_when_count_transcript_raises_arbitrary_error(
         self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
     ):
-        """count_transcript escaping with something other than
-        TranscriptSourceError must still degrade the contract, never
-        propagate past watch's never-raise boundary."""
+        """count_transcript escaping with RuntimeError (not
+        TranscriptSourceError, the only type this module unwraps for its
+        error code) must still degrade only the transcript block via the
+        blanket `except Exception`, never propagate past watch's
+        never-raise boundary or wipe the rest of the contract."""
         sd, ld = _make_run(
             isolated_runs_root, isolated_log_root, "tr4",
             status="running", pid=111, log_age_secs=1,
@@ -3606,13 +3609,17 @@ class TestTranscriptFacts:
         )
         monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
 
-        def _raise_sqlite_error(*_a, **_kw):
-            raise sqlite3.OperationalError("disk I/O error")
+        def _raise_runtime_error(*_a, **_kw):
+            raise RuntimeError("synthetic non-transcript-specific failure")
 
-        monkeypatch.setattr(transcript, "count_transcript", _raise_sqlite_error)
+        monkeypatch.setattr(transcript, "count_transcript", _raise_runtime_error)
         agent_run.cmd_watch(_watch_args("tr4"))
         payload = json.loads(capsys.readouterr().out)
         assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert payload["observation_error"] is None
+        assert payload["log"] is not None
+        assert payload["git"] is not None or payload["git_error"] is not None
+        assert payload["scratch"] is not None
         t = payload["transcript"]
         assert t["available"] is False
         assert t["entries"] is None

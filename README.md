@@ -821,8 +821,13 @@ it. `error` is one of `no_session_json` (raw run — routine, not a warning),
 runs). `entries` counts raw store records, not rendered transcript entries —
 for `opencode` this is `part` table rows before `_opencode_entry`'s filtering,
 so a count of `0` guarantees nothing renders, but a nonzero count does not
-guarantee anything does either. This block never raises past `watch`'s
-never-raise boundary; any read failure degrades to the unavailable form.
+guarantee anything does either; for `claude`/`codex` a file where every
+record was unparseable or session-mismatched (nothing counted, at least one
+skipped) reports `store_unreadable` rather than `entries: 0`, since a wholly
+malformed file is not evidence of an empty session. This block never raises
+past `watch`'s never-raise boundary; any read failure, including an
+unexpected exception type from the count call, degrades to the unavailable
+form.
 
 `submitted_age_s` is seconds since `state_dir/prompt_submitted` was written
 — the moment the prompt was actually delivered to the PTY — not since
@@ -851,7 +856,7 @@ tool calls with arguments and results — keyed by the session id in
 |---------|-------|
 | `opencode` | SQLite at `~/.local/share/opencode/opencode.db` (read-only, `mode=ro`), `part`/`message` rows for the session |
 | `claude` | `~/.claude/projects/<mangled-cwd>/<session_id>.jsonl`, plus any matching `subagents/*.jsonl` |
-| `codex` | `~/.codex/sessions/**/rollout-*-<session_id>.jsonl` |
+| `codex` | `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session_id>.jsonl` |
 
 Every store is opened strictly read-only — a live run may hold it open, and
 `transcript` never writes, migrates, or checkpoints it. Requires a

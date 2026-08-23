@@ -352,7 +352,6 @@ import shlex
 import shutil
 import signal
 import socket
-import sqlite3
 import stat as _stat_module
 import struct
 import subprocess
@@ -4280,9 +4279,10 @@ def _watch_transcript_facts(
     Absence of ``session.json`` (raw run) or an incomplete/invalid
     ``session_id``/``harness`` pair is routine, not a warning -- most runs
     launched without ``--harness`` never acquire a session at all. Any
-    other failure (unknown harness, missing/locked/corrupt store) degrades
-    to the unavailable form with a short discriminator; nothing from this
-    function may raise past ``_cmd_watch_observe``'s caller.
+    other failure (unknown harness, missing/locked/corrupt store, or any
+    unexpected exception from the count call) degrades to the unavailable
+    form with a short discriminator; nothing from this function may raise
+    past ``_cmd_watch_observe``'s caller.
     """
     submitted_age_s = _watch_prompt_submitted_age_s(state_dir, interactive)
 
@@ -4297,7 +4297,10 @@ def _watch_transcript_facts(
         count, newest_iso = _agent_run_transcript.count_transcript(harness, session_id, cwd)
     except _agent_run_transcript.TranscriptSourceError as exc:
         return _transcript_unknown(exc.code, submitted_age_s)
-    except (OSError, sqlite3.Error):
+    except Exception:
+        # Anything past TranscriptSourceError -- a reader bug, a type error
+        # in an unexpected store shape -- must still degrade the transcript
+        # block rather than escape and wipe the rest of the watch contract.
         return _transcript_unknown("store_unreadable", submitted_age_s)
 
     newest_age_s: Optional[float] = None
