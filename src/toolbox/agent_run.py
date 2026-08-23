@@ -11117,6 +11117,7 @@ class _CodexAppServer:
                             self.log_dir, self.acquire_log, "codex",
                             self.thread_id, "minted", "certain",
                         )
+                        break
                 elif "error" in msg:
                     self.log(f"thread/start error: {msg['error']}")
                     thread_start_error = msg["error"]
@@ -11128,7 +11129,7 @@ class _CodexAppServer:
             if thread_start_error is not None:
                 reason = f"thread/start error: {thread_start_error}".replace("\n", " ")
                 if len(reason) > _THREAD_START_ERROR_REASON_MAX:
-                    reason = reason[:_THREAD_START_ERROR_REASON_MAX] + "..."
+                    reason = reason[:_THREAD_START_ERROR_REASON_MAX - 3] + "..."
             else:
                 self.log("thread/start failed or timed out")
                 reason = "thread/start failed or timed out"

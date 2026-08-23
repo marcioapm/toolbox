@@ -1492,6 +1492,92 @@ class TestMintThreadModelParam:
         assert session is not None
         assert "unknown model: gpt-nonexistent" in session["reason"]
 
+    def test_mint_thread_result_wins_over_same_batch_error(self, tmp_path, monkeypatch):
+        """A minted thread is not undone by a same-id error frame in the same read
+        batch: the mint succeeds and no failure reason is recorded."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "sys.stdout.flush()\n"
+            "recv()\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'result': {'thread': {'id': 'batch-tid', "
+            "'sessionId': 'batch-tid', 'path': 'r.jsonl'}}})\n"
+            "send({'id': msg['id'], 'error': {'code': -32602, 'message': 'late error'}})\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        state_dir = tmp_path / "state"
+        log_dir = tmp_path / "log"
+        state_dir.mkdir()
+        log_dir.mkdir()
+        server = agent_run._CodexAppServer(state_dir, log_dir, log_dir / "acquire.log", "test")
+        assert server.start([], str(tmp_path), lambda: None)
+        try:
+            thread_id = server.mint_thread(str(tmp_path))
+        finally:
+            server.close()
+        assert thread_id == "batch-tid"
+        session = agent_run._read_session_json(log_dir)
+        assert session is not None
+        assert session["acquisition"] == "minted"
+        assert session.get("reason") is None
+
+    def test_mint_thread_error_reason_stays_within_bound(self, tmp_path, monkeypatch):
+        """An oversized multi-line error payload is stored single-line and within
+        _THREAD_START_ERROR_REASON_MAX, truncation marker included."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'error': {'code': -32602, "
+            "'message': 'boom\\n' + 'x' * 4000}})\n"
+            "time.sleep(30)\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        state_dir = tmp_path / "state"
+        log_dir = tmp_path / "log"
+        state_dir.mkdir()
+        log_dir.mkdir()
+        server = agent_run._CodexAppServer(state_dir, log_dir, log_dir / "acquire.log", "test")
+        assert server.start([], str(tmp_path), lambda: None)
+        try:
+            assert server.mint_thread(str(tmp_path), model="huge") is None
+        finally:
+            server.close()
+        session = agent_run._read_session_json(log_dir)
+        reason = session["reason"]
+        assert len(reason) <= agent_run._THREAD_START_ERROR_REASON_MAX
+        assert "\n" not in reason
+        assert reason.endswith("...")
+
 
 # ---------------------------------------------------------------------------
 # Codex interactive: app-server JSON-RPC mint + turn/steer
