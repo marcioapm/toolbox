@@ -975,20 +975,23 @@ def _wait_terminal(state_dir: Path, timeout: float = 15.0) -> str:
 
 
 def _mock_witness_rises_after_baseline(monkeypatch) -> None:
-    """Patch _submission_witness_count with a strictly increasing counter, so
-    every _submit_and_verify call observes its very first post-submit poll
-    as a rise over whatever baseline it captured. Fake codex/claude/opencode
-    binaries in this file have no real transcript store to witness against,
-    so tests exercising launch/steer dispatch (not verification itself) use
-    this to clear the witness gate on both the launch and any later steer in
-    the same test, without burning the poll/retry budget."""
+    """Pin every _submit_and_verify call to a witness source with a strictly
+    increasing counter, so its very first post-submit poll reads as a rise
+    over whatever baseline it captured. Fake codex/claude/opencode binaries
+    in this file have no real transcript store to witness against, so tests
+    exercising launch/steer dispatch (not verification itself) use this to
+    clear the witness gate on both the launch and any later steer in the
+    same test, without burning the poll/retry budget."""
     calls = {"n": 0}
 
-    def fake_witness(_state_dir, _log_dir):
+    def fake_witness():
         calls["n"] += 1
         return calls["n"]
 
-    monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
+    monkeypatch.setattr(
+        agent_run, "_resolve_witness_source",
+        lambda *_a: agent_run._WitnessSource("fake", fake_witness),
+    )
 
 
 
@@ -2063,7 +2066,10 @@ class TestManagedCodexInteractiveAppServer:
             tmp_path, thread_id="iact-unverified", steer_wait_seconds=0.5
         )
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
-        monkeypatch.setattr(agent_run, "_submission_witness_count", lambda *_a: 0)
+        monkeypatch.setattr(
+            agent_run, "_resolve_witness_source",
+            lambda *_a: agent_run._WitnessSource("fake", lambda: 0),
+        )
         monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "0.05")
         monkeypatch.setenv("AGENT_RUN_SUBMIT_ATTEMPTS", "1")
         name = "codex-iact-unverified"

@@ -185,7 +185,7 @@ def test_steer_unverified_exits_nonzero_and_writes_no_marker(
     )
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
-    monkeypatch.setattr(agent_run, "_submission_witness_count", lambda *_a: None)
+    _witness_unreadable(monkeypatch)
     monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "0.05")
     try:
         assert agent_run.cmd_steer(_steer_args("run")) == 1
@@ -462,19 +462,36 @@ def test_teardown_deduplicates_and_reaps_tracked_children(tmp_path, monkeypatch)
 # ---------------------------------------------------------------------------
 
 def _witness_sequence(monkeypatch, counts: list) -> list:
-    """Patch _submission_witness_count to return successive values from
+    """Patch the pinned witness source to return successive values from
     *counts* (repeating the last value once exhausted) and return the list
     of (state_dir, log_dir) argument pairs it was called with, for callers
     that want to assert call counts."""
     calls: list = []
 
     def fake(state_dir, log_dir):
-        calls.append((state_dir, log_dir))
-        index = min(len(calls) - 1, len(counts) - 1)
-        return counts[index]
+        def count() -> "int | None":
+            calls.append((state_dir, log_dir))
+            index = min(len(calls) - 1, len(counts) - 1)
+            return counts[index]
 
-    monkeypatch.setattr(agent_run, "_submission_witness_count", fake)
+        return agent_run._WitnessSource("fake", count)
+
+    monkeypatch.setattr(agent_run, "_resolve_witness_source", fake)
     return calls
+
+
+def _witness_counter(monkeypatch, count: "callable") -> None:
+    """Pin every _submit_and_verify call to a witness source whose
+    user_count is *count*."""
+    monkeypatch.setattr(
+        agent_run, "_resolve_witness_source",
+        lambda *_a: agent_run._WitnessSource("fake", count),
+    )
+
+
+def _witness_unreadable(monkeypatch) -> None:
+    """Pin a witness source that exists but can never be read."""
+    _witness_counter(monkeypatch, lambda: None)
 
 
 def _no_transport_side_effects(monkeypatch) -> list:
@@ -548,7 +565,7 @@ def test_submit_and_verify_late_lander_skips_second_submission(tmp_path, monkeyp
     submissions = _no_transport_side_effects(monkeypatch)
     poll_calls = {"n": 0}
 
-    def fake_witness(_state_dir, _log_dir):
+    def fake_witness():
         poll_calls["n"] += 1
         if poll_calls["n"] == 1:
             return 0  # baseline
@@ -556,7 +573,7 @@ def test_submit_and_verify_late_lander_skips_second_submission(tmp_path, monkeyp
             return 0  # the only poll iteration before the deadline elapses
         return 1  # the post-timeout re-check
 
-    monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
+    _witness_counter(monkeypatch, fake_witness)
 
     outcome = agent_run._submit_and_verify(
         tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
@@ -569,9 +586,9 @@ def test_submit_and_verify_late_lander_skips_second_submission(tmp_path, monkeyp
 
 
 def test_submit_and_verify_witness_unreadable_submits_exactly_once(tmp_path, monkeypatch):
-    """count_transcript raising TranscriptSourceError (via
-    _submission_witness_count's real implementation) must degrade to
-    verified=False with detail=witness_unreadable, never propagate.
+    """count_user_records raising TranscriptSourceError (via the real
+    witness-source implementation) must degrade to verified=False with
+    detail=witness_unreadable, never propagate.
 
     A witness that stays unreadable for the whole attempt gives no evidence
     the submission failed to land -- resubmitting risks a real duplicate
@@ -588,7 +605,7 @@ def test_submit_and_verify_witness_unreadable_submits_exactly_once(tmp_path, mon
         raise agent_run_transcript.TranscriptSourceError("boom", code="store_missing")
 
     monkeypatch.setattr(
-        agent_run._agent_run_transcript, "count_transcript", raise_source_error
+        agent_run._agent_run_transcript, "count_user_records", raise_source_error
     )
     submissions = []
     monkeypatch.setattr(
@@ -631,6 +648,129 @@ def test_submit_and_verify_transport_selection(
     )
 
     assert outcome.transport == expected_transport
+
+
+# ---------------------------------------------------------------------------
+# The witness predicate: one pinned source, user records only, fresh sessions
+# ---------------------------------------------------------------------------
+
+def test_witness_source_pinned_to_opencode_http_never_falls_back_to_the_store(
+    tmp_path, monkeypatch
+):
+    """An opencode run whose HTTP endpoint stops answering must report an
+    unreadable witness, not silently start reading the transcript store:
+    the store's much larger count would clear the HTTP baseline instantly."""
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: (41234, "ses_1"))
+    monkeypatch.setattr(agent_run, "_submit_via_http", lambda *_a, **_k: None)
+    http_reads = {"n": 0}
+
+    def flaky_http(_port, _session):
+        http_reads["n"] += 1
+        return 2 if http_reads["n"] == 1 else None  # baseline only, then dead
+
+    monkeypatch.setattr(agent_run, "_opencode_http_message_count", flaky_http)
+
+    def store_would_verify(*_a, **_k):
+        raise AssertionError("a pinned HTTP witness must never read the transcript store")
+
+    monkeypatch.setattr(
+        agent_run._agent_run_transcript, "count_user_records", store_would_verify
+    )
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", deadline_s=0.05, max_attempts=1,
+    )
+
+    assert outcome.verified is False
+    assert outcome.detail == "timeout"
+
+
+def test_witness_counts_user_records_only_so_an_assistant_reply_cannot_verify(
+    tmp_path, monkeypatch
+):
+    """A swallowed prompt whose session emits an assistant record must stay
+    unverified: the witness reads count_user_records, not every record."""
+    submissions = _no_transport_side_effects(monkeypatch)
+    monkeypatch.setattr(
+        agent_run, "_read_session_json",
+        lambda _log_dir: {"session_id": "s1", "harness": "claude"},
+    )
+    # The full record count climbs from the assistant's own reply; the
+    # user-record count does not move, because nothing was delivered.
+    monkeypatch.setattr(
+        agent_run._agent_run_transcript, "count_user_records",
+        lambda *_a: 1,
+    )
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.05, max_attempts=2,
+    )
+
+    assert outcome.verified is False
+    assert outcome.detail == "timeout"
+    assert len(submissions) == 2
+
+
+def test_unreadable_baseline_cannot_verify_without_fresh_session(tmp_path, monkeypatch):
+    """A steer runs against an established session that already holds user
+    records, so an unreadable baseline followed by a readable nonzero count
+    is pre-existing history, not proof this steer landed."""
+    submissions = _no_transport_side_effects(monkeypatch)
+    _witness_sequence(monkeypatch, [None, 7])
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.05, max_attempts=2, fresh_session=False,
+    )
+
+    assert outcome.verified is False
+    assert outcome.detail == "witness_unreadable"
+    assert len(submissions) == 1  # no baseline evidence: never resent
+
+
+def test_unreadable_baseline_verifies_on_a_fresh_session(tmp_path, monkeypatch):
+    """A launch mints its session, so it holds no records until this
+    submission lands: the first readable nonzero user count is proof."""
+    _no_transport_side_effects(monkeypatch)
+    _witness_sequence(monkeypatch, [None, 1])
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=5.0, max_attempts=2, fresh_session=True,
+    )
+
+    assert outcome.verified is True
+    assert outcome.attempts == 1
+
+
+def test_resolve_witness_source_prefers_opencode_http_over_the_store(tmp_path):
+    (tmp_path / "opencode_port").write_text("41234\n")
+    (tmp_path / "session.json").write_text(
+        json.dumps({"session_id": "ses_1", "harness": "opencode"})
+    )
+
+    source = agent_run._resolve_witness_source(tmp_path, tmp_path)
+
+    assert source is not None
+    assert source.name == "opencode_http"
+
+
+def test_resolve_witness_source_names_the_harness_store_without_a_port(tmp_path):
+    (tmp_path / "session.json").write_text(
+        json.dumps({"session_id": "ses_1", "harness": "claude"})
+    )
+
+    source = agent_run._resolve_witness_source(tmp_path, tmp_path)
+
+    assert source is not None
+    assert source.name == "claude_transcript"
+
+
+def test_resolve_witness_source_is_none_for_an_unmanaged_run(tmp_path):
+    """No session.json means a raw run: there is no store to witness."""
+    assert agent_run._resolve_witness_source(tmp_path, tmp_path) is None
+    assert agent_run._resolve_witness_source(tmp_path, None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -804,7 +944,7 @@ def test_steer_raw_skips_witness_polling_entirely(isolated_runs_root, monkeypatc
     def fail_if_called(*_a, **_k):
         raise AssertionError("--raw must not poll the witness")
 
-    monkeypatch.setattr(agent_run, "_submission_witness_count", fail_if_called)
+    monkeypatch.setattr(agent_run, "_resolve_witness_source", fail_if_called)
     try:
         rc = agent_run.cmd_steer(_steer_args("run", raw=True))
         assert rc == 0

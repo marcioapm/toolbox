@@ -247,6 +247,23 @@ def count_transcript(
     raise TranscriptSourceError(f"unrecognised harness {harness!r} in session.json", code="unknown_harness")
 
 
+def count_user_records(harness: str, session_id: str, cwd: Optional[str]) -> int:
+    """Return the number of user-role records for one session.
+
+    Only records the *user* produced are counted: assistant text, reasoning,
+    tool calls and tool results are all excluded, so a rise in this number
+    can only come from new input reaching the harness. Failures raise
+    ``TranscriptSourceError`` rather than returning 0.
+    """
+    if harness == "opencode":
+        return _count_opencode_user(session_id)
+    if harness == "claude":
+        return _count_claude_user(session_id, cwd)
+    if harness == "codex":
+        return _count_codex_user(session_id)
+    raise TranscriptSourceError(f"unrecognised harness {harness!r} in session.json", code="unknown_harness")
+
+
 def _iso_from_epoch_ms(value: Any) -> Optional[str]:
     if not isinstance(value, (int, float)):
         return None
@@ -376,6 +393,46 @@ def _count_opencode(session_id: str) -> tuple[int, Optional[str]]:
     finally:
         conn.close()
     return count, _iso_from_epoch_ms(newest_raw)
+
+
+def _count_opencode_user(session_id: str) -> int:
+    """User-role `message` rows for one session.
+
+    Counted on the `message` table rather than `part`: one row per turn
+    instead of one per event, and `message.data` carries the role directly.
+    `json_extract` does the filtering inside sqlite when the build has the
+    JSON1 extension; otherwise the session's message rows (tens, not
+    thousands) are decoded here. Raises the same errors as
+    `_opencode_connect`/query execution (missing/locked/unreadable store).
+    """
+    conn = _opencode_connect()
+    try:
+        try:
+            cursor = conn.execute(
+                "select count(*) from message "
+                "where session_id = ? and json_extract(data, '$.role') = 'user'",
+                (session_id,),
+            )
+            return cursor.fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            if "json_extract" not in str(exc).lower():
+                raise
+        cursor = conn.execute(
+            "select data from message where session_id = ?", (session_id,)
+        )
+        count = 0
+        for (raw,) in cursor:
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(data, dict) and data.get("role") == "user":
+                count += 1
+        return count
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+        raise _opencode_query_error(exc) from exc
+    finally:
+        conn.close()
 
 
 def _opencode_entry(part: dict, message: dict) -> Optional[TranscriptEntry]:
@@ -641,6 +698,48 @@ def _count_claude(session_id: str, cwd: Optional[str]) -> tuple[int, Optional[st
             code="store_unreadable",
         )
     return total.entries, _iso_utc_z(total.newest) if total.newest is not None else None
+
+
+def _claude_record_is_user_input(record: dict, session_id: str) -> bool:
+    """True when one claude JSONL record is a user turn rather than a tool
+    result, an assistant record, or another session's record.
+
+    A `tool_result` block also arrives as a ``type: "user"`` record with
+    ``role: "user"``; only text content counts as input the user supplied.
+    """
+    if record.get("type") != "user":
+        return False
+    record_session_id = record.get("sessionId")
+    if record_session_id is not None and record_session_id != session_id:
+        return False
+    message = record.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content)
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+        for block in content
+    )
+
+
+def _count_claude_user(session_id: str, cwd: Optional[str]) -> int:
+    """User turns in a claude session, main file only.
+
+    Subagent files are skipped: they carry the parent agent's prompts to a
+    subagent, not input delivered to this session. Streaming the JSONL and
+    testing each record beats a full `_read_claude` parse, which also builds
+    and merges every assistant/tool entry.
+    """
+    path = _claude_session_path(session_id, cwd)
+    skip_counter = _JsonlSkipCounter()
+    return sum(
+        1 for record in _iter_jsonl_objects(path, skip_counter)
+        if _claude_record_is_user_input(record, session_id)
+    )
 
 
 def _parse_iso_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -1043,6 +1142,31 @@ def _count_codex(session_id: str) -> tuple[int, Optional[str]]:
             code="store_unreadable",
         )
     return stats.entries, _iso_utc_z(stats.newest) if stats.newest is not None else None
+
+
+def _count_codex_user(session_id: str) -> int:
+    """User turns in a codex rollout.
+
+    Uses the same `_is_codex_injected_context` filter as `_count_codex`, so
+    the harness's own `<environment_context>`/`<user_instructions>` preamble
+    -- written at thread/start, before any prompt is submitted -- is not
+    mistaken for a delivered user turn.
+    """
+    path = _codex_session_path(session_id)
+    skip_counter = _JsonlSkipCounter()
+    count = 0
+    for record in _iter_jsonl_objects(path, skip_counter):
+        if record.get("type") != "response_item":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "message":
+            continue
+        if payload.get("role") != "user":
+            continue
+        text = _codex_message_text(payload.get("content"))
+        if text and not _is_codex_injected_context(text):
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------

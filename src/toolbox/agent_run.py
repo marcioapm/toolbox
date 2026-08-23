@@ -4385,8 +4385,8 @@ def _opencode_http_endpoint(state_dir: Path, log_dir: Path) -> Optional[tuple[in
 
 def _opencode_http_message_count(port: int, session_id: str) -> Optional[int]:
     """GET /session/<id>/message and count user-role entries. None on any
-    failure (unreachable server, non-200, malformed body) so the caller falls
-    back to the transcript store rather than trusting a bogus zero."""
+    failure (unreachable server, non-200, malformed body): an unreadable
+    witness is unknown, never zero."""
     url = f"http://127.0.0.1:{port}/session/{urllib.parse.quote(session_id, safe='')}/message"
     try:
         with urllib.request.urlopen(url, timeout=2.0) as resp:
@@ -4407,23 +4407,42 @@ def _opencode_http_message_count(port: int, session_id: str) -> Optional[int]:
     )
 
 
-def _submission_witness_count(state_dir: Path, log_dir: Optional[Path]) -> Optional[int]:
-    """Transcript record count for the run's session, or None when the store
-    cannot be read. None must never be treated as 0 -- an unreadable witness
-    is unknown, not empty, the same fail-closed rule the watch contract uses.
+class _WitnessSource:
+    """One pinned place to count this run's user records.
 
-    Prefers opencode's own HTTP message endpoint when a port is known (the
-    authoritative source: it counts what the TUI itself has ingested);
-    falls back to the harness transcript store when the port/session are
-    unknown or the request fails.
+    Resolved once per _submit_and_verify call and never re-resolved: mixing
+    two sources within one verification compares counts that measure
+    different things (opencode's HTTP endpoint reports single-digit user
+    messages, the transcript store hundreds of records), which would let a
+    read from the second source look like a rise over the first's baseline.
+    A pinned source that stops answering is an unreadable witness, never a
+    reason to consult another one.
+    """
+
+    def __init__(self, name: str, count: Callable[[], Optional[int]]) -> None:
+        self.name = name
+        self._count = count
+
+    def user_count(self) -> Optional[int]:
+        """User-record count, or None when this source cannot be read."""
+        return self._count()
+
+
+def _resolve_witness_source(state_dir: Path, log_dir: Optional[Path]) -> Optional[_WitnessSource]:
+    """Pick the witness source for a run, or None when the run is unmanaged
+    (no session.json) and therefore has no transcript to witness against.
+
+    opencode's own HTTP endpoint wins when a port is known: it reports what
+    the TUI ingested, without the store's write lag.
     """
     if log_dir is None:
         return None
     endpoint = _opencode_http_endpoint(state_dir, log_dir)
     if endpoint is not None:
-        count = _opencode_http_message_count(*endpoint)
-        if count is not None:
-            return count
+        port, session_id = endpoint
+        return _WitnessSource(
+            "opencode_http", lambda: _opencode_http_message_count(port, session_id)
+        )
     session_data = _read_session_json(log_dir)
     if not isinstance(session_data, dict):
         return None
@@ -4431,17 +4450,39 @@ def _submission_witness_count(state_dir: Path, log_dir: Optional[Path]) -> Optio
     harness = session_data.get("harness")
     if not isinstance(session_id, str) or not session_id or not isinstance(harness, str):
         return None
+    cwd = _run_json_cwd(log_dir)
+    return _WitnessSource(
+        f"{harness}_transcript",
+        lambda: _transcript_user_count(harness, session_id, cwd),
+    )
+
+
+def _transcript_user_count(harness: str, session_id: str, cwd: Optional[str]) -> Optional[int]:
+    """User-record count from the harness transcript store, or None when the
+    store cannot be read. Never raises: every store failure is an unreadable
+    witness, the same fail-closed rule the watch contract uses."""
     try:
-        count, _newest = _agent_run_transcript.count_transcript(
-            harness, session_id, _run_json_cwd(log_dir)
-        )
-    except _agent_run_transcript.TranscriptSourceError:
-        return None
-    except Exception:
+        count = _agent_run_transcript.count_user_records(harness, session_id, cwd)
+    except Exception:  # noqa: BLE001
         return None
     if not isinstance(count, int) or isinstance(count, bool) or count < 0:
         return None
     return count
+
+
+def _submission_witness_count(state_dir: Path, log_dir: Optional[Path]) -> Optional[int]:
+    """User-record count for the run's session from its pinned witness
+    source, or None when the run has no witness or the source is
+    unreadable.
+
+    Resolves the source per call, so it is only for a one-off read;
+    _submit_and_verify pins one _WitnessSource for the whole verification
+    instead.
+    """
+    source = _resolve_witness_source(state_dir, log_dir)
+    if source is None:
+        return None
+    return source.user_count()
 
 
 @dataclass(frozen=True)
@@ -4508,9 +4549,22 @@ def _submit_and_verify(
     max_attempts: int = SUBMISSION_MAX_ATTEMPTS,
     submit: Optional[Callable[[bytes], None]] = None,
     transport: Optional[str] = None,
+    fresh_session: bool = False,
 ) -> SubmissionOutcome:
-    """Submit *text* and confirm it reached the agent via the transcript
-    witness, resubmitting up to max_attempts times on a verified timeout.
+    """Submit *text* and confirm a new user record appeared in the session,
+    resubmitting up to max_attempts times on a verified timeout.
+
+    The witness source is resolved once, before the baseline, and pinned for
+    the whole call; only user-role records are counted, so an assistant
+    reply or a tool call in the current turn can never be mistaken for a
+    delivered prompt.
+
+    *fresh_session* declares that this session was minted by this launch and
+    held no records before this submission. Only then can an unreadable
+    baseline be upgraded to proof by a later readable, nonzero count. A
+    steer runs against an established session whose history predates it, so
+    it must pass fresh_session=False and reports ``witness_unreadable``
+    instead.
 
     *submit*, when given, replaces the built-in HTTP/keystroke transports
     entirely -- callers with a non-file, non-HTTP channel (codex's
@@ -4528,8 +4582,8 @@ def _submit_and_verify(
     one submission regardless of max_attempts: an unreadable store carries
     no evidence the submission failed, so retrying cannot add information
     and risks a real duplicate prompt (messageID is not idempotent). Only a
-    witness that is readable but flat -- proof the record count truly did
-    not rise -- earns a retry.
+    witness that is readable but flat -- proof the user-record count truly
+    did not rise -- earns a retry.
 
     Never raises: an unreadable witness, a transport failure, or exhausted
     attempts all surface as SubmissionOutcome.verified=False with a reason in
@@ -4544,19 +4598,23 @@ def _submit_and_verify(
     else:
         endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
         transport = "http" if endpoint is not None else "keystroke"
-    baseline = _submission_witness_count(state_dir, log_dir)
-    # A newly minted session's transcript may not exist at baseline time. Its
-    # first readable, positive count is treated as the delivery witness.
+    witness = _resolve_witness_source(state_dir, log_dir)
+    baseline = witness.user_count() if witness is not None else None
+    # Without a baseline, a count is evidence only for a session this launch
+    # just minted, which held no user records before this submission. An
+    # established session's existing history makes any count unattributable.
+    comparable = witness is not None and (baseline is not None or fresh_session)
     ever_readable = baseline is not None
 
     def _witness_rose() -> bool:
         nonlocal ever_readable
-        current = _submission_witness_count(state_dir, log_dir)
-        if current is not None:
-            ever_readable = True
-        if baseline is None:
-            return current is not None and current > 0
-        return current is not None and current > baseline
+        if not comparable:
+            return False
+        current = witness.user_count()
+        if current is None:
+            return False
+        ever_readable = True
+        return current > baseline if baseline is not None else current > 0
 
     detail: Optional[str] = None
     attempts = 0
@@ -4583,9 +4641,8 @@ def _submit_and_verify(
                 return SubmissionOutcome(True, attempts, transport, None)
             time.sleep(SUBMISSION_VERIFY_POLL_INTERVAL_SECONDS)
 
-        # Timeout: re-check once more before giving up on this attempt. This
-        # catches a late-landing witness update that arrived right after the
-        # last poll, so a genuinely successful submission is never resent.
+        # Timeout: re-check once, catching a witness update that landed
+        # between the last poll and here.
         if _witness_rose():
             return SubmissionOutcome(True, attempts, transport, None)
 
@@ -10832,6 +10889,7 @@ def _run_interactive(
                     state_dir, log_dir, data.rstrip(b"\r\n"), submit_mode=submit_mode,
                     deadline_s=_submission_verify_timeout_seconds(),
                     max_attempts=_submission_max_attempts(),
+                    fresh_session=True,
                 )
                 if outcome.verified:
                     # Marks delivery for `_finalize`; absence means the agent
@@ -11835,6 +11893,7 @@ def _run_managed_interactive_codex_appserver(
             deadline_s=_submission_verify_timeout_seconds(),
             max_attempts=_submission_max_attempts(),
             submit=_send_initial_turn,
+            fresh_session=True,
         )
         turn_rpc_id = turn_rpc_id_holder[0] if turn_rpc_id_holder[0] is not None else -1
         if outcome.detail is not None and outcome.detail.startswith("rejected: "):

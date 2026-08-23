@@ -719,6 +719,191 @@ class TestCountTranscript:
 
 
 # ---------------------------------------------------------------------------
+# count_user_records: the submission witness's predicate
+# ---------------------------------------------------------------------------
+
+class TestCountUserRecords:
+    """Only user-role records count. A verification predicate that also
+    counted assistant/reasoning/tool records would be satisfied by the
+    current turn's own reply, with no new input delivered at all."""
+
+    def test_opencode_ignores_assistant_and_tool_records(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
+            parts=[{"type": "text", "text": "do it"}],
+        )
+        assert transcript.count_user_records("opencode", "ses_1", None) == 1
+
+        _opencode_insert(
+            db, message_id="m2", session_id="ses_1", role="assistant", time_created=2000,
+            parts=[
+                {"type": "text", "text": "on it"},
+                {"type": "reasoning", "text": "thinking"},
+                {"type": "tool", "tool": "bash", "state": {"status": "completed"}},
+            ],
+        )
+        assert transcript.count_user_records("opencode", "ses_1", None) == 1
+        assert transcript.count_transcript("opencode", "ses_1", None)[0] > 1
+
+        _opencode_insert(
+            db, message_id="m3", session_id="ses_1", role="user", time_created=3000,
+            parts=[{"type": "text", "text": "and again"}],
+        )
+        assert transcript.count_user_records("opencode", "ses_1", None) == 2
+
+    def test_opencode_scopes_to_one_session(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_a", role="user", time_created=1,
+            parts=[{"type": "text", "text": "for a"}],
+        )
+        _opencode_insert(
+            db, message_id="m2", session_id="ses_b", role="user", time_created=2,
+            parts=[{"type": "text", "text": "for b"}],
+        )
+        assert transcript.count_user_records("opencode", "ses_a", None) == 1
+
+    def test_opencode_missing_store_raises_rather_than_counting_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", tmp_path / "absent.db")
+        with pytest.raises(transcript.TranscriptSourceError):
+            transcript.count_user_records("opencode", "ses_1", None)
+
+    def test_claude_ignores_assistant_and_tool_result_records(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-user-only"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "the prompt"},
+                },
+                {
+                    "type": "assistant", "sessionId": session_id, "timestamp": "2026-08-16T00:00:01Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "replying"},
+                            {"type": "tool_use", "id": "tu1", "name": "Bash", "input": {}},
+                        ],
+                    },
+                },
+                {
+                    # A tool result arrives as a user-typed record, but is not input.
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:02Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": "tu1", "content": "out"}],
+                    },
+                },
+            ],
+        )
+        assert transcript.count_user_records("claude", session_id, "/Users/x/proj") == 1
+        assert transcript.count_transcript("claude", session_id, "/Users/x/proj")[0] > 1
+
+    def test_claude_skips_records_naming_another_session(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-mixed"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "mine"},
+                },
+                {
+                    "type": "user", "sessionId": "some-other-session",
+                    "timestamp": "2026-08-16T00:00:01Z",
+                    "message": {"role": "user", "content": "not mine"},
+                },
+            ],
+        )
+        assert transcript.count_user_records("claude", session_id, "/Users/x/proj") == 1
+
+    def test_claude_missing_store_raises_rather_than_counting_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError):
+            transcript.count_user_records("claude", "no-such-session", "/nonexistent/cwd")
+
+    def test_codex_ignores_assistant_reasoning_and_function_call_records(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-user-only"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "timestamp": "2026-08-19T00:00:00Z", "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "the prompt"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-08-19T00:00:01Z", "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "replying"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-08-19T00:00:02Z", "type": "response_item",
+                    "payload": {"type": "reasoning", "summary": [{"text": "thinking"}]},
+                },
+                {
+                    "timestamp": "2026-08-19T00:00:03Z", "type": "response_item",
+                    "payload": {"type": "function_call", "call_id": "c1", "name": "shell"},
+                },
+            ],
+        )
+        assert transcript.count_user_records("codex", session_id, None) == 1
+        assert transcript.count_transcript("codex", session_id, None)[0] > 1
+
+    def test_codex_ignores_the_harness_injected_context_preamble(self, tmp_path, monkeypatch):
+        """codex writes <environment_context> as a user message at thread
+        start, before any prompt is submitted; counting it would make a
+        never-delivered prompt verify off the harness's own preamble."""
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-preamble"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "timestamp": "2026-08-19T00:00:00Z", "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<environment_context>cwd=/tmp</environment_context>",
+                        }],
+                    },
+                },
+            ],
+        )
+        assert transcript.count_user_records("codex", session_id, None) == 0
+
+    def test_codex_missing_store_raises_rather_than_counting_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError):
+            transcript.count_user_records("codex", "no-such-session", None)
+
+    def test_unknown_harness_raises_unknown_harness_code(self):
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_user_records("some-future-harness", "ses_1", None)
+        assert exc_info.value.code == "unknown_harness"
+
+
+# ---------------------------------------------------------------------------
 # counters stream, not materialize
 # ---------------------------------------------------------------------------
 
