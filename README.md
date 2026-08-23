@@ -795,6 +795,50 @@ pre-existing key (`status`, `terminal`, `elapsed_s`, `log.*`, `git.*`,
 the run's persistent log dir, `session` is the parsed object; otherwise it is
 `null`.
 
+#### `watch --json` — additive `transcript` object
+
+`agent-run watch <name> --json` also gained an additive `transcript` field,
+alongside `scratch` and `hooks`:
+
+```json
+"transcript": {
+    "available": true,
+    "entries": 12,
+    "newest_age_s": 4.2,
+    "submitted_age_s": 5.9,
+    "error": null
+}
+```
+
+`available` is `true` only when the harness's own conversation store was
+located, opened and queried successfully. Every decision field is `null`
+rather than `0` on failure — modeled on `scratch`'s `_scratch_unknown` rule —
+so a poller can never read a failed count as an observed empty transcript;
+`entries: 0` is trustworthy exactly because the failure paths never produce
+it. `error` is one of `no_session_json` (raw run — routine, not a warning),
+`no_session_id`, `unknown_harness`, `store_missing`, `store_locked`,
+`store_unreadable`, or `not_observed` (the payload default before observation
+runs). `entries` counts raw store records, not rendered transcript entries —
+for `opencode` this is `part` table rows before `_opencode_entry`'s filtering,
+so a count of `0` guarantees nothing renders, but a nonzero count does not
+guarantee anything does either; for `claude`/`codex` a file where every
+record was unparseable or named a different session (nothing counted, at
+least one unparseable or mismatched) reports `store_unreadable` rather than
+`entries: 0`, since a wholly malformed or misidentified file is not evidence
+of an empty session. This block never raises
+past `watch`'s never-raise boundary; any read failure, including an
+unexpected exception type from the count call, degrades to the unavailable
+form.
+
+`submitted_age_s` is seconds since `state_dir/prompt_submitted` was written
+— the moment the prompt was actually delivered to the PTY — not since
+process launch (`elapsed_s`), which also counts harness boot, session mint
+and TUI readiness. Populated only for interactive runs (`interactive: true`)
+that have written the marker; `null` otherwise, including when the run is
+still starting up, is not interactive, or the marker is unreadable. Computed
+independently of the store read, so it survives a transcript-store failure
+that nulls out `entries`.
+
 #### `transcript` — the harness's own conversation record
 
 ```bash
@@ -813,7 +857,7 @@ tool calls with arguments and results — keyed by the session id in
 |---------|-------|
 | `opencode` | SQLite at `~/.local/share/opencode/opencode.db` (read-only, `mode=ro`), `part`/`message` rows for the session |
 | `claude` | `~/.claude/projects/<mangled-cwd>/<session_id>.jsonl`, plus any matching `subagents/*.jsonl` |
-| `codex` | `~/.codex/sessions/**/rollout-*-<session_id>.jsonl` |
+| `codex` | `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session_id>.jsonl` |
 
 Every store is opened strictly read-only — a live run may hold it open, and
 `transcript` never writes, migrates, or checkpoints it. Requires a
@@ -821,10 +865,14 @@ Every store is opened strictly read-only — a live run may hold it open, and
 (`agent-run NAME -- <cmd>`) has no `session.json` and therefore no
 transcript; `transcript` exits non-zero naming the two alternatives (relaunch
 under `--harness`, or use `logs --clean` on the captured PTY log). Unparseable
-individual records are skipped and counted on stderr; a missing or unusable
-store is an error, and so is a store that opens and reads cleanly but yields
-zero entries for the session — both exit non-zero, so a caller can tell "no
-transcript" apart from ordinary success. A single tool result is
+individual records are skipped and counted on stderr. Exit status
+discriminates *availability*, not emptiness: a store that was located,
+opened and queried successfully exits **0** whether or not it holds any
+entries for this session — an empty result prints nothing on stdout and an
+explanatory note on stderr, so a caller can branch on "rc=0, blank stdout"
+to mean "available and empty" specifically, distinct from "no transcript to
+read at all" (raw run, unacquired session id, missing/unreadable store),
+which still exits non-zero. A single tool result is
 truncated at 40 lines / 4 KiB with a marker naming how much was dropped,
 independent of `--head`/`--tail`, which slice whole entries (not bytes) using
 the same defaults as `logs`. For `claude`, entries from the main session and

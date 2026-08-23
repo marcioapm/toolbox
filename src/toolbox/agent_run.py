@@ -371,6 +371,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 from toolbox import __version__ as TOOLBOX_VERSION
+from toolbox import agent_run_transcript as _agent_run_transcript
 
 
 # Absolutised against the invocation directory at import: --cwd chdirs the
@@ -4211,6 +4212,97 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
     }
 
 
+def _transcript_unknown(code: str, submitted_age_s: Optional[float] = None) -> dict:
+    """Return unavailable facts; an unknown entry count is never zero."""
+    return {
+        "available": False,
+        "entries": None,
+        "newest_age_s": None,
+        "submitted_age_s": submitted_age_s,
+        "error": code,
+    }
+
+
+def _read_prompt_submitted_sentinel(path: Path) -> Optional[tuple[str, float]]:
+    """Read bounded regular-file content and mtime from one descriptor."""
+    max_bytes = 256  # generous for either on-disk format: an ISO-8601 timestamp or the bare "1" sentinel
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not _stat_module.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            return None
+        data = os.read(fd, max_bytes)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        return data.decode("utf-8").strip(), st.st_mtime
+    except UnicodeError:
+        return None
+
+
+def _watch_prompt_submitted_age_s(state_dir: Optional[Path], interactive: Optional[bool]) -> Optional[float]:
+    """Return interactive prompt age from ISO content or legacy sentinel mtime."""
+    if interactive is not True or state_dir is None:
+        return None
+    read = _read_prompt_submitted_sentinel(state_dir / "prompt_submitted")
+    if read is None:
+        return None
+    raw, mtime = read
+    if not raw:
+        return None
+    now = datetime.now(timezone.utc)
+    parsed = _watch_parse_iso(raw)
+    if parsed is not None:
+        return max(0.0, (now - parsed).total_seconds())
+    if raw != "1":
+        return None
+    return max(0.0, now.timestamp() - mtime)
+
+
+def _watch_transcript_facts(
+    session_data: Optional[dict],
+    cwd: Optional[str],
+    state_dir: Optional[Path] = None,
+    interactive: Optional[bool] = None,
+) -> dict:
+    """Return transcript facts, degrading every store failure to unavailable."""
+    submitted_age_s = _watch_prompt_submitted_age_s(state_dir, interactive)
+
+    if not isinstance(session_data, dict):
+        return _transcript_unknown("no_session_json", submitted_age_s)
+    session_id = session_data.get("session_id")
+    harness = session_data.get("harness")
+    if not isinstance(session_id, str) or not session_id or not isinstance(harness, str):
+        return _transcript_unknown("no_session_id", submitted_age_s)
+
+    try:
+        count, newest_iso = _agent_run_transcript.count_transcript(harness, session_id, cwd)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise TypeError(f"count_transcript returned a non-count value: {count!r}")
+        if newest_iso is not None and not isinstance(newest_iso, str):
+            raise TypeError(f"count_transcript returned a non-timestamp newest value: {newest_iso!r}")
+        newest_age_s: Optional[float] = None
+        newest_dt = _watch_parse_iso(newest_iso)
+        if newest_dt is not None:
+            newest_age_s = max(0.0, (datetime.now(timezone.utc) - newest_dt).total_seconds())
+        return {
+            "available": True,
+            "entries": count,
+            "newest_age_s": newest_age_s,
+            "submitted_age_s": submitted_age_s,
+            "error": None,
+        }
+    except _agent_run_transcript.TranscriptSourceError as exc:
+        return _transcript_unknown(exc.code, submitted_age_s)
+    except Exception:
+        return _transcript_unknown("store_unreadable", submitted_age_s)
+
+
 def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
     """Build the watch contract with every field at its null/unknown default,
     overridden by *fields*. The key set is fixed here so it cannot vary
@@ -4247,6 +4339,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
         "session": None,
         "scratch": _scratch_unknown("not_observed"),
         "hooks": None,
+        "transcript": _transcript_unknown("not_observed"),
     }
     unknown = set(fields) - set(payload)
     if unknown:
@@ -4283,7 +4376,13 @@ def _cmd_watch_observe(
     # names can change between this line and the actual read.
     log = _log_file_for(name)
 
-    def observed(repo: Optional[str], launch_head: Optional[str], cwd: Optional[str]) -> dict:
+    def observed(
+        repo: Optional[str],
+        launch_head: Optional[str],
+        cwd: Optional[str],
+        session_data: Optional[dict],
+        interactive: Optional[bool],
+    ) -> dict:
         git, git_error = _watch_repo_git(repo, launch_head)
         log_facts, signals = _watch_log_observation(log)
         return {
@@ -4296,6 +4395,10 @@ def _cmd_watch_observe(
             "git_error": git_error,
             "signals": signals,
             "scratch": _watch_scratch_facts(cwd),
+            # Match cmd_transcript's persistent cwd source for Claude lookup.
+            "transcript": _watch_transcript_facts(
+                session_data, _run_json_cwd(log_dir), state_dir, interactive
+            ),
         }
 
     state_dir_state = _probe_dir_state(state_dir)
@@ -4318,7 +4421,7 @@ def _cmd_watch_observe(
         session_data = _read_session_json(log_dir)
         payload = _watch_payload(
             name, observed_at, WATCH_STATUS_LOG_PRESERVED,
-            **observed(repo_arg, None, repo_arg),
+            **observed(repo_arg, None, repo_arg, session_data, None),
             session=session_data,
             hooks=_read_hooks_jsonl(log_dir),
         )
@@ -4348,13 +4451,14 @@ def _cmd_watch_observe(
     repo_str = repo_arg or (_watch_read_cwd_file(state_dir / "cwd") or None)
     session_data = _read_session_json(log_dir)
     recorded_cwd = _watch_read_cwd_file(state_dir / "cwd") or None
+    interactive = interactive_raw == "1" if interactive_raw in {"0", "1"} else None
     payload = _watch_payload(
         name,
         observed_at,
         status,
         exit_code=_safe_int(_read(state_dir / "exit_code")),
         pid=pid,
-        interactive=interactive_raw == "1" if interactive_raw in {"0", "1"} else None,
+        interactive=interactive,
         started_at=started_raw,
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
@@ -4363,7 +4467,7 @@ def _cmd_watch_observe(
         # repo_str is for git-fact attribution; recorded_cwd is for scratch so
         # that --repo (correcting which repo to inspect) does not silently move
         # the scratch scan off the run's launch directory.
-        **observed(repo_str, _read(state_dir / "launch_head") or None, recorded_cwd),
+        **observed(repo_str, _read(state_dir / "launch_head") or None, recorded_cwd, session_data, interactive),
     )
     _watch_emit(
         payload,
@@ -4921,18 +5025,13 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 
 def cmd_transcript(args: argparse.Namespace) -> int:
-    """Print the harness's own conversation record for a managed run.
+    """Print a run's harness transcript.
 
-    Reads session.json for session_id/harness (written at launch by
-    _record_session) and dispatches to the matching reader in
-    agent_run_transcript. Raw runs and any run whose session id was never
-    acquired have nothing to read; exit non-zero naming the two
-    alternatives rather than raising, since neither is a bug in this run.
-    An empty entry list is likewise an error, not a silent no-op: a caller
-    needs to tell "the store had nothing for this session" apart from
-    ordinary success.
+    A readable empty store exits zero with blank stdout. Missing session
+    metadata or an unavailable store exits nonzero.
     """
-    from toolbox import agent_run_transcript as transcript
+
+    transcript = _agent_run_transcript
 
     name = _validate_run_name(args.name)
     log_dir = _log_dir(name)
@@ -4952,32 +5051,25 @@ def cmd_transcript(args: argparse.Namespace) -> int:
             f"relaunch under --harness <name> for a transcript, or use 'agent-run logs {name} --clean'"
         )
 
-    try:
-        run_data = json.loads((log_dir / "run.json").read_text())
-    except (OSError, json.JSONDecodeError, ValueError):
-        run_data = {}
-    cwd = run_data.get("cwd") if isinstance(run_data, dict) else None
-    cwd = cwd if isinstance(cwd, str) else None
+    cwd = _run_json_cwd(log_dir)
     try:
         entries, skipped = transcript.read_transcript(harness, session_id, cwd)
     except transcript.TranscriptSourceError as exc:
         sys.exit(f"agent-run: {exc}")
 
     if not entries:
-        # An empty read and a broken pipeline both print nothing and exit 0
-        # unless this is an error: a caller (including threadctl) branching
-        # on exit status needs "no transcript" distinguishable from a
-        # transcript that happens to hold zero entries.
         store = {
             "opencode": transcript.OPENCODE_DB_PATH,
             "claude": transcript.CLAUDE_PROJECTS_DIR,
             "codex": transcript.CODEX_SESSIONS_DIR,
         }.get(harness, "?")
         skipped_note = f", {skipped} record(s) skipped as unparseable" if skipped else ""
-        sys.exit(
+        print(
             f"agent-run: transcript for '{name}' ({harness}, session {session_id}) is empty "
-            f"(store: {store}{skipped_note})"
+            f"(store: {store}{skipped_note})",
+            file=sys.stderr,
         )
+        return 0
 
     if args.head is not None:
         entries = entries[: args.head]
@@ -10872,6 +10964,20 @@ def _read_session_json(log_dir: Path) -> Optional[dict]:
         return data if isinstance(data, dict) else None
     except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
         return None
+
+
+def _run_json_cwd(log_dir: Path) -> Optional[str]:
+    """Read the launch ``cwd`` recorded in run.json, or None if absent,
+    malformed, or not a string. Used to locate a claude session's project
+    directory (see ``_claude_session_path``) without depending on the
+    ephemeral state dir's ``cwd`` file, which a preserved-log-only run no
+    longer has."""
+    try:
+        data = json.loads((log_dir / "run.json").read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    cwd = data.get("cwd") if isinstance(data, dict) else None
+    return cwd if isinstance(cwd, str) else None
 
 
 def _write_run_json(log_dir: Path, data: dict) -> None:

@@ -10,15 +10,26 @@ session, and a tool call with a large output.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import inspect
 import json
+import os
 import sqlite3
 import time
+import tracemalloc
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
 from toolbox import agent_run
 from toolbox import agent_run_transcript as transcript
+
+
+ROOT_SKIP = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores permission bits",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +38,8 @@ from toolbox import agent_run_transcript as transcript
 
 def _make_opencode_db(path: Path) -> None:
     """Minimal `part`/`message` tables matching the real opencode schema
-    (only the columns this reader touches)."""
+    (only the columns this reader touches), including the `part_session_idx`
+    index `_count_opencode` relies on to avoid a full table scan."""
     conn = sqlite3.connect(path)
     try:
         conn.execute(
@@ -38,6 +50,7 @@ def _make_opencode_db(path: Path) -> None:
             "create table part (id text primary key, message_id text, "
             "session_id text, time_created integer, data text)"
         )
+        conn.execute("create index part_session_idx on part (session_id)")
         conn.commit()
     finally:
         conn.close()
@@ -70,6 +83,19 @@ def _opencode_insert(
 def _write_jsonl(path: Path, records: list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
+
+
+@contextlib.contextmanager
+def _unreadable_dir(path: Path):
+    """Make an existing directory genuinely unreadable (mode 000) for the
+    duration of the block, restoring it in a `finally` so test cleanup
+    (tmp_path removal) still works. Exercises the real permission-denied
+    path the production code must handle, not a simulated one."""
+    path.chmod(0o000)
+    try:
+        yield
+    finally:
+        path.chmod(0o755)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +174,23 @@ class TestOpencodeReader:
         monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", tmp_path / "does-not-exist.db")
         with pytest.raises(transcript.TranscriptSourceError):
             transcript.read_transcript("opencode", "ses_1", None)
+
+    @ROOT_SKIP
+    def test_unreadable_parent_dir_raises_store_unreadable_not_missing(self, tmp_path, monkeypatch):
+        """A permission-denied parent directory makes the db file
+        genuinely unstat'able -- distinct from it simply not existing --
+        and must not collapse into `store_missing`, which a supervisor
+        would otherwise read as a routine empty session."""
+        parent = tmp_path / "opencode-data"
+        parent.mkdir()
+        db = parent / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        with _unreadable_dir(parent):
+            with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+                transcript.read_transcript("opencode", "ses_1", None)
+        assert exc_info.value.code == "store_unreadable"
+        assert exc_info.value.__cause__ is not None
 
     def test_corrupt_row_mid_session_is_skipped_not_raised(self, tmp_path, monkeypatch):
         db = tmp_path / "opencode.db"
@@ -248,6 +291,512 @@ class TestOpencodeReader:
         assert "truncated" in out
         assert "line 0" in out
         assert "line 2999" not in out
+
+
+# ---------------------------------------------------------------------------
+# count_transcript
+# ---------------------------------------------------------------------------
+
+class TestCountTranscript:
+    def test_opencode_count_query_uses_the_session_index_not_a_full_scan(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
+            parts=[{"type": "text", "text": "hi"}],
+        )
+        conn = sqlite3.connect(db)
+        try:
+            plan = conn.execute(
+                "explain query plan select count(*), max(time_created) from part where session_id = ?",
+                ("ses_1",),
+            ).fetchall()
+        finally:
+            conn.close()
+        plan_text = " ".join(str(cell) for row in plan for cell in row).lower()
+        assert "using index part_session_idx" in plan_text, f"expected an index scan, got plan: {plan}"
+
+    def test_opencode_counts_raw_part_rows_and_finds_newest_time(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
+            parts=[{"type": "text", "text": "hi"}],
+        )
+        _opencode_insert(
+            db, message_id="m2", session_id="ses_1", role="assistant", time_created=2000,
+            parts=[{"type": "text", "text": "ok"}, {"type": "step-start"}],
+        )
+        count, newest = transcript.count_transcript("opencode", "ses_1", None)
+        # Two messages, three parts total (one is bookkeeping and would be
+        # filtered by read_transcript, but the raw count still includes it).
+        assert count == 3
+        assert newest is not None
+        entries, _ = transcript.read_transcript("opencode", "ses_1", None)
+        assert count >= len(entries)
+
+    def test_opencode_absent_session_counts_zero_with_no_newest(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        count, newest = transcript.count_transcript("opencode", "ses_nonexistent", None)
+        assert count == 0
+        assert newest is None
+
+    def test_opencode_missing_store_raises_source_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", tmp_path / "does-not-exist.db")
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("opencode", "ses_1", None)
+        assert exc_info.value.code == "store_missing"
+
+    def test_opencode_held_lock_raises_locked_code(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        locker = sqlite3.connect(db)
+        locker.execute("begin exclusive")
+        locker.execute("insert into message (id, session_id, time_created, data) values ('x', 'ses_1', 1, '{}')")
+        try:
+            with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+                transcript.count_transcript("opencode", "ses_1", None)
+            assert exc_info.value.code == "store_locked"
+        finally:
+            locker.rollback()
+            locker.close()
+
+    def test_opencode_corrupt_database_raises_unreadable_code(self, tmp_path, monkeypatch):
+        db = tmp_path / "garbage.db"
+        db.write_bytes(b"not a sqlite database")
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("opencode", "ses_1", None)
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_unknown_harness_raises_unknown_harness_code(self):
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("some-future-harness", "ses_1", None)
+        assert exc_info.value.code == "unknown_harness"
+
+    @pytest.mark.parametrize(
+        "bad_session_id",
+        [
+            pytest.param("../../escaped-session", id="parent_traversal"),
+            pytest.param("wild*card", id="glob_star"),
+            pytest.param("br[ack]et", id="glob_bracket"),
+            pytest.param("question?mark", id="glob_question"),
+            pytest.param("has/slash", id="path_separator"),
+            pytest.param("has\\backslash", id="backslash"),
+            pytest.param("has\x00nul", id="embedded_nul"),
+        ],
+    )
+    def test_unsafe_session_id_rejected_before_path_construction_claude(
+        self, tmp_path, monkeypatch, bad_session_id
+    ):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("claude", bad_session_id, "/Users/x/proj")
+        assert exc_info.value.code == "store_unreadable"
+
+    @pytest.mark.parametrize(
+        "bad_session_id",
+        [
+            pytest.param("../../escaped-session", id="parent_traversal"),
+            pytest.param("wild*card", id="glob_star"),
+            pytest.param("br[ack]et", id="glob_bracket"),
+            pytest.param("has/slash", id="path_separator"),
+        ],
+    )
+    def test_unsafe_session_id_rejected_before_path_construction_codex(
+        self, tmp_path, monkeypatch, bad_session_id
+    ):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("codex", bad_session_id, None)
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_claude_count_matches_read_transcript_entry_count(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        cwd = "/Users/x/proj"
+        session_id = "sess-count"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "hi"},
+                },
+                {
+                    "type": "assistant", "sessionId": session_id, "timestamp": "2026-08-16T00:00:01Z",
+                    "message": {"role": "assistant", "content": "hello back"},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("claude", session_id, cwd)
+        entries, _ = transcript.read_transcript("claude", session_id, cwd)
+        assert count == len(entries) == 2
+        assert newest == "2026-08-16T00:00:01Z"
+
+    def test_claude_count_converts_non_utc_offset_to_true_utc_instant(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        cwd = "/Users/x/proj"
+        session_id = "sess-offset"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T12:00:00+14:00",
+                    "message": {"role": "user", "content": "hi"},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("claude", session_id, cwd)
+        assert count == 1
+        assert newest == "2026-08-15T22:00:00Z"  # same instant, converted to UTC
+
+    def test_claude_count_converts_negative_offset_to_true_utc_instant(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        cwd = "/Users/x/proj"
+        session_id = "sess-offset-neg"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T12:00:00-05:00",
+                    "message": {"role": "user", "content": "hi"},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("claude", session_id, cwd)
+        assert count == 1
+        assert newest == "2026-08-16T17:00:00Z"  # same instant, converted to UTC
+
+    def test_codex_count_converts_non_utc_offset_to_true_utc_instant(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "offset-session"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "timestamp": "2026-08-19T12:00:00+14:00", "type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("codex", session_id, None)
+        assert count == 1
+        assert newest == "2026-08-18T22:00:00Z"
+
+    def test_claude_missing_store_raises_store_missing_code(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("claude", "no-such-session", "/nonexistent/cwd")
+        assert exc_info.value.code == "store_missing"
+
+    def test_codex_count_matches_read_transcript_entry_count(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "count-session"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "timestamp": "2026-08-19T00:00:00Z", "type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                },
+                {
+                    "timestamp": "2026-08-19T00:00:01Z", "type": "response_item",
+                    "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hey"}]},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("codex", session_id, None)
+        entries, _ = transcript.read_transcript("codex", session_id, None)
+        assert count == len(entries) == 2
+        assert newest == "2026-08-19T00:00:01Z"
+
+    def test_codex_missing_store_raises_store_missing_code(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("codex", "no-such-session", None)
+        assert exc_info.value.code == "store_missing"
+
+    @ROOT_SKIP
+    def test_claude_unreadable_glob_directory_raises_store_unreadable_not_missing(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "projects"
+        root.mkdir()
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", root)
+        with _unreadable_dir(root):
+            with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+                transcript.count_transcript("claude", "some-session", "/nonexistent/cwd")
+        assert exc_info.value.code == "store_unreadable"
+        assert exc_info.value.__cause__ is not None
+
+    @ROOT_SKIP
+    def test_codex_unreadable_sessions_dir_raises_store_unreadable_not_missing(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "sessions"
+        root.mkdir()
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", root)
+        with _unreadable_dir(root):
+            with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+                transcript.count_transcript("codex", "some-session", None)
+        assert exc_info.value.code == "store_unreadable"
+        assert exc_info.value.__cause__ is not None
+
+    def test_claude_skipped_only_file_raises_store_unreadable_not_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-all-skipped"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {"type": "user", "sessionId": session_id, "message": "not-a-dict"},
+                {"type": "assistant", "sessionId": session_id, "message": None},
+            ],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("claude", session_id, "/Users/x/proj")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_claude_partially_skipped_file_still_counts_the_readable_records(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-partial-skip"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {"type": "user", "sessionId": session_id, "message": "not-a-dict"},
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "hi"},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("claude", session_id, "/Users/x/proj")
+        assert count == 1
+        assert newest == "2026-08-16T00:00:00Z"
+
+    def test_claude_direct_path_all_mismatched_records_raises_store_unreadable(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-direct-all-mismatched"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": "someone-elses-session",
+                    "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "not mine"},
+                },
+                {
+                    "type": "assistant", "sessionId": "someone-elses-session",
+                    "timestamp": "2026-08-16T00:00:01Z",
+                    "message": {"role": "assistant", "content": "also not mine"},
+                },
+            ],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("claude", session_id, "/Users/x/proj")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_claude_direct_path_mismatched_plus_ignorable_metadata_raises_store_unreadable(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-direct-mismatched-plus-meta"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {"type": "queue-operation", "sessionId": session_id, "op": "noop"},
+                {
+                    "type": "user", "sessionId": "someone-elses-session",
+                    "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "not mine"},
+                },
+            ],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("claude", session_id, "/Users/x/proj")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_claude_direct_path_one_match_among_mismatched_records_counts_the_match(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-direct-one-match"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": "someone-elses-session",
+                    "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "not mine"},
+                },
+                {
+                    "type": "user", "sessionId": session_id,
+                    "timestamp": "2026-08-16T00:00:01Z",
+                    "message": {"role": "user", "content": "mine"},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("claude", session_id, "/Users/x/proj")
+        assert count == 1
+        assert newest == "2026-08-16T00:00:01Z"
+
+    def test_claude_direct_path_empty_file_is_a_valid_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-direct-empty"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(path, [])
+        count, newest = transcript.count_transcript("claude", session_id, "/Users/x/proj")
+        assert count == 0
+        assert newest is None
+
+    def test_claude_direct_path_metadata_only_file_is_a_valid_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-direct-metadata-only"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {"type": "queue-operation", "sessionId": session_id, "op": "noop"},
+                {"type": "mode", "sessionId": session_id, "mode": "plan"},
+            ],
+        )
+        count, newest = transcript.count_transcript("claude", session_id, "/Users/x/proj")
+        assert count == 0
+        assert newest is None
+
+    def test_codex_skipped_only_file_raises_store_unreadable_not_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "sess-codex-all-skipped"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {"timestamp": "2026-08-19T00:00:00Z", "type": "response_item", "payload": "not-a-dict"},
+                {"timestamp": "2026-08-19T00:00:01Z", "type": "response_item", "payload": None},
+            ],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("codex", session_id, None)
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_codex_partially_skipped_file_still_counts_the_readable_records(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "sess-codex-partial-skip"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {"timestamp": "2026-08-19T00:00:00Z", "type": "response_item", "payload": "not-a-dict"},
+                {
+                    "timestamp": "2026-08-19T00:00:01Z", "type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("codex", session_id, None)
+        assert count == 1
+        assert newest == "2026-08-19T00:00:01Z"
+
+
+# ---------------------------------------------------------------------------
+# counters stream, not materialize
+# ---------------------------------------------------------------------------
+
+class TestCountersStream:
+    def test_iter_jsonl_objects_is_a_generator_not_a_list_builder(self):
+        assert inspect.isgeneratorfunction(transcript._iter_jsonl_objects)
+
+    def test_claude_count_peak_memory_bounded_by_largest_line_not_file_size(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-streaming-claude"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        record_count = 20_000
+        filler = "x" * 200  # ~250 bytes/record once JSON-encoded
+
+        def _records():
+            for i in range(record_count):
+                yield {
+                    "type": "user", "sessionId": session_id,
+                    "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": f"{filler}-{i}"},
+                }
+
+        _write_jsonl(path, _records())
+        file_size = path.stat().st_size
+        assert file_size > 4_000_000  # sanity: this is a genuinely large file
+
+        tracemalloc.start()
+        try:
+            tracemalloc.clear_traces()
+            count, _ = transcript.count_transcript("claude", session_id, "/Users/x/proj")
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert count == record_count
+        assert peak < file_size // 4, (
+            f"peak traced memory {peak} bytes is too close to file size {file_size} bytes "
+            "-- counter appears to materialize the whole file rather than stream it"
+        )
+
+    def test_codex_count_peak_memory_bounded_by_largest_line_not_file_size(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "sess-streaming-codex"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        record_count = 20_000
+        filler = "x" * 200
+
+        def _records():
+            for i in range(record_count):
+                yield {
+                    "timestamp": "2026-08-19T00:00:00Z", "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": f"{filler}-{i}"}],
+                    },
+                }
+
+        _write_jsonl(path, _records())
+        file_size = path.stat().st_size
+        assert file_size > 4_000_000
+
+        tracemalloc.start()
+        try:
+            tracemalloc.clear_traces()
+            count, _ = transcript.count_transcript("codex", session_id, None)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert count == record_count
+        assert peak < file_size // 4, (
+            f"peak traced memory {peak} bytes is too close to file size {file_size} bytes "
+            "-- counter appears to materialize the whole file rather than stream it"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +956,93 @@ class TestClaudeReader:
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         with pytest.raises(transcript.TranscriptSourceError):
             transcript.read_transcript("claude", "no-such-session", "/nowhere")
+
+    @ROOT_SKIP
+    def test_unreadable_cwd_candidate_check_raises_store_unreadable(self, tmp_path, monkeypatch):
+        """A permission-denied path component under the cwd-derived
+        candidate's directory (stat failure) must surface as a read
+        failure, not fall through to the glob path and possibly report
+        absence."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-unreadable-candidate"
+        project_dir = tmp_path / "-Users-x-proj"
+        project_dir.mkdir()
+        with _unreadable_dir(project_dir):
+            with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+                transcript.read_transcript("claude", session_id, "/Users/x/proj")
+        assert exc_info.value.code == "store_unreadable"
+        assert exc_info.value.__cause__ is not None
+
+    @ROOT_SKIP
+    def test_unreadable_glob_directory_raises_store_unreadable_not_missing(self, tmp_path, monkeypatch):
+        """CLAUDE_PROJECTS_DIR itself unreadable (permission denied on
+        scandir) is not evidence the session is absent -- it must not
+        collapse into store_missing."""
+        root = tmp_path / "projects"
+        root.mkdir()
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", root)
+        session_id = "sess-unreadable-glob"
+        with _unreadable_dir(root):
+            with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+                transcript.read_transcript("claude", session_id, None)
+        assert exc_info.value.code == "store_unreadable"
+        assert exc_info.value.__cause__ is not None
+
+    @ROOT_SKIP
+    def test_unreadable_subagents_dir_check_raises_store_unreadable(self, tmp_path, monkeypatch):
+        """A readable main file whose session directory (housing
+        subagents/) cannot be stat'd must not silently report only the
+        main file's entries -- the subagent tree is part of this
+        session's transcript."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-unreadable-subagents"
+        cwd = "/Users/x/proj"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "main turn"},
+                }
+            ],
+        )
+        session_dir = path.parent / path.stem
+        session_dir.mkdir()
+        with _unreadable_dir(session_dir):
+            with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+                transcript.read_transcript("claude", session_id, cwd)
+        assert exc_info.value.code == "store_unreadable"
+        assert exc_info.value.__cause__ is not None
+
+    @ROOT_SKIP
+    def test_unreadable_subagents_glob_raises_store_unreadable(self, tmp_path, monkeypatch):
+        """The subagents/ directory itself stat'able (mode allows lookup)
+        but not listable (execute-only) must still surface as a read
+        failure."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-unreadable-subagents-glob"
+        cwd = "/Users/x/proj"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "main turn"},
+                }
+            ],
+        )
+        subagents_dir = path.parent / path.stem / "subagents"
+        subagents_dir.mkdir(parents=True)
+        subagents_dir.chmod(0o111)  # traversable (stat/is_dir succeeds) but not listable
+        try:
+            with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+                transcript.read_transcript("claude", session_id, cwd)
+        finally:
+            subagents_dir.chmod(0o755)
+        assert exc_info.value.code == "store_unreadable"
+        assert exc_info.value.__cause__ is not None
 
     def test_empty_session_file_returns_no_entries(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
@@ -810,6 +1446,19 @@ class TestCodexReader:
         with pytest.raises(transcript.TranscriptSourceError):
             transcript.read_transcript("codex", "no-such-session", None)
 
+    @ROOT_SKIP
+    def test_unreadable_sessions_dir_raises_store_unreadable_not_missing(self, tmp_path, monkeypatch):
+        """CODEX_SESSIONS_DIR itself unreadable (permission-denied scandir)
+        is not evidence the session is absent."""
+        root = tmp_path / "sessions"
+        root.mkdir()
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", root)
+        with _unreadable_dir(root):
+            with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+                transcript.read_transcript("codex", "some-session", None)
+        assert exc_info.value.code == "store_unreadable"
+        assert exc_info.value.__cause__ is not None
+
     def test_empty_session_file_returns_no_entries(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
         session_id = "empty-session"
@@ -1091,8 +1740,8 @@ class TestCmdTranscript:
         stderr = captured.err.decode("utf-8")
         assert "skipped 1" in stderr
 
-    def test_empty_but_valid_store_exits_nonzero_naming_run_and_session(
-        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path
+    def test_empty_but_valid_store_exits_zero_with_stderr_note_and_no_stdout(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path, capsysbinary
     ):
         db = tmp_path / "opencode.db"
         _make_opencode_db(db)
@@ -1108,16 +1757,18 @@ class TestCmdTranscript:
             {"session_id": "ses_gone", "harness": "opencode", "acquisition": "minted", "confidence": "certain"},
         )
 
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run.cmd_transcript(self._args(name))
-        message = str(exc_info.value)
+        rc = agent_run.cmd_transcript(self._args(name))
+        assert rc == 0
+        captured = capsysbinary.readouterr()
+        assert captured.out == b""
+        message = captured.err.decode("utf-8")
         assert name in message
         assert "opencode" in message
         assert "ses_gone" in message
         assert str(db) in message
 
-    def test_skipped_only_store_exits_nonzero_with_skipped_count(
-        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path
+    def test_skipped_only_store_exits_zero_with_skipped_count_on_stderr(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path, capsysbinary
     ):
         db = tmp_path / "opencode.db"
         _make_opencode_db(db)
@@ -1146,9 +1797,11 @@ class TestCmdTranscript:
             {"session_id": "ses_onlyskip", "harness": "opencode", "acquisition": "minted", "confidence": "certain"},
         )
 
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run.cmd_transcript(self._args(name))
-        message = str(exc_info.value)
+        rc = agent_run.cmd_transcript(self._args(name))
+        assert rc == 0
+        captured = capsysbinary.readouterr()
+        assert captured.out == b""
+        message = captured.err.decode("utf-8")
         assert "1" in message
         assert "skip" in message.lower()
 
