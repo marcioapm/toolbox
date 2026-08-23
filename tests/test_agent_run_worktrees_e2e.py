@@ -28,6 +28,7 @@ E2E6 -- `du` and `reap --include-worktrees` against a real linked worktree.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -139,7 +140,7 @@ def _kill_and_reap(pid: Optional[int], timeout: float = 10.0) -> None:
     except ProcessLookupError:
         return
     try:
-        os.kill(pid, __import__("signal").SIGKILL)
+        os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         return
     _wait_for(lambda: _pid_gone(pid), timeout, f"pid {pid} to exit after SIGKILL")
@@ -274,3 +275,94 @@ class TestE2E1RealLaunch:
         assert _wait_terminal(state_dir) == "done"
 
         assert _git(wt, "rev-parse", "HEAD").strip() == tag_commit
+
+
+# ---------------------------------------------------------------------------
+# E2E2: the rollback contract
+# ---------------------------------------------------------------------------
+
+@live_only
+class TestE2E2RollbackContract:
+    """A worktree this invocation created is removed by a preflight failure
+    and preserved by a post-process failure -- through the real CLI, a real
+    fork, and real filesystem state, never a mocked seam."""
+
+    def test_preflight_failure_after_worktree_creation_removes_worktree_and_branch(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        """A missing -f/--prompt-file is rejected inside _cmd_launch_locked,
+        before os.fork() is reached -- after _create_launch_worktree has
+        already run inside cmd_launch's publication lock. This is a genuine
+        argv/preflight failure reached only after the worktree exists."""
+        repo = _make_repo(tmp_path, "repo-pre")
+        wt = tmp_path / "wt-pre"
+        name = "e2e-preflight-fail"
+        missing_prompt = tmp_path / "no-such-prompt.txt"
+        argv = _launch_argv(
+            name=name, worktree=wt, worktree_base="main", worktree_repo=repo,
+            command=["true"], prompt_file=str(missing_prompt),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.main(argv)
+        assert "prompt file not found" in str(exc.value)
+
+        assert not wt.exists()
+        porcelain = _git(repo, "worktree", "list", "--porcelain")
+        assert str(wt.resolve()) not in porcelain
+        assert name not in _git(repo, "branch", "--list")
+        assert not (isolated_runs_root / name).exists()
+
+    def test_post_process_failure_preserves_worktree_and_branch(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        """A real interrupt delivered to the real CLI process after its real
+        `os.fork()` has already produced a live runner must never roll back:
+        the worktree and branch survive, and the real workload process (a
+        `sleep`, standing in for the launched agent) is reaped by the test."""
+        repo = _make_repo(tmp_path, "repo-post")
+        wt = tmp_path / "wt-post"
+        name = "e2e-postprocess-fail"
+        argv = [
+            sys.executable, "-m", "toolbox.agent_run",
+            *_launch_argv(
+                name=name, worktree=wt, worktree_base="main", worktree_repo=repo,
+                command=[sys.executable, "-c", "import time; time.sleep(30)"],
+            ),
+        ]
+        env = dict(os.environ)
+        env["AGENT_RUN_STATE_DIR"] = str(isolated_runs_root)
+        env["AGENT_RUN_LOG_DIR"] = str(isolated_log_root)
+
+        launcher = subprocess.Popen(argv, env=env)
+        runner_pid: Optional[int] = None
+        agent_pid: Optional[int] = None
+        try:
+            state_dir = isolated_runs_root / name
+            # Proof the fork already produced a live runner: the runner
+            # publishes its own pid before anything else. Once this file
+            # exists, os.fork() has returned in the launcher and
+            # args._worktree_process_started is unconditionally set.
+            _wait_for(lambda: (state_dir / "pid").exists(), 10.0, "runner pid file")
+            runner_pid = int((state_dir / "pid").read_text().strip())
+            assert agent_run._pid_alive(runner_pid)
+
+            launcher.send_signal(signal.SIGINT)
+            launcher.wait(timeout=15)
+
+            assert wt.is_dir(), "worktree must survive a post-fork interrupt"
+            porcelain = _git(repo, "worktree", "list", "--porcelain")
+            assert str(wt.resolve()) in porcelain
+            assert name in _git(repo, "branch", "--list", name)
+
+            _wait_for(
+                lambda: (state_dir / "agent_pid").exists(), 10.0, "agent_pid file"
+            )
+            agent_pid = int((state_dir / "agent_pid").read_text().strip())
+        finally:
+            launcher.poll()
+            if launcher.returncode is None:
+                launcher.kill()
+                launcher.wait(timeout=10)
+            _kill_and_reap(agent_pid)
+            _kill_and_reap(runner_pid)
