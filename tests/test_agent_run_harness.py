@@ -3137,6 +3137,112 @@ class TestPreforkMintPostKillWaitInterrupt:
         )
         assert launch_args._worktree_process_started is True
 
+    def test_post_kill_system_exit_outranks_a_failed_mint_body(
+        self, tmp_path, monkeypatch
+    ):
+        exit_request = SystemExit(37)
+        body_failure = RuntimeError("health poll blew up")
+
+        class _FakeProc:
+            pid = 4444
+            returncode = None
+
+            def __init__(self):
+                self.wait_calls = 0
+                self.killed = False
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="opencode", timeout=timeout)
+                raise exit_request
+
+            def kill(self):
+                self.killed = True
+
+        created = []
+
+        def _fake_popen(cmd, **kwargs):
+            proc = _FakeProc()
+            created.append(proc)
+            return proc
+
+        def _raising_poll(*a, **k):
+            raise body_failure
+
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", _raising_poll)
+
+        launch_args = argparse.Namespace(_worktree_process_started=False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run._opencode_prefork_mint(
+                12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+                launch_args=launch_args,
+            )
+
+        assert exc_info.value is exit_request
+        assert exc_info.value.code == 37, (
+            "the operator's interrupt is the latest control-flow request and must "
+            "outrank an already-unwinding mint body failure"
+        )
+        assert any("health poll blew up" in note for note in exc_info.value.__notes__), (
+            "the body failure must stay visible as a note on the interrupt"
+        )
+        assert created[0].killed is True
+        assert launch_args._worktree_process_started is True
+
+    def test_cleanup_failure_does_not_displace_an_explicit_body_cause(
+        self, tmp_path, monkeypatch
+    ):
+        original_cause = LookupError("the real root cause")
+        body_failure = RuntimeError("mint body failed")
+        body_failure.__cause__ = original_cause
+        cleanup_failure = OSError("reap blew up")
+
+        class _FakeProc:
+            pid = 4545
+            returncode = None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                raise cleanup_failure
+
+            def kill(self):
+                pass
+
+        def _raising_poll(*a, **k):
+            raise body_failure
+
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: _FakeProc())
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", _raising_poll)
+
+        launch_args = argparse.Namespace(_worktree_process_started=False)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            agent_run._opencode_prefork_mint(
+                12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+                launch_args=launch_args,
+            )
+
+        assert exc_info.value is body_failure, (
+            "a bare raise inside the cleanup handler re-raises the cleanup failure, "
+            "not the body exception it claims to preserve"
+        )
+        assert exc_info.value.__cause__ is original_cause, (
+            "an explicit cause the body raised must not be displaced by the "
+            "cleanup failure"
+        )
+        assert any("reap blew up" in note for note in exc_info.value.__notes__), (
+            "the cleanup failure must stay visible as a note"
+        )
+        assert launch_args._worktree_process_started is True
+
 
 # ---------------------------------------------------------------------------
 # Teardown tests: no app-server process must survive kill or signal

@@ -11382,18 +11382,22 @@ def _opencode_prefork_mint(
     except BaseException as body_exc:
         _restore_handlers()
         _mint_proc_ref[0] = None
-        # The mint body's own failure is the caller's real cause and wins
-        # over a cleanup failure. A cleanup failure is chained on as
-        # __cause__ only when the body exception has none of its own: an
-        # explicit cause the body raised is real causal information and must
-        # not be displaced, so it is recorded as a note instead.
+        # A fresh interrupt during cleanup is the operator's latest request and
+        # outranks the body's failure, which is kept as a note rather than as
+        # __cause__ so the interrupt's own first-wait cause survives. Otherwise
+        # the body's failure is the caller's real cause and wins over a cleanup
+        # failure, which is chained on as __cause__ only when the body exception
+        # has none of its own -- an explicit cause must not be displaced.
         try:
             _mint_terminate_and_reap(proc, timeout=5.0)
+        except (KeyboardInterrupt, SystemExit) as interrupt_exc:
+            interrupt_exc.add_note(f"mint body also failed: {body_exc!r}")
+            raise
         except BaseException as cleanup_exc:
             if body_exc.__cause__ is None:
                 raise body_exc from cleanup_exc
-            _add_exception_note(body_exc, f"mint cleanup also failed: {cleanup_exc!r}")
-            raise
+            body_exc.add_note(f"mint cleanup also failed: {cleanup_exc!r}")
+            raise body_exc
         raise
     else:
         _restore_handlers()
@@ -11403,20 +11407,6 @@ def _opencode_prefork_mint(
         # itself rather than being masked by a normal return.
         _mint_terminate_and_reap(proc, timeout=5.0)
         return result
-
-
-def _add_exception_note(exc: BaseException, note: str) -> None:
-    """Attach a diagnostic note to ``exc`` where the runtime supports it.
-
-    ``BaseException.add_note`` is 3.11+; on older runtimes the note is
-    dropped rather than raising, since it is diagnostic only.
-    """
-    add_note = getattr(exc, "add_note", None)
-    if add_note is not None:
-        try:
-            add_note(note)
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def _mint_terminate_and_reap(proc: subprocess.Popen, timeout: float) -> None:
