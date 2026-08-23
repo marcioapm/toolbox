@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -2877,6 +2878,99 @@ class TestPreforkMintKillEscalationReapsChild:
             with pytest.raises(ProcessLookupError):
                 os.kill(proc.pid, 0)
         finally:
+            proc = state["proc"]
+            if proc is not None and proc.returncode is None:
+                try:
+                    real_kill(proc)
+                except OSError:
+                    pass
+                try:
+                    real_wait(proc, timeout=5)
+                except (subprocess.TimeoutExpired, OSError, ValueError):
+                    pass
+
+
+class TestSignalHandlerReapsDirectChildBeforeRedelivery:
+    """_mint_cleanup_handler must have reaped the direct child before it
+    self-redelivers the handled signal: the outer finally in
+    _opencode_prefork_mint cannot have run yet at that instant (the handler
+    call itself has not returned), so a non-None Popen.returncode observed
+    from inside a custom original handler, invoked via that redelivery,
+    specifically proves the handler's own wait() did the reaping."""
+
+    def test_original_handler_sees_reaped_returncode_on_redelivery(
+        self, tmp_path, monkeypatch
+    ):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        ready_file = tmp_path / "ready"
+        fake_opencode = bin_dir / "opencode"
+        # Publishes readiness, then ignores TERM permanently (exec replaces
+        # the shell's image, so the ignore survives into the sleep) --
+        # forcing the handler's terminate() to be genuinely insufficient
+        # and its wait() to genuinely observe the timeout before kill().
+        fake_opencode.write_text(
+            "#!/bin/sh\n"
+            "trap '' TERM\n"
+            f"touch {shlex.quote(str(ready_file))}\n"
+            "exec sleep 60\n"
+        )
+        fake_opencode.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir) + ":" + os.environ.get("PATH", ""))
+
+        real_popen = subprocess.Popen
+        real_kill = real_popen.kill
+        real_wait = real_popen.wait
+        state = {"proc": None}
+
+        def _popen_tracking(argv, *a, **kw):
+            proc = real_popen(argv, *a, **kw)
+            if argv and argv[0] == "opencode":
+                state["proc"] = proc
+            return proc
+
+        monkeypatch.setattr(subprocess, "Popen", _popen_tracking)
+
+        class _RedeliveredWithReturncode(Exception):
+            def __init__(self, returncode):
+                self.returncode = returncode
+
+        def _custom_original_handler(signum, frame):
+            proc = state["proc"]
+            raise _RedeliveredWithReturncode(proc.returncode if proc else "no-proc")
+
+        prev_handler = signal.signal(signal.SIGTERM, _custom_original_handler)
+
+        def _health_poll_delivers_signal_once_ready(*_a, **_k):
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if ready_file.exists():
+                    break
+                time.sleep(0.02)
+            else:
+                pytest.fail("fake opencode never published readiness")
+            os.kill(os.getpid(), signal.SIGTERM)
+            return False
+
+        monkeypatch.setattr(
+            agent_run, "_opencode_health_poll", _health_poll_delivers_signal_once_ready
+        )
+
+        try:
+            with pytest.raises(_RedeliveredWithReturncode) as exc_info:
+                agent_run._opencode_prefork_mint(
+                    12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+                )
+            assert exc_info.value.returncode is not None, (
+                "Popen.returncode must already be set when the original "
+                "handler observes the self-redelivered signal -- this is "
+                "only true if _mint_cleanup_handler's own wait() reaped "
+                "the child before redelivering, since the outer finally "
+                "in _opencode_prefork_mint cannot have run yet at that "
+                "point (the handler call has not returned)."
+            )
+        finally:
+            signal.signal(signal.SIGTERM, prev_handler)
             proc = state["proc"]
             if proc is not None and proc.returncode is None:
                 try:
