@@ -822,9 +822,10 @@ runs). `entries` counts raw store records, not rendered transcript entries —
 for `opencode` this is `part` table rows before `_opencode_entry`'s filtering,
 so a count of `0` guarantees nothing renders, but a nonzero count does not
 guarantee anything does either; for `claude`/`codex` a file where every
-record was unparseable or session-mismatched (nothing counted, at least one
-skipped) reports `store_unreadable` rather than `entries: 0`, since a wholly
-malformed file is not evidence of an empty session. This block never raises
+record was unparseable or named a different session (nothing counted, at
+least one unparseable or mismatched) reports `store_unreadable` rather than
+`entries: 0`, since a wholly malformed or misidentified file is not evidence
+of an empty session. This block never raises
 past `watch`'s never-raise boundary; any read failure, including an
 unexpected exception type from the count call, degrades to the unavailable
 form.

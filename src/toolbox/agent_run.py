@@ -4231,6 +4231,37 @@ def _transcript_unknown(code: str, submitted_age_s: Optional[float] = None) -> d
     }
 
 
+def _read_prompt_submitted_sentinel(path: Path) -> Optional[tuple[str, float]]:
+    """Open *path* once and return (stripped content, mtime) read from
+    that single descriptor, or ``None`` if it cannot be opened, is not a
+    regular file, or exceeds the bound. Reading content and mtime off one
+    fd -- rather than a separate ``read_text()`` followed by a
+    pathname-based ``stat()`` -- means a concurrent replacement of the
+    file cannot pair one version's content with a different version's
+    mtime; our own writer replaces this file atomically, so this is
+    hardening against a hypothetical future non-atomic writer, not an
+    observed failure.
+    """
+    max_bytes = 256  # generous for either on-disk format: an ISO-8601 timestamp or the bare "1" sentinel
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not _stat_module.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            return None
+        data = os.read(fd, max_bytes)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        return data.decode("utf-8").strip(), st.st_mtime
+    except UnicodeError:
+        return None
+
+
 def _watch_prompt_submitted_age_s(state_dir: Optional[Path], interactive: Optional[bool]) -> Optional[float]:
     """Seconds since ``state_dir/prompt_submitted`` was written -- the
     anchor a consumer should measure "empty transcript" against instead of
@@ -4241,14 +4272,16 @@ def _watch_prompt_submitted_age_s(state_dir: Optional[Path], interactive: Option
     writers) and a bare ``1`` sentinel (older writers), whose age falls
     back to the file's mtime. Null whenever the age cannot be trusted --
     the run is not interactive (no PTY-delivery gap to measure), the file
-    is absent, or its content is neither format -- never a guessed value.
-    Clock skew (a timestamp or mtime in the future) clamps to 0.0 rather
-    than going negative.
+    is absent/unreadable/not a regular file, or its content is neither
+    format -- never a guessed value. Clock skew (a timestamp or mtime in
+    the future) clamps to 0.0 rather than going negative.
     """
     if interactive is not True or state_dir is None:
         return None
-    path = state_dir / "prompt_submitted"
-    raw = _read(path)
+    read = _read_prompt_submitted_sentinel(state_dir / "prompt_submitted")
+    if read is None:
+        return None
+    raw, mtime = read
     if not raw:
         return None
     now = datetime.now(timezone.utc)
@@ -4256,10 +4289,6 @@ def _watch_prompt_submitted_age_s(state_dir: Optional[Path], interactive: Option
     if parsed is not None:
         return max(0.0, (now - parsed).total_seconds())
     if raw != "1":
-        return None
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
         return None
     return max(0.0, now.timestamp() - mtime)
 
@@ -4278,11 +4307,15 @@ def _watch_transcript_facts(
 
     Absence of ``session.json`` (raw run) or an incomplete/invalid
     ``session_id``/``harness`` pair is routine, not a warning -- most runs
-    launched without ``--harness`` never acquire a session at all. Any
-    other failure (unknown harness, missing/locked/corrupt store, or any
-    unexpected exception from the count call) degrades to the unavailable
-    form with a short discriminator; nothing from this function may raise
-    past ``_cmd_watch_observe``'s caller.
+    launched without ``--harness`` never acquire a session at all. Every
+    other failure -- unknown harness, missing/locked/corrupt store, a
+    malformed return value from the count call, an unparseable timestamp,
+    or any other unexpected exception -- degrades to the unavailable form
+    with a short discriminator. The whole count-through-result-construction
+    sequence runs under one exception guard so nothing downstream of a
+    malformed return can raise past it and wipe the rest of the watch
+    contract; nothing from this function may raise past
+    ``_cmd_watch_observe``'s caller.
     """
     submitted_age_s = _watch_prompt_submitted_age_s(state_dir, interactive)
 
@@ -4295,25 +4328,29 @@ def _watch_transcript_facts(
 
     try:
         count, newest_iso = _agent_run_transcript.count_transcript(harness, session_id, cwd)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise TypeError(f"count_transcript returned a non-count value: {count!r}")
+        if newest_iso is not None and not isinstance(newest_iso, str):
+            raise TypeError(f"count_transcript returned a non-timestamp newest value: {newest_iso!r}")
+        newest_age_s: Optional[float] = None
+        newest_dt = _watch_parse_iso(newest_iso)
+        if newest_dt is not None:
+            newest_age_s = max(0.0, (datetime.now(timezone.utc) - newest_dt).total_seconds())
+        return {
+            "available": True,
+            "entries": count,
+            "newest_age_s": newest_age_s,
+            "submitted_age_s": submitted_age_s,
+            "error": None,
+        }
     except _agent_run_transcript.TranscriptSourceError as exc:
         return _transcript_unknown(exc.code, submitted_age_s)
     except Exception:
-        # Anything past TranscriptSourceError -- a reader bug, a type error
-        # in an unexpected store shape -- must still degrade the transcript
-        # block rather than escape and wipe the rest of the watch contract.
+        # A reader bug, a type error from an unexpected store shape, or a
+        # malformed (count, newest_iso) return -- all degrade the
+        # transcript block rather than escape and wipe the rest of the
+        # watch contract.
         return _transcript_unknown("store_unreadable", submitted_age_s)
-
-    newest_age_s: Optional[float] = None
-    newest_dt = _watch_parse_iso(newest_iso)
-    if newest_dt is not None:
-        newest_age_s = max(0.0, (datetime.now(timezone.utc) - newest_dt).total_seconds())
-    return {
-        "available": True,
-        "entries": count,
-        "newest_age_s": newest_age_s,
-        "submitted_age_s": submitted_age_s,
-        "error": None,
-    }
 
 
 def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:

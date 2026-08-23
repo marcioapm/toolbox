@@ -3444,6 +3444,18 @@ class TestTranscriptFacts:
         (sd / "prompt_submitted").write_text("garbage, not a timestamp or sentinel\n")
         assert agent_run._watch_prompt_submitted_age_s(sd, True) is None
 
+    def test_submitted_age_s_null_when_marker_is_a_directory(self, tmp_path):
+        sd = tmp_path / "state"
+        sd.mkdir()
+        (sd / "prompt_submitted").mkdir()
+        assert agent_run._watch_prompt_submitted_age_s(sd, True) is None
+
+    def test_submitted_age_s_null_when_marker_content_oversized(self, tmp_path):
+        sd = tmp_path / "state"
+        sd.mkdir()
+        (sd / "prompt_submitted").write_text("1" * 10_000)
+        assert agent_run._watch_prompt_submitted_age_s(sd, True) is None
+
     def test_submitted_age_s_clamps_future_iso_timestamp_to_zero(self, tmp_path):
         sd = tmp_path / "state"
         sd.mkdir()
@@ -3624,3 +3636,83 @@ class TestTranscriptFacts:
         assert t["available"] is False
         assert t["entries"] is None
         assert t["error"] == "store_unreadable"
+
+    def test_malformed_return_tuple_degrades_transcript_without_wiping_other_facts(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """A counter returning a wrong-shape tuple, e.g. (0, object()),
+        must not raise past the whole-block exception guard in
+        `_watch_transcript_facts` -- the resulting TypeError at timestamp
+        parsing must degrade only the transcript block."""
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "tr5",
+            status="running", pid=111, log_age_secs=1,
+        )
+        agent_run._write_session_json(
+            ld, {"session_id": "ses_y", "harness": "opencode", "acquisition": "minted", "confidence": "certain"}
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+
+        def _malformed_tuple(*_a, **_kw):
+            return (0, object())
+
+        monkeypatch.setattr(transcript, "count_transcript", _malformed_tuple)
+        agent_run.cmd_watch(_watch_args("tr5"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert payload["observation_error"] is None
+        assert payload["log"] is not None
+        assert payload["git"] is not None or payload["git_error"] is not None
+        assert payload["scratch"] is not None
+        t = payload["transcript"]
+        assert t["available"] is False
+        assert t["entries"] is None
+        assert t["error"] == "store_unreadable"
+
+    @pytest.mark.parametrize(
+        "bad_return",
+        [
+            pytest.param((-1, None), id="negative_count"),
+            pytest.param((True, None), id="bool_count_not_int"),
+            pytest.param(("3", None), id="string_count"),
+            pytest.param((3, 12345), id="non_string_newest"),
+            pytest.param((3, "not-an-iso-timestamp"), id="unparseable_newest_still_reports_entries"),
+        ],
+    )
+    def test_malformed_count_or_timestamp_values_degrade_or_null_appropriately(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys, bad_return
+    ):
+        """A malformed `count` (negative, bool, non-int) degrades the whole
+        transcript block; a malformed `newest_iso` that is not a string at
+        all also degrades it; a `newest_iso` that is a string but not a
+        parseable ISO timestamp degrades only `newest_age_s`, not the
+        rest of the block, since `count` alone is trustworthy."""
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "tr6",
+            status="running", pid=111, log_age_secs=1,
+        )
+        agent_run._write_session_json(
+            ld, {"session_id": "ses_z", "harness": "opencode", "acquisition": "minted", "confidence": "certain"}
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        monkeypatch.setattr(transcript, "count_transcript", lambda *_a, **_kw: bad_return)
+        agent_run.cmd_watch(_watch_args("tr6"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert payload["log"] is not None
+        assert payload["scratch"] is not None
+        t = payload["transcript"]
+        count, newest_iso = bad_return
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0 and (
+            newest_iso is None or isinstance(newest_iso, str)
+        ):
+            # Only the unparseable-string-timestamp case reaches here:
+            # count is trustworthy, newest_age_s alone nulls out.
+            assert t["available"] is True
+            assert t["entries"] == count
+            assert t["newest_age_s"] is None
+            assert t["error"] is None
+        else:
+            assert t["available"] is False
+            assert t["entries"] is None
+            assert t["error"] == "store_unreadable"
