@@ -2815,6 +2815,61 @@ class TestPreforkMintCleanupPreservesCausalException:
         )
 
 
+class TestPreforkMintKillEscalationReapsChild:
+    """After proc.wait() times out and cleanup escalates to proc.kill(),
+    the direct child must be positively reaped -- not left as a zombie
+    until the launcher process itself exits."""
+
+    def test_direct_child_is_reaped_after_kill_escalation(
+        self, tmp_path, monkeypatch
+    ):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_opencode = bin_dir / "opencode"
+        fake_opencode.write_text("#!/bin/sh\ntrap '' TERM\nsleep 60\n")
+        fake_opencode.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir) + ":" + os.environ.get("PATH", ""))
+
+        real_popen = subprocess.Popen
+        state = {"proc": None, "wait_calls": 0}
+
+        def _popen_forces_wait_timeout(argv, *a, **kw):
+            proc = real_popen(argv, *a, **kw)
+            if argv and argv[0] == "opencode":
+                state["proc"] = proc
+                real_wait = proc.wait
+
+                def _wait_times_out_once(timeout=None):
+                    state["wait_calls"] += 1
+                    if state["wait_calls"] == 1:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    return real_wait(timeout=timeout)
+
+                proc.wait = _wait_times_out_once
+            return proc
+
+        monkeypatch.setattr(subprocess, "Popen", _popen_forces_wait_timeout)
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", lambda *a, **k: False)
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            agent_run._opencode_prefork_mint(
+                12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+            )
+
+        proc = state["proc"]
+        assert proc is not None, "the temporary opencode process must have started"
+        assert state["wait_calls"] >= 2, (
+            "cleanup must call wait() again after kill() escalates, not just "
+            "once before the timeout"
+        )
+        assert proc.returncode is not None, (
+            "the direct child must be positively reaped after kill() -- "
+            "otherwise it lingers as a zombie"
+        )
+        with pytest.raises(ProcessLookupError):
+            os.kill(proc.pid, 0)
+
+
 # ---------------------------------------------------------------------------
 # Teardown tests: no app-server process must survive kill or signal
 # ---------------------------------------------------------------------------

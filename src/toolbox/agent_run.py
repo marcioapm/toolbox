@@ -11337,6 +11337,11 @@ def _opencode_prefork_mint(
                     p.kill()
                 except OSError:
                     pass
+                else:
+                    try:
+                        p.wait(timeout=3.0)
+                    except BaseException:
+                        pass
         if state_dir is not None:
             try:
                 _write(state_dir / "exit_code", "1\n")
@@ -11373,6 +11378,11 @@ def _opencode_prefork_mint(
                 proc.kill()
             except BaseException:
                 pass
+            else:
+                try:
+                    proc.wait(timeout=5.0)
+                except BaseException:
+                    pass
             if active_exc is not None:
                 raise active_exc
             raise
