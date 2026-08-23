@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -16,13 +17,14 @@ from typing import Optional
 import pytest
 
 from toolbox import agent_run
+from toolbox import agent_run_transcript as transcript
 
 
 WATCH_CONTRACT_KEYS = {
     "schema", "agent_run_version", "name", "observed_at", "status", "exit_code", "pid",
     "interactive", "started_at", "ended_at", "elapsed_s", "terminal",
     "launch_error", "log", "repo", "git", "git_error", "signals", "observation_error",
-    "session", "scratch", "hooks",
+    "session", "scratch", "hooks", "transcript",
 }
 
 # The `signals` object emitted whenever the log could not be read at all.
@@ -3230,3 +3232,268 @@ class TestScratchFacts:
         assert scratch["files_modified_recent"] >= 1, (
             "Scratch must see the recent file in recorded cwd, not the old file in repo_override"
         )
+
+
+# ---------------------------------------------------------------------------
+# transcript block
+# ---------------------------------------------------------------------------
+
+def _make_opencode_db(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "create table message (id text primary key, session_id text, "
+            "time_created integer, data text)"
+        )
+        conn.execute(
+            "create table part (id text primary key, message_id text, "
+            "session_id text, time_created integer, data text)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _opencode_insert_part(path: Path, *, part_id: str, message_id: str, session_id: str, time_created: int) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "insert into message (id, session_id, time_created, data) values (?, ?, ?, ?)",
+            (message_id, session_id, time_created, json.dumps({"role": "user", "time": {"created": time_created}})),
+        )
+        conn.execute(
+            "insert into part (id, message_id, session_id, time_created, data) values (?, ?, ?, ?, ?)",
+            (part_id, message_id, session_id, time_created, json.dumps({"type": "text", "text": "hi"})),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestTranscriptFacts:
+    """Tests for _watch_transcript_facts and the transcript field in the watch contract."""
+
+    TRANSCRIPT_KEYS = {"available", "entries", "newest_age_s", "error"}
+
+    # ------------------------------------------------------------------
+    # unit-level tests of _watch_transcript_facts
+    # ------------------------------------------------------------------
+
+    def test_no_session_json_yields_unavailable_no_session_json(self):
+        result = agent_run._watch_transcript_facts(None, None)
+        assert set(result.keys()) == self.TRANSCRIPT_KEYS
+        assert result["available"] is False
+        assert result["entries"] is None
+        assert result["newest_age_s"] is None
+        assert result["error"] == "no_session_json"
+
+    def test_session_json_missing_session_id_yields_no_session_id(self):
+        result = agent_run._watch_transcript_facts(
+            {"session_id": None, "harness": "opencode"}, None
+        )
+        assert result["available"] is False
+        assert result["entries"] is None
+        assert result["error"] == "no_session_id"
+
+    def test_unknown_harness_yields_unavailable_with_matching_error(self):
+        result = agent_run._watch_transcript_facts(
+            {"session_id": "ses_1", "harness": "some-future-harness"}, None
+        )
+        assert result["available"] is False
+        assert result["entries"] is None
+        assert result["error"] == "unknown_harness"
+
+    def test_populated_session_reports_available_true_with_entries_and_age(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert_part(
+            db, part_id="p1", message_id="m1", session_id="ses_1",
+            time_created=int(time.time() * 1000),
+        )
+        result = agent_run._watch_transcript_facts(
+            {"session_id": "ses_1", "harness": "opencode"}, None
+        )
+        assert result["available"] is True
+        assert result["entries"] == 1
+        assert result["error"] is None
+        assert result["newest_age_s"] is not None
+        assert result["newest_age_s"] >= 0.0
+
+    def test_absent_session_id_reports_available_true_with_zero_entries(self, tmp_path, monkeypatch):
+        """A store that exists but holds nothing for this session is a
+        trustworthy 0, not an unavailable read."""
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        result = agent_run._watch_transcript_facts(
+            {"session_id": "ses_nonexistent", "harness": "opencode"}, None
+        )
+        assert result["available"] is True
+        assert result["entries"] == 0
+        assert result["error"] is None
+
+    def test_missing_store_yields_unavailable_store_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", tmp_path / "does-not-exist.db")
+        result = agent_run._watch_transcript_facts(
+            {"session_id": "ses_1", "harness": "opencode"}, None
+        )
+        assert result["available"] is False
+        assert result["entries"] is None
+        assert result["error"] == "store_missing"
+
+    def test_locked_store_yields_unavailable_store_locked(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        locker = sqlite3.connect(db)
+        locker.execute("begin exclusive")
+        locker.execute("insert into message (id, session_id, time_created, data) values ('x', 'ses_1', 1, '{}')")
+        try:
+            result = agent_run._watch_transcript_facts(
+                {"session_id": "ses_1", "harness": "opencode"}, None
+            )
+        finally:
+            locker.rollback()
+            locker.close()
+        assert result["available"] is False
+        assert result["entries"] is None
+        assert result["error"] == "store_locked"
+
+    def test_corrupt_store_yields_unavailable_store_unreadable_distinct_from_locked(
+        self, tmp_path, monkeypatch
+    ):
+        db = tmp_path / "garbage.db"
+        db.write_bytes(b"not a sqlite database")
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        result = agent_run._watch_transcript_facts(
+            {"session_id": "ses_1", "harness": "opencode"}, None
+        )
+        assert result["available"] is False
+        assert result["entries"] is None
+        assert result["error"] == "store_unreadable"
+
+    def test_every_unavailable_path_never_yields_entries_zero(self, tmp_path, monkeypatch):
+        """The one property this block exists for: a failed read must never
+        be mistaken for an observed empty transcript."""
+        cases = []
+
+        cases.append(agent_run._watch_transcript_facts(None, None))
+        cases.append(
+            agent_run._watch_transcript_facts({"session_id": None, "harness": "opencode"}, None)
+        )
+        cases.append(
+            agent_run._watch_transcript_facts(
+                {"session_id": "ses_1", "harness": "no-such-harness"}, None
+            )
+        )
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", tmp_path / "absent.db")
+        cases.append(
+            agent_run._watch_transcript_facts({"session_id": "ses_1", "harness": "opencode"}, None)
+        )
+
+        for result in cases:
+            assert result["available"] is False
+            assert result["entries"] is None, (
+                f"unavailable transcript facts must carry entries=None, got {result!r}"
+            )
+
+    # ------------------------------------------------------------------
+    # end-to-end tests through cmd_watch
+    # ------------------------------------------------------------------
+
+    def test_transcript_key_present_in_normal_branch(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert_part(
+            db, part_id="p1", message_id="m1", session_id="ses_watch",
+            time_created=int(time.time() * 1000),
+        )
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "tr1",
+            status="running", pid=111, log_age_secs=1,
+        )
+        agent_run._write_session_json(
+            ld, {"session_id": "ses_watch", "harness": "opencode", "acquisition": "minted", "confidence": "certain"}
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("tr1"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        t = payload["transcript"]
+        assert set(t.keys()) == self.TRANSCRIPT_KEYS
+        assert t["available"] is True
+        assert t["entries"] == 1
+        assert t["error"] is None
+
+    def test_transcript_key_present_and_null_in_missing_state_dir_branch(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """Missing-state-dir branch, raw run: no session.json survives, so
+        transcript degrades to no_session_json -- routine, not a warning."""
+        _make_run(
+            isolated_runs_root, isolated_log_root, "tr2",
+            write_state=False, log_text="line1\n",
+        )
+        agent_run.cmd_watch(_watch_args("tr2"))
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert captured.err == ""
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        t = payload["transcript"]
+        assert set(t.keys()) == self.TRANSCRIPT_KEYS
+        assert t["available"] is False
+        assert t["entries"] is None
+        assert t["error"] == "no_session_json"
+
+    def test_transcript_key_defaults_to_not_observed_in_observation_error_branch(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _make_run(
+            isolated_runs_root, isolated_log_root, "tr3",
+            status="running", pid=111, log_age_secs=1,
+        )
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("synthetic crash")
+
+        monkeypatch.setattr(agent_run, "_effective_status", _boom)
+        agent_run.cmd_watch(_watch_args("tr3"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        t = payload["transcript"]
+        assert set(t.keys()) == self.TRANSCRIPT_KEYS
+        assert t["available"] is False
+        assert t["entries"] is None
+        assert t["newest_age_s"] is None
+        assert t["error"] == "not_observed"
+
+    def test_watch_never_raises_when_count_transcript_raises_arbitrary_error(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """count_transcript escaping with something other than
+        TranscriptSourceError must still degrade the contract, never
+        propagate past watch's never-raise boundary."""
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "tr4",
+            status="running", pid=111, log_age_secs=1,
+        )
+        agent_run._write_session_json(
+            ld, {"session_id": "ses_x", "harness": "opencode", "acquisition": "minted", "confidence": "certain"}
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+
+        def _raise_sqlite_error(*_a, **_kw):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(transcript, "count_transcript", _raise_sqlite_error)
+        agent_run.cmd_watch(_watch_args("tr4"))
+        payload = json.loads(capsys.readouterr().out)
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        t = payload["transcript"]
+        assert t["available"] is False
+        assert t["entries"] is None
+        assert t["error"] == "store_unreadable"

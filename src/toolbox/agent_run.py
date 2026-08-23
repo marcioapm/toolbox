@@ -352,6 +352,7 @@ import shlex
 import shutil
 import signal
 import socket
+import sqlite3
 import stat as _stat_module
 import struct
 import subprocess
@@ -371,6 +372,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 from toolbox import __version__ as TOOLBOX_VERSION
+from toolbox import agent_run_transcript as _agent_run_transcript
 
 
 # Absolutised against the invocation directory at import: --cwd chdirs the
@@ -4211,6 +4213,60 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
     }
 
 
+def _transcript_unknown(code: str) -> dict:
+    """Transcript facts saying "unavailable, because *code*".
+
+    Modeled on ``_scratch_unknown``: every decision field is null rather
+    than 0 so a poller cannot read a failed count as an observed empty
+    transcript. ``entries == 0`` must only ever mean "the store was
+    queried and holds no records for this session" -- never "the query
+    failed".
+    """
+    return {
+        "available": False,
+        "entries": None,
+        "newest_age_s": None,
+        "error": code,
+    }
+
+
+def _watch_transcript_facts(session_data: Optional[dict], cwd: Optional[str]) -> dict:
+    """Count records in the harness's own conversation store for the run's
+    session, without materializing entries (see ``count_transcript``).
+
+    Absence of ``session.json`` (raw run) or an incomplete/invalid
+    ``session_id``/``harness`` pair is routine, not a warning -- most runs
+    launched without ``--harness`` never acquire a session at all. Any
+    other failure (unknown harness, missing/locked/corrupt store) degrades
+    to the unavailable form with a short discriminator; nothing from this
+    function may raise past ``_cmd_watch_observe``'s caller.
+    """
+    if not isinstance(session_data, dict):
+        return _transcript_unknown("no_session_json")
+    session_id = session_data.get("session_id")
+    harness = session_data.get("harness")
+    if not isinstance(session_id, str) or not session_id or not isinstance(harness, str):
+        return _transcript_unknown("no_session_id")
+
+    try:
+        count, newest_iso = _agent_run_transcript.count_transcript(harness, session_id, cwd)
+    except _agent_run_transcript.TranscriptSourceError as exc:
+        return _transcript_unknown(exc.code)
+    except (OSError, sqlite3.Error):
+        return _transcript_unknown("store_unreadable")
+
+    newest_age_s: Optional[float] = None
+    newest_dt = _watch_parse_iso(newest_iso)
+    if newest_dt is not None:
+        newest_age_s = max(0.0, (datetime.now(timezone.utc) - newest_dt).total_seconds())
+    return {
+        "available": True,
+        "entries": count,
+        "newest_age_s": newest_age_s,
+        "error": None,
+    }
+
+
 def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
     """Build the watch contract with every field at its null/unknown default,
     overridden by *fields*. The key set is fixed here so it cannot vary
@@ -4247,6 +4303,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
         "session": None,
         "scratch": _scratch_unknown("not_observed"),
         "hooks": None,
+        "transcript": _transcript_unknown("not_observed"),
     }
     unknown = set(fields) - set(payload)
     if unknown:
@@ -4283,7 +4340,9 @@ def _cmd_watch_observe(
     # names can change between this line and the actual read.
     log = _log_file_for(name)
 
-    def observed(repo: Optional[str], launch_head: Optional[str], cwd: Optional[str]) -> dict:
+    def observed(
+        repo: Optional[str], launch_head: Optional[str], cwd: Optional[str], session_data: Optional[dict]
+    ) -> dict:
         git, git_error = _watch_repo_git(repo, launch_head)
         log_facts, signals = _watch_log_observation(log)
         return {
@@ -4296,6 +4355,11 @@ def _cmd_watch_observe(
             "git_error": git_error,
             "signals": signals,
             "scratch": _watch_scratch_facts(cwd),
+            # run.json's cwd, not the state dir's: run.json survives the
+            # state dir's disappearance (see WATCH_STATUS_LOG_PRESERVED
+            # below) and is what cmd_transcript itself reads for the
+            # claude project-directory lookup.
+            "transcript": _watch_transcript_facts(session_data, _run_json_cwd(log_dir)),
         }
 
     state_dir_state = _probe_dir_state(state_dir)
@@ -4318,7 +4382,7 @@ def _cmd_watch_observe(
         session_data = _read_session_json(log_dir)
         payload = _watch_payload(
             name, observed_at, WATCH_STATUS_LOG_PRESERVED,
-            **observed(repo_arg, None, repo_arg),
+            **observed(repo_arg, None, repo_arg, session_data),
             session=session_data,
             hooks=_read_hooks_jsonl(log_dir),
         )
@@ -4363,7 +4427,7 @@ def _cmd_watch_observe(
         # repo_str is for git-fact attribution; recorded_cwd is for scratch so
         # that --repo (correcting which repo to inspect) does not silently move
         # the scratch scan off the run's launch directory.
-        **observed(repo_str, _read(state_dir / "launch_head") or None, recorded_cwd),
+        **observed(repo_str, _read(state_dir / "launch_head") or None, recorded_cwd, session_data),
     )
     _watch_emit(
         payload,
@@ -10872,6 +10936,20 @@ def _read_session_json(log_dir: Path) -> Optional[dict]:
         return data if isinstance(data, dict) else None
     except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
         return None
+
+
+def _run_json_cwd(log_dir: Path) -> Optional[str]:
+    """Read the launch ``cwd`` recorded in run.json, or None if absent,
+    malformed, or not a string. Used to locate a claude session's project
+    directory (see ``_claude_session_path``) without depending on the
+    ephemeral state dir's ``cwd`` file, which a preserved-log-only run no
+    longer has."""
+    try:
+        data = json.loads((log_dir / "run.json").read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    cwd = data.get("cwd") if isinstance(data, dict) else None
+    return cwd if isinstance(cwd, str) else None
 
 
 def _write_run_json(log_dir: Path, data: dict) -> None:
