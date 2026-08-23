@@ -11279,10 +11279,12 @@ def _opencode_prefork_mint(
     that would otherwise be left behind if the launcher is killed mid-poll.
 
     launch_args, when given, is the same Namespace cmd_launch reads for
-    ``_worktree_process_started``. It is set immediately before the
-    ``Popen`` below -- the temporary process's cwd is the launch worktree --
-    and cleared only once that exact process is positively reaped, and only
-    if it was not already set on entry.
+    ``_worktree_process_started``. It is set immediately before the ``Popen``
+    below -- the temporary process's cwd is the launch worktree -- and is
+    cleared only when ``Popen`` itself raises, proving no child was created.
+    Reaping the direct child does not prove its descendants are dead: a
+    descendant inherits the worktree as cwd and can outlive that reap, so a
+    successful wait must never clear the mark.
     """
     mark_was_set = bool(getattr(launch_args, "_worktree_process_started", False))
     if launch_args is not None:
@@ -11366,8 +11368,6 @@ def _opencode_prefork_mint(
             except BaseException:
                 pass
             raise
-        if launch_args is not None and not mark_was_set:
-            launch_args._worktree_process_started = False
 
 
 def _acquire_log_write(path: Path, message: str) -> None:
