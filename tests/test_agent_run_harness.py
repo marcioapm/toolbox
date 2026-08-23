@@ -3377,6 +3377,146 @@ class TestPreforkMintPostKillWaitInterrupt:
         )
         assert launch_args._worktree_process_started is True
 
+    def test_add_note_keyboard_interrupt_outranks_the_body_exception(
+        self, tmp_path, monkeypatch
+    ):
+        annotation_interrupt = KeyboardInterrupt("operator interrupted during annotation")
+
+        class _InterruptingNotes(RuntimeError):
+            def add_note(self, note):
+                raise annotation_interrupt
+
+        body_failure = _InterruptingNotes("mint body failed")
+        body_failure.__cause__ = LookupError("the real root cause")
+
+        class _FakeProc:
+            pid = 4949
+            returncode = None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                raise OSError("reap blew up")
+
+            def kill(self):
+                pass
+
+        def _raising_poll(*a, **k):
+            raise body_failure
+
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: _FakeProc())
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", _raising_poll)
+
+        launch_args = argparse.Namespace(_worktree_process_started=False)
+
+        with pytest.raises(KeyboardInterrupt) as exc_info:
+            agent_run._opencode_prefork_mint(
+                12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+                launch_args=launch_args,
+            )
+
+        assert exc_info.value is annotation_interrupt, (
+            "an interrupt arriving during annotation is the operator's current "
+            "request and must not be swallowed as a note failure"
+        )
+        assert launch_args._worktree_process_started is True
+
+    def test_add_note_system_exit_outranks_a_post_kill_interrupt(
+        self, tmp_path, monkeypatch
+    ):
+        annotation_exit = SystemExit(41)
+
+        class _InterruptingExit(SystemExit):
+            def add_note(self, note):
+                raise annotation_exit
+
+        exit_request = _InterruptingExit(37)
+        body_failure = RuntimeError("health poll blew up")
+
+        class _FakeProc:
+            pid = 5050
+            returncode = None
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="opencode", timeout=timeout)
+                raise exit_request
+
+            def kill(self):
+                pass
+
+        def _raising_poll(*a, **k):
+            raise body_failure
+
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: _FakeProc())
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", _raising_poll)
+
+        launch_args = argparse.Namespace(_worktree_process_started=False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            agent_run._opencode_prefork_mint(
+                12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+                launch_args=launch_args,
+            )
+
+        assert exc_info.value is annotation_exit, (
+            "a SystemExit raised during annotation is more current than the one "
+            "already selected for propagation"
+        )
+        assert exc_info.value.code == 41
+        assert launch_args._worktree_process_started is True
+
+    def test_add_note_memory_error_does_not_displace_the_body_exception(
+        self, tmp_path, monkeypatch
+    ):
+        class _StarvedNotes(RuntimeError):
+            def add_note(self, note):
+                raise MemoryError("no room for a note")
+
+        body_failure = _StarvedNotes("mint body failed")
+        body_failure.__cause__ = LookupError("the real root cause")
+
+        class _FakeProc:
+            pid = 5151
+            returncode = None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                raise OSError("reap blew up")
+
+            def kill(self):
+                pass
+
+        def _raising_poll(*a, **k):
+            raise body_failure
+
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: _FakeProc())
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", _raising_poll)
+
+        launch_args = argparse.Namespace(_worktree_process_started=False)
+
+        with pytest.raises(_StarvedNotes) as exc_info:
+            agent_run._opencode_prefork_mint(
+                12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+                launch_args=launch_args,
+            )
+
+        assert exc_info.value is body_failure, (
+            "a failed best-effort annotation must not replace the operational "
+            "failure the caller needs to see"
+        )
+        assert launch_args._worktree_process_started is True
+
 
 # ---------------------------------------------------------------------------
 # Teardown tests: no app-server process must survive kill or signal

@@ -11410,16 +11410,19 @@ def _opencode_prefork_mint(
 
 
 def _add_exception_note(exc: BaseException, note: str) -> None:
-    """Attach a diagnostic note to ``exc``, never altering control flow.
+    """Attach a diagnostic note to ``exc`` without displacing it.
 
     ``add_note`` is dynamically dispatched: a subclass can override it, and the
-    built-in raises TypeError when ``__notes__`` has been set to a non-list. A
-    diagnostic annotation must never displace the exception already selected
-    for propagation, so every failure here is discarded.
+    built-in raises TypeError when ``__notes__`` has been set to a non-list.
+    Such a failure must not replace the exception already selected for
+    propagation. A KeyboardInterrupt or SystemExit is the exception: it is the
+    operator's current request, no less so for arriving during annotation.
     """
     try:
         exc.add_note(note)
-    except BaseException:  # noqa: BLE001
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
         pass
 
 
