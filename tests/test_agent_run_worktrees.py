@@ -4275,6 +4275,45 @@ class TestLaunchCreatesWorktree:
         # Rollback never ran, so the worktree it would have removed survives.
         assert wt_dir.is_dir()
 
+    def test_rollback_after_state_dir_and_marker_exist_removes_worktree_and_branch(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
+    ):
+        """Both existing rollback tests fail at the very first statement of
+        _cmd_launch_locked (command=[]), before the state dir, marker,
+        status=starting, or the fork exist. This forces a failure *after*
+        all of that is on disk (a fork() failure, reached deterministically
+        by monkeypatching os.fork) and pins the resulting state explicitly:
+        the worktree and branch are rolled back, and the state dir is left
+        behind with status=failed naming the now-deleted directory -- a
+        known, accepted dangling record (see _create_launch_worktree's
+        crash-residual note), not cleaned up by rollback."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-rollback-post-publish"
+        name = "rollback-post-publish"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+        )
+
+        def _fork_always_fails():
+            raise OSError("simulated fork failure")
+
+        monkeypatch.setattr(os, "fork", _fork_always_fails)
+
+        with pytest.raises(SystemExit, match="failed to start agent"):
+            agent_run.cmd_launch(args)
+
+        state_dir = isolated_runs_root / name
+        # Rolled back: this invocation created the worktree and branch, and
+        # nothing was ever published (no readiness ack), so rollback applies.
+        assert not wt_dir.exists()
+        assert name not in _git(repo, "branch", "--list", name)
+        # Pinned dangling-record choice: the state dir is not cleaned up by
+        # rollback, and still names the worktree that no longer exists.
+        assert state_dir.is_dir()
+        assert agent_run._read(state_dir / "status") == "failed"
+        assert agent_run._read(state_dir / "cwd") == str(wt_dir.resolve())
+        assert agent_run._read(state_dir / "worktree_created") == str(wt_dir.resolve())
+
     def test_interrupt_after_readiness_published_never_rolls_back(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
     ):
