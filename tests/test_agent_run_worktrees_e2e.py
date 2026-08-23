@@ -333,6 +333,11 @@ class TestE2E2RollbackContract:
         env = dict(os.environ)
         env["AGENT_RUN_STATE_DIR"] = str(isolated_runs_root)
         env["AGENT_RUN_LOG_DIR"] = str(isolated_log_root)
+        # Widens the real window between the runner publishing its pid and
+        # the launcher's parent process returning, so the SIGINT below
+        # reliably lands while the launcher is still alive to receive it,
+        # rather than racing the launcher's own fast normal exit.
+        env["AGENT_RUN_TEST_SLOW_IDENTITY"] = "1"
 
         launcher = subprocess.Popen(argv, env=env)
         runner_pid: Optional[int] = None
@@ -456,3 +461,84 @@ class TestE2E3PreforkMintBoundary:
                 launcher.kill()
                 launcher.wait(timeout=10)
             _kill_and_reap(descendant_pid)
+
+
+# ---------------------------------------------------------------------------
+# E2E4: the leaked-worktree cleanup commands must actually work
+# ---------------------------------------------------------------------------
+
+@live_only
+class TestE2E4LeakedWorktreeCleanupCommandsWork:
+    """When a post-process failure leaves a worktree behind, the cleanup
+    commands agent-run prints to stderr must be independently runnable: this
+    executes them through a real shell and proves the worktree and branch
+    are actually gone afterward. A space in both the repository path and the
+    worktree path, plus a shell-significant branch name, forces every
+    shlex.quote() call in the printed line to do real work."""
+
+    def test_printed_cleanup_commands_executed_through_a_real_shell_remove_everything(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        git_root = tmp_path / "git roots"
+        git_root.mkdir()
+        repo = _make_repo(git_root, "main repo")
+        wt = git_root / "wt dir; rm -rf nope"
+        name = "e2e4-cleanup"
+        branch = "feature;touch-pwned"
+        argv = [
+            sys.executable, "-m", "toolbox.agent_run",
+            *_launch_argv(
+                name=name, worktree=wt, worktree_base="main", worktree_repo=repo,
+                worktree_branch=branch,
+                command=[sys.executable, "-c", "import time; time.sleep(30)"],
+            ),
+        ]
+        env = dict(os.environ)
+        env["AGENT_RUN_STATE_DIR"] = str(isolated_runs_root)
+        env["AGENT_RUN_LOG_DIR"] = str(isolated_log_root)
+        # See E2E2: widens the runner-publication window so the SIGINT below
+        # reliably lands on a still-alive launcher.
+        env["AGENT_RUN_TEST_SLOW_IDENTITY"] = "1"
+
+        launcher = subprocess.Popen(argv, env=env, stderr=subprocess.PIPE, text=True)
+        runner_pid: Optional[int] = None
+        agent_pid: Optional[int] = None
+        try:
+            state_dir = isolated_runs_root / name
+            _wait_for(lambda: (state_dir / "pid").exists(), 10.0, "runner pid file")
+            runner_pid = int((state_dir / "pid").read_text().strip())
+
+            launcher.send_signal(signal.SIGINT)
+            _, stderr = launcher.communicate(timeout=15)
+
+            assert wt.is_dir(), "precondition: the worktree must have leaked"
+            marker = "clean up by hand: "
+            assert marker in stderr, f"no cleanup line printed; stderr={stderr!r}"
+            cleanup_line = stderr[stderr.index(marker) + len(marker):].splitlines()[0]
+
+            _wait_for(
+                lambda: (state_dir / "agent_pid").exists(), 10.0, "agent_pid file"
+            )
+            agent_pid = int((state_dir / "agent_pid").read_text().strip())
+            _kill_and_reap(agent_pid)
+            _kill_and_reap(runner_pid)
+            runner_pid = agent_pid = None
+
+            # The exact recovery path advertised to an operator: run the
+            # printed line through a real shell, not a re-parsed argv list.
+            shell_result = subprocess.run(
+                cleanup_line, shell=True, capture_output=True, text=True,
+            )
+            assert shell_result.returncode == 0, shell_result.stderr
+
+            assert not wt.exists()
+            porcelain = _git(repo, "worktree", "list", "--porcelain")
+            assert str(wt.resolve()) not in porcelain
+            assert branch not in _git(repo, "branch", "--list", branch)
+        finally:
+            launcher.poll()
+            if launcher.returncode is None:
+                launcher.kill()
+                launcher.wait(timeout=10)
+            _kill_and_reap(agent_pid)
+            _kill_and_reap(runner_pid)
