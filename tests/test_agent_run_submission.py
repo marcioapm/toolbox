@@ -495,14 +495,16 @@ def _witness_unreadable(monkeypatch) -> None:
 
 
 def _no_transport_side_effects(monkeypatch) -> list:
-    """Stub both transports as no-ops that just record how many times they
-    were invoked, and force keystroke transport (no opencode HTTP endpoint)."""
+    """Stub the keystroke transport as a no-op recording each attempt's
+    payload, force keystroke transport (no opencode HTTP endpoint), and
+    remove the inter-attempt backoff so retry tests do not sleep."""
     submissions: list = []
     monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
     monkeypatch.setattr(
         agent_run, "_submit_via_keystroke",
-        lambda *_a, **_k: submissions.append(1),
+        lambda _state_dir, payload: submissions.append(payload),
     )
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
     return submissions
 
 
@@ -541,12 +543,13 @@ def test_submit_and_verify_verified_on_first_attempt(tmp_path, monkeypatch):
 
 
 def test_submit_and_verify_verified_on_retry(tmp_path, monkeypatch):
-    """Flat through the entire first attempt's poll window, then rises during
-    the second attempt: two submissions, verified True, attempts == 2."""
+    """Flat through the entire first attempt's poll window and through the
+    pre-resend re-check, then rises during the second attempt: two
+    submissions, verified True, attempts == 2."""
     submissions = _no_transport_side_effects(monkeypatch)
-    # baseline=0; attempt 1 polls stay at 0 through its deadline and its
-    # post-timeout re-check; attempt 2's first poll rises to 1.
-    _witness_sequence(monkeypatch, [0, 0, 0, 1])
+    # baseline=0; attempt 1's poll and post-timeout re-check stay at 0, as
+    # does attempt 2's pre-send re-check; attempt 2's first poll rises to 1.
+    _witness_sequence(monkeypatch, [0, 0, 0, 0, 1])
 
     outcome = agent_run._submit_and_verify(
         tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
@@ -682,6 +685,32 @@ def test_witness_source_pinned_to_opencode_http_never_falls_back_to_the_store(
     )
 
     assert outcome.verified is False
+    assert outcome.detail == "witness_unreadable"
+
+
+def test_witness_source_pinned_to_the_store_never_reaches_for_http(tmp_path, monkeypatch):
+    """A source pinned to the transcript store must not start querying an
+    HTTP endpoint that appeared mid-verification."""
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+    monkeypatch.setattr(
+        agent_run, "_read_session_json",
+        lambda _log_dir: {"session_id": "ses_1", "harness": "opencode"},
+    )
+    monkeypatch.setattr(agent_run, "_submit_via_keystroke", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        agent_run._agent_run_transcript, "count_user_records", lambda *_a: 4,
+    )
+
+    def http_would_verify(*_a, **_k):
+        raise AssertionError("a pinned store witness must never query the HTTP endpoint")
+
+    monkeypatch.setattr(agent_run, "_opencode_http_message_count", http_would_verify)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", deadline_s=0.05, max_attempts=1,
+    )
+
+    assert outcome.verified is False
     assert outcome.detail == "timeout"
 
 
@@ -774,6 +803,220 @@ def test_resolve_witness_source_is_none_for_an_unmanaged_run(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Retry safety: attempt scoping, transport errors, keystroke framing
+# ---------------------------------------------------------------------------
+
+def test_readable_witness_flag_is_scoped_to_each_attempt(tmp_path, monkeypatch):
+    """An attempt whose every read failed must stop the loop even when an
+    earlier attempt read the witness fine: only evidence gathered during
+    this attempt can justify one more submission."""
+    submissions = _no_transport_side_effects(monkeypatch)
+    reads = {"n": 0}
+
+    def witness():
+        reads["n"] += 1
+        # Baseline and attempt 1 read 0; every read from attempt 2 on fails.
+        return 0 if reads["n"] <= 3 else None
+
+    _witness_counter(monkeypatch, witness)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.05, max_attempts=5,
+    )
+
+    assert outcome.verified is False
+    assert outcome.detail == "witness_unreadable"
+    assert outcome.attempts == 2
+    assert len(submissions) == 2
+
+
+def test_transport_error_polls_the_witness_before_retrying(tmp_path, monkeypatch):
+    """A connection that broke after the peer queued the request still
+    delivers. Polling the witness after a transport error catches that and
+    avoids a duplicate submission -- messageID is not idempotent."""
+    calls = {"n": 0}
+
+    def broken_then_unused(_text):
+        calls["n"] += 1
+        raise ConnectionResetError("reset after the request was queued")
+
+    _witness_sequence(monkeypatch, [0, 1])
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello",
+        deadline_s=5.0, max_attempts=3, submit=broken_then_unused,
+    )
+
+    assert outcome.verified is True
+    assert outcome.attempts == 1
+    assert calls["n"] == 1  # never resent: the witness proved it landed
+
+
+def test_transport_error_still_retries_when_the_witness_stays_flat(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def flaky(_text):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionResetError("reset")
+
+    _witness_sequence(monkeypatch, [0])  # flat forever
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello",
+        deadline_s=0.05, max_attempts=2, submit=flaky,
+    )
+
+    assert outcome.verified is False
+    assert calls["n"] == 2
+
+
+def test_transport_errors_back_off_between_attempts(tmp_path, monkeypatch):
+    """Without a backoff a 100ms blip burns every attempt instantly."""
+    slept: list = []
+    monkeypatch.setattr(agent_run.time, "sleep", lambda seconds: slept.append(seconds))
+    _witness_sequence(monkeypatch, [0])
+
+    def always_broken(_text):
+        raise ConnectionResetError("reset")
+
+    agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello",
+        deadline_s=0.0, max_attempts=3, submit=always_broken,
+    )
+
+    backoffs = [s for s in slept if s >= agent_run.SUBMISSION_RETRY_BACKOFF_SECONDS]
+    assert len(backoffs) == 2, f"expected one backoff before each retry, slept {slept}"
+    assert all(s <= agent_run.SUBMISSION_RETRY_BACKOFF_MAX_SECONDS for s in backoffs)
+
+
+def test_keystroke_retry_sends_the_terminator_alone_before_resending_text():
+    """The failure a keystroke retry targets is 'TUI took the text, swallowed
+    the Enter'. Attempt 2 must submit what is already buffered rather than
+    doubling the prompt; only attempt 3 clears the composer and resends."""
+    text = b"do the thing"
+    cr = agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)
+
+    assert agent_run._keystroke_payload(1, text, agent_run.SUBMIT_MODE_CR) == text + cr
+    assert agent_run._keystroke_payload(2, text, agent_run.SUBMIT_MODE_CR) == cr
+    third = agent_run._keystroke_payload(3, text, agent_run.SUBMIT_MODE_CR)
+    assert third == agent_run._COMPOSER_RESET_BYTES + text + cr
+    assert third.startswith(b"\x1b")
+
+
+def test_keystroke_retry_payloads_reach_the_fifo_in_order(tmp_path, monkeypatch):
+    submissions = _no_transport_side_effects(monkeypatch)
+    _witness_sequence(monkeypatch, [0])
+
+    agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CRLF,
+        deadline_s=0.01, max_attempts=3,
+    )
+
+    crlf = agent_run._submit_bytes(agent_run.SUBMIT_MODE_CRLF)
+    assert submissions == [
+        b"hello" + crlf,
+        crlf,
+        agent_run._COMPOSER_RESET_BYTES + b"hello" + crlf,
+    ]
+
+
+def test_fifo_write_loops_until_every_byte_lands(monkeypatch):
+    """os.write on a pipe is atomic only to PIPE_BUF; a short write past
+    that would truncate the prompt or drop the terminator."""
+    payload = b"a long prompt" + agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)
+    delivered = bytearray()
+    chunk_sizes = iter([4, 3, 999])
+
+    def short_write(_fd, data):
+        written = min(next(chunk_sizes), len(data))
+        delivered.extend(data[:written])
+        return written
+
+    monkeypatch.setattr(agent_run.os, "write", short_write)
+
+    agent_run._write_all_to_fifo(7, payload)
+
+    assert bytes(delivered) == payload
+
+
+def test_fifo_write_retries_eintr(monkeypatch):
+    payload = b"prompt\r"
+    delivered = bytearray()
+    actions = iter([InterruptedError(), 999])
+
+    def interrupted_write(_fd, data):
+        action = next(actions)
+        if isinstance(action, BaseException):
+            raise action
+        delivered.extend(data)
+        return len(data)
+
+    monkeypatch.setattr(agent_run.os, "write", interrupted_write)
+
+    agent_run._write_all_to_fifo(7, payload)
+
+    assert bytes(delivered) == payload
+
+
+def test_submit_and_verify_rechecks_the_witness_immediately_before_a_resend(
+    tmp_path, monkeypatch
+):
+    """A witness that rose during the inter-attempt gap must be seen before
+    the transport is invoked again, not after another duplicate lands."""
+    submissions = _no_transport_side_effects(monkeypatch)
+    reads = {"n": 0}
+
+    def witness():
+        reads["n"] += 1
+        # Baseline plus attempt 1's poll and post-timeout re-check read 0;
+        # the pre-resend re-check is the first read to see the rise.
+        return 0 if reads["n"] <= 3 else 1
+
+    _witness_counter(monkeypatch, witness)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.01, max_attempts=2,
+    )
+
+    assert outcome.verified is True
+    assert len(submissions) == 1
+
+
+def test_submit_and_verify_propagates_a_watchdog_timeout_error(tmp_path, monkeypatch):
+    """TimeoutError subclasses OSError; swallowing it into transport_error
+    would make cmd_steer's SIGALRM guard retry a stuck FIFO forever."""
+    _witness_sequence(monkeypatch, [0])
+
+    def alarm_fires(_text):
+        raise TimeoutError("write timed out")
+
+    with pytest.raises(TimeoutError):
+        agent_run._submit_and_verify(
+            tmp_path, tmp_path, b"hello",
+            deadline_s=5.0, max_attempts=3, submit=alarm_fires,
+        )
+
+
+def test_submit_via_http_reports_a_socket_timeout_as_a_connection_error(monkeypatch):
+    """A transport-level timeout must not surface as TimeoutError, which
+    _submit_and_verify reserves for a caller's own watchdog."""
+    import socket as socket_module
+
+    def timing_out(*_a, **_k):
+        raise TimeoutError("connect timed out")
+
+    monkeypatch.setattr(socket_module, "create_connection", timing_out)
+
+    with pytest.raises(ConnectionError):
+        agent_run._submit_via_http(41234, "ses_1", "hello")
+
+
+# ---------------------------------------------------------------------------
 # _submit_and_verify: submit= seam (codex's JSON-RPC transport)
 # ---------------------------------------------------------------------------
 
@@ -842,7 +1085,8 @@ def test_submit_and_verify_custom_submit_rejected_is_fast_and_non_retryable(
 
 def test_submit_and_verify_custom_submit_transport_error_retries(tmp_path, monkeypatch):
     """A plain OSError from the submit callable is treated like a built-in
-    transport failure: retried on the next attempt, not fatal."""
+    transport failure: retried on the next attempt, not fatal. The retry
+    happens only because the post-error witness poll stayed flat."""
     calls = {"n": 0}
 
     def flaky_submit(_text):
@@ -850,11 +1094,14 @@ def test_submit_and_verify_custom_submit_transport_error_retries(tmp_path, monke
         if calls["n"] == 1:
             raise OSError("connection reset")
 
-    _witness_sequence(monkeypatch, [0, 1])
+    # Baseline 0; every read through the post-error poll and the pre-resend
+    # re-check stays flat, so attempt 2 runs; then the witness rises.
+    _witness_sequence(monkeypatch, [0, 0, 0, 0, 1])
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
 
     outcome = agent_run._submit_and_verify(
         tmp_path, tmp_path, b"hello",
-        deadline_s=1.0, max_attempts=2,
+        deadline_s=0.01, max_attempts=2,
         submit=flaky_submit,
     )
 
@@ -896,8 +1143,35 @@ def test_submit_via_http_is_fire_and_forget(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# steer exit codes (verified / unverified / --raw)
+# steer exit codes (verified / unverified / --raw) and its write watchdog
 # ---------------------------------------------------------------------------
+
+def test_steer_times_out_instead_of_hanging_on_a_stuck_fifo(
+    isolated_runs_root, monkeypatch
+):
+    """cmd_steer arms SIGALRM around the whole submit+verify call. Because
+    TimeoutError subclasses OSError, _submit_and_verify must re-raise it
+    rather than logging transport_error and retrying the same stuck FIFO."""
+    _fifo, reader = _seed_live_interactive_run(
+        isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
+    )
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
+    _witness_sequence(monkeypatch, [0])
+    sends = {"n": 0}
+
+    def stuck_fifo(*_a, **_k):
+        sends["n"] += 1
+        raise TimeoutError("write timed out")
+
+    monkeypatch.setattr(agent_run, "_submit_via_keystroke", stuck_fifo)
+    try:
+        with pytest.raises(SystemExit, match="timed out writing to FIFO"):
+            agent_run.cmd_steer(_steer_args("run"))
+    finally:
+        os.close(reader)
+    assert sends["n"] == 1, "a stuck FIFO must not be retried"
+
 
 def test_steer_verified_prints_verified_and_exits_zero(isolated_runs_root, monkeypatch):
     _fifo, reader = _seed_live_interactive_run(

@@ -1159,6 +1159,10 @@ PROMPT_SUBMISSION_DELAY_SECONDS = 4.0
 SUBMISSION_VERIFY_TIMEOUT_SECONDS = 10.0
 SUBMISSION_VERIFY_POLL_INTERVAL_SECONDS = 0.25
 SUBMISSION_MAX_ATTEMPTS = 2
+# Slept before attempt N+1, scaled by attempt number and capped, so a
+# sub-second transport blip does not consume every attempt instantly.
+SUBMISSION_RETRY_BACKOFF_SECONDS = 0.5
+SUBMISSION_RETRY_BACKOFF_MAX_SECONDS = 2.0
 
 
 # Off by default, unlike the thresholds above. An invalid flag value is a hard
@@ -4508,8 +4512,14 @@ def _submit_via_http(port: int, session_id: str, text: str) -> None:
     """POST *text* to opencode's message endpoint without waiting for a
     response. A normal POST blocks until the whole turn completes; dropping
     the connection right after the request is written is safe -- the turn
-    still runs to completion server-side. Raises OSError on a connection
-    failure, which the caller treats as a failed attempt, not a crash."""
+    still runs to completion server-side.
+
+    Raises OSError on a connection failure, which the caller treats as a
+    failed attempt, not a crash. A socket timeout is re-raised as a
+    ConnectionError: TimeoutError is reserved for the caller's own
+    out-of-band deadlines, which must never be mistaken for a retryable
+    transport failure.
+    """
     path = f"/session/{urllib.parse.quote(session_id, safe='')}/message"
     body = json.dumps({"parts": [{"type": "text", "text": text}]}).encode("utf-8")
     request = (
@@ -4520,23 +4530,67 @@ def _submit_via_http(port: int, session_id: str, text: str) -> None:
         "Connection: close\r\n"
         "\r\n"
     ).encode("ascii") + body
-    sock = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+    except TimeoutError as exc:
+        raise ConnectionError(f"connect to 127.0.0.1:{port} timed out: {exc}") from exc
     try:
         sock.sendall(request)
+    except TimeoutError as exc:
+        raise ConnectionError(f"send to 127.0.0.1:{port} timed out: {exc}") from exc
     finally:
         sock.close()
 
 
-def _submit_via_keystroke(state_dir: Path, text: bytes, submit_mode: str) -> None:
-    """Write *text* plus the launch-selected Enter sequence to the run's
-    stdin FIFO in one shot. Raises OSError if the FIFO cannot be opened or
-    the write fails; the caller treats that as a failed attempt, not a
-    crash."""
+def _write_all_to_fifo(fd: int, payload: bytes) -> None:
+    """Write every byte of *payload* to *fd*, retrying short writes.
+
+    A pipe guarantees atomicity only up to PIPE_BUF; past that a single
+    os.write can truncate the text or drop the submit terminator, leaving
+    the composer holding a partial prompt. EINTR retries; any other OSError
+    propagates to the caller as a failed attempt.
+    """
+    written = 0
+    while written < len(payload):
+        try:
+            written += os.write(fd, payload[written:])
+        except InterruptedError:
+            continue
+
+
+def _submit_via_keystroke(state_dir: Path, payload: bytes) -> None:
+    """Write *payload* to the run's stdin FIFO. Raises OSError if the FIFO
+    cannot be opened or the write fails; the caller treats that as a failed
+    attempt, not a crash."""
     fd = os.open(str(state_dir / "stdin"), os.O_WRONLY)
     try:
-        os.write(fd, text + _submit_bytes(submit_mode))
+        _write_all_to_fifo(fd, payload)
     finally:
         os.close(fd)
+
+
+# Sent alone to clear a TUI composer that may still hold a previous
+# attempt's text: ESC leaves any mode the previous keystrokes entered,
+# ctrl-u kills the line readline-style.
+_COMPOSER_RESET_BYTES = b"\x1b\x15"
+
+
+def _keystroke_payload(attempt: int, text: bytes, submit_mode: str) -> bytes:
+    """FIFO bytes for one keystroke attempt.
+
+    Attempt 1 sends the text and the Enter sequence. The failure a retry
+    exists for is "the TUI took the text but swallowed the Enter", which
+    leaves attempt 1's text sitting in the composer -- so attempt 2 sends
+    the terminator alone, submitting what is already buffered rather than
+    doubling the prompt. Only attempt 3 and later assume the composer is
+    holding something unusable and clear it before re-sending in full.
+    """
+    terminator = _submit_bytes(submit_mode)
+    if attempt == 1:
+        return text + terminator
+    if attempt == 2:
+        return terminator
+    return _COMPOSER_RESET_BYTES + text + terminator
 
 
 def _submit_and_verify(
@@ -4583,15 +4637,20 @@ def _submit_and_verify(
     no evidence the submission failed, so retrying cannot add information
     and risks a real duplicate prompt (messageID is not idempotent). Only a
     witness that is readable but flat -- proof the user-record count truly
-    did not rise -- earns a retry.
+    did not rise -- earns a retry. Because no transport here offers
+    idempotent submission, a submission that lands between the final read
+    and the resend is still duplicated; the pre-send re-check narrows that
+    window without closing it.
 
-    Never raises: an unreadable witness, a transport failure, or exhausted
-    attempts all surface as SubmissionOutcome.verified=False with a reason in
-    .detail -- a verification bug must not kill an otherwise working run.
+    Never raises for a submission failure: an unreadable witness, a
+    transport failure, or exhausted attempts all surface as
+    SubmissionOutcome.verified=False with a reason in .detail -- a
+    verification bug must not kill an otherwise working run. A TimeoutError
+    from a caller's own watchdog (cmd_steer's SIGALRM) propagates.
 
-    text carries no submit-sequence framing; the keystroke transport appends
-    submit_mode's Enter sequence itself, HTTP submits text verbatim as the
-    message body.
+    text carries no submit-sequence framing; the keystroke transport frames
+    each attempt itself (see _keystroke_payload), HTTP submits text verbatim
+    as the message body.
     """
     if submit is not None:
         transport = transport or "rpc"
@@ -4604,16 +4663,16 @@ def _submit_and_verify(
     # just minted, which held no user records before this submission. An
     # established session's existing history makes any count unattributable.
     comparable = witness is not None and (baseline is not None or fresh_session)
-    ever_readable = baseline is not None
+    readable_this_attempt = False
 
     def _witness_rose() -> bool:
-        nonlocal ever_readable
+        nonlocal readable_this_attempt
         if not comparable:
             return False
         current = witness.user_count()
         if current is None:
             return False
-        ever_readable = True
+        readable_this_attempt = True
         return current > baseline if baseline is not None else current > 0
 
     detail: Optional[str] = None
@@ -4621,6 +4680,19 @@ def _submit_and_verify(
 
     for attempt in range(1, max_attempts + 1):
         attempts = attempt
+        # Scoped per attempt: the guard below asks whether *this* attempt saw
+        # a readable witness, not whether any attempt ever did.
+        readable_this_attempt = False
+        if attempt > 1:
+            # A backoff between attempts, so a brief transport blip cannot
+            # burn the whole attempt budget in milliseconds.
+            time.sleep(min(SUBMISSION_RETRY_BACKOFF_SECONDS * (attempt - 1),
+                           SUBMISSION_RETRY_BACKOFF_MAX_SECONDS))
+            # The previous attempt's last read is already stale. Re-read
+            # immediately before sending so a witness that rose in between is
+            # not answered with a duplicate submission.
+            if _witness_rose():
+                return SubmissionOutcome(True, attempts, transport, None)
         try:
             if submit is not None:
                 submit(text)
@@ -4628,33 +4700,52 @@ def _submit_and_verify(
                 port, session_id = endpoint
                 _submit_via_http(port, session_id, text.decode("utf-8", errors="replace"))
             else:
-                _submit_via_keystroke(state_dir, text, submit_mode)
+                _submit_via_keystroke(state_dir, _keystroke_payload(attempt, text, submit_mode))
         except _SubmissionRejected as exc:
             return SubmissionOutcome(False, attempts, transport, f"rejected: {exc}")
+        except TimeoutError:
+            # TimeoutError subclasses OSError, so the arm below would swallow
+            # cmd_steer's SIGALRM watchdog and retry against the same stuck
+            # FIFO forever. Transport-level timeouts are re-raised as
+            # non-TimeoutError OSErrors by the transports themselves, so
+            # anything reaching here is an out-of-band deadline.
+            raise
         except OSError as exc:
+            # The peer may well have queued the request before the connection
+            # broke (an HTTP reset after the write, an equivalent RPC write),
+            # and no transport here is idempotent. Poll the witness for the
+            # normal window before deciding a resend is warranted.
             detail = f"transport_error: {exc}"
+            if _poll_witness(_witness_rose, deadline_s):
+                return SubmissionOutcome(True, attempts, transport, None)
             continue
 
-        poll_deadline = time.monotonic() + deadline_s
-        while time.monotonic() < poll_deadline:
-            if _witness_rose():
-                return SubmissionOutcome(True, attempts, transport, None)
-            time.sleep(SUBMISSION_VERIFY_POLL_INTERVAL_SECONDS)
-
-        # Timeout: re-check once, catching a witness update that landed
-        # between the last poll and here.
-        if _witness_rose():
+        if _poll_witness(_witness_rose, deadline_s):
             return SubmissionOutcome(True, attempts, transport, None)
 
-        detail = "timeout" if ever_readable else "witness_unreadable"
+        detail = "timeout" if readable_this_attempt else "witness_unreadable"
 
-        # No evidence to justify a resend: the witness never proved readable
-        # this attempt, so a second submission could only duplicate the
-        # prompt, never confirm or refute the first one.
-        if not ever_readable:
+        # No evidence to justify a resend: the witness was never readable
+        # during this attempt, so a second submission could only duplicate
+        # the prompt, never confirm or refute the first one.
+        if not readable_this_attempt:
             break
 
     return SubmissionOutcome(False, attempts, transport, detail)
+
+
+def _poll_witness(witness_rose: Callable[[], bool], deadline_s: float) -> bool:
+    """Poll *witness_rose* for deadline_s, then once more.
+
+    The trailing read catches an update that landed between the last poll
+    and the deadline expiring.
+    """
+    poll_deadline = time.monotonic() + deadline_s
+    while time.monotonic() < poll_deadline:
+        if witness_rose():
+            return True
+        time.sleep(SUBMISSION_VERIFY_POLL_INTERVAL_SECONDS)
+    return witness_rose()
 
 
 def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
