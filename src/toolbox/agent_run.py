@@ -9133,6 +9133,59 @@ def cmd_kill(args: argparse.Namespace) -> int:
 # launch + runner
 # ---------------------------------------------------------------------------
 
+# Grace given to a runner whose launcher was interrupted before readiness
+# resolved: bounded so an interrupted launch cannot hang indefinitely, short
+# because there is no published state yet for a slow teardown to protect.
+_UNPUBLISHED_RUNNER_TERM_GRACE_SECONDS = 3.0
+
+
+def _terminate_unpublished_runner(state_dir: Path) -> None:
+    """Best-effort termination of a runner whose launcher was interrupted
+    before readiness resolved (before ``status=running`` is published).
+
+    Called only from the window between forking the runner and observing
+    its readiness acknowledgement: an interruption there means a live
+    runner may already exist with nothing yet marking it "running", and the
+    caller is about to decide whether the worktree it owns can be rolled
+    back. That decision must never race a live process still writing into
+    the directory `git worktree remove` is about to delete, so this
+    terminates (and gives a bounded grace period to exit) before returning.
+
+    The pid may not be written yet if the runner had not reached that point
+    before the interruption; polls briefly to cover that ordering, then
+    gives up (nothing to terminate).
+    """
+    deadline = time.time() + 1.0
+    pid_raw = ""
+    while time.time() < deadline:
+        pid_raw = _read(state_dir / "pid")
+        if pid_raw:
+            break
+        time.sleep(0.05)
+    pid = _safe_int(pid_raw)
+    if pid is None or pid <= 0 or not _pid_alive(pid):
+        return
+    identity = _read(state_dir / "process_identity")
+    try:
+        if identity:
+            _send_signal_to_verified_pid(pid, signal.SIGTERM, identity)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, RuntimeError):
+        return
+    term_deadline = time.time() + _UNPUBLISHED_RUNNER_TERM_GRACE_SECONDS
+    while time.time() < term_deadline and _pid_alive(pid):
+        time.sleep(0.1)
+    if not _pid_alive(pid):
+        return
+    current_identity = _process_identity(pid)
+    if not identity or current_identity == identity:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 def cmd_launch(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
     # A relative --prompt-file names a file the caller typed, so it is anchored
@@ -9165,11 +9218,17 @@ def cmd_launch(args: argparse.Namespace) -> int:
         # fails before the run is published. _cmd_launch_locked signals
         # failure with sys.exit (SystemExit), not a return value, so the
         # guard must catch BaseException to see it; the original failure is
-        # always re-raised, even if rollback itself also fails.
+        # always re-raised, even if rollback itself also fails. Once
+        # _cmd_launch_locked has observed a successful readiness
+        # acknowledgement it marks args._worktree_launch_published, and from
+        # that point on a live runner owns the worktree: rollback must never
+        # run, no matter what fails afterward (pid parsing, the print calls).
         try:
             with _launch_lock(name) as lock_fd:
                 rc = _cmd_launch_locked(args, name, lock_fd)
         except BaseException:
+            if getattr(args, "_worktree_launch_published", False):
+                raise
             try:
                 _rollback_launch_worktree(created)
             except BaseException as rollback_exc:  # noqa: BLE001
@@ -9506,13 +9565,23 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     if child_pid != 0:
         # Parent: wait for the grandchild to publish its pid, then return.
         os.close(w_ack)
-        os.waitpid(child_pid, 0)  # reap the intermediate forker
-        # Read the structured readiness result. EOF, malformed data, and an
-        # explicit setup error all mean launch failed.
         try:
-            ack_raw = os.read(r_ack, 65536)
-        except OSError:
-            ack_raw = b""
+            os.waitpid(child_pid, 0)  # reap the intermediate forker
+            # Read the structured readiness result. EOF, malformed data, and an
+            # explicit setup error all mean launch failed.
+            try:
+                ack_raw = os.read(r_ack, 65536)
+            except OSError:
+                ack_raw = b""
+        except BaseException:
+            # Interrupted before readiness could be confirmed: a runner may
+            # already be live and about to publish "running". Terminate it
+            # here, before this call's caller is allowed to roll back the
+            # worktree -- otherwise a live agent process could be orphaned
+            # in a directory `git worktree remove` has just deleted.
+            os.close(r_ack)
+            _terminate_unpublished_runner(d)
+            raise
         os.close(r_ack)
         try:
             ack = json.loads(ack_raw.decode()) if ack_raw else {}
@@ -9525,6 +9594,11 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
                 _write(d / "ended_at", _now_iso() + "\n")
                 _write(d / "status", "failed\n")
             sys.exit(f"agent-run: failed to start agent: {error}")
+        # From here on the run is published: status=running is on disk and a
+        # live runner owns this worktree. An interruption further down (pid
+        # parsing, the print calls below) must never cause the caller to
+        # roll back and remove the worktree out from under it.
+        args._worktree_launch_published = True
         bg_pid_raw = _read(d / "pid")
         if not bg_pid_raw:
             sys.exit("agent-run: failed to start agent (no pid recorded)")

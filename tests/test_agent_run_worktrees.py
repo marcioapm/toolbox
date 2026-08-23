@@ -4210,6 +4210,134 @@ class TestLaunchCreatesWorktree:
         # Rollback never ran, so the worktree it would have removed survives.
         assert wt_dir.is_dir()
 
+    def test_interrupt_after_readiness_published_never_rolls_back(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
+    ):
+        """Once the runner has acknowledged readiness (status=running is
+        published and a live runner owns the worktree), an interruption in
+        the launcher's own remaining bookkeeping (pid parsing, print calls)
+        must never trigger rollback: the worktree is a live run's cwd, not
+        a leftover from a failed launch."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-interrupt-after-ready"
+        name = "interrupt-after-ready"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+        )
+
+        real_print = print
+        calls = {"n": 0}
+
+        def _print_raises_once(*p_args, **p_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise KeyboardInterrupt("interrupted right after publication")
+            return real_print(*p_args, **p_kwargs)
+
+        monkeypatch.setattr("builtins.print", _print_raises_once)
+
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                agent_run.cmd_launch(args)
+        finally:
+            state_dir = isolated_runs_root / name
+            _wait_terminal(state_dir)
+
+        # Published before the interrupt: rollback must never have run.
+        assert wt_dir.is_dir()
+        assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+        assert name in _git(repo, "branch", "--list", name)
+
+    def test_interrupt_before_readiness_terminates_runner_before_rollback(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
+    ):
+        """An interruption before the readiness acknowledgement is observed
+        means a runner may already be live with nothing yet marking it
+        published. `_terminate_unpublished_runner` must run, and it must run
+        strictly before rollback removes the worktree the runner's cwd is
+        inside -- verified by recording call order rather than relying on
+        the runner's own crash behaviour once its cwd disappears."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-interrupt-before-ready"
+        name = "interrupt-before-ready"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+            command=[sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+
+        order: list[str] = []
+        real_terminate = agent_run._terminate_unpublished_runner
+        real_rollback = agent_run._rollback_launch_worktree
+
+        def _traced_terminate(state_dir):
+            order.append("terminate")
+            return real_terminate(state_dir)
+
+        def _traced_rollback(created):
+            order.append("rollback")
+            return real_rollback(created)
+
+        monkeypatch.setattr(agent_run, "_terminate_unpublished_runner", _traced_terminate)
+        monkeypatch.setattr(agent_run, "_rollback_launch_worktree", _traced_rollback)
+
+        real_fork = os.fork
+        real_waitpid = os.waitpid
+        main_pid = os.getpid()
+        state = {"child_pid": None, "raised": False}
+
+        def _fork_recording():
+            pid = real_fork()
+            if pid != 0 and state["child_pid"] is None:
+                state["child_pid"] = pid
+            return pid
+
+        def _waitpid_raises_once(pid, options):
+            # Guarded on the *original* process id, not just the target pid:
+            # this patch is inherited by every forked child's copy of the os
+            # module, and a recycled pid number could otherwise misfire this
+            # injected interrupt inside the runner itself.
+            if (
+                os.getpid() == main_pid
+                and pid == state["child_pid"]
+                and not state["raised"]
+            ):
+                state["raised"] = True
+                raise KeyboardInterrupt("interrupted before readiness ack")
+            return real_waitpid(pid, options)
+
+        monkeypatch.setattr(os, "fork", _fork_recording)
+        monkeypatch.setattr(os, "waitpid", _waitpid_raises_once)
+
+        with pytest.raises(KeyboardInterrupt):
+            agent_run.cmd_launch(args)
+
+        assert order == ["terminate", "rollback"]
+        # Nothing was published: rollback must have removed the worktree
+        # and branch this invocation created.
+        assert not wt_dir.exists()
+        assert name not in _git(repo, "branch", "--list", name)
+
+    def test_terminate_unpublished_runner_kills_a_live_process(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        """Direct unit test of the termination helper itself: given a state
+        dir naming a live pid, it must terminate that process."""
+        state_dir = tmp_path / "state-fake"
+        state_dir.mkdir()
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            (state_dir / "pid").write_text(f"{proc.pid}\n")
+            assert agent_run._pid_alive(proc.pid)
+
+            agent_run._terminate_unpublished_runner(state_dir)
+
+            # Reap so a signalled-but-unwaited child (a zombie) doesn't read
+            # as still alive: os.kill(pid, 0) succeeds against a zombie.
+            proc.wait(timeout=5)
+            assert not agent_run._pid_alive(proc.pid)
+        finally:
+            proc.wait(timeout=5)
+
     def test_invocation_cwd_outside_repo_without_worktree_repo_is_usage_error(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch, capsys
     ):
