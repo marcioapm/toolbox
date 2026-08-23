@@ -10031,12 +10031,14 @@ def _runner(
                 return
 
     def _prompt_was_required_but_unsubmitted() -> bool:
-        """True when an interactive prompt file never reached the agent. The
-        submission helper publishes its marker only after both FIFO writes.
+        """True when an interactive prompt never reached the agent. The
+        submission helper publishes prompt_submitted only after
+        _submit_and_verify confirms the transcript witness rose.
 
-        Bounded by the helper's own delay plus the launch grace: past that, the
-        run may have been steered manually and done real work, which must not
-        be recorded as a launch failure.
+        Bounded by the helper's own pre-submit delay plus its full
+        verify/retry budget: past that, the run may have been steered
+        manually and done real work, which must not be recorded as a launch
+        failure.
         """
         if not (interactive and prompt_file is not None):
             return False
@@ -10045,7 +10047,8 @@ def _runner(
         if agent_started_monotonic is None:
             return False
         elapsed = time.monotonic() - agent_started_monotonic
-        return elapsed <= LAUNCH_GRACE_SECONDS + PROMPT_SUBMISSION_DELAY_SECONDS
+        verify_budget = _submission_verify_timeout_seconds() * _submission_max_attempts()
+        return elapsed <= LAUNCH_GRACE_SECONDS + PROMPT_SUBMISSION_DELAY_SECONDS + verify_budget
 
     def _finalize(code: int) -> None:
         if not (state_dir / "exit_code").exists():
@@ -10781,29 +10784,24 @@ def _run_interactive(
                     data = Path(prompt_file).read_bytes()
                 except OSError:
                     os._exit(0)
-                # Submit with the launch-selected Enter sequence. Trailing
-                # Enter is unconditional so the agent treats the file as a
-                # single submitted message. Send a second separate Enter
-                # after a brief settle so the TUI is guaranteed to see it
-                # even if the first one races input-buffer reset.
-                submit_writes = _prompt_submission_writes(data, submit_mode)
-                try:
-                    fd = os.open(str(stdin_path), os.O_WRONLY)
-                    try:
-                        os.write(fd, submit_writes[0])
-                    finally:
-                        os.close(fd)
-                    time.sleep(0.5)
-                    fd = os.open(str(stdin_path), os.O_WRONLY)
-                    try:
-                        os.write(fd, submit_writes[1])
-                    finally:
-                        os.close(fd)
+                # _submit_and_verify appends its own submit sequence; strip a
+                # trailing newline from the file content first so the agent
+                # does not see two Enters in a row.
+                outcome = _submit_and_verify(
+                    state_dir, log_dir, data.rstrip(b"\r\n"), submit_mode=submit_mode
+                )
+                if outcome.verified:
                     # Marks delivery for `_finalize`; absence means the agent
-                    # died before its task ever reached it.
+                    # never actually received its task.
                     _write(state_dir / "prompt_submitted", _now_iso() + "\n")
-                except OSError:
-                    pass
+                else:
+                    _write(state_dir / "prompt_unverified", f"{outcome.detail}\n")
+                    _log_write(
+                        log_fd,
+                        f"\r\nagent-run: WARNING: initial prompt could not be verified "
+                        f"as delivered ({outcome.detail}, {outcome.attempts} attempt(s) "
+                        f"via {outcome.transport}) -- the agent may be idle\r\n".encode(),
+                    )
             finally:
                 os._exit(0)
 
