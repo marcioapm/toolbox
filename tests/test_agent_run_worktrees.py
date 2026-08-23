@@ -138,6 +138,19 @@ def _row(out: str, key: str) -> list[str]:
     return next(ln for ln in out.splitlines() if ln.split() and ln.split()[0] == key).split()
 
 
+def _exit_status(code: object) -> int:
+    """The OS-visible exit status ``sys.exit(code)`` would produce: ``0`` for
+    ``None``, ``code`` itself for an ``int``, else ``1`` (any message string
+    is printed to stderr and the process exits 1). Distinguishes ordinary
+    ``sys.exit(message)`` rejections (status 1) from this module's explicit
+    ``_worktree_usage_error`` (``SystemExit(2)``)."""
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    return 1
+
+
 def _kill_run_pid(state_dir: Path) -> None:
     """Terminate the runner recorded in state_dir; no-op if already gone."""
     import signal
@@ -3854,9 +3867,10 @@ class TestLaunchCreatesWorktree:
             worktree_branch="a-brand-new-branch", worktree_repo=str(repo),
         )
 
-        with pytest.raises(SystemExit, match="already exists"):
+        with pytest.raises(SystemExit, match="already exists") as exc:
             agent_run.cmd_launch(args)
 
+        assert _exit_status(exc.value.code) == 1
         assert marker.read_text() == before
         assert agent_run._worktree_classify(existing).kind == agent_run._WORKTREE_LINKED
         assert not (isolated_runs_root / "existing-dir").exists()
@@ -3872,9 +3886,11 @@ class TestLaunchCreatesWorktree:
             worktree_branch="taken-branch", worktree_repo=str(repo),
         )
 
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit, match="already exists in") as exc:
             agent_run.cmd_launch(args)
 
+        assert _exit_status(exc.value.code) == 1
+        assert "--worktree-reuse" in str(exc.value)
         assert not wt_dir.exists()
         assert not (isolated_runs_root / "existing-branch").exists()
 
@@ -4037,9 +4053,10 @@ class TestLaunchCreatesWorktree:
             worktree_repo=str(repo),
         )
 
-        with pytest.raises(SystemExit, match="does not resolve to a commit"):
+        with pytest.raises(SystemExit, match="does not resolve to a commit") as exc:
             agent_run.cmd_launch(args)
 
+        assert _exit_status(exc.value.code) == 1
         assert not wt_dir.exists()
         assert not (isolated_runs_root / "bad-base").exists()
         assert _git(repo, "worktree", "list").count("\n") == 1  # only the main worktree
@@ -4473,9 +4490,10 @@ class TestLaunchCreatesWorktree:
             worktree_branch="-not-a-valid-branch", worktree_repo=str(repo),
         )
 
-        with pytest.raises(SystemExit, match="not a valid git branch name"):
+        with pytest.raises(SystemExit, match="not a valid git branch name") as exc:
             agent_run.cmd_launch(args)
 
+        assert _exit_status(exc.value.code) == 1
         assert not wt_dir.exists()
         assert _git(repo, "worktree", "list").count("\n") == 1  # only the main worktree
 
@@ -4506,7 +4524,8 @@ class TestLaunchCreatesWorktree:
             worktree_repo=str(git_root / "no-such-repo"),
         )
 
-        with pytest.raises(SystemExit, match="does not exist or is not a directory"):
+        with pytest.raises(SystemExit, match="does not exist or is not a directory") as exc:
             agent_run.cmd_launch(args)
 
+        assert _exit_status(exc.value.code) == 1
         assert not wt_dir.exists()
