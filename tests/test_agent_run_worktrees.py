@@ -170,36 +170,6 @@ def _kill_run_pid(state_dir: Path) -> None:
             time.sleep(0.3)
 
 
-def _spawn_reparented_sleeper(seconds: float) -> int:
-    """Fork twice and sleep in the grandchild, matching the production
-    runner's process shape: reparented to init rather than staying a
-    pytest-waited child. The intermediate child exits immediately, so
-    ``os.kill(grandchild_pid, 0)`` cannot false-positive against a zombie
-    the way a plain ``subprocess.Popen`` child does after SIGTERM."""
-    read_fd, write_fd = os.pipe()
-    outer_pid = os.fork()
-    if outer_pid == 0:
-        os.close(read_fd)
-        inner_pid = os.fork()
-        if inner_pid == 0:
-            os.close(write_fd)
-            time.sleep(seconds)
-            os._exit(0)
-        os.write(write_fd, str(inner_pid).encode())
-        os.close(write_fd)
-        os._exit(0)
-    os.close(write_fd)
-    os.waitpid(outer_pid, 0)
-    raw = b""
-    while True:
-        chunk = os.read(read_fd, 64)
-        if not chunk:
-            break
-        raw += chunk
-    os.close(read_fd)
-    return int(raw)
-
-
 def _wait_terminal(state_dir: Path, timeout: float = 15.0) -> str:
     """Poll <state_dir>/status until terminal; kill the runner on timeout."""
     deadline = time.monotonic() + timeout
@@ -4643,18 +4613,20 @@ class TestLaunchCreatesWorktree:
         # Rollback never ran, so the worktree it would have removed survives.
         assert wt_dir.is_dir()
 
-    def test_rollback_after_state_dir_and_marker_exist_removes_worktree_and_branch(
-        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
+    def test_fork_failure_after_state_dir_and_marker_exist_leaves_worktree_with_warning(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
-        """Both existing rollback tests fail at the very first statement of
-        _cmd_launch_locked (command=[]), before the state dir, marker,
-        status=starting, or the fork exist. This forces a failure *after*
-        all of that is on disk (a fork() failure, reached deterministically
-        by monkeypatching os.fork) and pins the resulting state explicitly:
-        the worktree and branch are rolled back, and the state dir is left
-        behind with status=failed naming the now-deleted directory -- a
-        known, accepted dangling record (see _create_launch_worktree's
-        crash-residual note), not cleaned up by rollback."""
+        """Both existing pre-fork rollback tests fail at the very first
+        statement of _cmd_launch_locked (command=[]), before the state dir,
+        marker, status=starting, or args._worktree_forked exist. This forces
+        a failure *after* all of that is on disk: os.fork() itself raising
+        (reached deterministically by monkeypatching it) happens after
+        args._worktree_forked is set, since that flag is the statement
+        immediately preceding the call -- so this is a post-fork failure by
+        definition, even though no child process actually came into being.
+        The worktree and branch must survive with an actionable warning, and
+        the state dir is left behind with status=failed naming the
+        still-existing directory."""
         repo = _make_repo(git_root)
         wt_dir = git_root / "wt-rollback-post-publish"
         name = "rollback-post-publish"
@@ -4671,16 +4643,16 @@ class TestLaunchCreatesWorktree:
             agent_run.cmd_launch(args)
 
         state_dir = isolated_runs_root / name
-        # Rolled back: this invocation created the worktree and branch, and
-        # nothing was ever published (no readiness ack), so rollback applies.
-        assert not wt_dir.exists()
-        assert name not in _git(repo, "branch", "--list", name)
-        # Pinned dangling-record choice: the state dir is not cleaned up by
-        # rollback, and still names the worktree that no longer exists.
+        assert wt_dir.is_dir()
+        assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+        assert name in _git(repo, "branch", "--list", name)
         assert state_dir.is_dir()
         assert agent_run._read(state_dir / "status") == "failed"
         assert agent_run._read(state_dir / "cwd") == str(wt_dir.resolve())
-        assert agent_run._read(state_dir / "worktree_created") == str(wt_dir.resolve())
+        err = capsys.readouterr().err
+        assert str(wt_dir) in err
+        assert "git worktree remove" in err
+        assert f"git branch -D {name}" in err
 
     def test_interrupt_after_readiness_published_never_rolls_back(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
@@ -4720,16 +4692,19 @@ class TestLaunchCreatesWorktree:
         assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
         assert name in _git(repo, "branch", "--list", name)
 
-    def test_failed_readiness_ack_still_rolls_back(
-        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
+    def test_failed_readiness_ack_survives_rollback_with_warning(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
         """A runner that reaches its own error handler and sends
-        {"status": "error"} over the ack pipe never became live -- the
-        worktree and branch this invocation created must still be rolled
-        back. This is the test that keeps the ack-uncertain classification
-        honest: the provisional "possibly published" mark set right after
-        the pipe read must be cleared once the ack decodes as a failure,
-        not left standing in the caller's way."""
+        {"status": "error"} over the ack pipe is a post-fork failure: the
+        fork that produced it already ran, so args._worktree_forked was set
+        before cmd_launch's except clause can ever see the SystemExit this
+        raises. The worktree and branch this invocation created must
+        survive, with an actionable warning telling the operator how to
+        clean up by hand. This is the single most important behavioural
+        test in this design: it is the exact shape every prior rollback
+        race was found in, and the fix here is to never attempt the
+        decision at all rather than get it right under pressure."""
         repo = _make_repo(git_root)
         wt_dir = git_root / "wt-failed-ack"
         name = "failed-ack-run"
@@ -4745,40 +4720,33 @@ class TestLaunchCreatesWorktree:
         with pytest.raises(SystemExit, match="simulated setup failure"):
             agent_run.cmd_launch(args)
 
-        assert not wt_dir.exists()
-        assert name not in _git(repo, "branch", "--list", name)
+        assert wt_dir.is_dir()
+        assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+        assert name in _git(repo, "branch", "--list", name)
+        err = capsys.readouterr().err
+        assert str(wt_dir) in err
+        assert "git worktree remove" in err
+        assert f"git branch -D {name}" in err
 
-    def test_interrupt_during_ack_classification_refuses_rollback(
+    def test_post_fork_oserror_leaves_worktree_and_branch_intact_with_warning(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
-        """H3: an interruption that lands after os.read() successfully
-        returns the ack bytes but before json.loads/the status check
-        classifies them must not be treated as an unpublished launch. The
-        runner may already be live (it sent a successful ack), so rollback
-        must be refused rather than deleting a live runner's worktree."""
+        """A plain exception raised anywhere after os.fork() has returned --
+        not just an interrupt -- must also be treated as post-fork: the
+        worktree and branch survive with the actionable warning, and the
+        original OSError still propagates unmasked."""
         repo = _make_repo(git_root)
-        wt_dir = git_root / "wt-interrupt-during-classify"
-        name = "interrupt-during-classify"
+        wt_dir = git_root / "wt-post-fork-oserror"
+        name = "post-fork-oserror"
         args = _launch_args(
             name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+            command=[sys.executable, "-c", "import time; time.sleep(30)"],
         )
 
-        real_loads = agent_run.json.loads
-
-        def _loads_raises_once(*a, **kw):
-            agent_run.json.loads = real_loads
-            raise KeyboardInterrupt("interrupted during ack classification")
-
-        # os.read is used for many things during worktree/state setup
-        # before the ack pipe read (git subprocess output capture, etc.),
-        # so the trap on json.loads is armed only once os.waitpid has
-        # reaped the exact intermediate forker pid this launch's own
-        # fork() produced -- the ack pipe read is the parent's next step
-        # right after that reap.
         real_fork = os.fork
         real_waitpid = os.waitpid
         main_pid = os.getpid()
-        state = {"child_pid": None, "reaped": False}
+        state = {"child_pid": None, "raised": False}
 
         def _fork_recording():
             pid = real_fork()
@@ -4786,239 +4754,50 @@ class TestLaunchCreatesWorktree:
                 state["child_pid"] = pid
             return pid
 
-        def _waitpid_then_arm(pid, options):
-            result = real_waitpid(pid, options)
+        def _waitpid_raises_once(pid, options):
             if (
                 os.getpid() == main_pid
                 and pid == state["child_pid"]
-                and not state["reaped"]
+                and not state["raised"]
             ):
-                state["reaped"] = True
-                agent_run.json.loads = _loads_raises_once
-            return result
+                state["raised"] = True
+                raise OSError("simulated post-fork bookkeeping failure")
+            return real_waitpid(pid, options)
 
         monkeypatch.setattr(os, "fork", _fork_recording)
-        monkeypatch.setattr(os, "waitpid", _waitpid_then_arm)
+        monkeypatch.setattr(os, "waitpid", _waitpid_raises_once)
 
         try:
-            with pytest.raises(KeyboardInterrupt, match="interrupted during ack classification"):
+            with pytest.raises(OSError, match="simulated post-fork bookkeeping failure"):
                 agent_run.cmd_launch(args)
         finally:
-            agent_run.json.loads = real_loads
             state_dir = isolated_runs_root / name
             _wait_terminal(state_dir)
 
         assert wt_dir.is_dir()
         assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
         assert name in _git(repo, "branch", "--list", name)
-        assert "ack" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "git worktree remove" in err
+        assert f"git branch -D {name}" in err
 
-    def test_interrupt_before_readiness_terminates_runner_before_rollback(
-        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
-    ):
-        """An interruption before the readiness acknowledgement is observed
-        means a runner may already be live with nothing yet marking it
-        published. `_terminate_unpublished_runner` must run, and it must run
-        strictly before rollback removes the worktree the runner's cwd is
-        inside -- verified by recording call order rather than relying on
-        the runner's own crash behaviour once its cwd disappears."""
-        repo = _make_repo(git_root)
-        wt_dir = git_root / "wt-interrupt-before-ready"
-        name = "interrupt-before-ready"
-        args = _launch_args(
-            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
-            command=[sys.executable, "-c", "import time; time.sleep(30)"],
-        )
-
-        order: list[str] = []
-        real_terminate = agent_run._terminate_unpublished_runner
-        real_rollback = agent_run._rollback_launch_worktree
-
-        def _traced_terminate(state_dir):
-            order.append("terminate")
-            return real_terminate(state_dir)
-
-        def _traced_rollback(created):
-            order.append("rollback")
-            return real_rollback(created)
-
-        monkeypatch.setattr(agent_run, "_terminate_unpublished_runner", _traced_terminate)
-        monkeypatch.setattr(agent_run, "_rollback_launch_worktree", _traced_rollback)
-
-        real_fork = os.fork
-        real_waitpid = os.waitpid
-        main_pid = os.getpid()
-        state = {"child_pid": None, "raised": False}
-
-        def _fork_recording():
-            pid = real_fork()
-            if pid != 0 and state["child_pid"] is None:
-                state["child_pid"] = pid
-            return pid
-
-        def _waitpid_raises_once(pid, options):
-            # Guarded on the *original* process id, not just the target pid:
-            # this patch is inherited by every forked child's copy of the os
-            # module, and a recycled pid number could otherwise misfire this
-            # injected interrupt inside the runner itself.
-            if (
-                os.getpid() == main_pid
-                and pid == state["child_pid"]
-                and not state["raised"]
-            ):
-                state["raised"] = True
-                raise KeyboardInterrupt("interrupted before readiness ack")
-            return real_waitpid(pid, options)
-
-        monkeypatch.setattr(os, "fork", _fork_recording)
-        monkeypatch.setattr(os, "waitpid", _waitpid_raises_once)
-
-        with pytest.raises(KeyboardInterrupt):
-            agent_run.cmd_launch(args)
-
-        assert order == ["terminate", "rollback"]
-        # Nothing was published: rollback must have removed the worktree
-        # and branch this invocation created.
-        assert not wt_dir.exists()
-        assert name not in _git(repo, "branch", "--list", name)
-
-    def test_terminate_unpublished_runner_kills_a_live_process(
-        self, isolated_runs_root, isolated_log_root
-    ):
-        """Direct unit test of the termination helper itself: given a state
-        dir naming a live pid, it must terminate that process.
-
-        The victim is double-forked and reparented to init, matching the
-        production runner's shape. A subprocess.Popen child stays a zombie
-        (still "alive" to os.kill(pid, 0)) after SIGTERM until this process
-        reaps it, which would let the helper's SIGTERM branch pass even if
-        it did nothing at all."""
-        state_dir = isolated_runs_root / "state-fake"
-        state_dir.mkdir()
-        pid = _spawn_reparented_sleeper(30)
-        try:
-            assert agent_run._pid_alive(pid)
-            identity = agent_run._process_identity(pid)
-            assert identity is not None
-            (state_dir / "pid").write_text(f"{pid}\n")
-            (state_dir / "process_identity").write_text(identity + "\n")
-
-            assert agent_run._terminate_unpublished_runner(state_dir)
-
-            assert not agent_run._pid_alive(pid)
-        finally:
-            if agent_run._pid_alive(pid):
-                os.kill(pid, signal.SIGKILL)
-
-    def test_terminate_unpublished_runner_returns_false_when_pid_never_appears(
-        self, isolated_runs_root, isolated_log_root, monkeypatch
-    ):
-        """No pid on disk within the poll window is not "nothing to
-        terminate": the caller must treat it as unsafe to roll back."""
-        state_dir = isolated_runs_root / "state-no-pid"
-        state_dir.mkdir()
-        monkeypatch.setattr(agent_run, "_UNPUBLISHED_RUNNER_IDENTITY_POLL_SECONDS", 0.2)
-
-        assert agent_run._terminate_unpublished_runner(state_dir) is False
-
-    def test_terminate_unpublished_runner_returns_false_when_identity_never_appears(
-        self, isolated_runs_root, isolated_log_root, monkeypatch
-    ):
-        """A pid on disk with no process_identity yet is unsignalable through
-        the verified path; the caller must not treat this as safe."""
-        state_dir = isolated_runs_root / "state-pid-no-identity"
-        state_dir.mkdir()
-        pid = _spawn_reparented_sleeper(30)
-        try:
-            (state_dir / "pid").write_text(f"{pid}\n")
-            monkeypatch.setattr(agent_run, "_UNPUBLISHED_RUNNER_IDENTITY_POLL_SECONDS", 0.2)
-
-            assert agent_run._terminate_unpublished_runner(state_dir) is False
-            assert agent_run._pid_alive(pid)
-        finally:
-            if agent_run._pid_alive(pid):
-                os.kill(pid, signal.SIGKILL)
-
-    def test_terminate_unpublished_runner_refuses_when_recorded_identity_is_stale(
-        self, isolated_runs_root, isolated_log_root
-    ):
-        """If the identity on disk no longer matches the live process at that
-        pid (a PID-reuse shape), the helper must refuse to signal it rather
-        than terminating an unrelated process, and must report failure so
-        the caller does not roll back believing the runner is confirmed
-        dead."""
-        state_dir = isolated_runs_root / "state-stale-identity"
-        state_dir.mkdir()
-        pid = _spawn_reparented_sleeper(30)
-        try:
-            (state_dir / "pid").write_text(f"{pid}\n")
-            (state_dir / "process_identity").write_text("darwin:not-the-real-identity\n")
-
-            assert agent_run._terminate_unpublished_runner(state_dir) is False
-
-            assert agent_run._pid_alive(pid)
-        finally:
-            if agent_run._pid_alive(pid):
-                os.kill(pid, signal.SIGKILL)
-
-    def test_terminate_unpublished_runner_escalates_to_sigkill_after_grace_period(
-        self, isolated_runs_root, isolated_log_root, monkeypatch
-    ):
-        """A runner that ignores SIGTERM must be SIGKILLed once the grace
-        period elapses, and the helper must confirm that exact identity is
-        gone before reporting success."""
-        state_dir = isolated_runs_root / "state-ignores-term"
-        state_dir.mkdir()
-        monkeypatch.setattr(agent_run, "_UNPUBLISHED_RUNNER_TERM_GRACE_SECONDS", 0.3)
-        read_fd, write_fd = os.pipe()
-        outer_pid = os.fork()
-        if outer_pid == 0:
-            os.close(read_fd)
-            inner_pid = os.fork()
-            if inner_pid == 0:
-                os.close(write_fd)
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                time.sleep(30)
-                os._exit(0)
-            os.write(write_fd, str(inner_pid).encode())
-            os.close(write_fd)
-            os._exit(0)
-        os.close(write_fd)
-        os.waitpid(outer_pid, 0)
-        pid = int(os.read(read_fd, 64))
-        os.close(read_fd)
-        try:
-            identity = agent_run._process_identity(pid)
-            assert identity is not None
-            (state_dir / "pid").write_text(f"{pid}\n")
-            (state_dir / "process_identity").write_text(identity + "\n")
-
-            started = time.monotonic()
-            result = agent_run._terminate_unpublished_runner(state_dir)
-            elapsed = time.monotonic() - started
-
-            assert result is True
-            assert not agent_run._pid_alive(pid)
-            assert elapsed >= 0.3  # actually waited out the grace period
-        finally:
-            if agent_run._pid_alive(pid):
-                os.kill(pid, signal.SIGKILL)
-
-    def test_interrupt_before_readiness_with_unconfirmed_termination_leaves_worktree(
+    def test_interrupt_after_fork_leaves_worktree_intact(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
-        """When termination cannot confirm the runner is dead, rollback must
-        be refused, not just skipped silently: the worktree may still be a
-        live runner's cwd."""
+        """An interrupt landing at any point after os.fork() has returned
+        must never trigger rollback: args._worktree_forked was set as the
+        last statement before that call, so nothing past this point can
+        prove the forked process (or whatever it has itself forked) is
+        dead. Interrupting os.waitpid's reap of the intermediate forker --
+        the parent's very next statement once fork() returns -- exercises
+        the earliest possible post-fork interruption point."""
         repo = _make_repo(git_root)
-        wt_dir = git_root / "wt-interrupt-unconfirmed"
-        name = "interrupt-unconfirmed"
+        wt_dir = git_root / "wt-interrupt-after-fork"
+        name = "interrupt-after-fork"
         args = _launch_args(
             name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
             command=[sys.executable, "-c", "import time; time.sleep(30)"],
         )
-
-        monkeypatch.setattr(agent_run, "_terminate_unpublished_runner", lambda state_dir: False)
 
         real_fork = os.fork
         real_waitpid = os.waitpid
@@ -5032,13 +4811,17 @@ class TestLaunchCreatesWorktree:
             return pid
 
         def _waitpid_raises_once(pid, options):
+            # Guarded on the *original* process id, not just the target
+            # pid: this patch is inherited by every forked child's copy of
+            # the os module, and a recycled pid number could otherwise
+            # misfire this injected interrupt inside the runner itself.
             if (
                 os.getpid() == main_pid
                 and pid == state["child_pid"]
                 and not state["raised"]
             ):
                 state["raised"] = True
-                raise KeyboardInterrupt("interrupted before readiness ack")
+                raise KeyboardInterrupt("interrupted right after fork")
             return real_waitpid(pid, options)
 
         monkeypatch.setattr(os, "fork", _fork_recording)
@@ -5054,64 +4837,8 @@ class TestLaunchCreatesWorktree:
         assert wt_dir.is_dir()
         assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
         assert name in _git(repo, "branch", "--list", name)
-        assert "could not confirm" in capsys.readouterr().err
-
-    def test_second_interrupt_during_termination_is_treated_as_unconfirmed(
-        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
-    ):
-        """A second interrupt raised out of _terminate_unpublished_runner
-        itself (e.g. a second Ctrl-C while it is polling) must not propagate
-        past the original interrupt or be read as confirmed death; it must
-        fall back to the same unsafe-to-roll-back path."""
-        repo = _make_repo(git_root)
-        wt_dir = git_root / "wt-double-interrupt"
-        name = "double-interrupt"
-        args = _launch_args(
-            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
-            command=[sys.executable, "-c", "import time; time.sleep(30)"],
-        )
-
-        def _terminate_raises(state_dir):
-            raise KeyboardInterrupt("second interrupt during termination")
-
-        monkeypatch.setattr(agent_run, "_terminate_unpublished_runner", _terminate_raises)
-
-        real_fork = os.fork
-        real_waitpid = os.waitpid
-        main_pid = os.getpid()
-        state = {"child_pid": None, "raised": False}
-
-        def _fork_recording():
-            pid = real_fork()
-            if pid != 0 and state["child_pid"] is None:
-                state["child_pid"] = pid
-            return pid
-
-        def _waitpid_raises_once(pid, options):
-            if (
-                os.getpid() == main_pid
-                and pid == state["child_pid"]
-                and not state["raised"]
-            ):
-                state["raised"] = True
-                raise KeyboardInterrupt("interrupted before readiness ack")
-            return real_waitpid(pid, options)
-
-        monkeypatch.setattr(os, "fork", _fork_recording)
-        monkeypatch.setattr(os, "waitpid", _waitpid_raises_once)
-
-        try:
-            with pytest.raises(KeyboardInterrupt, match="interrupted before readiness ack"):
-                agent_run.cmd_launch(args)
-        finally:
-            state_dir = isolated_runs_root / name
-            _wait_terminal(state_dir)
-
-        # The original interrupt is what propagates, not the second one.
-        assert wt_dir.is_dir()
-        assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
-        assert name in _git(repo, "branch", "--list", name)
-        assert "could not confirm" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "git worktree remove" in err
 
     def test_invocation_cwd_outside_repo_without_worktree_repo_is_usage_error(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch, capsys
