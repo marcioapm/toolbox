@@ -9,7 +9,7 @@ E2E1 -- real launch: worktree registration, branch name, HEAD, the recorded
 E2E2 -- rollback contract: a preflight failure reached after worktree
         creation removes the worktree and branch; a failure once a real
         forked runner exists preserves both.
-E2E3 -- prefork-mint boundary (round-4 High): a real child process holds
+E2E3 -- prefork-mint boundary: a real child process holds
         the worktree as its cwd, and an interrupt escapes mint cleanup.
         The `opencode` binary is substituted with a real sleeping shell
         script -- the ownership-mark/rollback machinery under test runs
@@ -440,10 +440,9 @@ class TestE2E3PreforkMintBoundary:
             except ProcessLookupError:
                 pytest.fail(f"descendant pid {descendant_pid} died before the interrupt")
 
-            # The mint child is real and blocked in a real health-poll loop;
-            # give it a moment past the pidfile write to be certain the
-            # ownership mark (set immediately before Popen) is in place.
-            time.sleep(0.2)
+            # The pidfile can only exist after the mint Popen, which itself
+            # runs after the ownership mark is set, so the mark is already
+            # in place here and no further wait is needed.
             launcher.send_signal(signal.SIGINT)
             rc = launcher.wait(timeout=15)
             assert rc != 0

@@ -54,7 +54,8 @@ time (E2E3's fake-opencode health-poll timeout — bounded, ~1s in practice beca
 interrupt lands well before the 30s ceiling — dominates runtime). No flake observed;
 no seed to report because none of these tests use randomised ordering or seeded
 inputs — every wait is a bounded poll on a real file/process condition
-(`_wait_for`), never a fixed `sleep` or a wall-clock assertion.
+(`_wait_for`), with no wall-clock assertions and no fixed sleep used as a
+synchronisation primitive.
 
 Per-run summary (identical across all five):
 ```
