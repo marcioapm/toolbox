@@ -4195,6 +4195,26 @@ class TestLaunchCreatesWorktree:
         assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "actual"
         assert not (isolated_runs_root / "branch-mismatch-reuse").exists()
 
+    def test_reuse_refuses_branch_that_is_a_prefix_of_the_requested_branch(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """T5: the branch-equality check must be exact string equality, not
+        a prefix match in either direction. A worktree actually on branch
+        'feat' must not satisfy a request for '--worktree-branch feature'
+        just because 'feature'.startswith('feat')."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt-feat-prefix", "feat")
+        args = _launch_args(
+            name="prefix-mismatch-reuse", worktree=str(wt), worktree_base="main",
+            worktree_branch="feature", worktree_repo=str(repo), worktree_reuse=True,
+        )
+
+        with pytest.raises(SystemExit, match="is on branch 'feat'"):
+            agent_run.cmd_launch(args)
+
+        assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip() == "feat"
+        assert not (isolated_runs_root / "prefix-mismatch-reuse").exists()
+
     def test_reuse_refuses_detached_head(
         self, isolated_runs_root, isolated_log_root, git_root
     ):
