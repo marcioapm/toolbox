@@ -4323,6 +4323,167 @@ class TestLaunchCreatesWorktree:
         assert name not in _git(repo, "branch", "--list", name)
         assert not (isolated_runs_root / name).exists()
 
+    def test_rollback_keeps_a_branch_the_workload_moved(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """The branch OID guard in _worktree_delete_branch_if_unchanged is
+        what stops rollback from discarding committed work: if the branch
+        moved away from the OID this invocation created it at (a workload
+        committing into the new worktree before launch fails), the branch
+        must survive rollback with a warning naming the OID reason."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-moved-branch"
+        name = "moved-branch-run"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo),
+        )
+
+        real_apply_cwd = agent_run._apply_launch_cwd
+
+        def _apply_cwd_then_commit(a):
+            real_apply_cwd(a)
+            # A clean commit: the worktree itself has no untracked/modified
+            # content, so `git worktree remove` (force=False) succeeds and
+            # the branch-delete path is actually reached.
+            (wt_dir / "workload-output.txt").write_text("work done\n")
+            _git(wt_dir, "add", "workload-output.txt")
+            _git(wt_dir, "commit", "-qm", "workload commit")
+
+        monkeypatch.setattr(agent_run, "_apply_launch_cwd", _apply_cwd_then_commit)
+
+        with pytest.raises(SystemExit, match="missing command"):
+            agent_run.cmd_launch(args)
+
+        assert not wt_dir.exists()  # the worktree itself is still rolled back
+        branch_list = _git(repo, "branch", "--list", name)
+        assert name in branch_list
+        err = capsys.readouterr().err
+        assert "no longer points at the commit this invocation created" in err
+
+    def test_rollback_refuses_a_branch_checked_out_in_another_worktree(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """The checked-out guard: if the branch this invocation created is
+        (somehow) also checked out elsewhere by the time rollback runs, the
+        branch must survive -- `git branch -D` itself refuses this, and the
+        pre-check must not paper over a refusal by reporting success."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-checked-out-elsewhere"
+        name = "checked-out-run"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo), worktree_branch="checked-out-elsewhere",
+        )
+
+        real_apply_cwd = agent_run._apply_launch_cwd
+        elsewhere = git_root / "wt-elsewhere"
+
+        def _apply_cwd_then_checkout_elsewhere(a):
+            real_apply_cwd(a)
+            # A second worktree attaches to the same branch this invocation
+            # created, simulating another actor checking it out concurrently.
+            _git(repo, "worktree", "add", "-q", "--force", str(elsewhere), "checked-out-elsewhere")
+
+        monkeypatch.setattr(agent_run, "_apply_launch_cwd", _apply_cwd_then_checkout_elsewhere)
+
+        with pytest.raises(SystemExit, match="missing command"):
+            agent_run.cmd_launch(args)
+
+        assert "checked-out-elsewhere" in _git(repo, "branch", "--list", "checked-out-elsewhere")
+        assert "checked out in a worktree" in capsys.readouterr().err
+        assert elsewhere.is_dir()
+
+    def test_rollback_refuses_branch_deletion_when_worktree_enumeration_fails(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """`_worktree_branch_checked_out`'s docstring commits to treating a
+        `worktree list` failure as assume-checked-out; this pins that the
+        caller actually refuses in that case rather than deleting anyway."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-enum-fails"
+        name = "enum-fails-run"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo),
+        )
+
+        real_git_checked = agent_run._watch_run_git_checked
+
+        def _fail_worktree_list(repo_arg, argv, **kw):
+            if argv[:2] == ["worktree", "list"]:
+                return agent_run._WatchGitOutcome(None, "simulated enumeration failure")
+            return real_git_checked(repo_arg, argv, **kw)
+
+        monkeypatch.setattr(agent_run, "_watch_run_git_checked", _fail_worktree_list)
+
+        with pytest.raises(SystemExit, match="missing command"):
+            agent_run.cmd_launch(args)
+
+        assert name in _git(repo, "branch", "--list", name)
+        assert "cannot confirm" in capsys.readouterr().err
+
+    def test_rollback_branch_delete_itself_refuses_a_checked_out_branch(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """H2: even if the pre-check (`_worktree_branch_checked_out`) is
+        stale or races a concurrent checkout and reports "not checked out",
+        `git branch -D` must be the actual protection -- it refuses on its
+        own when the branch really is checked out somewhere. This is what
+        distinguishes rollback's delete from a plain `git update-ref -d`,
+        which does not refuse and would silently discard the ref out from
+        under the concurrent checkout."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-stale-precheck"
+        name = "stale-precheck-run"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo), worktree_branch="stale-precheck",
+        )
+
+        real_apply_cwd = agent_run._apply_launch_cwd
+        elsewhere = git_root / "wt-stale-elsewhere"
+
+        def _apply_cwd_then_checkout_elsewhere(a):
+            real_apply_cwd(a)
+            _git(repo, "worktree", "add", "-q", "--force", str(elsewhere), "stale-precheck")
+
+        monkeypatch.setattr(agent_run, "_apply_launch_cwd", _apply_cwd_then_checkout_elsewhere)
+        # The pre-check itself is stubbed to (falsely) report the branch as
+        # unused, simulating a stale read racing the concurrent checkout
+        # above: this isolates branch -D's own refusal as the sole guard.
+        monkeypatch.setattr(agent_run, "_worktree_branch_checked_out", lambda repo, branch: (False, None))
+
+        with pytest.raises(SystemExit, match="missing command"):
+            agent_run.cmd_launch(args)
+
+        assert "stale-precheck" in _git(repo, "branch", "--list", "stale-precheck")
+        assert elsewhere.is_dir()
+
+    def test_rollback_branch_check_does_not_prefix_match(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A worktree checked out on branch 'feat-2' must not be read as
+        satisfying a checked-out check for branch 'feat': the comparison is
+        exact-match on the full ref, not a prefix match."""
+        repo = _make_repo(git_root)
+        _git(repo, "branch", "-f", "feat-2", "main")
+        _git(repo, "worktree", "add", "-q", str(git_root / "wt-feat-2"), "feat-2")
+        wt_dir = git_root / "wt-feat"
+        name = "feat-run"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo), worktree_branch="feat",
+        )
+
+        with pytest.raises(SystemExit, match="missing command"):
+            agent_run.cmd_launch(args)
+
+        # 'feat' was never checked out anywhere, so rollback must delete it
+        # despite 'feat-2' being checked out concurrently.
+        assert "feat" not in _git(repo, "branch", "--list", "feat").replace("feat-2", "")
+        assert "feat-2" in _git(repo, "branch", "--list", "feat-2")
+
     def test_rollback_does_not_discard_uncommitted_work(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
     ):

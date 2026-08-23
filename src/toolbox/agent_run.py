@@ -7013,8 +7013,9 @@ def _worktree_branch_checked_out(repo: Path, branch: str) -> Tuple[Optional[bool
     """Whether ``refs/heads/<branch>`` is checked out in any worktree
     registered to ``repo``. Returns ``(None, error)`` when this cannot be
     determined; callers must treat that as "assume checked out" and refuse
-    to delete, since ``git update-ref -d`` — unlike ``git branch -D`` — does
-    not itself refuse to delete a branch some worktree has checked out.
+    to delete. ``git branch -D`` itself refuses a checked-out branch and is
+    the actual protection; this function exists only to produce a clear
+    diagnostic before attempting the delete, not to gate correctness.
     """
     outcome = _watch_run_git_checked(repo, ["worktree", "list", "--porcelain", "-z"])
     if outcome.stdout is None:
@@ -7030,9 +7031,22 @@ def _worktree_delete_branch_if_unchanged(repo: Path, branch: str, expected_oid: 
     """Delete ``refs/heads/<branch>`` iff it still points at ``expected_oid``
     and no registered worktree has it checked out. Returns ``None`` on
     success or if the branch is already gone, else the reason it was left in
-    place. The delete itself is an atomic expected-old-value ``update-ref``,
-    so a branch that moved between the check above and this call is still
-    refused rather than silently discarded.
+    place.
+
+    The OID check guards against a branch the workload (or anything else)
+    moved: it is compared here, then the deletion is ``git branch -D``, not
+    ``git update-ref -d``, because git itself refuses ``branch -D`` against
+    a branch any worktree has checked out -- closing the gap between the
+    checked-out scan below and the delete, which a scan-then-delete of our
+    own could never do atomically. ``_worktree_branch_checked_out`` is kept
+    as a pre-check purely for a clear diagnostic; ``branch -D``'s own refusal
+    is what actually protects a concurrent checkout.
+
+    Residual: an unrelated actor deleting and recreating ``branch`` at
+    ``expected_oid`` between the OID check and the delete below is
+    indistinguishable from this invocation's own branch never having moved,
+    so ``branch -D`` would delete a branch this invocation no longer owns.
+    Accepted rather than closed -- see H2 in the fix-round report.
     """
     current = _watch_run_git_checked(repo, ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"])
     if current.stdout is None:
@@ -7044,9 +7058,9 @@ def _worktree_delete_branch_if_unchanged(repo: Path, branch: str, expected_oid: 
         return f"cannot confirm branch {branch!r} is unused: {err}"
     if checked_out:
         return f"branch {branch!r} is checked out in a worktree; refusing to delete"
-    outcome = _watch_run_git_checked(repo, ["update-ref", "-d", f"refs/heads/{branch}", expected_oid])
+    outcome = _watch_run_git_checked(repo, ["branch", "-D", branch])
     if outcome.stdout is None:
-        return outcome.error_detail or "update-ref failed"
+        return outcome.error_detail or "git branch -D failed"
     return None
 
 
