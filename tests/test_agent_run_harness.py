@@ -1869,7 +1869,18 @@ class TestManagedCodexInteractiveAppServer:
         assert reached, "Run must reach running before steer"
         time.sleep(0.8)  # let initial turn complete so the agent is idle
 
-        # Send steer via cmd_steer.
+        # Send steer via cmd_steer. The fake app-server has no real codex
+        # rollout file to witness against, so simulate one rising right after
+        # the FIFO write -- the transport behavior under test (turn/steer
+        # dispatch and the response landing in the log) is independent of
+        # which store backs the witness.
+        witness_calls = {"n": 0}
+
+        def fake_witness(_state_dir, _log_dir):
+            witness_calls["n"] += 1
+            return 0 if witness_calls["n"] == 1 else 1
+
+        monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
         steer_ns = argparse.Namespace(name=name, message=["STEER_MSG"], raw=False, esc=False)
         rc = agent_run.cmd_steer(steer_ns)
         assert rc == 0, "steer must exit 0 on an interactive run"
@@ -3138,6 +3149,17 @@ class TestCodexRpcEdgeCases:
 
         # The turn is still active (server sent active-turn-1 id). The steer
         # dispatches as turn/steer. The server rejects it with an rpc error.
+        # No real codex rollout file exists for the fake server to witness
+        # against; force an immediate witness rise so cmd_steer doesn't burn
+        # its full verify/retry budget on an assertion that only cares about
+        # the acquire log content.
+        witness_calls = {"n": 0}
+
+        def fake_witness(_state_dir, _log_dir):
+            witness_calls["n"] += 1
+            return 0 if witness_calls["n"] == 1 else 1
+
+        monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
         steer_ns = argparse.Namespace(name=name, message=["DO SOMETHING"], raw=False, esc=False)
         agent_run.cmd_steer(steer_ns)
 
@@ -3182,6 +3204,16 @@ class TestCodexRpcEdgeCases:
         time.sleep(0.8)
 
         # Send steer: if active_turn_id was cleared correctly, this becomes turn/start.
+        # No real codex rollout file exists for the fake server; force an
+        # immediate witness rise so cmd_steer doesn't burn its verify/retry
+        # budget on an assertion that only cares about the dispatch method.
+        witness_calls = {"n": 0}
+
+        def fake_witness(_state_dir, _log_dir):
+            witness_calls["n"] += 1
+            return 0 if witness_calls["n"] == 1 else 1
+
+        monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
         steer_ns = argparse.Namespace(name=name, message=["after-turn"], raw=False, esc=False)
         agent_run.cmd_steer(steer_ns)
         self._wait_terminal(state_dir, timeout=12.0)

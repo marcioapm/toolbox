@@ -8645,60 +8645,82 @@ def _reject_raw_steer_for_codex(name: str) -> None:
 
 def cmd_steer(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
-    d, pid = _require_live_interactive_run(name)
+    d, _pid = _require_live_interactive_run(name)
     if args.raw:
         _reject_raw_steer_for_codex(name)
     fifo = d / "stdin"
     if not fifo.is_fifo():
         sys.exit(f"agent-run: no stdin FIFO at {fifo}")
     msg = " ".join(args.message)
+
+    def _write_with_timeout(seconds: float, write: "callable") -> Any:
+        # A healthy run has the keeper holding the FIFO open for reading, so
+        # a write returns immediately; this guards only against a genuinely
+        # stuck agent, not against expected verification polling.
+        def _alarm(_sig, _frame):
+            raise TimeoutError("write timed out")
+        signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(int(seconds))
+        try:
+            return write()
+        except TimeoutError:
+            sys.exit("agent-run: steer timed out writing to FIFO — is the agent alive?")
+        finally:
+            signal.alarm(0)
+
     if args.raw:
-        # Caller knows what they want — send bytes verbatim.
+        # Caller knows what they want — send bytes verbatim. Arbitrary raw
+        # bytes (e.g. an escape sequence) leave nothing in the transcript for
+        # a witness to observe, so verification is skipped entirely.
         data = msg.encode()
-        esc_payload: Optional[bytes] = None
-        submit = b""
-    else:
-        # Most PTY + raw-mode TUIs use CR for Enter. OpenCode's Bubble Tea
-        # TUI needs CRLF; the mode was selected from launch argv and persisted.
-        submit = _submit_bytes(_submit_mode_from_state(d))
-        data = msg.encode() + submit
-        # --esc: send ESC first as its own write so the TUI has time to
-        # exit generation mode before the new prompt + Enter arrive. Sending
-        # ESC + text in one chunk races the TUI's mode switch and Enter can
-        # end up dropped while the input buffer is still being reset.
-        esc_payload = b"\x1b" if args.esc else None
-    send_separate_submit = not args.raw and args.esc
-    # Write with a timeout guard: a healthy run has the keeper holding the
-    # FIFO open for reading, so this returns immediately.
-    def _alarm(_sig, _frame):
-        raise TimeoutError("write timed out")
-    signal.signal(signal.SIGALRM, _alarm)
-    signal.alarm(10)
-    try:
-        with fifo.open("wb") as f:
-            if esc_payload is not None:
-                f.write(esc_payload)
+
+        def _write_raw() -> None:
+            with fifo.open("wb") as f:
+                f.write(data)
                 f.flush()
-                # Give the TUI ~600ms to register the interrupt, reset the
-                # input buffer, and switch back to input mode before the new
-                # prompt arrives.
-                time.sleep(0.6)
-            f.write(data)
-            f.flush()
-            if send_separate_submit:
-                # Belt-and-braces: send a final Enter as its own write after a
-                # brief settle so the TUI is guaranteed to see it even if it
-                # briefly flushed input while exiting generation mode.
-                time.sleep(0.2)
-                f.write(submit)
+
+        _write_with_timeout(10, _write_raw)
+        print(f"agent-run: steered '{args.name}' ({len(data)} bytes, raw, unverified)")
+        return 0
+
+    if args.esc:
+        # Send ESC first as its own write so the TUI has time to exit
+        # generation mode before the new prompt + Enter arrive. Sending ESC
+        # and text in one chunk races the TUI's mode switch and Enter can
+        # end up dropped while the input buffer is still being reset. ESC is
+        # a control byte, not conversation text, so it has no witness of its
+        # own -- only the text submitted below is verified.
+        def _write_esc() -> None:
+            with fifo.open("wb") as f:
+                f.write(b"\x1b")
                 f.flush()
-    except TimeoutError:
-        sys.exit("agent-run: steer timed out writing to FIFO — is the agent alive?")
-    finally:
-        signal.alarm(0)
-    sent = len(data) + (len(esc_payload) if esc_payload else 0) + (len(submit) if send_separate_submit else 0)
-    print(f"agent-run: steered '{args.name}' ({sent} bytes)")
-    return 0
+
+        _write_with_timeout(10, _write_esc)
+        time.sleep(0.6)
+
+    submit_mode = _submit_mode_from_state(d)
+    verify_timeout = _submission_verify_timeout_seconds()
+    max_attempts = _submission_max_attempts()
+    outcome = _write_with_timeout(
+        10 + verify_timeout * max_attempts + 5,
+        lambda: _submit_and_verify(
+            d, _log_dir(name), msg.encode(), submit_mode=submit_mode,
+            deadline_s=verify_timeout, max_attempts=max_attempts,
+        ),
+    )
+
+    sent = len(msg.encode())
+    if outcome.verified:
+        print(f"agent-run: steered '{args.name}' ({sent} bytes, verified)")
+        return 0
+    # Deliberate non-zero exit: a lost steer that reports success is the bug
+    # this whole feature exists to close.
+    print(
+        f"agent-run: steer to '{args.name}' could not be verified as delivered "
+        f"({outcome.detail}, {outcome.attempts} attempt(s) via {outcome.transport})",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _signal_by_name(name: str) -> int:

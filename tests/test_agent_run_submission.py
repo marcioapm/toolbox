@@ -119,6 +119,19 @@ def _steer_args(name: str, *, esc: bool = False, raw: bool = False) -> argparse.
     return argparse.Namespace(name=name, message=["hello"], esc=esc, raw=raw)
 
 
+def _mock_witness_rises_on_first_poll(monkeypatch) -> None:
+    """Baseline read returns 0; every subsequent read returns 1, so
+    _submit_and_verify's very first post-submit poll sees the rise and
+    returns immediately without sleeping through the real poll interval."""
+    calls = {"n": 0}
+
+    def fake_witness(_state_dir, _log_dir):
+        calls["n"] += 1
+        return 0 if calls["n"] == 1 else 1
+
+    monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
+
+
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
@@ -132,6 +145,7 @@ def test_steer_uses_persisted_submit_mode(
     _fifo, reader = _seed_live_interactive_run(isolated_runs_root, "run", mode)
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
+    _mock_witness_rises_on_first_poll(monkeypatch)
     try:
         assert agent_run.cmd_steer(_steer_args("run")) == 0
         assert os.read(reader, 4096) == expected
@@ -142,8 +156,8 @@ def test_steer_uses_persisted_submit_mode(
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
-        (agent_run.SUBMIT_MODE_CR, b"\x1bhello\r\r"),
-        (agent_run.SUBMIT_MODE_CRLF, b"\x1bhello\r\n\r\n"),
+        (agent_run.SUBMIT_MODE_CR, b"\x1bhello\r"),
+        (agent_run.SUBMIT_MODE_CRLF, b"\x1bhello\r\n"),
     ],
 )
 def test_steer_esc_reuses_persisted_submit_mode(
@@ -153,6 +167,7 @@ def test_steer_esc_reuses_persisted_submit_mode(
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
     monkeypatch.setattr(agent_run.time, "sleep", lambda _seconds: None)
+    _mock_witness_rises_on_first_poll(monkeypatch)
     try:
         assert agent_run.cmd_steer(_steer_args("run", esc=True)) == 0
         assert os.read(reader, 4096) == expected
@@ -169,6 +184,26 @@ def test_steer_raw_is_verbatim_even_for_opencode_and_esc(isolated_runs_root, mon
     try:
         assert agent_run.cmd_steer(_steer_args("run", esc=True, raw=True)) == 0
         assert os.read(reader, 4096) == b"hello"
+    finally:
+        os.close(reader)
+
+
+def test_steer_unverified_exits_nonzero_and_writes_no_marker(
+    isolated_runs_root, monkeypatch
+):
+    """The bug this feature closes: a steer that never lands must not report
+    success. With no witness (unreadable session/transcript), verification
+    can never succeed, exactly one submission is attempted, and the CLI
+    reports failure."""
+    _fifo, reader = _seed_live_interactive_run(
+        isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
+    )
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
+    monkeypatch.setattr(agent_run, "_submission_witness_count", lambda *_a: None)
+    try:
+        assert agent_run.cmd_steer(_steer_args("run")) == 1
+        assert os.read(reader, 4096) == b"hello\r"
     finally:
         os.close(reader)
 
