@@ -7063,6 +7063,15 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
     ``--worktree`` was absent, or ``--worktree-reuse`` attached to an
     already-existing worktree directory. The non-``None`` case is exactly
     "this invocation is the one that must clean it up on a later failure".
+
+    Rollback (``_rollback_launch_worktree``) is best-effort, not crash-atomic:
+    a SIGKILL of this process between ``git worktree add``/``git branch``
+    succeeding and the caller publishing run state leaves a linked worktree,
+    a `.git/worktrees/<name>` admin entry, and possibly a branch that no
+    Python code ever runs again to attribute or remove. Nothing in this
+    module journals worktree creation intent durably enough to survive that;
+    recovering from it is a manual `git worktree remove` / `git branch -D`
+    against the orphaned path this invocation would have printed.
     """
     worktree_raw: Optional[str] = getattr(args, "worktree", None)
     reuse: bool = bool(getattr(args, "worktree_reuse", False))
