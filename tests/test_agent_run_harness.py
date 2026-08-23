@@ -1189,6 +1189,7 @@ class TestManagedCodexOneShotAppServer:
         *,
         thread_id: str = "test-thread-uuid-0001",
         appserver_works: bool = True,
+        params_out: Optional[Path] = None,
     ) -> str:
         """Write a fake `codex` Python script that handles app-server JSON-RPC.
 
@@ -1197,12 +1198,18 @@ class TestManagedCodexOneShotAppServer:
         item/agentMessage/delta events → turn/completed.
 
         When app-server fails (appserver_works=False), exits immediately.
+        When params_out is set, the received thread/start params are written
+        to that path as JSON before the fake responds.
         """
         fake_dir = tmp_path / "bin"
         fake_dir.mkdir(parents=True, exist_ok=True)
         fake = fake_dir / "codex"
 
         if appserver_works:
+            params_dump = (
+                f"open({str(params_out)!r}, 'w').write(json.dumps(msg['params']))\n"
+                if params_out is not None else ""
+            )
             # Full JSON-RPC app-server implemented in Python for reliability.
             fake.write_text(
                 "#!/usr/bin/env python3\n"
@@ -1239,6 +1246,7 @@ class TestManagedCodexOneShotAppServer:
                 "msg = recv()\n"
                 "if not msg or msg.get('method') != 'thread/start':\n"
                 "    sys.exit(1)\n"
+                f"{params_dump}"
                 "send({'id': msg['id'], 'result': {'thread': {\n"
                 "    'id': THREAD_ID, 'sessionId': THREAD_ID,\n"
                 "    'path': f'~/.codex/sessions/rollout-{THREAD_ID}.jsonl',\n"
@@ -1337,24 +1345,10 @@ class TestManagedCodexOneShotAppServer:
     ):
         """--model on a one-shot codex launch lands in thread/start's params."""
         params_file = tmp_path / "thread_start_params.json"
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        fake = bin_dir / "codex"
-        fake.write_text(
-            "#!/usr/bin/env python3\n"
-            "import sys, json\n"
-            "def send(obj): print(json.dumps(obj), flush=True)\n"
-            "def recv(): return json.loads(sys.stdin.readline())\n"
-            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}}); recv()\n"
-            "msg = recv()\n"
-            f"open({str(params_file)!r}, 'w').write(json.dumps(msg['params']))\n"
-            "send({'id': msg['id'], 'result': {'thread': {'id': 'oneshot-tid', "
-            "'sessionId': 'oneshot-tid', 'path': 'r.jsonl'}}})\n"
-            "msg = recv(); send({'id': msg['id'], 'result': {'turn': {'id': 't1'}}})\n"
-            "send({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})\n"
+        bin_dir = self._make_fake_codex_suite(
+            tmp_path, thread_id="oneshot-tid", params_out=params_file
         )
-        fake.chmod(0o755)
-        monkeypatch.setenv("PATH", str(bin_dir) + ":" + os.environ.get("PATH", ""))
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
         name = "codex-oneshot-model"
         _launch_and_wait(
             isolated_runs_root, isolated_log_root, name,
@@ -1452,6 +1446,52 @@ class TestMintThreadModelParam:
         params = self._mint(tmp_path, monkeypatch, model=None)
         assert "model" not in params
 
+    def test_mint_thread_error_fails_fast_with_diagnostic(self, tmp_path, monkeypatch):
+        """A thread/start error must return promptly, not wait out the full timeout,
+        and session.json's reason must carry the concrete JSON-RPC error text."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()  # initialized\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'error': {'code': -32602, "
+            "'message': 'unknown model: gpt-nonexistent'}})\n"
+            "# Stay alive: the app-server does not exit merely because a request\n"
+            "# it rejected, so mint_thread must not rely on EOF or process exit.\n"
+            "time.sleep(30)\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        state_dir = tmp_path / "state"
+        log_dir = tmp_path / "log"
+        state_dir.mkdir()
+        log_dir.mkdir()
+        server = agent_run._CodexAppServer(state_dir, log_dir, log_dir / "acquire.log", "test")
+        assert server.start([], str(tmp_path), lambda: None)
+        start = time.monotonic()
+        try:
+            thread_id = server.mint_thread(str(tmp_path), model="gpt-nonexistent")
+        finally:
+            server.close()
+        elapsed = time.monotonic() - start
+        assert thread_id is None
+        assert elapsed < 5.0, f"mint_thread took {elapsed:.1f}s, expected well under 5s"
+        session = agent_run._read_session_json(log_dir)
+        assert session is not None
+        assert "unknown model: gpt-nonexistent" in session["reason"]
+
 
 # ---------------------------------------------------------------------------
 # Codex interactive: app-server JSON-RPC mint + turn/steer
@@ -1467,6 +1507,7 @@ class TestManagedCodexInteractiveAppServer:
         thread_id: str = "interactive-thread-0001",
         appserver_works: bool = True,
         steer_wait_seconds: float = 3.0,
+        params_out: Optional[Path] = None,
     ) -> str:
         """Write a fake codex app-server that handles interactive protocol.
 
@@ -1474,12 +1515,18 @@ class TestManagedCodexInteractiveAppServer:
         item/agentMessage/delta → turn/completed → wait up to steer_wait_seconds
         for a steer (turn/steer or turn/start) → if received, emit steered response
         → exit.  If the steer wait times out or stdin closes, exit immediately.
+        When params_out is set, the received thread/start params are written to
+        that path as JSON before the fake responds.
         """
         fake_dir = tmp_path / "bin"
         fake_dir.mkdir(parents=True, exist_ok=True)
         fake = fake_dir / "codex"
 
         if appserver_works:
+            params_dump = (
+                f"open({str(params_out)!r}, 'w').write(json.dumps(msg['params']))\n"
+                if params_out is not None else ""
+            )
             fake.write_text(
                 "#!/usr/bin/env python3\n"
                 "import sys, json, time, select\n"
@@ -1520,6 +1567,7 @@ class TestManagedCodexInteractiveAppServer:
                 "msg = recv()\n"
                 "if not msg or msg.get('method') != 'thread/start':\n"
                 "    sys.exit(1)\n"
+                f"{params_dump}"
                 "send({'id': msg['id'], 'result': {'thread': {\n"
                 "    'id': THREAD_ID, 'sessionId': THREAD_ID,\n"
                 "    'path': f'~/.codex/sessions/rollout-{THREAD_ID}.jsonl',\n"
@@ -1613,25 +1661,12 @@ class TestManagedCodexInteractiveAppServer:
     ):
         """--model on an interactive codex launch lands in thread/start's params."""
         params_file = tmp_path / "thread_start_params.json"
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        fake = bin_dir / "codex"
-        fake.write_text(
-            "#!/usr/bin/env python3\n"
-            "import sys, json, time\n"
-            "def send(obj): print(json.dumps(obj), flush=True)\n"
-            "def recv(): return json.loads(sys.stdin.readline())\n"
-            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}}); recv()\n"
-            "msg = recv()\n"
-            f"open({str(params_file)!r}, 'w').write(json.dumps(msg['params']))\n"
-            "send({'id': msg['id'], 'result': {'thread': {'id': 'iact-model-tid', "
-            "'sessionId': 'iact-model-tid', 'path': 'r.jsonl'}}})\n"
-            "msg = recv(); send({'id': msg['id'], 'result': {'turn': {'id': 't1'}}})\n"
-            "send({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})\n"
-            "time.sleep(3)\n"
+        # steer_wait_seconds=0.5: fake exits quickly after initial turn completes.
+        bin_dir = self._make_fake_codex_interactive(
+            tmp_path, thread_id="iact-model-tid", steer_wait_seconds=0.5,
+            params_out=params_file,
         )
-        fake.chmod(0o755)
-        monkeypatch.setenv("PATH", str(bin_dir) + ":" + os.environ.get("PATH", ""))
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
         name = "codex-iact-model"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
@@ -2297,7 +2332,7 @@ class TestEndToEndThroughMain:
     def test_main_model_accepted_for_codex(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
-        """main() with --model and --harness codex launches and reaches thread/start."""
+        """main() accepts --model with --harness codex and the launch completes."""
         bin_dir = self._make_fake_codex_oneshot(tmp_path, thread_id="model-accept-tid")
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
         name = "main-codex-model-accept"

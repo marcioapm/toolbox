@@ -8919,6 +8919,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     # time and session.json exists before status=running is published.
     acquire_log = log_d / "session-acquire.log"
     managed_prompt: Optional[str] = None
+    managed_model: Optional[str] = None
     managed_harness_args: List[str] = []
     managed_agent_mode: Optional[str] = None
     opencode_extra_agent_names: set[str] = set()
@@ -9122,7 +9123,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             if harness == "codex" else None
         ),
         managed_prompt=managed_prompt if is_managed else None,
-        managed_model=managed_model if is_managed else None,
+        managed_model=managed_model,
         enable_planning=enable_planning,
         enable_questions=enable_questions,
         opencode_agent_mode=managed_agent_mode,
@@ -10619,6 +10620,9 @@ _OPENCODE_HEALTH_POLL_INTERVAL = 0.25
 # Timeout for the codex app-server initialize + thread/start handshake (seconds).
 _CODEX_APPSERVER_TIMEOUT = 20.0
 
+# Cap on the rendered thread/start error text stored in session.json's reason field.
+_THREAD_START_ERROR_REASON_MAX = 300
+
 _CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 
 
@@ -11084,6 +11088,7 @@ class _CodexAppServer:
             thread_start_params["model"] = model
         thread_rpc_id = self.call("thread/start", thread_start_params)
 
+        thread_start_error: Optional[dict] = None
         deadline = time.monotonic() + _CODEX_APPSERVER_TIMEOUT
         while time.monotonic() < deadline and self.thread_id is None:
             if self.proc.poll() is not None:
@@ -11114,14 +11119,21 @@ class _CodexAppServer:
                         )
                 elif "error" in msg:
                     self.log(f"thread/start error: {msg['error']}")
+                    thread_start_error = msg["error"]
                     break
-            if eof:
+            if thread_start_error is not None or eof:
                 break
 
         if self.thread_id is None:
-            self.log("thread/start failed or timed out")
+            if thread_start_error is not None:
+                reason = f"thread/start error: {thread_start_error}".replace("\n", " ")
+                if len(reason) > _THREAD_START_ERROR_REASON_MAX:
+                    reason = reason[:_THREAD_START_ERROR_REASON_MAX] + "..."
+            else:
+                self.log("thread/start failed or timed out")
+                reason = "thread/start failed or timed out"
             _record_session(self.log_dir, self.acquire_log, "codex", None, "missing", "missing",
-                            "thread/start failed or timed out")
+                            reason)
         return self.thread_id
 
     def start_turn(self, text: str, rpc_id: Optional[int] = None) -> int:
