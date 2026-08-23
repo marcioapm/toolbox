@@ -58,6 +58,13 @@ def _git(cwd: Path, *args: str) -> str:
     return result.stdout
 
 
+def _cleanup_raw_line(err: str) -> str:
+    """The raw cleanup command line as printed, unparsed."""
+    marker = "clean up by hand: "
+    idx = err.index(marker) + len(marker)
+    return err[idx:].splitlines()[0]
+
+
 def _cleanup_argv_lists(err: str) -> list[list[str]]:
     """Parse the semicolon-separated cleanup commands from a rollback
     warning into argv lists, the way a shell would after word-splitting.
@@ -65,11 +72,15 @@ def _cleanup_argv_lists(err: str) -> list[list[str]]:
     shlex.split on the whole line first, honoring quotes, so a literal
     ``;`` inside a quoted path is not mistaken for a command separator;
     the resulting tokens are then split on the unquoted ``;`` separator.
+
+    shlex.split treats only whitespace and quote characters specially --
+    an embedded ``;`` inside an unquoted token is not a metacharacter to
+    it -- so structural argv assertions built from this helper cannot by
+    themselves detect a missing quote around a value containing ``;``.
+    Pair them with execution of the raw line (_cleanup_raw_line) through
+    a real shell to catch that case.
     """
-    marker = "clean up by hand: "
-    idx = err.index(marker) + len(marker)
-    tail = err[idx:].splitlines()[0]
-    tokens = shlex.split(tail)
+    tokens = shlex.split(_cleanup_raw_line(err))
     commands: list[list[str]] = [[]]
     for tok in tokens:
         if tok == ";":
@@ -4928,23 +4939,42 @@ class TestLaunchCreatesWorktree:
         assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
         assert branch in _git(repo, "branch", "--list", branch)
         err = capsys.readouterr().err
+        raw_line = _cleanup_raw_line(err)
+
+        # shlex.split-based structural checks alone cannot distinguish
+        # correctly quoted output from an unquoted `;`-containing value:
+        # both parse to the same argv lists. Compare the emitted string
+        # byte-for-byte against the fully-quoted form the production code
+        # is required to build, so a dropped shlex.quote() call fails here.
+        repo_q = shlex.quote(str(repo))
+        expected_line = (
+            f"git -C {repo_q} worktree remove {shlex.quote(str(wt_dir))}"
+            f" ; git -C {repo_q} branch -D -- {shlex.quote(branch)}"
+        )
+        assert raw_line == expected_line
+
         cmds = _cleanup_argv_lists(err)
         assert cmds[0] == ["git", "-C", str(repo), "worktree", "remove", str(wt_dir)]
         assert cmds[1] == ["git", "-C", str(repo), "branch", "-D", "--", branch]
 
-        remove_proc = subprocess.run(cmds[0], capture_output=True, text=True)
-        assert remove_proc.returncode == 0, remove_proc.stderr
+        # Execute the exact emitted line through a real shell, the way an
+        # operator following the printed instructions would: this is what
+        # actually catches a missing shlex.quote() around a `;`-containing
+        # value, since shell word-splitting -- not argv comparison -- is
+        # what a regression there would corrupt.
+        shell_proc = subprocess.run(
+            raw_line, shell=True, capture_output=True, text=True,
+        )
+        assert shell_proc.returncode == 0, shell_proc.stderr
         assert not wt_dir.exists()
-        branch_proc = subprocess.run(cmds[1], capture_output=True, text=True)
-        assert branch_proc.returncode == 0, branch_proc.stderr
         assert branch not in _git(repo, "branch", "--list", branch)
 
     def test_mint_cleanup_baseexception_with_live_child_refuses_rollback(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch
     ):
-        """A managed opencode launch starts the temporary mint process with
-        the worktree as its cwd before args._worktree_process_started is
-        set. If a KeyboardInterrupt escapes _opencode_prefork_mint's cleanup
+        """A managed opencode launch sets args._worktree_process_started
+        before starting the temporary mint process with the worktree as its
+        cwd. If a KeyboardInterrupt escapes _opencode_prefork_mint's cleanup
         wait(), the worktree must survive (the mark was set before Popen and
         cleanup failure must not clear it), and cleanup must still attempt
         proc.kill() as a best-effort escalation -- proving the interrupt is
