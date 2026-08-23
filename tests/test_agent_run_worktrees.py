@@ -4160,6 +4160,71 @@ class TestLaunchCreatesWorktree:
         assert name not in _git(repo, "branch", "--list", name)
         assert not (isolated_runs_root / name).exists()
 
+    def test_rollback_does_not_discard_uncommitted_work(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
+    ):
+        """Rollback must refuse (not force-remove) a worktree that already has
+        untracked content by the time launch fails: force=False is the only
+        thing standing between rollback and discarding a runner's work."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-rollback-dirty"
+        name = "rollback-dirty"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo),
+        )
+
+        real_apply_cwd = agent_run._apply_launch_cwd
+
+        def _apply_cwd_then_dirty(a):
+            real_apply_cwd(a)
+            # Simulate a runner having already written into the worktree
+            # before the launch failure that triggers rollback: an untracked
+            # file `git worktree remove` (without --force) must refuse to
+            # discard.
+            (wt_dir / "untracked-work.txt").write_text("must survive\n")
+
+        monkeypatch.setattr(agent_run, "_apply_launch_cwd", _apply_cwd_then_dirty)
+
+        with pytest.raises(SystemExit, match="missing command"):
+            agent_run.cmd_launch(args)
+
+        assert wt_dir.is_dir()
+        assert (wt_dir / "untracked-work.txt").read_text() == "must survive\n"
+
+    def test_rollback_refuses_a_replaced_non_worktree_directory(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """If DIR is replaced with an ordinary directory between creation and
+        the failure that triggers rollback, rollback must refuse to touch it
+        rather than calling git worktree remove against something that is no
+        longer the worktree it created."""
+        import shutil
+
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-rollback-replaced"
+        name = "rollback-replaced"
+        args = _launch_args(
+            name=name, command=[], worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(repo),
+        )
+
+        real_apply_cwd = agent_run._apply_launch_cwd
+
+        def _apply_cwd_then_replace(a):
+            real_apply_cwd(a)
+            shutil.rmtree(wt_dir)
+            wt_dir.mkdir()
+            (wt_dir / "replacement-marker.txt").write_text("not the worktree\n")
+
+        monkeypatch.setattr(agent_run, "_apply_launch_cwd", _apply_cwd_then_replace)
+
+        with pytest.raises(SystemExit, match="missing command"):
+            agent_run.cmd_launch(args)
+
+        assert (wt_dir / "replacement-marker.txt").read_text() == "not the worktree\n"
+        assert "not a linked worktree" in capsys.readouterr().err
+
     def test_rollback_failure_does_not_mask_original_error(
         self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
     ):
