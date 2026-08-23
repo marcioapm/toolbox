@@ -4941,11 +4941,10 @@ class TestLaunchCreatesWorktree:
         err = capsys.readouterr().err
         raw_line = _cleanup_raw_line(err)
 
-        # shlex.split-based structural checks alone cannot distinguish
-        # correctly quoted output from an unquoted `;`-containing value:
-        # both parse to the same argv lists. Compare the emitted string
-        # byte-for-byte against the fully-quoted form the production code
-        # is required to build, so a dropped shlex.quote() call fails here.
+        # shlex.split-based structural checks cannot distinguish correctly
+        # quoted output from an unquoted `;`-containing value -- both parse
+        # to the same argv lists. Compare byte-for-byte against the fully
+        # quoted form instead, so a dropped shlex.quote() call fails here.
         repo_q = shlex.quote(str(repo))
         expected_line = (
             f"git -C {repo_q} worktree remove {shlex.quote(str(wt_dir))}"
@@ -4957,11 +4956,9 @@ class TestLaunchCreatesWorktree:
         assert cmds[0] == ["git", "-C", str(repo), "worktree", "remove", str(wt_dir)]
         assert cmds[1] == ["git", "-C", str(repo), "branch", "-D", "--", branch]
 
-        # Execute the exact emitted line through a real shell, the way an
-        # operator following the printed instructions would: this is what
-        # actually catches a missing shlex.quote() around a `;`-containing
-        # value, since shell word-splitting -- not argv comparison -- is
-        # what a regression there would corrupt.
+        # Run the exact emitted line through a real shell: argv comparison
+        # alone cannot catch a missing shlex.quote() around a `;`-containing
+        # value, since word-splitting is what such a regression corrupts.
         shell_proc = subprocess.run(
             raw_line, shell=True, capture_output=True, text=True,
         )
@@ -5075,10 +5072,9 @@ class TestLaunchCreatesWorktree:
         monkeypatch.setenv("PATH", str(bin_dir) + ":" + os.environ.get("PATH", ""))
 
         def _health_poll_wait_for_fork(*_a, **_k):
-            # Block until the fake opencode's descendant has actually
-            # forked and recorded its pid, so the cleanup below reaps a
-            # direct child that has already produced a live descendant --
-            # not a shell still mid-startup with no fork behind it yet.
+            # Block until the descendant's pid is recorded, so cleanup
+            # reaps a direct child that has already forked -- not a shell
+            # still mid-startup.
             deadline = time.monotonic() + 10.0
             while time.monotonic() < deadline:
                 if pidfile.exists() and pidfile.read_text().strip():
@@ -5088,10 +5084,9 @@ class TestLaunchCreatesWorktree:
 
         monkeypatch.setattr(agent_run, "_opencode_health_poll", _health_poll_wait_for_fork)
 
-        # Fail between mint's return (child reaped, mark left set) and
-        # os.fork() (where the mark is set again unconditionally): a
-        # failure at os.fork() itself would not distinguish this path from
-        # any other post-fork rollback refusal already covered elsewhere.
+        # Fails strictly after mint returns (mark left set, child reaped)
+        # and strictly before os.fork() (which sets the mark again
+        # unconditionally, masking this exact path).
         def _build_managed_argv_always_fails(*_a, **_k):
             raise RuntimeError("simulated post-mint launch failure")
 
