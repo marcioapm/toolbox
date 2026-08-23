@@ -3273,7 +3273,7 @@ def _opencode_insert_part(path: Path, *, part_id: str, message_id: str, session_
 class TestTranscriptFacts:
     """Tests for _watch_transcript_facts and the transcript field in the watch contract."""
 
-    TRANSCRIPT_KEYS = {"available", "entries", "newest_age_s", "error"}
+    TRANSCRIPT_KEYS = {"available", "entries", "newest_age_s", "submitted_age_s", "error"}
 
     # ------------------------------------------------------------------
     # unit-level tests of _watch_transcript_facts
@@ -3399,6 +3399,83 @@ class TestTranscriptFacts:
             )
 
     # ------------------------------------------------------------------
+    # unit-level tests of _watch_prompt_submitted_age_s
+    # ------------------------------------------------------------------
+
+    def test_submitted_age_s_null_when_not_interactive(self, tmp_path):
+        sd = tmp_path / "state"
+        sd.mkdir()
+        (sd / "prompt_submitted").write_text(agent_run._now_iso() + "\n")
+        assert agent_run._watch_prompt_submitted_age_s(sd, False) is None
+        assert agent_run._watch_prompt_submitted_age_s(sd, None) is None
+
+    def test_submitted_age_s_null_when_file_absent(self, tmp_path):
+        sd = tmp_path / "state"
+        sd.mkdir()
+        assert agent_run._watch_prompt_submitted_age_s(sd, True) is None
+
+    def test_submitted_age_s_null_when_state_dir_none(self):
+        assert agent_run._watch_prompt_submitted_age_s(None, True) is None
+
+    def test_submitted_age_s_from_iso_timestamp(self, tmp_path):
+        sd = tmp_path / "state"
+        sd.mkdir()
+        submitted = datetime.now(timezone.utc) - timedelta(seconds=30)
+        (sd / "prompt_submitted").write_text(submitted.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+        age = agent_run._watch_prompt_submitted_age_s(sd, True)
+        assert age is not None
+        assert 29.0 <= age <= 35.0
+
+    def test_submitted_age_s_from_legacy_sentinel_uses_mtime(self, tmp_path):
+        sd = tmp_path / "state"
+        sd.mkdir()
+        marker = sd / "prompt_submitted"
+        marker.write_text("1\n")
+        old = time.time() - 45
+        os.utime(marker, (old, old))
+        age = agent_run._watch_prompt_submitted_age_s(sd, True)
+        assert age is not None
+        assert 44.0 <= age <= 50.0
+
+    def test_submitted_age_s_null_on_unparseable_content(self, tmp_path):
+        sd = tmp_path / "state"
+        sd.mkdir()
+        (sd / "prompt_submitted").write_text("garbage, not a timestamp or sentinel\n")
+        assert agent_run._watch_prompt_submitted_age_s(sd, True) is None
+
+    def test_submitted_age_s_clamps_future_iso_timestamp_to_zero(self, tmp_path):
+        sd = tmp_path / "state"
+        sd.mkdir()
+        future = datetime.now(timezone.utc) + timedelta(seconds=60)
+        (sd / "prompt_submitted").write_text(future.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+        assert agent_run._watch_prompt_submitted_age_s(sd, True) == 0.0
+
+    def test_submitted_age_s_clamps_future_mtime_to_zero(self, tmp_path):
+        sd = tmp_path / "state"
+        sd.mkdir()
+        marker = sd / "prompt_submitted"
+        marker.write_text("1\n")
+        future = time.time() + 60
+        os.utime(marker, (future, future))
+        assert agent_run._watch_prompt_submitted_age_s(sd, True) == 0.0
+
+    def test_submitted_age_s_populated_even_when_store_unavailable(self, tmp_path, monkeypatch):
+        """submitted_age_s is computed independently of the store read, so
+        it survives a transcript-store failure that nulls out entries."""
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", tmp_path / "does-not-exist.db")
+        sd = tmp_path / "state"
+        sd.mkdir()
+        submitted = datetime.now(timezone.utc) - timedelta(seconds=10)
+        (sd / "prompt_submitted").write_text(submitted.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+        result = agent_run._watch_transcript_facts(
+            {"session_id": "ses_1", "harness": "opencode"}, None, sd, True
+        )
+        assert result["available"] is False
+        assert result["entries"] is None
+        assert result["submitted_age_s"] is not None
+        assert result["submitted_age_s"] >= 9.0
+
+    # ------------------------------------------------------------------
     # end-to-end tests through cmd_watch
     # ------------------------------------------------------------------
 
@@ -3428,6 +3505,49 @@ class TestTranscriptFacts:
         assert t["available"] is True
         assert t["entries"] == 1
         assert t["error"] is None
+
+    def test_submitted_age_s_populated_end_to_end_for_interactive_run(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "tr1b",
+            status="running", pid=111, log_age_secs=1, interactive="1",
+        )
+        agent_run._write_session_json(
+            ld, {"session_id": "ses_watch2", "harness": "opencode", "acquisition": "minted", "confidence": "certain"}
+        )
+        submitted = datetime.now(timezone.utc) - timedelta(seconds=20)
+        (sd / "prompt_submitted").write_text(submitted.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("tr1b"))
+        payload = json.loads(capsys.readouterr().out)
+        t = payload["transcript"]
+        assert t["submitted_age_s"] is not None
+        assert t["submitted_age_s"] >= 19.0
+
+    def test_submitted_age_s_null_end_to_end_for_noninteractive_run(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys
+    ):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "tr1c",
+            status="running", pid=111, log_age_secs=1, interactive="0",
+        )
+        agent_run._write_session_json(
+            ld, {"session_id": "ses_watch3", "harness": "opencode", "acquisition": "minted", "confidence": "certain"}
+        )
+        # A one-shot codex/opencode run writes prompt_submitted too, but
+        # interactive=0 means there is no PTY-delivery gap to measure.
+        (sd / "prompt_submitted").write_text(agent_run._now_iso() + "\n")
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+        agent_run.cmd_watch(_watch_args("tr1c"))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["transcript"]["submitted_age_s"] is None
 
     def test_transcript_key_present_and_null_in_missing_state_dir_branch(
         self, isolated_runs_root, isolated_log_root, capsys

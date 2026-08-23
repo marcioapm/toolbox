@@ -805,6 +805,7 @@ alongside `scratch` and `hooks`:
     "available": true,
     "entries": 12,
     "newest_age_s": 4.2,
+    "submitted_age_s": 5.9,
     "error": null
 }
 ```
@@ -822,6 +823,15 @@ for `opencode` this is `part` table rows before `_opencode_entry`'s filtering,
 so a count of `0` guarantees nothing renders, but a nonzero count does not
 guarantee anything does either. This block never raises past `watch`'s
 never-raise boundary; any read failure degrades to the unavailable form.
+
+`submitted_age_s` is seconds since `state_dir/prompt_submitted` was written
+— the moment the prompt was actually delivered to the PTY — not since
+process launch (`elapsed_s`), which also counts harness boot, session mint
+and TUI readiness. Populated only for interactive runs (`interactive: true`)
+that have written the marker; `null` otherwise, including when the run is
+still starting up, is not interactive, or the marker is unreadable. Computed
+independently of the store read, so it survives a transcript-store failure
+that nulls out `entries`.
 
 #### `transcript` — the harness's own conversation record
 

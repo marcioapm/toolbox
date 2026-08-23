@@ -4213,26 +4213,69 @@ def _watch_scratch_facts(working_dir: Optional[str]) -> dict:
     }
 
 
-def _transcript_unknown(code: str) -> dict:
+def _transcript_unknown(code: str, submitted_age_s: Optional[float] = None) -> dict:
     """Transcript facts saying "unavailable, because *code*".
 
     Modeled on ``_scratch_unknown``: every decision field is null rather
     than 0 so a poller cannot read a failed count as an observed empty
     transcript. ``entries == 0`` must only ever mean "the store was
     queried and holds no records for this session" -- never "the query
-    failed".
+    failed". ``submitted_age_s`` is accepted separately because it is
+    computed from the run's state dir, not the store read that failed.
     """
     return {
         "available": False,
         "entries": None,
         "newest_age_s": None,
+        "submitted_age_s": submitted_age_s,
         "error": code,
     }
 
 
-def _watch_transcript_facts(session_data: Optional[dict], cwd: Optional[str]) -> dict:
+def _watch_prompt_submitted_age_s(state_dir: Optional[Path], interactive: Optional[bool]) -> Optional[float]:
+    """Seconds since ``state_dir/prompt_submitted`` was written -- the
+    anchor a consumer should measure "empty transcript" against instead of
+    process start (``elapsed_s``), which conflates harness boot, session
+    mint and TUI readiness with actual prompt delivery.
+
+    Two on-disk formats exist: an ISO-8601 ``_now_iso()`` timestamp (current
+    writers) and a bare ``1`` sentinel (older writers), whose age falls
+    back to the file's mtime. Null whenever the age cannot be trusted --
+    the run is not interactive (no PTY-delivery gap to measure), the file
+    is absent, or its content is neither format -- never a guessed value.
+    Clock skew (a timestamp or mtime in the future) clamps to 0.0 rather
+    than going negative.
+    """
+    if interactive is not True or state_dir is None:
+        return None
+    path = state_dir / "prompt_submitted"
+    raw = _read(path)
+    if not raw:
+        return None
+    now = datetime.now(timezone.utc)
+    parsed = _watch_parse_iso(raw)
+    if parsed is not None:
+        return max(0.0, (now - parsed).total_seconds())
+    if raw != "1":
+        return None
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    return max(0.0, now.timestamp() - mtime)
+
+
+def _watch_transcript_facts(
+    session_data: Optional[dict],
+    cwd: Optional[str],
+    state_dir: Optional[Path] = None,
+    interactive: Optional[bool] = None,
+) -> dict:
     """Count records in the harness's own conversation store for the run's
-    session, without materializing entries (see ``count_transcript``).
+    session, without materializing entries (see ``count_transcript``), plus
+    ``submitted_age_s`` (see ``_watch_prompt_submitted_age_s``) -- computed
+    independently of the store read, so it is populated even when the
+    store itself is unavailable.
 
     Absence of ``session.json`` (raw run) or an incomplete/invalid
     ``session_id``/``harness`` pair is routine, not a warning -- most runs
@@ -4241,19 +4284,21 @@ def _watch_transcript_facts(session_data: Optional[dict], cwd: Optional[str]) ->
     to the unavailable form with a short discriminator; nothing from this
     function may raise past ``_cmd_watch_observe``'s caller.
     """
+    submitted_age_s = _watch_prompt_submitted_age_s(state_dir, interactive)
+
     if not isinstance(session_data, dict):
-        return _transcript_unknown("no_session_json")
+        return _transcript_unknown("no_session_json", submitted_age_s)
     session_id = session_data.get("session_id")
     harness = session_data.get("harness")
     if not isinstance(session_id, str) or not session_id or not isinstance(harness, str):
-        return _transcript_unknown("no_session_id")
+        return _transcript_unknown("no_session_id", submitted_age_s)
 
     try:
         count, newest_iso = _agent_run_transcript.count_transcript(harness, session_id, cwd)
     except _agent_run_transcript.TranscriptSourceError as exc:
-        return _transcript_unknown(exc.code)
+        return _transcript_unknown(exc.code, submitted_age_s)
     except (OSError, sqlite3.Error):
-        return _transcript_unknown("store_unreadable")
+        return _transcript_unknown("store_unreadable", submitted_age_s)
 
     newest_age_s: Optional[float] = None
     newest_dt = _watch_parse_iso(newest_iso)
@@ -4263,6 +4308,7 @@ def _watch_transcript_facts(session_data: Optional[dict], cwd: Optional[str]) ->
         "available": True,
         "entries": count,
         "newest_age_s": newest_age_s,
+        "submitted_age_s": submitted_age_s,
         "error": None,
     }
 
@@ -4341,7 +4387,11 @@ def _cmd_watch_observe(
     log = _log_file_for(name)
 
     def observed(
-        repo: Optional[str], launch_head: Optional[str], cwd: Optional[str], session_data: Optional[dict]
+        repo: Optional[str],
+        launch_head: Optional[str],
+        cwd: Optional[str],
+        session_data: Optional[dict],
+        interactive: Optional[bool],
     ) -> dict:
         git, git_error = _watch_repo_git(repo, launch_head)
         log_facts, signals = _watch_log_observation(log)
@@ -4358,8 +4408,13 @@ def _cmd_watch_observe(
             # run.json's cwd, not the state dir's: run.json survives the
             # state dir's disappearance (see WATCH_STATUS_LOG_PRESERVED
             # below) and is what cmd_transcript itself reads for the
-            # claude project-directory lookup.
-            "transcript": _watch_transcript_facts(session_data, _run_json_cwd(log_dir)),
+            # claude project-directory lookup. state_dir may itself be gone
+            # by the time this runs (missing-state-dir branch below), in
+            # which case prompt_submitted is unreadable and submitted_age_s
+            # is null along with everything else in that branch.
+            "transcript": _watch_transcript_facts(
+                session_data, _run_json_cwd(log_dir), state_dir, interactive
+            ),
         }
 
     state_dir_state = _probe_dir_state(state_dir)
@@ -4382,7 +4437,7 @@ def _cmd_watch_observe(
         session_data = _read_session_json(log_dir)
         payload = _watch_payload(
             name, observed_at, WATCH_STATUS_LOG_PRESERVED,
-            **observed(repo_arg, None, repo_arg, session_data),
+            **observed(repo_arg, None, repo_arg, session_data, None),
             session=session_data,
             hooks=_read_hooks_jsonl(log_dir),
         )
@@ -4412,13 +4467,14 @@ def _cmd_watch_observe(
     repo_str = repo_arg or (_watch_read_cwd_file(state_dir / "cwd") or None)
     session_data = _read_session_json(log_dir)
     recorded_cwd = _watch_read_cwd_file(state_dir / "cwd") or None
+    interactive = interactive_raw == "1" if interactive_raw in {"0", "1"} else None
     payload = _watch_payload(
         name,
         observed_at,
         status,
         exit_code=_safe_int(_read(state_dir / "exit_code")),
         pid=pid,
-        interactive=interactive_raw == "1" if interactive_raw in {"0", "1"} else None,
+        interactive=interactive,
         started_at=started_raw,
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
@@ -4427,7 +4483,7 @@ def _cmd_watch_observe(
         # repo_str is for git-fact attribution; recorded_cwd is for scratch so
         # that --repo (correcting which repo to inspect) does not silently move
         # the scratch scan off the run's launch directory.
-        **observed(repo_str, _read(state_dir / "launch_head") or None, recorded_cwd, session_data),
+        **observed(repo_str, _read(state_dir / "launch_head") or None, recorded_cwd, session_data, interactive),
     )
     _watch_emit(
         payload,
