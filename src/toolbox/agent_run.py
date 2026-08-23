@@ -9142,13 +9142,17 @@ def cmd_kill(args: argparse.Namespace) -> int:
 # launch + runner
 # ---------------------------------------------------------------------------
 
-# Grace given to a runner whose launcher was interrupted before readiness
-# resolved: bounded so an interrupted launch cannot hang indefinitely, short
-# because there is no published state yet for a slow teardown to protect.
+# Bounds for terminating a runner before its readiness ack is observed.
+# IDENTITY_POLL covers the pid+identity write racing this call: identity may
+# shell out (a `ps` subprocess on Darwin, see _process_identity) and take up
+# to a couple of seconds. TERM_GRACE and KILL_VERIFY bound escalation so an
+# interrupted launch cannot hang indefinitely.
+_UNPUBLISHED_RUNNER_IDENTITY_POLL_SECONDS = 3.0
 _UNPUBLISHED_RUNNER_TERM_GRACE_SECONDS = 3.0
+_UNPUBLISHED_RUNNER_KILL_VERIFY_SECONDS = 2.0
 
 
-def _terminate_unpublished_runner(state_dir: Path) -> None:
+def _terminate_unpublished_runner(state_dir: Path) -> bool:
     """Best-effort termination of a runner whose launcher was interrupted
     before readiness resolved (before ``status=running`` is published).
 
@@ -9157,42 +9161,56 @@ def _terminate_unpublished_runner(state_dir: Path) -> None:
     runner may already exist with nothing yet marking it "running", and the
     caller is about to decide whether the worktree it owns can be rolled
     back. That decision must never race a live process still writing into
-    the directory `git worktree remove` is about to delete, so this
-    terminates (and gives a bounded grace period to exit) before returning.
+    the directory `git worktree remove` is about to delete.
 
-    The pid may not be written yet if the runner had not reached that point
-    before the interruption; polls briefly to cover that ordering, then
-    gives up (nothing to terminate).
+    Returns True only once the exact process this launch forked is
+    positively confirmed dead (or never came alive at all). Every other
+    outcome -- no pid/identity within the poll window, an unsignalable
+    process, a signal that could not be identity-verified, a process that
+    outlives SIGKILL -- returns False. The caller must treat False as unsafe
+    to roll back, not as "nothing to terminate".
     """
-    deadline = time.time() + 1.0
+    deadline = time.monotonic() + _UNPUBLISHED_RUNNER_IDENTITY_POLL_SECONDS
     pid_raw = ""
-    while time.time() < deadline:
+    identity = ""
+    while time.monotonic() < deadline:
         pid_raw = _read(state_dir / "pid")
-        if pid_raw:
+        identity = _read(state_dir / "process_identity")
+        if pid_raw and identity:
             break
         time.sleep(0.05)
     pid = _safe_int(pid_raw)
-    if pid is None or pid <= 0 or not _pid_alive(pid):
-        return
-    identity = _read(state_dir / "process_identity")
+    if pid is None or pid <= 0:
+        return False
+    if not _pid_alive(pid):
+        return True
+    if not identity:
+        # A pid with no identity yet is unsignalable through the verified
+        # path; signaling a bare pid risks hitting a reused pid instead.
+        return False
     try:
-        if identity:
-            _send_signal_to_verified_pid(pid, signal.SIGTERM, identity)
-        else:
-            os.kill(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, RuntimeError):
-        return
-    term_deadline = time.time() + _UNPUBLISHED_RUNNER_TERM_GRACE_SECONDS
-    while time.time() < term_deadline and _pid_alive(pid):
+        _send_signal_to_verified_pid(pid, signal.SIGTERM, identity)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, RuntimeError):
+        return False
+    term_deadline = time.monotonic() + _UNPUBLISHED_RUNNER_TERM_GRACE_SECONDS
+    while time.monotonic() < term_deadline and _pid_alive(pid):
         time.sleep(0.1)
     if not _pid_alive(pid):
-        return
-    current_identity = _process_identity(pid)
-    if not identity or current_identity == identity:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        return True
+    try:
+        _send_signal_to_verified_pid(pid, signal.SIGKILL, identity)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, RuntimeError):
+        return False
+    kill_deadline = time.monotonic() + _UNPUBLISHED_RUNNER_KILL_VERIFY_SECONDS
+    while time.monotonic() < kill_deadline:
+        if not _pid_alive(pid) or _process_identity(pid) != identity:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def cmd_launch(args: argparse.Namespace) -> int:
@@ -9232,11 +9250,23 @@ def cmd_launch(args: argparse.Namespace) -> int:
         # acknowledgement it marks args._worktree_launch_published, and from
         # that point on a live runner owns the worktree: rollback must never
         # run, no matter what fails afterward (pid parsing, the print calls).
+        # If an interruption before that point left the runner's termination
+        # unconfirmed, args._worktree_rollback_unsafe is set instead: the
+        # runner might still be alive with no proof either way, so rollback
+        # is refused there too.
         try:
             with _launch_lock(name) as lock_fd:
                 rc = _cmd_launch_locked(args, name, lock_fd)
         except BaseException:
             if getattr(args, "_worktree_launch_published", False):
+                raise
+            if getattr(args, "_worktree_rollback_unsafe", False):
+                print(
+                    f"agent-run: warning: could not confirm the runner for '{name}' "
+                    f"is terminated; leaving worktree {created.path} in place "
+                    f"(possible orphaned launch, inspect and clean up manually)",
+                    file=sys.stderr,
+                )
                 raise
             try:
                 _rollback_launch_worktree(created)
@@ -9587,9 +9617,18 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             # already be live and about to publish "running". Terminate it
             # here, before this call's caller is allowed to roll back the
             # worktree -- otherwise a live agent process could be orphaned
-            # in a directory `git worktree remove` has just deleted.
+            # in a directory `git worktree remove` has just deleted. A
+            # second BaseException from the termination attempt itself
+            # (e.g. a second interrupt) is caught and folded into the same
+            # not-confirmed-dead outcome rather than replacing the original
+            # exception.
             os.close(r_ack)
-            _terminate_unpublished_runner(d)
+            try:
+                confirmed_dead = _terminate_unpublished_runner(d)
+            except BaseException:  # noqa: BLE001
+                confirmed_dead = False
+            if not confirmed_dead:
+                args._worktree_rollback_unsafe = True
             raise
         os.close(r_ack)
         try:

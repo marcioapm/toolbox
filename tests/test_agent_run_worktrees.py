@@ -23,6 +23,7 @@ import argparse
 import inspect
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -154,7 +155,6 @@ def _exit_status(code: object) -> int:
 
 def _kill_run_pid(state_dir: Path) -> None:
     """Terminate the runner recorded in state_dir; no-op if already gone."""
-    import signal
     try:
         pid = int((state_dir / "pid").read_text().strip())
     except (FileNotFoundError, ValueError, OSError):
@@ -168,6 +168,36 @@ def _kill_run_pid(state_dir: Path) -> None:
             return
         if sig == signal.SIGTERM:
             time.sleep(0.3)
+
+
+def _spawn_reparented_sleeper(seconds: float) -> int:
+    """Fork twice and sleep in the grandchild, matching the production
+    runner's process shape: reparented to init rather than staying a
+    pytest-waited child. The intermediate child exits immediately, so
+    ``os.kill(grandchild_pid, 0)`` cannot false-positive against a zombie
+    the way a plain ``subprocess.Popen`` child does after SIGTERM."""
+    read_fd, write_fd = os.pipe()
+    outer_pid = os.fork()
+    if outer_pid == 0:
+        os.close(read_fd)
+        inner_pid = os.fork()
+        if inner_pid == 0:
+            os.close(write_fd)
+            time.sleep(seconds)
+            os._exit(0)
+        os.write(write_fd, str(inner_pid).encode())
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    os.waitpid(outer_pid, 0)
+    raw = b""
+    while True:
+        chunk = os.read(read_fd, 64)
+        if not chunk:
+            break
+        raw += chunk
+    os.close(read_fd)
+    return int(raw)
 
 
 def _wait_terminal(state_dir: Path, timeout: float = 15.0) -> str:
@@ -4555,25 +4585,235 @@ class TestLaunchCreatesWorktree:
         assert name not in _git(repo, "branch", "--list", name)
 
     def test_terminate_unpublished_runner_kills_a_live_process(
-        self, isolated_runs_root, isolated_log_root, tmp_path
+        self, isolated_runs_root, isolated_log_root
     ):
         """Direct unit test of the termination helper itself: given a state
-        dir naming a live pid, it must terminate that process."""
-        state_dir = tmp_path / "state-fake"
+        dir naming a live pid, it must terminate that process.
+
+        The victim is double-forked and reparented to init, matching the
+        production runner's shape. A subprocess.Popen child stays a zombie
+        (still "alive" to os.kill(pid, 0)) after SIGTERM until this process
+        reaps it, which would let the helper's SIGTERM branch pass even if
+        it did nothing at all."""
+        state_dir = isolated_runs_root / "state-fake"
         state_dir.mkdir()
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        pid = _spawn_reparented_sleeper(30)
         try:
-            (state_dir / "pid").write_text(f"{proc.pid}\n")
-            assert agent_run._pid_alive(proc.pid)
+            assert agent_run._pid_alive(pid)
+            identity = agent_run._process_identity(pid)
+            assert identity is not None
+            (state_dir / "pid").write_text(f"{pid}\n")
+            (state_dir / "process_identity").write_text(identity + "\n")
 
-            agent_run._terminate_unpublished_runner(state_dir)
+            assert agent_run._terminate_unpublished_runner(state_dir)
 
-            # Reap so a signalled-but-unwaited child (a zombie) doesn't read
-            # as still alive: os.kill(pid, 0) succeeds against a zombie.
-            proc.wait(timeout=5)
-            assert not agent_run._pid_alive(proc.pid)
+            assert not agent_run._pid_alive(pid)
         finally:
-            proc.wait(timeout=5)
+            if agent_run._pid_alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+    def test_terminate_unpublished_runner_returns_false_when_pid_never_appears(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """No pid on disk within the poll window is not "nothing to
+        terminate": the caller must treat it as unsafe to roll back."""
+        state_dir = isolated_runs_root / "state-no-pid"
+        state_dir.mkdir()
+        monkeypatch.setattr(agent_run, "_UNPUBLISHED_RUNNER_IDENTITY_POLL_SECONDS", 0.2)
+
+        assert agent_run._terminate_unpublished_runner(state_dir) is False
+
+    def test_terminate_unpublished_runner_returns_false_when_identity_never_appears(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """A pid on disk with no process_identity yet is unsignalable through
+        the verified path; the caller must not treat this as safe."""
+        state_dir = isolated_runs_root / "state-pid-no-identity"
+        state_dir.mkdir()
+        pid = _spawn_reparented_sleeper(30)
+        try:
+            (state_dir / "pid").write_text(f"{pid}\n")
+            monkeypatch.setattr(agent_run, "_UNPUBLISHED_RUNNER_IDENTITY_POLL_SECONDS", 0.2)
+
+            assert agent_run._terminate_unpublished_runner(state_dir) is False
+            assert agent_run._pid_alive(pid)
+        finally:
+            if agent_run._pid_alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+    def test_terminate_unpublished_runner_refuses_when_recorded_identity_is_stale(
+        self, isolated_runs_root, isolated_log_root
+    ):
+        """If the identity on disk no longer matches the live process at that
+        pid (a PID-reuse shape), the helper must refuse to signal it rather
+        than terminating an unrelated process, and must report failure so
+        the caller does not roll back believing the runner is confirmed
+        dead."""
+        state_dir = isolated_runs_root / "state-stale-identity"
+        state_dir.mkdir()
+        pid = _spawn_reparented_sleeper(30)
+        try:
+            (state_dir / "pid").write_text(f"{pid}\n")
+            (state_dir / "process_identity").write_text("darwin:not-the-real-identity\n")
+
+            assert agent_run._terminate_unpublished_runner(state_dir) is False
+
+            assert agent_run._pid_alive(pid)
+        finally:
+            if agent_run._pid_alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+    def test_terminate_unpublished_runner_escalates_to_sigkill_after_grace_period(
+        self, isolated_runs_root, isolated_log_root, monkeypatch
+    ):
+        """A runner that ignores SIGTERM must be SIGKILLed once the grace
+        period elapses, and the helper must confirm that exact identity is
+        gone before reporting success."""
+        state_dir = isolated_runs_root / "state-ignores-term"
+        state_dir.mkdir()
+        monkeypatch.setattr(agent_run, "_UNPUBLISHED_RUNNER_TERM_GRACE_SECONDS", 0.3)
+        read_fd, write_fd = os.pipe()
+        outer_pid = os.fork()
+        if outer_pid == 0:
+            os.close(read_fd)
+            inner_pid = os.fork()
+            if inner_pid == 0:
+                os.close(write_fd)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                time.sleep(30)
+                os._exit(0)
+            os.write(write_fd, str(inner_pid).encode())
+            os.close(write_fd)
+            os._exit(0)
+        os.close(write_fd)
+        os.waitpid(outer_pid, 0)
+        pid = int(os.read(read_fd, 64))
+        os.close(read_fd)
+        try:
+            identity = agent_run._process_identity(pid)
+            assert identity is not None
+            (state_dir / "pid").write_text(f"{pid}\n")
+            (state_dir / "process_identity").write_text(identity + "\n")
+
+            started = time.monotonic()
+            result = agent_run._terminate_unpublished_runner(state_dir)
+            elapsed = time.monotonic() - started
+
+            assert result is True
+            assert not agent_run._pid_alive(pid)
+            assert elapsed >= 0.3  # actually waited out the grace period
+        finally:
+            if agent_run._pid_alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+    def test_interrupt_before_readiness_with_unconfirmed_termination_leaves_worktree(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """When termination cannot confirm the runner is dead, rollback must
+        be refused, not just skipped silently: the worktree may still be a
+        live runner's cwd."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-interrupt-unconfirmed"
+        name = "interrupt-unconfirmed"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+            command=[sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+
+        monkeypatch.setattr(agent_run, "_terminate_unpublished_runner", lambda state_dir: False)
+
+        real_fork = os.fork
+        real_waitpid = os.waitpid
+        main_pid = os.getpid()
+        state = {"child_pid": None, "raised": False}
+
+        def _fork_recording():
+            pid = real_fork()
+            if pid != 0 and state["child_pid"] is None:
+                state["child_pid"] = pid
+            return pid
+
+        def _waitpid_raises_once(pid, options):
+            if (
+                os.getpid() == main_pid
+                and pid == state["child_pid"]
+                and not state["raised"]
+            ):
+                state["raised"] = True
+                raise KeyboardInterrupt("interrupted before readiness ack")
+            return real_waitpid(pid, options)
+
+        monkeypatch.setattr(os, "fork", _fork_recording)
+        monkeypatch.setattr(os, "waitpid", _waitpid_raises_once)
+
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                agent_run.cmd_launch(args)
+        finally:
+            state_dir = isolated_runs_root / name
+            _wait_terminal(state_dir)
+
+        assert wt_dir.is_dir()
+        assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+        assert name in _git(repo, "branch", "--list", name)
+        assert "could not confirm" in capsys.readouterr().err
+
+    def test_second_interrupt_during_termination_is_treated_as_unconfirmed(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch, capsys
+    ):
+        """A second interrupt raised out of _terminate_unpublished_runner
+        itself (e.g. a second Ctrl-C while it is polling) must not propagate
+        past the original interrupt or be read as confirmed death; it must
+        fall back to the same unsafe-to-roll-back path."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "wt-double-interrupt"
+        name = "double-interrupt"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+            command=[sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+
+        def _terminate_raises(state_dir):
+            raise KeyboardInterrupt("second interrupt during termination")
+
+        monkeypatch.setattr(agent_run, "_terminate_unpublished_runner", _terminate_raises)
+
+        real_fork = os.fork
+        real_waitpid = os.waitpid
+        main_pid = os.getpid()
+        state = {"child_pid": None, "raised": False}
+
+        def _fork_recording():
+            pid = real_fork()
+            if pid != 0 and state["child_pid"] is None:
+                state["child_pid"] = pid
+            return pid
+
+        def _waitpid_raises_once(pid, options):
+            if (
+                os.getpid() == main_pid
+                and pid == state["child_pid"]
+                and not state["raised"]
+            ):
+                state["raised"] = True
+                raise KeyboardInterrupt("interrupted before readiness ack")
+            return real_waitpid(pid, options)
+
+        monkeypatch.setattr(os, "fork", _fork_recording)
+        monkeypatch.setattr(os, "waitpid", _waitpid_raises_once)
+
+        try:
+            with pytest.raises(KeyboardInterrupt, match="interrupted before readiness ack"):
+                agent_run.cmd_launch(args)
+        finally:
+            state_dir = isolated_runs_root / name
+            _wait_terminal(state_dir)
+
+        # The original interrupt is what propagates, not the second one.
+        assert wt_dir.is_dir()
+        assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+        assert name in _git(repo, "branch", "--list", name)
+        assert "could not confirm" in capsys.readouterr().err
 
     def test_invocation_cwd_outside_repo_without_worktree_repo_is_usage_error(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch, capsys
