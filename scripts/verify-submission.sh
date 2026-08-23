@@ -76,29 +76,66 @@ LAUNCHED_RUNS=()
 TEMP_REPOS=()
 CLAUDE_TRUSTED_DIRS=()
 
-# claude_trust_dir <realpath>: pre-accept claude's workspace-trust dialog for
-# a throwaway repo so an interactive launch doesn't block on it forever.
-# Claude keys ~/.claude.json's per-project trust entry by realpath, not by
-# whatever path mktemp -d returned (macOS's /var/... is a symlink to
-# /private/var/...); passing the raw mktemp path here silently no-ops.
+# claude_trust_dir <dir>: pre-accept claude's workspace-trust dialog for a
+# throwaway repo so an interactive launch doesn't block on it forever.
+# Claude keys ~/.claude.json's per-project trust entry by realpath: macOS's
+# /var/... is a symlink to /private/var/..., and os.chdir + os.getcwd() in
+# the launched agent-run process already resolves through it, so claude's
+# own cwd is the resolved path even when *dir* is not. Both the raw and
+# resolved forms are written so the entry matches regardless of which form
+# claude looks up (measured live: only the resolved form is read on macOS,
+# but writing the raw form too costs nothing and guards a platform where
+# cwd is not pre-resolved). Exits the script if the resolved key cannot be
+# confirmed on disk afterwards -- an unconfirmed trust write left C1 to fail
+# on a misleading "prompt_unverified" path instead of the real cause.
 # Read-modify-write races with a concurrently running `claude` are accepted:
 # this script never runs more than one harness launch against ~/.claude.json
 # at a time.
 claude_trust_dir() {
   local dir="$1"
-  python3 -c "
-import json, sys
-path = '${HOME}/.claude.json'
+  local resolved status
+  resolved="$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$dir")"
+  status=0
+  DIR_RAW="$dir" DIR_RESOLVED="$resolved" python3 -c "
+import json, os, sys
+
+path = os.path.expanduser('~/.claude.json')
 try:
     with open(path) as f:
         data = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    sys.exit(0)  # nothing to seed into; claude creates its own defaults
-data.setdefault('projects', {})['${dir}'] = {'hasTrustDialogAccepted': True}
+except FileNotFoundError:
+    # Nothing to seed trust into yet -- claude creates its own defaults on
+    # first run, and manufacturing its full config schema here is out of
+    # scope. The launch will hit the trust dialog; that is a pre-existing
+    # limitation of this hook, not the realpath bug this fix addresses.
+    sys.exit(2)
+except json.JSONDecodeError as exc:
+    print(f'~/.claude.json is not valid JSON: {exc}', file=sys.stderr)
+    sys.exit(1)
+
+raw, resolved = os.environ['DIR_RAW'], os.environ['DIR_RESOLVED']
+entry = {'hasTrustDialogAccepted': True}
+projects = data.setdefault('projects', {})
+projects[raw] = entry
+projects[resolved] = entry
 with open(path, 'w') as f:
     json.dump(data, f)
-" 2>/dev/null || true
-  CLAUDE_TRUSTED_DIRS+=("$dir")
+
+with open(path) as f:
+    written = json.load(f)
+if resolved not in written.get('projects', {}):
+    print(f'trust entry for {resolved} did not persist after write', file=sys.stderr)
+    sys.exit(1)
+" || status=$?
+  if [ "$status" -eq 2 ]; then
+    log "claude trust: ~/.claude.json does not exist yet — skipping pre-trust, C1 may hit the trust dialog"
+    return 0
+  fi
+  if [ "$status" -ne 0 ]; then
+    echo "verify-submission: could not confirm claude trust entry for ${resolved} in ~/.claude.json" >&2
+    exit 1
+  fi
+  CLAUDE_TRUSTED_DIRS+=("$dir" "$resolved")
 }
 
 # shellcheck disable=SC2329  # invoked indirectly via `trap cleanup EXIT`
@@ -347,7 +384,14 @@ run_harness_cells() {
       fi
     else
       c1="FAIL"
-      log "C1 FAIL: prompt_submitted/prompt_unverified state is wrong"
+      local unverified_detail trust_dialog_seen log_path
+      unverified_detail="$(cat "${state_dir}/prompt_unverified" 2>/dev/null || echo "(prompt_unverified not written)")"
+      log_path="${LOG_DIR}/${run_name}/log"
+      trust_dialog_seen="no"
+      if [ "$harness" = "claude" ] && grep -qi "trust" "$log_path" 2>/dev/null; then
+        trust_dialog_seen="yes"
+      fi
+      log "C1 FAIL: prompt_unverified detail=[${unverified_detail}] trust_dialog_in_log=${trust_dialog_seen}"
     fi
   else
     c1="FAIL"
