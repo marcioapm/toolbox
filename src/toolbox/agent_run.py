@@ -9175,6 +9175,12 @@ def cmd_kill(args: argparse.Namespace) -> int:
 
 def cmd_launch(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
+    # Scope ownership evidence to this invocation: args is caller-owned and
+    # may be reused across multiple cmd_launch calls (e.g. a script driving
+    # several launches off one parsed Namespace). A True left over from an
+    # earlier, unrelated launch on the same object would authorize rollback
+    # refusal here for a worktree no process from *this* call ever touched.
+    args._worktree_process_started = False
     # A relative --prompt-file names a file the caller typed, so it is anchored
     # to the invocation directory before --cwd moves the process; the recorded
     # <state_dir>/prompt_file is then absolute with or without --cwd.

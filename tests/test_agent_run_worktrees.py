@@ -5129,6 +5129,42 @@ class TestLaunchCreatesWorktree:
                         break
                     time.sleep(0.05)
 
+    def test_stale_ownership_mark_on_reused_namespace_does_not_block_second_rollback(
+        self, isolated_runs_root, isolated_log_root, git_root, monkeypatch
+    ):
+        """args is caller-owned and may be reused across cmd_launch calls. A
+        real first launch sets args._worktree_process_started True and
+        completes; a second call on the same Namespace, targeting a
+        different worktree, must not inherit that True. Failing before any
+        process starts must still roll back the second worktree and
+        branch."""
+        repo = _make_repo(git_root)
+        wt_dir_1 = git_root / "wt-reuse-first"
+        args = _launch_args(
+            name="reuse-first", worktree=str(wt_dir_1), worktree_base="main",
+            worktree_repo=str(repo),
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+        _wait_terminal(isolated_runs_root / "reuse-first")
+        assert args._worktree_process_started is True
+
+        wt_dir_2 = git_root / "wt-reuse-second"
+        args.name = "reuse-second"
+        args.worktree = str(wt_dir_2)
+        args.cwd = None  # _create_launch_worktree pointed this at wt_dir_1
+        args.command = []  # fails at the first statement of _cmd_launch_locked
+
+        with pytest.raises(SystemExit, match="missing command"):
+            agent_run.cmd_launch(args)
+
+        assert not wt_dir_2.exists()
+        assert "reuse-second" not in _git(repo, "branch", "--list", "reuse-second")
+        # The first launch's worktree and branch are unaffected.
+        assert wt_dir_1.is_dir()
+        assert "reuse-first" in _git(repo, "branch", "--list", "reuse-first")
+
     def test_invocation_cwd_outside_repo_without_worktree_repo_is_usage_error(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch, capsys
     ):
