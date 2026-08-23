@@ -830,10 +830,10 @@ past `watch`'s never-raise boundary; any read failure, including an
 unexpected exception type from the count call, degrades to the unavailable
 form.
 
-`submitted_age_s` is seconds since `state_dir/prompt_submitted` was written
-— the moment the prompt was actually delivered to the PTY — not since
-process launch (`elapsed_s`), which also counts harness boot, session mint
-and TUI readiness. Populated only for interactive runs (`interactive: true`)
+`submitted_age_s` is seconds since `state_dir/prompt_submitted` was written,
+when initial-prompt submission was confirmed, not since process launch
+(`elapsed_s`), which also counts harness boot, session mint and TUI readiness.
+Populated only for interactive runs (`interactive: true`)
 that have written the marker; `null` otherwise, including when the run is
 still starting up, is not interactive, or the marker is unreadable. Computed
 independently of the store read, so it survives a transcript-store failure
@@ -976,10 +976,9 @@ is confirmed against the harness's own transcript record count (opencode's
 HTTP `/session/<id>/message` endpoint when a port is known, else the
 transcript store), not merely by a successful FIFO/HTTP write. `steer`
 prints `verified` and exits 0 only once the record count has risen above
-its pre-submit baseline; a submission that cannot be verified within
-`SUBMISSION_VERIFY_TIMEOUT_SECONDS` (default 10s) is retried once
-(`SUBMISSION_MAX_ATTEMPTS`, default 2) when the witness was readable but
-stayed flat -- proof the prompt did not land. A witness that never became
+its pre-submit baseline; a submission that cannot be verified within the
+default 10 seconds is retried once (two attempts total) when the witness was
+readable but stayed flat -- proof the prompt did not land. A witness that never became
 readable through the whole attempt is left at a single submission: it
 carries no evidence the prompt failed to land, so a retry could only
 duplicate it (messageID is not idempotent). Either way an unverified
@@ -992,16 +991,8 @@ records the port a managed interactive opencode run's HTTP API is
 listening on, so the witness can query it directly.
 
 `scripts/verify-submission.sh [--harness opencode|claude|codex] [--keep]`
-drives real installed harness binaries end to end (not the fakes the unit
-suite uses) to catch a harness upgrade that silently breaks submission —
-e.g. opencode renaming its message route, or a transcript store's on-disk
-layout changing. Run it after any change touching submission and whenever
-a new harness release lands. It prints a PASS/FAIL/SKIP table per harness
-plus opencode's HTTP contract checks, and cleans up every run and temp
-repo it creates unless `--keep`. A `FAIL` on `C3` (its anti-vacuity
-negative control) means verification is not actually gating the marker —
-treat that as the highest-priority failure in the table, since it means
-every other PASS in the same row may be meaningless.
+runs the end-to-end compatibility checks against installed harnesses and
+prints their PASS/FAIL/SKIP results.
 
 
 `agent-run reap` reconciles stale state and cleans up old runs in one pass:

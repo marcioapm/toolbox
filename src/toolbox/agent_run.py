@@ -117,19 +117,9 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     pid          runner process id
     pgid         process group id (also the `kill --force` fallback target)
     launch_error first output line of a run that failed at launch
-    prompt_submitted  written once an interactive prompt was verified to have
-                 reached the agent (transcript record count rose above its
-                 pre-submit baseline) -- NOT written merely because the bytes
-                 were handed to the FIFO/HTTP transport; see prompt_unverified
-    prompt_unverified  written instead of prompt_submitted when submission
-                 attempts were exhausted (a readable, flat witness retries up
-                 to SUBMISSION_MAX_ATTEMPTS) or stopped after one submission
-                 (a witness that stayed unreadable the whole attempt); one
-                 line naming the reason (see _submit_and_verify)
-    opencode_port  TCP port of a managed interactive opencode run's HTTP API,
-                 used by the submission witness to query
-                 /session/<id>/message directly instead of the transcript
-                 store; absent for other harnesses and one-shot runs
+    prompt_submitted  interactive prompt submission was verified
+    prompt_unverified  verification failed; contains the reason
+    opencode_port  managed interactive opencode HTTP API port used by the witness
     idle_timeout      idle-timeout seconds this run was launched with
     idle_timeout_fired  idle seconds measured when the watchdog fired
     process_identity  platform-specific runner birth token (kill verification)
@@ -4327,13 +4317,6 @@ def _watch_transcript_facts(
 
 # ---------------------------------------------------------------------------
 # Submission verification (launch prompt + steer)
-#
-# A submission (an initial prompt or a steer message) is verified once the
-# transcript record count for the run's session rises above a baseline
-# captured immediately before submitting. Writing bytes to a FIFO or getting
-# a 200 from an HTTP POST proves only that the transport accepted them, never
-# that the agent actually consumed them -- this is the fail-closed witness
-# that closes that gap.
 # ---------------------------------------------------------------------------
 
 def _submission_verify_timeout_seconds() -> float:
@@ -4371,7 +4354,7 @@ def _opencode_argv_port(state_dir: Path) -> Optional[int]:
     opencode_port was written directly."""
     try:
         argv = json.loads((state_dir / "argv").read_text())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(argv, list):
         return None
@@ -4410,7 +4393,7 @@ def _opencode_http_message_count(port: int, session_id: str) -> Optional[int]:
             if resp.status != 200:
                 return None
             body = resp.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, OSError):
+    except OSError:
         return None
     try:
         data = json.loads(body)
@@ -4562,17 +4545,8 @@ def _submit_and_verify(
         endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
         transport = "http" if endpoint is not None else "keystroke"
     baseline = _submission_witness_count(state_dir, log_dir)
-    # A None baseline is genuinely common, not exceptional: claude's session
-    # transcript file does not exist until claude finishes its own startup
-    # (trust check, config load), which routinely lands a few hundred
-    # milliseconds after this helper's pre-write delay elapses -- measured
-    # live, the file appears at ~4.2-4.3s against a 4.0s delay. Giving up
-    # immediately here would fail verification on nearly every real launch.
-    # Instead of comparing against a magnitude that was never established,
-    # treat any witness read that is readable and nonzero as delivery proof:
-    # sound because state_dir's session id is always freshly minted, so a
-    # store that could not be read before submission cannot hold unrelated
-    # pre-existing records once it becomes readable.
+    # A newly minted session's transcript may not exist at baseline time. Its
+    # first readable, positive count is treated as the delivery witness.
     ever_readable = baseline is not None
 
     def _witness_rose() -> bool:
@@ -8692,7 +8666,7 @@ def _reject_raw_steer_for_codex(name: str) -> None:
 
 def cmd_steer(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
-    d, _pid = _require_live_interactive_run(name)
+    d, _ = _require_live_interactive_run(name)
     if args.raw:
         _reject_raw_steer_for_codex(name)
     fifo = d / "stdin"
@@ -8748,20 +8722,19 @@ def cmd_steer(args: argparse.Namespace) -> int:
     submit_mode = _submit_mode_from_state(d)
     verify_timeout = _submission_verify_timeout_seconds()
     max_attempts = _submission_max_attempts()
+    data = msg.encode()
     outcome = _write_with_timeout(
         10 + verify_timeout * max_attempts + 5,
         lambda: _submit_and_verify(
-            d, _log_dir(name), msg.encode(), submit_mode=submit_mode,
+            d, _log_dir(name), data, submit_mode=submit_mode,
             deadline_s=verify_timeout, max_attempts=max_attempts,
         ),
     )
 
-    sent = len(msg.encode())
+    sent = len(data)
     if outcome.verified:
         print(f"agent-run: steered '{args.name}' ({sent} bytes, verified)")
         return 0
-    # Deliberate non-zero exit: a lost steer that reports success is the bug
-    # this whole feature exists to close.
     print(
         f"agent-run: steer to '{args.name}' could not be verified as delivered "
         f"({outcome.detail}, {outcome.attempts} attempt(s) via {outcome.transport})",
@@ -9362,7 +9335,6 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     opencode_extra_agent_names: set[str] = set()
     opencode_port: Optional[int] = None
     if is_managed:
-        opencode_port: Optional[int] = None
         managed_prompt = getattr(args, "prompt", None)
         managed_model = getattr(args, "model", None)
         managed_agent_mode = getattr(args, "agent_mode", None)
@@ -11538,7 +11510,7 @@ class _CodexAppServer:
         for line_bytes in lines:
             try:
                 frames.append(json.loads(line_bytes.decode("utf-8", errors="replace")))
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except json.JSONDecodeError:
                 continue
         return frames, bool(lines) or bool(requeued), eof
 
@@ -11735,18 +11707,12 @@ def _run_managed_oneshot_codex_appserver(
             return 1
 
         turn_rpc_id = server.start_turn(_managed_prompt_text(prompt, prompt_file))
-        # turn/start has no other matcher for its response frame; a fast
-        # server-side rejection (e.g. bad params) would otherwise sit
-        # unnoticed until the main loop's next frame, or be silently
-        # attributed to some other cause once turn_done never flips true.
+        # Fail fast on an immediate turn/start rejection.
         early_error = server.turn_start_error(turn_rpc_id)
         if early_error is not None:
             server.log(f"turn/start rejected immediately: {early_error}")
             return 1
-        # The turn is underway and was not rejected outright; mark the
-        # prompt delivered so _finalize does not misclassify a later
-        # failure as launch_failed. Transcript verification of the turn's
-        # actual content still happens uniformly through `watch`/`transcript`.
+        # Prevent a later failure from being misclassified as launch_failed.
         _write(state_dir / "prompt_submitted", "1\n")
 
         turn_done = False
@@ -11859,9 +11825,7 @@ def _run_managed_interactive_codex_appserver(
         def _send_initial_turn(payload: bytes) -> None:
             rpc_id = server.start_turn(payload.decode("utf-8", errors="replace"))
             turn_rpc_id_holder[0] = rpc_id
-            # turn/start has no other matcher for its response frame; a
-            # server-side rejection must fail this attempt immediately
-            # rather than wait out the witness poll window.
+            # Fail fast on an immediate turn/start rejection.
             early_error = server.turn_start_error(rpc_id)
             if early_error is not None:
                 raise _SubmissionRejected(early_error)

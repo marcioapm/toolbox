@@ -120,19 +120,6 @@ def _steer_args(name: str, *, esc: bool = False, raw: bool = False) -> argparse.
     return argparse.Namespace(name=name, message=["hello"], esc=esc, raw=raw)
 
 
-def _mock_witness_rises_on_first_poll(monkeypatch) -> None:
-    """Baseline read returns 0; every subsequent read returns 1, so
-    _submit_and_verify's very first post-submit poll sees the rise and
-    returns immediately without sleeping through the real poll interval."""
-    calls = {"n": 0}
-
-    def fake_witness(_state_dir, _log_dir):
-        calls["n"] += 1
-        return 0 if calls["n"] == 1 else 1
-
-    monkeypatch.setattr(agent_run, "_submission_witness_count", fake_witness)
-
-
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
@@ -146,7 +133,7 @@ def test_steer_uses_persisted_submit_mode(
     _fifo, reader = _seed_live_interactive_run(isolated_runs_root, "run", mode)
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
-    _mock_witness_rises_on_first_poll(monkeypatch)
+    _witness_sequence(monkeypatch, [0, 1])
     try:
         assert agent_run.cmd_steer(_steer_args("run")) == 0
         assert os.read(reader, 4096) == expected
@@ -168,7 +155,7 @@ def test_steer_esc_reuses_persisted_submit_mode(
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
     monkeypatch.setattr(agent_run.time, "sleep", lambda _seconds: None)
-    _mock_witness_rises_on_first_poll(monkeypatch)
+    _witness_sequence(monkeypatch, [0, 1])
     try:
         assert agent_run.cmd_steer(_steer_args("run", esc=True)) == 0
         assert os.read(reader, 4096) == expected
@@ -192,9 +179,7 @@ def test_steer_raw_is_verbatim_even_for_opencode_and_esc(isolated_runs_root, mon
 def test_steer_unverified_exits_nonzero_and_writes_no_marker(
     isolated_runs_root, monkeypatch
 ):
-    """The bug this feature closes: a steer that never lands must not report
-    success. A permanently unreadable witness submits exactly once (no
-    evidence to justify a retry) and the CLI reports failure."""
+    """An unreadable witness submits once and makes steer report failure."""
     _fifo, reader = _seed_live_interactive_run(
         isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
     )
@@ -505,9 +490,7 @@ def _no_transport_side_effects(monkeypatch) -> list:
 
 
 def test_submit_and_verify_swallowed_input_exhausts_attempts(tmp_path, monkeypatch):
-    """Reproduces the production bug: transport accepts every write but the
-    witness never rises. Exactly max_attempts submissions are made and the
-    outcome reports unverified with a timeout reason."""
+    """A flat witness exhausts max_attempts and reports a timeout."""
     submissions = _no_transport_side_effects(monkeypatch)
     _witness_sequence(monkeypatch, [0])  # baseline 0, every later read also 0
 
@@ -811,8 +794,7 @@ def test_steer_unverified_exits_one_with_reason_on_stderr(
 
 
 def test_steer_raw_skips_witness_polling_entirely(isolated_runs_root, monkeypatch):
-    """--raw must never call the witness: raw bytes have no transcript
-    record to observe, and the brief requires zero polling for this path."""
+    """--raw must not poll because raw bytes have no transcript record."""
     _fifo, reader = _seed_live_interactive_run(
         isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
     )
