@@ -117,7 +117,18 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     pid          runner process id
     pgid         process group id (also the `kill --force` fallback target)
     launch_error first output line of a run that failed at launch
-    prompt_submitted  written once an interactive prompt file was delivered
+    prompt_submitted  written once an interactive prompt was verified to have
+                 reached the agent (transcript record count rose above its
+                 pre-submit baseline) -- NOT written merely because the bytes
+                 were handed to the FIFO/HTTP transport; see prompt_unverified
+    prompt_unverified  written instead of prompt_submitted when every
+                 submission attempt exhausted SUBMISSION_MAX_ATTEMPTS without
+                 the transcript witness confirming delivery; one line naming
+                 the reason (see _submit_and_verify)
+    opencode_port  TCP port of a managed interactive opencode run's HTTP API,
+                 used by the submission witness to query
+                 /session/<id>/message directly instead of the transcript
+                 store; absent for other harnesses and one-shot runs
     idle_timeout      idle-timeout seconds this run was launched with
     idle_timeout_fired  idle seconds measured when the watchdog fired
     process_identity  platform-specific runner birth token (kill verification)
@@ -363,9 +374,11 @@ import traceback
 import tty
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import platform
+from dataclasses import dataclass
 from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1147,6 +1160,14 @@ PROMPT_UNSUBMITTED_ERROR = "agent exited before its prompt file was submitted"
 # before submitting; it also bounds how late an unsubmitted prompt still counts
 # as a launch failure.
 PROMPT_SUBMISSION_DELAY_SECONDS = 4.0
+
+# Submission verification (launch prompt + steer): total time budget across
+# every attempt, poll cadence while waiting for the transcript witness to
+# rise, and the number of submit attempts before giving up. Overridable via
+# AGENT_RUN_SUBMIT_VERIFY_TIMEOUT / AGENT_RUN_SUBMIT_ATTEMPTS.
+SUBMISSION_VERIFY_TIMEOUT_SECONDS = 10.0
+SUBMISSION_VERIFY_POLL_INTERVAL_SECONDS = 0.25
+SUBMISSION_MAX_ATTEMPTS = 2
 
 
 # Off by default, unlike the thresholds above. An invalid flag value is a hard
@@ -4301,6 +4322,261 @@ def _watch_transcript_facts(
         return _transcript_unknown(exc.code, submitted_age_s)
     except Exception:
         return _transcript_unknown("store_unreadable", submitted_age_s)
+
+
+# ---------------------------------------------------------------------------
+# Submission verification (launch prompt + steer)
+#
+# A submission (an initial prompt or a steer message) is verified once the
+# transcript record count for the run's session rises above a baseline
+# captured immediately before submitting. Writing bytes to a FIFO or getting
+# a 200 from an HTTP POST proves only that the transport accepted them, never
+# that the agent actually consumed them -- this is the fail-closed witness
+# that closes that gap.
+# ---------------------------------------------------------------------------
+
+def _submission_verify_timeout_seconds() -> float:
+    """Parse AGENT_RUN_SUBMIT_VERIFY_TIMEOUT; unset or malformed falls back
+    to SUBMISSION_VERIFY_TIMEOUT_SECONDS without raising."""
+    raw = os.environ.get("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT")
+    if raw is None:
+        return SUBMISSION_VERIFY_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(raw)
+    except ValueError:
+        return SUBMISSION_VERIFY_TIMEOUT_SECONDS
+    return value
+
+
+def _submission_max_attempts() -> int:
+    """Parse AGENT_RUN_SUBMIT_ATTEMPTS; unset or malformed falls back to
+    SUBMISSION_MAX_ATTEMPTS without raising."""
+    raw = os.environ.get("AGENT_RUN_SUBMIT_ATTEMPTS")
+    if raw is None:
+        return SUBMISSION_MAX_ATTEMPTS
+    try:
+        value = int(raw)
+        if value < 1:
+            raise ValueError(raw)
+    except ValueError:
+        return SUBMISSION_MAX_ATTEMPTS
+    return value
+
+
+def _opencode_argv_port(state_dir: Path) -> Optional[int]:
+    """Recover --port from the persisted argv, for a run launched before
+    opencode_port was written directly."""
+    try:
+        argv = json.loads((state_dir / "argv").read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(argv, list):
+        return None
+    for i, token in enumerate(argv):
+        if token == "--port" and i + 1 < len(argv):
+            return _safe_int(argv[i + 1])
+    return None
+
+
+def _opencode_http_endpoint(state_dir: Path, log_dir: Path) -> Optional[tuple[int, str]]:
+    """(port, session_id) for a managed interactive opencode run whose HTTP
+    API is expected to be reachable, else None.
+
+    Port comes from state_dir/opencode_port, falling back to parsing --port
+    out of the persisted argv for runs launched before that file existed.
+    """
+    session_data = _read_session_json(log_dir)
+    if not isinstance(session_data, dict) or session_data.get("harness") != "opencode":
+        return None
+    session_id = session_data.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    port = _safe_int(_read(state_dir / "opencode_port")) or _opencode_argv_port(state_dir)
+    if port is None or port <= 0:
+        return None
+    return port, session_id
+
+
+def _opencode_http_message_count(port: int, session_id: str) -> Optional[int]:
+    """GET /session/<id>/message and count user-role entries. None on any
+    failure (unreachable server, non-200, malformed body) so the caller falls
+    back to the transcript store rather than trusting a bogus zero."""
+    url = f"http://127.0.0.1:{port}/session/{urllib.parse.quote(session_id, safe='')}/message"
+    try:
+        with urllib.request.urlopen(url, timeout=2.0) as resp:
+            if resp.status != 200:
+                return None
+            body = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError):
+        return None
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return sum(
+        1 for item in data
+        if isinstance(item, dict) and (item.get("info") or {}).get("role") == "user"
+    )
+
+
+def _submission_witness_count(state_dir: Path, log_dir: Optional[Path]) -> Optional[int]:
+    """Transcript record count for the run's session, or None when the store
+    cannot be read. None must never be treated as 0 -- an unreadable witness
+    is unknown, not empty, the same fail-closed rule the watch contract uses.
+
+    Prefers opencode's own HTTP message endpoint when a port is known (the
+    authoritative source: it counts what the TUI itself has ingested);
+    falls back to the harness transcript store when the port/session are
+    unknown or the request fails.
+    """
+    if log_dir is None:
+        return None
+    endpoint = _opencode_http_endpoint(state_dir, log_dir)
+    if endpoint is not None:
+        count = _opencode_http_message_count(*endpoint)
+        if count is not None:
+            return count
+    session_data = _read_session_json(log_dir)
+    if not isinstance(session_data, dict):
+        return None
+    session_id = session_data.get("session_id")
+    harness = session_data.get("harness")
+    if not isinstance(session_id, str) or not session_id or not isinstance(harness, str):
+        return None
+    try:
+        count, _newest = _agent_run_transcript.count_transcript(
+            harness, session_id, _run_json_cwd(log_dir)
+        )
+    except _agent_run_transcript.TranscriptSourceError:
+        return None
+    except Exception:
+        return None
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        return None
+    return count
+
+
+@dataclass(frozen=True)
+class SubmissionOutcome:
+    """Result of one _submit_and_verify call. verified=False always carries
+    a human-readable reason in detail."""
+    verified: bool
+    attempts: int
+    transport: str          # "http" | "keystroke"
+    detail: Optional[str]   # why unverified; None when verified
+
+
+def _submit_via_http(port: int, session_id: str, text: str) -> None:
+    """POST *text* to opencode's message endpoint without waiting for a
+    response. A normal POST blocks until the whole turn completes; dropping
+    the connection right after the request is written is safe -- the turn
+    still runs to completion server-side. Raises OSError on a connection
+    failure, which the caller treats as a failed attempt, not a crash."""
+    path = f"/session/{urllib.parse.quote(session_id, safe='')}/message"
+    body = json.dumps({"parts": [{"type": "text", "text": text}]}).encode("utf-8")
+    request = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("ascii") + body
+    sock = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+    try:
+        sock.sendall(request)
+    finally:
+        sock.close()
+
+
+def _submit_via_keystroke(state_dir: Path, text: bytes, submit_mode: str) -> None:
+    """Write *text* plus the launch-selected Enter sequence to the run's
+    stdin FIFO in one shot. Raises OSError if the FIFO cannot be opened or
+    the write fails; the caller treats that as a failed attempt, not a
+    crash."""
+    fd = os.open(str(state_dir / "stdin"), os.O_WRONLY)
+    try:
+        os.write(fd, text + _submit_bytes(submit_mode))
+    finally:
+        os.close(fd)
+
+
+def _submit_and_verify(
+    state_dir: Path,
+    log_dir: Optional[Path],
+    text: bytes,
+    *,
+    submit_mode: str,
+    deadline_s: float = SUBMISSION_VERIFY_TIMEOUT_SECONDS,
+    max_attempts: int = SUBMISSION_MAX_ATTEMPTS,
+) -> SubmissionOutcome:
+    """Submit *text* and confirm it reached the agent via the transcript
+    witness, resubmitting up to max_attempts times on a verified timeout.
+
+    Never raises: an unreadable witness, a transport failure, or exhausted
+    attempts all surface as SubmissionOutcome.verified=False with a reason in
+    .detail -- a verification bug must not kill an otherwise working run.
+
+    text carries no submit-sequence framing; the keystroke transport appends
+    submit_mode's Enter sequence itself, HTTP submits text verbatim as the
+    message body.
+    """
+    endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
+    transport = "http" if endpoint is not None else "keystroke"
+    baseline = _submission_witness_count(state_dir, log_dir)
+
+    if baseline is None:
+        # Nothing to compare a post-submit count against. Still deliver the
+        # text once (best effort — the agent may well receive it), but there
+        # is no basis to claim verification or to justify a blind retry.
+        try:
+            if transport == "http":
+                port, session_id = endpoint
+                _submit_via_http(port, session_id, text.decode("utf-8", errors="replace"))
+            else:
+                _submit_via_keystroke(state_dir, text, submit_mode)
+        except OSError:
+            pass
+        return SubmissionOutcome(False, 1, transport, "witness_unreadable")
+
+    def _witness_rose() -> bool:
+        current = _submission_witness_count(state_dir, log_dir)
+        return current is not None and current > baseline
+
+    detail: Optional[str] = None
+    attempts = 0
+
+    for attempt in range(1, max_attempts + 1):
+        attempts = attempt
+        try:
+            if transport == "http":
+                port, session_id = endpoint
+                _submit_via_http(port, session_id, text.decode("utf-8", errors="replace"))
+            else:
+                _submit_via_keystroke(state_dir, text, submit_mode)
+        except OSError as exc:
+            detail = f"transport_error: {exc}"
+            continue
+
+        poll_deadline = time.monotonic() + deadline_s
+        while time.monotonic() < poll_deadline:
+            if _witness_rose():
+                return SubmissionOutcome(True, attempts, transport, None)
+            time.sleep(SUBMISSION_VERIFY_POLL_INTERVAL_SECONDS)
+
+        # Timeout: re-check once more before giving up on this attempt. This
+        # catches a late-landing witness update that arrived right after the
+        # last poll, so a genuinely successful submission is never resent.
+        if _witness_rose():
+            return SubmissionOutcome(True, attempts, transport, None)
+
+        detail = "timeout"
+
+    return SubmissionOutcome(False, attempts, transport, detail)
 
 
 def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
@@ -9015,6 +9291,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     managed_harness_args: List[str] = []
     managed_agent_mode: Optional[str] = None
     opencode_extra_agent_names: set[str] = set()
+    opencode_port: Optional[int] = None
     if is_managed:
         opencode_port: Optional[int] = None
         managed_prompt = getattr(args, "prompt", None)
@@ -9112,6 +9389,10 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     submit_mode = _persist_submit_mode(
         d, argv, getattr(args, "submit_mode", None)
     )
+    if opencode_port is not None:
+        # Read by the submission witness to reach opencode's own HTTP
+        # message endpoint instead of falling back to the transcript store.
+        _write(d / "opencode_port", f"{opencode_port}\n")
 
     # Copy the launch facts into the persistent log dir so postmortem survives a
     # reboot that wipes the ephemeral /tmp state. Never a liveness signal.
