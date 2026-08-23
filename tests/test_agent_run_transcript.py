@@ -1216,8 +1216,8 @@ class TestCmdTranscript:
         stderr = captured.err.decode("utf-8")
         assert "skipped 1" in stderr
 
-    def test_empty_but_valid_store_exits_nonzero_naming_run_and_session(
-        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path
+    def test_empty_but_valid_store_exits_zero_with_stderr_note_and_no_stdout(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path, capsysbinary
     ):
         db = tmp_path / "opencode.db"
         _make_opencode_db(db)
@@ -1233,16 +1233,18 @@ class TestCmdTranscript:
             {"session_id": "ses_gone", "harness": "opencode", "acquisition": "minted", "confidence": "certain"},
         )
 
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run.cmd_transcript(self._args(name))
-        message = str(exc_info.value)
+        rc = agent_run.cmd_transcript(self._args(name))
+        assert rc == 0
+        captured = capsysbinary.readouterr()
+        assert captured.out == b""
+        message = captured.err.decode("utf-8")
         assert name in message
         assert "opencode" in message
         assert "ses_gone" in message
         assert str(db) in message
 
-    def test_skipped_only_store_exits_nonzero_with_skipped_count(
-        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path
+    def test_skipped_only_store_exits_zero_with_skipped_count_on_stderr(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, tmp_path, capsysbinary
     ):
         db = tmp_path / "opencode.db"
         _make_opencode_db(db)
@@ -1271,9 +1273,11 @@ class TestCmdTranscript:
             {"session_id": "ses_onlyskip", "harness": "opencode", "acquisition": "minted", "confidence": "certain"},
         )
 
-        with pytest.raises(SystemExit) as exc_info:
-            agent_run.cmd_transcript(self._args(name))
-        message = str(exc_info.value)
+        rc = agent_run.cmd_transcript(self._args(name))
+        assert rc == 0
+        captured = capsysbinary.readouterr()
+        assert captured.out == b""
+        message = captured.err.decode("utf-8")
         assert "1" in message
         assert "skip" in message.lower()
 

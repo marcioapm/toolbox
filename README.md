@@ -795,6 +795,34 @@ pre-existing key (`status`, `terminal`, `elapsed_s`, `log.*`, `git.*`,
 the run's persistent log dir, `session` is the parsed object; otherwise it is
 `null`.
 
+#### `watch --json` — additive `transcript` object
+
+`agent-run watch <name> --json` also gained an additive `transcript` field,
+alongside `scratch` and `hooks`:
+
+```json
+"transcript": {
+    "available": true,
+    "entries": 12,
+    "newest_age_s": 4.2,
+    "error": null
+}
+```
+
+`available` is `true` only when the harness's own conversation store was
+located, opened and queried successfully. Every decision field is `null`
+rather than `0` on failure — modeled on `scratch`'s `_scratch_unknown` rule —
+so a poller can never read a failed count as an observed empty transcript;
+`entries: 0` is trustworthy exactly because the failure paths never produce
+it. `error` is one of `no_session_json` (raw run — routine, not a warning),
+`no_session_id`, `unknown_harness`, `store_missing`, `store_locked`,
+`store_unreadable`, or `not_observed` (the payload default before observation
+runs). `entries` counts raw store records, not rendered transcript entries —
+for `opencode` this is `part` table rows before `_opencode_entry`'s filtering,
+so a count of `0` guarantees nothing renders, but a nonzero count does not
+guarantee anything does either. This block never raises past `watch`'s
+never-raise boundary; any read failure degrades to the unavailable form.
+
 #### `transcript` — the harness's own conversation record
 
 ```bash
@@ -821,10 +849,14 @@ Every store is opened strictly read-only — a live run may hold it open, and
 (`agent-run NAME -- <cmd>`) has no `session.json` and therefore no
 transcript; `transcript` exits non-zero naming the two alternatives (relaunch
 under `--harness`, or use `logs --clean` on the captured PTY log). Unparseable
-individual records are skipped and counted on stderr; a missing or unusable
-store is an error, and so is a store that opens and reads cleanly but yields
-zero entries for the session — both exit non-zero, so a caller can tell "no
-transcript" apart from ordinary success. A single tool result is
+individual records are skipped and counted on stderr. Exit status
+discriminates *availability*, not emptiness: a store that was located,
+opened and queried successfully exits **0** whether or not it holds any
+entries for this session — an empty result prints nothing on stdout and an
+explanatory note on stderr, so a caller can branch on "rc=0, blank stdout"
+to mean "available and empty" specifically, distinct from "no transcript to
+read at all" (raw run, unacquired session id, missing/unreadable store),
+which still exits non-zero. A single tool result is
 truncated at 40 lines / 4 KiB with a marker naming how much was dropped,
 independent of `--head`/`--tail`, which slice whole entries (not bytes) using
 the same defaults as `logs`. For `claude`, entries from the main session and

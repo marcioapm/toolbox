@@ -4992,9 +4992,17 @@ def cmd_transcript(args: argparse.Namespace) -> int:
     agent_run_transcript. Raw runs and any run whose session id was never
     acquired have nothing to read; exit non-zero naming the two
     alternatives rather than raising, since neither is a bug in this run.
-    An empty entry list is likewise an error, not a silent no-op: a caller
-    needs to tell "the store had nothing for this session" apart from
-    ordinary success.
+
+    Exit status discriminates *availability*, not emptiness: a store that
+    was located, opened and queried successfully exits 0 whether or not it
+    holds any entries for this session, printing nothing on stdout and an
+    explanatory note on stderr when it holds none. Emptiness is carried by
+    the absence of stdout output, not by the exit code -- a caller
+    (threadctl's drift tier) needs "the store is fine, this session just
+    has no records" (rc=0, blank stdout) distinguishable from "there is no
+    transcript to read at all" (rc!=0: raw run, unacquired session id,
+    unreadable/missing store), and those are different situations that a
+    single non-zero exit code could not tell apart.
     """
     from toolbox import agent_run_transcript as transcript
 
@@ -5016,32 +5024,29 @@ def cmd_transcript(args: argparse.Namespace) -> int:
             f"relaunch under --harness <name> for a transcript, or use 'agent-run logs {name} --clean'"
         )
 
-    try:
-        run_data = json.loads((log_dir / "run.json").read_text())
-    except (OSError, json.JSONDecodeError, ValueError):
-        run_data = {}
-    cwd = run_data.get("cwd") if isinstance(run_data, dict) else None
-    cwd = cwd if isinstance(cwd, str) else None
+    cwd = _run_json_cwd(log_dir)
     try:
         entries, skipped = transcript.read_transcript(harness, session_id, cwd)
     except transcript.TranscriptSourceError as exc:
         sys.exit(f"agent-run: {exc}")
 
     if not entries:
-        # An empty read and a broken pipeline both print nothing and exit 0
-        # unless this is an error: a caller (including threadctl) branching
-        # on exit status needs "no transcript" distinguishable from a
-        # transcript that happens to hold zero entries.
+        # The store was read successfully and holds nothing for this
+        # session: a legitimate, common outcome (e.g. the harness never
+        # received a prompt), not a caller-visible error. Note kept on
+        # stderr so blank stdout + rc=0 is unambiguous to a script.
         store = {
             "opencode": transcript.OPENCODE_DB_PATH,
             "claude": transcript.CLAUDE_PROJECTS_DIR,
             "codex": transcript.CODEX_SESSIONS_DIR,
         }.get(harness, "?")
         skipped_note = f", {skipped} record(s) skipped as unparseable" if skipped else ""
-        sys.exit(
+        print(
             f"agent-run: transcript for '{name}' ({harness}, session {session_id}) is empty "
-            f"(store: {store}{skipped_note})"
+            f"(store: {store}{skipped_note})",
+            file=sys.stderr,
         )
+        return 0
 
     if args.head is not None:
         entries = entries[: args.head]
