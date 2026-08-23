@@ -512,7 +512,7 @@ agent-run reap --dry-run                  # preview idle-kills + terminal-state 
 # Managed mode: agent-run builds the command, records the session id
 agent-run --harness claude --prompt 'Refactor X' build
 agent-run --harness opencode --model llmproxy-anthropic/claude-sonnet-4.6 --prompt 'Refactor X' build
-agent-run --harness codex --harness-arg -c --harness-arg model=o4-mini --prompt 'Refactor X' build
+agent-run --harness codex --model o4-mini --prompt 'Refactor X' build
 agent-run -i --harness claude --prompt 'Start task' chat   # interactive; steer after launch
 ```
 
@@ -632,8 +632,8 @@ All existing raw-mode launch forms keep working.
 --prompt TEXT                     inline prompt (mutually exclusive with --prompt-file)
 -f, --prompt-file PATH            read prompt from a file
 -i                                interactive/steerable (stays running; accepts steer)
---model MODEL                     model string forwarded to the harness
-                                  (not supported for codex; use --harness-arg -c model=<m>)
+--model MODEL                     model string forwarded verbatim to the harness; the
+                                  harness/provider must be configured to recognise it
 --agent-mode NAME                 harness agent/mode name (e.g. opencode --agent build)
 --permissions bypass|prompt       bypass (default): appends --permission-mode bypassPermissions
                                   or --auto; prompt: omits those flags so the harness's own
@@ -691,12 +691,19 @@ agent-run --harness opencode --model llmproxy-anthropic/claude-sonnet-4.6 \
           --prompt 'Refactor X' build
 
 # codex — mints a thread via app-server thread/start
-agent-run --harness codex --harness-arg -c --harness-arg model=o4-mini \
+agent-run --harness codex --model o4-mini \
           --prompt 'Refactor X' build
 
 # prompt from a file (works with any harness)
 agent-run --harness claude --prompt-file brief.md build
 ```
+
+`--model` is forwarded verbatim to every harness, including codex's
+`thread/start`; it is not validated against a known-model list. The harness
+must be configured to recognise the string (e.g. codex's `model_provider` in
+`~/.codex/config.toml`) — provider selection and auth are the operator's
+responsibility. `--harness-arg -c key=value` remains the escape hatch for
+other codex config keys.
 
 #### Interactive examples
 
@@ -711,7 +718,7 @@ agent-run -i --harness opencode \
           --prompt 'Start the task' chat
 
 # codex interactive (uses app-server turn/steer)
-agent-run -i --harness codex --harness-arg -c --harness-arg model=o4-mini \
+agent-run -i --harness codex --model o4-mini \
           --prompt 'Start the task' chat
 ```
 

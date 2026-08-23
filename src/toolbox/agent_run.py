@@ -8787,13 +8787,8 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         sys.exit(f"agent-run: prompt file not found: {prompt_file}")
     enable_planning: bool = bool(getattr(args, "enable_planning", False))
     enable_questions: bool = bool(getattr(args, "enable_questions", False))
-    # _parse_launch_argv rejects these too; repeated here because cmd_launch is
+    # _parse_launch_argv rejects this too; repeated here because cmd_launch is
     # also called with a hand-built Namespace, which bypasses the parser.
-    if harness == "codex" and getattr(args, "model", None):
-        sys.exit(
-            "agent-run: --model is not supported for --harness codex; "
-            "use --harness-arg -c model=<model> to set the model via codex config"
-        )
     if harness == "codex" and enable_planning:
         sys.exit(
             "agent-run: --enable-planning is unsupported for --harness codex; "
@@ -9127,6 +9122,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             if harness == "codex" else None
         ),
         managed_prompt=managed_prompt if is_managed else None,
+        managed_model=managed_model if is_managed else None,
         enable_planning=enable_planning,
         enable_questions=enable_questions,
         opencode_agent_mode=managed_agent_mode,
@@ -9607,6 +9603,7 @@ def _runner(
     managed_harness: Optional[str] = None,
     codex_appserver_args: Optional[List[str]] = None,
     managed_prompt: Optional[str] = None,
+    managed_model: Optional[str] = None,
     enable_planning: bool = False,
     enable_questions: bool = False,
     opencode_agent_mode: Optional[str] = None,
@@ -9865,6 +9862,7 @@ def _runner(
                 log_fd=log_fd,
                 ready=_ready,
                 acquire_log=log_dir / "session-acquire.log",
+                model=managed_model,
             )
         elif interactive:
             # Managed claude/opencode use the same PTY path as raw runs: the
@@ -11070,13 +11068,21 @@ class _CodexAppServer:
                 continue
         return frames, bool(lines), eof
 
-    def mint_thread(self, cwd: str) -> Optional[str]:
-        """Run initialize + thread/start and write session.json. Returns the thread id."""
+    def mint_thread(self, cwd: str, model: Optional[str] = None) -> Optional[str]:
+        """Run initialize + thread/start and write session.json. Returns the thread id.
+
+        ``model`` is forwarded verbatim in thread/start params when given; omitted
+        entirely (not sent as null) when None, so codex falls back to whatever
+        model_provider/model the operator's ~/.codex/config.toml selects.
+        """
         self.call("initialize", {
             "clientInfo": {"name": "codex_exec", "title": "agent-run", "version": "0"},
         })
         self.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
-        thread_rpc_id = self.call("thread/start", {"cwd": cwd})
+        thread_start_params: dict = {"cwd": cwd}
+        if model is not None:
+            thread_start_params["model"] = model
+        thread_rpc_id = self.call("thread/start", thread_start_params)
 
         deadline = time.monotonic() + _CODEX_APPSERVER_TIMEOUT
         while time.monotonic() < deadline and self.thread_id is None:
@@ -11097,9 +11103,10 @@ class _CodexAppServer:
                         break
                     self.thread_id = thread.get("id") or thread.get("sessionId")
                     if self.thread_id:
+                        model_suffix = f" model={model!r}" if model is not None else ""
                         self.log(
                             f"minted thread_id={self.thread_id!r} "
-                            f"rollout={thread.get('path', '?')!r}"
+                            f"rollout={thread.get('path', '?')!r}{model_suffix}"
                         )
                         _record_session(
                             self.log_dir, self.acquire_log, "codex",
@@ -11189,6 +11196,7 @@ def _run_managed_oneshot_codex_appserver(
     log_fd: int,
     ready: "callable",
     acquire_log: Path,
+    model: Optional[str] = None,
 ) -> int:
     """One-shot codex run: mint a thread, run one turn, stream its text to the log.
 
@@ -11202,7 +11210,7 @@ def _run_managed_oneshot_codex_appserver(
 
     exit_code = 1
     try:
-        thread_id = server.mint_thread(cwd)
+        thread_id = server.mint_thread(cwd, model=model)
 
         _write(state_dir / "status", "running\n")
         ready()
@@ -11281,6 +11289,7 @@ def _run_managed_interactive_codex_appserver(
     log_fd: int,
     ready: "callable",
     acquire_log: Path,
+    model: Optional[str] = None,
 ) -> int:
     """Interactive codex run: one long-lived app-server relaying steer input.
 
@@ -11305,7 +11314,7 @@ def _run_managed_interactive_codex_appserver(
     fifo_fd = _open_fifo_reader(state_dir / "stdin")
 
     try:
-        thread_id = server.mint_thread(cwd)
+        thread_id = server.mint_thread(cwd, model=model)
         if thread_id is None:
             _write(state_dir / "status", "running\n")
             ready()
@@ -11671,8 +11680,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--model",
         metavar="MODEL",
         default=argparse.SUPPRESS,
-        help="model string forwarded to the harness (not supported for codex; use "
-        "--harness-arg -c model=<m> instead)",
+        help="model string forwarded verbatim to the harness",
     )
     mg.add_argument(
         "--agent-mode",
@@ -12419,13 +12427,6 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
                         "Claude plan mode directly, bypassing the planning deny policy; use "
                         "--enable-planning to relax the policy instead"
                     )
-        # thread/start has no model field, so a forwarded --model would be
-        # silently ignored rather than applied.
-        if model is not None and harness == "codex":
-            raise _LaunchArgvError(
-                "agent-run: --model is not supported for --harness codex; "
-                "use --harness-arg -c model=<model> to set the model via codex config"
-            )
         if enable_planning and harness == "codex":
             raise _LaunchArgvError(
                 "agent-run: --enable-planning is unsupported for --harness codex; "
