@@ -11016,6 +11016,11 @@ _CODEX_APPSERVER_TIMEOUT = 20.0
 # Cap on the rendered thread/start error text stored in session.json's reason field.
 _THREAD_START_ERROR_REASON_MAX = 300
 
+# How long turn_start_error polls for a same-id turn/start response before
+# giving up and letting the caller's normal frame loop pick up a delayed one.
+_TURN_START_ERROR_POLL_SECONDS = 0.5
+
+
 _CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 
 
@@ -11405,6 +11410,10 @@ class _CodexAppServer:
         self.thread_id: Optional[str] = None
         self._buf = b""
         self._rpc_id = 0
+        # Frames consumed by turn_start_error while scanning for one specific
+        # rpc id, but not matching it -- requeued here so the caller's own
+        # frame loop still sees them on its next read_frames call.
+        self._pending_frames: list[dict] = []
 
     def log(self, message: str) -> None:
         _acquire_log_write(self.acquire_log, f"{self.tag}: {message}")
@@ -11469,15 +11478,20 @@ class _CodexAppServer:
 
         ``saw_lines`` is reported separately from the frame list so callers can
         tell "nothing arrived" from "a frame arrived but did not decode".
+        Frames requeued by turn_start_error are drained first, ahead of
+        anything newly read this call, preserving arrival order.
         """
+        requeued = self._pending_frames
+        if requeued:
+            self._pending_frames = []
         lines, self._buf, eof = _appserver_read_lines(self.out_fd, self._buf, timeout)
-        frames: list[dict] = []
+        frames: list[dict] = list(requeued)
         for line_bytes in lines:
             try:
                 frames.append(json.loads(line_bytes.decode("utf-8", errors="replace")))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
-        return frames, bool(lines), eof
+        return frames, bool(lines) or bool(requeued), eof
 
     def mint_thread(self, cwd: str, model: Optional[str] = None) -> Optional[str]:
         """Run initialize + thread/start and write session.json. Returns the thread id.
@@ -11549,6 +11563,34 @@ class _CodexAppServer:
             "threadId": self.thread_id,
             "input": [{"type": "text", "text": text}],
         }, rpc_id=rpc_id)
+
+    def turn_start_error(self, rpc_id: int, timeout_s: float = _TURN_START_ERROR_POLL_SECONDS) -> Optional[str]:
+        """Poll briefly for a turn/start response matching rpc_id, returning
+        its error message if the server rejected the turn, or None if it
+        succeeded, is still pending, or the process already exited.
+
+        turn/start otherwise has no matcher for its response frame: nothing
+        else notices a server-side rejection, so a lost turn looks identical
+        to one that is merely slow. Every frame read here -- including the
+        matching one, on a success -- is requeued onto self._pending_frames
+        so the caller's own frame loop still processes it (e.g. to capture
+        the turn id from a successful result) on its next read_frames call;
+        nothing is dropped.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.proc is not None and self.proc.poll() is not None:
+                return None
+            frames, _, eof = self.read_frames(0.05)
+            self._pending_frames.extend(frames)
+            for msg in frames:
+                if msg.get("id") == rpc_id and "error" in msg:
+                    return str(msg["error"])
+            if any(msg.get("id") == rpc_id for msg in frames):
+                return None
+            if eof:
+                return None
+        return None
 
     def steer_turn(self, text: str, expected_turn_id: str, rpc_id: Optional[int] = None) -> int:
         return self.call("turn/steer", {
@@ -11634,13 +11676,23 @@ def _run_managed_oneshot_codex_appserver(
 
         _write(state_dir / "status", "running\n")
         ready()
-        # The prompt goes out via turn/start below; mark it now so _finalize does
-        # not misclassify a codex failure as a launch failure.
-        _write(state_dir / "prompt_submitted", "1\n")
         if thread_id is None:
             return 1
 
         turn_rpc_id = server.start_turn(_managed_prompt_text(prompt, prompt_file))
+        # turn/start has no other matcher for its response frame; a fast
+        # server-side rejection (e.g. bad params) would otherwise sit
+        # unnoticed until the main loop's next frame, or be silently
+        # attributed to some other cause once turn_done never flips true.
+        early_error = server.turn_start_error(turn_rpc_id)
+        if early_error is not None:
+            server.log(f"turn/start rejected immediately: {early_error}")
+            return 1
+        # The turn is underway and was not rejected outright; mark the
+        # prompt delivered so _finalize does not misclassify a later
+        # failure as launch_failed. Transcript verification of the turn's
+        # actual content still happens uniformly through `watch`/`transcript`.
+        _write(state_dir / "prompt_submitted", "1\n")
 
         turn_done = False
         deadline = time.monotonic() + 600  # hard cap for a one-shot turn
@@ -11744,8 +11796,16 @@ def _run_managed_interactive_codex_appserver(
 
         _write(state_dir / "status", "running\n")
         ready()
-        # The prompt went out via turn/start; mark it so _finalize does not
-        # misclassify a failure as launch_failed.
+        # turn/start has no other matcher for its response frame; check for
+        # a fast server-side rejection before claiming the prompt landed.
+        early_error = server.turn_start_error(turn_rpc_id)
+        if early_error is not None:
+            server.log(f"turn/start rejected immediately: {early_error}")
+            return 1
+        # The prompt went out via turn/start and was not rejected outright;
+        # mark it so _finalize does not misclassify a later failure as
+        # launch_failed. Transcript verification of the turn's actual
+        # content still happens uniformly through `watch`/`transcript`.
         _write(state_dir / "prompt_submitted", "1\n")
 
         steer_buf = b""
@@ -11764,7 +11824,12 @@ def _run_managed_interactive_codex_appserver(
                     continue
                 break
 
-            if server.out_fd in readable:
+            # A frame requeued by turn_start_error sits in server._pending_frames
+            # until the next read_frames call; select() only reports out_fd
+            # readable on new socket data, so a pending frame with no new data
+            # behind it would otherwise stall until the app-server's next
+            # message, ignored by select above. Force it into this iteration.
+            if server.out_fd in readable or server._pending_frames:
                 frames, _, eof = server.read_frames(0)
                 for msg in frames:
                     msg_id = msg.get("id")

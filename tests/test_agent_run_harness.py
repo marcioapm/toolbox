@@ -1580,6 +1580,125 @@ class TestMintThreadModelParam:
 
 
 # ---------------------------------------------------------------------------
+# _CodexAppServer.turn_start_error: early rejection detection for turn/start
+# ---------------------------------------------------------------------------
+
+class TestTurnStartError:
+    def _server_pair(self, tmp_path: Path, monkeypatch, script: str) -> "agent_run._CodexAppServer":
+        """Spawn a fake codex app-server that performs the initialize
+        handshake, then runs *script* (already-indented Python source)."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()  # initialized\n"
+            + script
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        state_dir = tmp_path / "state"
+        log_dir = tmp_path / "log"
+        state_dir.mkdir()
+        log_dir.mkdir()
+        server = agent_run._CodexAppServer(state_dir, log_dir, log_dir / "acquire.log", "test")
+        assert server.start([], str(tmp_path), lambda: None)
+        # Perform the same initialize handshake mint_thread does, so the fake
+        # server's first real request is turn/start, matching the protocol
+        # order turn_start_error is used under in practice.
+        server.call("initialize", {"clientInfo": {"name": "test", "title": "test", "version": "0"}})
+        server.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            frames, saw_lines, _eof = server.read_frames(0.2)
+            if any(f.get("id") == 1 for f in frames):
+                break
+        return server
+
+    def test_turn_start_error_reports_rejection(self, tmp_path, monkeypatch):
+        """A turn/start response carrying an error is surfaced promptly."""
+        server = self._server_pair(
+            tmp_path, monkeypatch,
+            "msg = recv()  # turn/start\n"
+            "send({'id': msg['id'], 'error': {'code': -32602, 'message': 'bad turn params'}})\n"
+            "time.sleep(30)\n",
+        )
+        try:
+            rpc_id = server.start_turn("hello")
+            start = time.monotonic()
+            error = server.turn_start_error(rpc_id, timeout_s=5.0)
+            elapsed = time.monotonic() - start
+        finally:
+            server.close()
+        assert error is not None and "bad turn params" in error
+        assert elapsed < 5.0, f"turn_start_error took {elapsed:.1f}s, expected well under 5s"
+
+    def test_turn_start_error_returns_none_on_success(self, tmp_path, monkeypatch):
+        """A normal turn/start result is not mistaken for a rejection, and the
+        result frame remains available to the caller's own frame loop."""
+        server = self._server_pair(
+            tmp_path, monkeypatch,
+            "msg = recv()  # turn/start\n"
+            "send({'id': msg['id'], 'result': {'turn': {'id': 'turn-ok', 'status': 'inProgress'}}})\n"
+            "time.sleep(30)\n",
+        )
+        try:
+            rpc_id = server.start_turn("hello")
+            error = server.turn_start_error(rpc_id, timeout_s=5.0)
+            # The success frame must be requeued, not dropped.
+            frames, _, _ = server.read_frames(0.5)
+        finally:
+            server.close()
+        assert error is None
+        assert any(f.get("id") == rpc_id and "result" in f for f in frames)
+
+    def test_turn_start_error_none_when_still_pending(self, tmp_path, monkeypatch):
+        """A slow server that never responds within the poll window reports
+        None (unknown), not a false rejection."""
+        server = self._server_pair(
+            tmp_path, monkeypatch,
+            "recv()  # turn/start received but never answered\n"
+            "time.sleep(30)\n",
+        )
+        try:
+            rpc_id = server.start_turn("hello")
+            error = server.turn_start_error(rpc_id, timeout_s=0.3)
+        finally:
+            server.close()
+        assert error is None
+
+    def test_turn_start_error_requeues_unrelated_frames(self, tmp_path, monkeypatch):
+        """A delta frame arriving before the matching response is preserved
+        for the caller's frame loop rather than discarded."""
+        server = self._server_pair(
+            tmp_path, monkeypatch,
+            "msg = recv()  # turn/start\n"
+            "send({'method': 'item/agentMessage/delta', 'params': {'delta': 'stray'}})\n"
+            "send({'id': msg['id'], 'result': {'turn': {'id': 't', 'status': 'inProgress'}}})\n"
+            "time.sleep(30)\n",
+        )
+        try:
+            rpc_id = server.start_turn("hello")
+            error = server.turn_start_error(rpc_id, timeout_s=5.0)
+            frames, _, _ = server.read_frames(0.5)
+        finally:
+            server.close()
+        assert error is None
+        deltas = [agent_run._turn_delta_text(f) for f in frames]
+        assert "stray" in deltas
+
+
+# ---------------------------------------------------------------------------
 # Codex interactive: app-server JSON-RPC mint + turn/steer
 # ---------------------------------------------------------------------------
 
