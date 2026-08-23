@@ -3995,3 +3995,17 @@ class TestLaunchCreatesWorktree:
         branches = _git(repo, "branch", "--list")
         assert "explicit-branch-name" in branches
         assert "run-name-not-branch" not in branches
+
+    def test_nonexistent_worktree_repo_is_rejected(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        wt_dir = git_root / "wt-bad-repo"
+        args = _launch_args(
+            name="bad-repo", worktree=str(wt_dir), worktree_base="main",
+            worktree_repo=str(git_root / "no-such-repo"),
+        )
+
+        with pytest.raises(SystemExit, match="does not exist or is not a directory"):
+            agent_run.cmd_launch(args)
+
+        assert not wt_dir.exists()
