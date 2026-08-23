@@ -7086,6 +7086,14 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
     module journals worktree creation intent durably enough to survive that;
     recovering from it is a manual `git worktree remove` / `git branch -D`
     against the orphaned path this invocation would have printed.
+
+    ``--worktree-reuse`` validation (registered root, branch, detached-HEAD
+    checks) is a snapshot taken at preflight, not a lease: nothing here
+    prevents an external ``git switch``/``git worktree remove`` against the
+    same directory between this check and the runner forking. It is
+    advisory against concurrent external mutation, not a guarantee of
+    isolation -- a dedicated worktree (the default, non-reuse path) is what
+    actually isolates a run from concurrent activity elsewhere.
     """
     worktree_raw: Optional[str] = getattr(args, "worktree", None)
     reuse: bool = bool(getattr(args, "worktree_reuse", False))
@@ -12329,7 +12337,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="attach to an existing worktree directory (of the same --worktree-repo) or "
         "an existing --worktree-branch instead of failing; without this flag, an "
-        "existing DIR or branch is always a hard failure, never a silent attach",
+        "existing DIR or branch is always a hard failure, never a silent attach. "
+        "Validation runs once at preflight and is advisory: it does not prevent a "
+        "concurrent external git switch/worktree remove against DIR before the agent "
+        "starts. Use a dedicated (non-reuse) --worktree for isolation guarantees",
     )
     mg.add_argument(
         "--harness",
