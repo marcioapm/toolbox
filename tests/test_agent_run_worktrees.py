@@ -3745,7 +3745,7 @@ class TestLaunchCreatesWorktree:
         os.chdir(origin)
 
     def test_happy_path_creates_worktree_branch_and_launches(
-        self, isolated_runs_root, isolated_log_root, git_root
+        self, isolated_runs_root, isolated_log_root, git_root, capsys
     ):
         repo = _make_repo(git_root)
         wt_dir = git_root / "wt-happy"
@@ -3768,6 +3768,13 @@ class TestLaunchCreatesWorktree:
         branch_list = _git(repo, "branch", "--list", name)
         assert name in branch_list
 
+        # cmd_status must surface worktree_created in its user-visible line,
+        # not just leave it as a file only cmd_launch itself reads.
+        capsys.readouterr()  # discard cmd_launch's own stdout
+        agent_run.cmd_status(argparse.Namespace(name=name))
+        status_out = capsys.readouterr().out
+        assert f"worktree_created={resolved!r}" in status_out
+
         # The integration this feature exists for: the real classifier must
         # recognise the created directory as a linked worktree, exactly as
         # `reap --include-worktrees` and `du` would.
@@ -3775,6 +3782,88 @@ class TestLaunchCreatesWorktree:
         assert info.kind == agent_run._WORKTREE_LINKED
         assert info.common_dir is not None
         assert Path(info.common_dir).samefile(repo / ".git")
+
+    def test_worktree_dir_recorded_through_symlinked_ancestor_resolves_to_realpath(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """`state_dir/cwd` and `state_dir/worktree_created` must agree with
+        each other and with `os.path.realpath`, not the raw --worktree path
+        as typed. Uses an explicit symlink rather than relying on tmp_path
+        happening to already be symlink-resolved (it is, via macOS's
+        /var -> /private/var, which makes str(tmp_path) == realpath(tmp_path)
+        and so cannot distinguish the two)."""
+        repo = _make_repo(git_root)
+        real_parent = git_root / "real-parent"
+        real_parent.mkdir()
+        link_parent = git_root / "link-parent"
+        os.symlink(real_parent, link_parent)
+        wt_dir_via_link = link_parent / "wt"
+        name = "wt-symlinked-ancestor"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir_via_link), worktree_base="main",
+            worktree_repo=str(repo),
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+        state_dir = isolated_runs_root / name
+        _wait_terminal(state_dir)
+
+        expected = os.path.realpath(wt_dir_via_link)
+        assert expected == str(real_parent / "wt")  # actually resolved the symlink
+        cwd_recorded = (state_dir / "cwd").read_text().strip()
+        created_recorded = (state_dir / "worktree_created").read_text().strip()
+        assert cwd_recorded == expected
+        assert created_recorded == expected
+        assert cwd_recorded == created_recorded
+
+    def test_relative_worktree_and_worktree_repo_anchored_at_invocation_cwd(
+        self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch
+    ):
+        """A relative --worktree DIR (and --worktree-repo) must be resolved
+        against the invocation cwd (where agent-run was actually typed),
+        before --cwd/--worktree entry ever chdirs the process -- not some
+        other anchor such as the repo root."""
+        repo = _make_repo(git_root)
+        invocation_dir = tmp_path / "invocation-dir"
+        invocation_dir.mkdir()
+        monkeypatch.chdir(invocation_dir)
+        name = "wt-relative-paths"
+        args = _launch_args(
+            name=name, worktree="../wt-rel", worktree_base="main",
+            worktree_repo=str(Path("..") / git_root.name / repo.name),
+        )
+        # worktree_repo relative to invocation_dir must resolve to repo.
+        assert (invocation_dir / ".." / git_root.name / repo.name).resolve() == repo.resolve()
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+        _wait_terminal(isolated_runs_root / name)
+
+        expected_wt = (invocation_dir / ".." / "wt-rel").resolve()
+        assert expected_wt.is_dir()
+        assert agent_run._worktree_classify(expected_wt).kind == agent_run._WORKTREE_LINKED
+
+    def test_tilde_worktree_is_expanded(
+        self, isolated_runs_root, isolated_log_root, git_root, tmp_path, monkeypatch
+    ):
+        """--worktree ~/... must have ~ expanded, matching --cwd/--prompt-file."""
+        repo = _make_repo(git_root)
+        fake_home = tmp_path / "fake-home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        name = "wt-tilde"
+        args = _launch_args(
+            name=name, worktree="~/wt-tilde", worktree_base="main", worktree_repo=str(repo),
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+        _wait_terminal(isolated_runs_root / name)
+
+        expected_wt = fake_home / "wt-tilde"
+        assert expected_wt.is_dir()
+        assert agent_run._worktree_classify(expected_wt).kind == agent_run._WORKTREE_LINKED
 
     def test_missing_parent_directories_are_created_like_git_worktree_add(
         self, isolated_runs_root, isolated_log_root, git_root
@@ -3851,6 +3940,32 @@ class TestLaunchCreatesWorktree:
 
         assert exc.value.code == 2
         assert not (isolated_runs_root / "worktree-flag-alone").exists()
+
+    def test_reuse_attaches_to_existing_branch_when_dir_is_absent(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """--worktree-reuse with an existing branch but DIR absent must check
+        that branch out (not create a detached checkout at --worktree-base),
+        and this invocation did create the directory -- so worktree_created
+        must be written, even though the branch pre-existed."""
+        repo = _make_repo(git_root)
+        _git(repo, "branch", "pre-existing-branch", "main")
+        wt_dir = git_root / "wt-reuse-existing-branch"
+        name = "reuse-existing-branch"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main",
+            worktree_branch="pre-existing-branch", worktree_repo=str(repo),
+            worktree_reuse=True,
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+        state_dir = isolated_runs_root / name
+        _wait_terminal(state_dir)
+
+        assert _git(wt_dir, "rev-parse", "--abbrev-ref", "HEAD").strip() == "pre-existing-branch"
+        resolved = str(wt_dir.resolve())
+        assert (state_dir / "worktree_created").read_text().strip() == resolved
 
     def test_existing_directory_without_reuse_fails_and_is_untouched(
         self, isolated_runs_root, isolated_log_root, git_root
