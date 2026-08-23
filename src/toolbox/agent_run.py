@@ -7104,12 +7104,6 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
         args.cwd = str(worktree_dir)
         return None  # attached as-is; this invocation created nothing
 
-    parent = worktree_dir.parent
-    if not parent.is_dir():
-        sys.exit(f"agent-run: --worktree parent directory does not exist: {parent}")
-    if not os.access(parent, os.W_OK):
-        sys.exit(f"agent-run: --worktree parent directory is not writable: {parent}")
-
     if branch_exists:
         # --worktree-reuse attaching to a pre-existing branch: check it out
         # rather than creating it.

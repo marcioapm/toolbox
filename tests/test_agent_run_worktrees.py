@@ -3763,6 +3763,24 @@ class TestLaunchCreatesWorktree:
         assert info.common_dir is not None
         assert Path(info.common_dir).samefile(repo / ".git")
 
+    def test_missing_parent_directories_are_created_like_git_worktree_add(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """`git worktree add` creates missing parent directories on its own;
+        agent-run must not be stricter than the tool it wraps here."""
+        repo = _make_repo(git_root)
+        wt_dir = git_root / "deep" / "nested" / "wt"
+        name = "wt-deep-parent"
+        args = _launch_args(
+            name=name, worktree=str(wt_dir), worktree_base="main", worktree_repo=str(repo),
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+
+        _wait_terminal(isolated_runs_root / name)
+        assert agent_run._worktree_classify(wt_dir).kind == agent_run._WORKTREE_LINKED
+
     def test_worktree_and_cwd_are_mutually_exclusive(
         self, isolated_runs_root, isolated_log_root, git_root, tmp_path
     ):
