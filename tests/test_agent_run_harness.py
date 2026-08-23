@@ -2826,24 +2826,31 @@ class TestPreforkMintKillEscalationReapsChild:
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         fake_opencode = bin_dir / "opencode"
-        fake_opencode.write_text("#!/bin/sh\ntrap '' TERM\nsleep 60\n")
+        # A single-process fake: `exec sleep 60` replaces the shell's image
+        # in place, so the tracked pid has no forked descendant to leak if
+        # the assertions below fail before cleanup runs. TERM is ignored
+        # before the exec and stays ignored after (POSIX exec semantics),
+        # forcing the real timeout-then-kill escalation path.
+        fake_opencode.write_text("#!/bin/sh\ntrap '' TERM\nexec sleep 60\n")
         fake_opencode.chmod(0o755)
         monkeypatch.setenv("PATH", str(bin_dir) + ":" + os.environ.get("PATH", ""))
 
         real_popen = subprocess.Popen
+        real_kill = real_popen.kill
+        real_wait = real_popen.wait
         state = {"proc": None, "wait_calls": 0}
 
         def _popen_forces_wait_timeout(argv, *a, **kw):
             proc = real_popen(argv, *a, **kw)
             if argv and argv[0] == "opencode":
                 state["proc"] = proc
-                real_wait = proc.wait
+                proc_wait = proc.wait
 
                 def _wait_times_out_once(timeout=None):
                     state["wait_calls"] += 1
                     if state["wait_calls"] == 1:
                         raise subprocess.TimeoutExpired(argv, timeout)
-                    return real_wait(timeout=timeout)
+                    return proc_wait(timeout=timeout)
 
                 proc.wait = _wait_times_out_once
             return proc
@@ -2851,23 +2858,35 @@ class TestPreforkMintKillEscalationReapsChild:
         monkeypatch.setattr(subprocess, "Popen", _popen_forces_wait_timeout)
         monkeypatch.setattr(agent_run, "_opencode_health_poll", lambda *a, **k: False)
 
-        with pytest.raises(subprocess.TimeoutExpired):
-            agent_run._opencode_prefork_mint(
-                12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
-            )
+        try:
+            with pytest.raises(subprocess.TimeoutExpired):
+                agent_run._opencode_prefork_mint(
+                    12345, "test-run", str(tmp_path), tmp_path / "acquire.log",
+                )
 
-        proc = state["proc"]
-        assert proc is not None, "the temporary opencode process must have started"
-        assert state["wait_calls"] >= 2, (
-            "cleanup must call wait() again after kill() escalates, not just "
-            "once before the timeout"
-        )
-        assert proc.returncode is not None, (
-            "the direct child must be positively reaped after kill() -- "
-            "otherwise it lingers as a zombie"
-        )
-        with pytest.raises(ProcessLookupError):
-            os.kill(proc.pid, 0)
+            proc = state["proc"]
+            assert proc is not None, "the temporary opencode process must have started"
+            assert state["wait_calls"] >= 2, (
+                "cleanup must call wait() again after kill() escalates, not just "
+                "once before the timeout"
+            )
+            assert proc.returncode is not None, (
+                "the direct child must be positively reaped after kill() -- "
+                "otherwise it lingers as a zombie"
+            )
+            with pytest.raises(ProcessLookupError):
+                os.kill(proc.pid, 0)
+        finally:
+            proc = state["proc"]
+            if proc is not None and proc.returncode is None:
+                try:
+                    real_kill(proc)
+                except OSError:
+                    pass
+                try:
+                    real_wait(proc, timeout=5)
+                except (subprocess.TimeoutExpired, OSError, ValueError):
+                    pass
 
 
 class TestPreforkMintCleanupNotScopedToCallerException:
