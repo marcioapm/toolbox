@@ -366,3 +366,93 @@ class TestE2E2RollbackContract:
                 launcher.wait(timeout=10)
             _kill_and_reap(agent_pid)
             _kill_and_reap(runner_pid)
+
+
+# ---------------------------------------------------------------------------
+# E2E3: the prefork-mint boundary
+# ---------------------------------------------------------------------------
+
+_FAKE_OPENCODE_SCRIPT = """#!/bin/sh
+trap 'exit 0' TERM
+sleep 60 &
+echo $! > {pidfile}
+wait
+"""
+
+
+@live_only
+class TestE2E3PreforkMintBoundary:
+    """A managed opencode launch starts a real temporary child with the new
+    worktree as its cwd, before the ownership mark that gates rollback is
+    read by cmd_launch's except clause. An interrupt escaping the mint
+    cleanup path must still leave that live child, and the worktree it is
+    using, untouched.
+
+    The external `opencode` binary is substituted with a real shell script
+    that forks a real `sleep` descendant and never becomes healthy, so the
+    mint step blocks in its own real health-poll loop with a real process
+    tree in place -- only the far end of the process (an actual OpenCode
+    server) is faked; the fork, cwd, ownership mark and rollback refusal all
+    execute for real.
+    """
+
+    def test_interrupt_during_mint_cleanup_refuses_rollback_with_live_child(
+        self, isolated_runs_root, isolated_log_root, tmp_path
+    ):
+        repo = _make_repo(tmp_path, "repo-mint")
+        wt = tmp_path / "wt-mint"
+        name = "e2e3-mint-interrupt"
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        pidfile = tmp_path / "descendant.pid"
+        fake_opencode = bin_dir / "opencode"
+        fake_opencode.write_text(_FAKE_OPENCODE_SCRIPT.format(pidfile=pidfile))
+        fake_opencode.chmod(0o755)
+
+        argv = [
+            sys.executable, "-m", "toolbox.agent_run",
+            "--harness", "opencode", "--prompt", "hi",
+            "--worktree", str(wt), "--worktree-base", "main",
+            "--worktree-repo", str(repo),
+            name,
+        ]
+        env = dict(os.environ)
+        env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+        env["AGENT_RUN_STATE_DIR"] = str(isolated_runs_root)
+        env["AGENT_RUN_LOG_DIR"] = str(isolated_log_root)
+
+        launcher = subprocess.Popen(argv, env=env)
+        descendant_pid: Optional[int] = None
+        try:
+            _wait_for(pidfile.exists, 10.0, "fake opencode's sleep descendant pidfile")
+            descendant_pid = int(pidfile.read_text().strip())
+            assert descendant_pid > 0
+            try:
+                os.kill(descendant_pid, 0)
+            except ProcessLookupError:
+                pytest.fail(f"descendant pid {descendant_pid} died before the interrupt")
+
+            # The mint child is real and blocked in a real health-poll loop;
+            # give it a moment past the pidfile write to be certain the
+            # ownership mark (set immediately before Popen) is in place.
+            time.sleep(0.2)
+            launcher.send_signal(signal.SIGINT)
+            rc = launcher.wait(timeout=15)
+            assert rc != 0
+
+            try:
+                os.kill(descendant_pid, 0)
+            except ProcessLookupError:
+                pytest.fail("mint's live descendant must survive the interrupted cleanup")
+
+            assert wt.is_dir(), "worktree must survive an interrupted mint cleanup"
+            porcelain = _git(repo, "worktree", "list", "--porcelain")
+            assert str(wt.resolve()) in porcelain
+            assert name in _git(repo, "branch", "--list", name)
+        finally:
+            launcher.poll()
+            if launcher.returncode is None:
+                launcher.kill()
+                launcher.wait(timeout=10)
+            _kill_and_reap(descendant_pid)
