@@ -969,7 +969,36 @@ When hidden preserved logs exist, a one-line hint is printed to stderr
 `attach` always read the persistent log, falling back to the old
 single-directory layout for runs launched before the state/log split.
 
-### Reaping
+### Verified submission
+
+An interactive launch prompt and every `steer` are self-verifying: delivery
+is confirmed against the harness's own transcript record count (opencode's
+HTTP `/session/<id>/message` endpoint when a port is known, else the
+transcript store), not merely by a successful FIFO/HTTP write. `steer`
+prints `verified` and exits 0 only once the record count has risen above
+its pre-submit baseline; a submission that cannot be verified within
+`SUBMISSION_VERIFY_TIMEOUT_SECONDS` (default 10s) is retried once
+(`SUBMISSION_MAX_ATTEMPTS`, default 2) and, if still unverified, `steer`
+exits 1 with the reason on stderr and a launch prompt writes
+`state_dir/prompt_unverified` instead of stamping `prompt_submitted`.
+Override the timeout/attempt count with `AGENT_RUN_SUBMIT_VERIFY_TIMEOUT`
+and `AGENT_RUN_SUBMIT_ATTEMPTS`; `--raw` steer skips verification entirely
+(arbitrary bytes leave nothing in the transcript to witness). `opencode_port`
+records the port a managed interactive opencode run's HTTP API is
+listening on, so the witness can query it directly.
+
+`scripts/verify-submission.sh [--harness opencode|claude|codex] [--keep]`
+drives real installed harness binaries end to end (not the fakes the unit
+suite uses) to catch a harness upgrade that silently breaks submission —
+e.g. opencode renaming its message route, or a transcript store's on-disk
+layout changing. Run it after any change touching submission and whenever
+a new harness release lands. It prints a PASS/FAIL/SKIP table per harness
+plus opencode's HTTP contract checks, and cleans up every run and temp
+repo it creates unless `--keep`. A `FAIL` on `C3` (its anti-vacuity
+negative control) means verification is not actually gating the marker —
+treat that as the highest-priority failure in the table, since it means
+every other PASS in the same row may be meaningless.
+
 
 `agent-run reap` reconciles stale state and cleans up old runs in one pass:
 
