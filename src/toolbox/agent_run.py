@@ -11285,17 +11285,17 @@ def _opencode_prefork_mint(
     that would otherwise be left behind if the launcher is killed mid-poll.
 
     launch_args, when given, is the same Namespace cmd_launch reads for
-    ``_worktree_process_started``. It is set immediately before the ``Popen``
-    below -- the temporary process's cwd is the launch worktree -- and is
-    never cleared afterwards. Neither exit from ``Popen`` proves no process
+    ``_worktree_process_started``. It is set as the last statement before the
+    ``Popen`` below -- the temporary process's cwd is the launch worktree --
+    and is never cleared afterwards. Environment and policy construction run
+    before the mark: they can raise with no child in existence, and a worktree
+    nothing owns must still be rolled back. Neither exit from ``Popen`` proves no process
     holds the worktree: with a non-None cwd CPython forks before the parent
     closes descriptors and reads the exec-error pipe, so an ``OSError`` from
     those later steps can escape while the child is alive and unreaped.
     Reaping the direct child proves no more: a descendant inherits the
     worktree as cwd and can outlive that reap.
     """
-    if launch_args is not None:
-        launch_args._worktree_process_started = True
     mint_env = dict(os.environ)
     mint_env["OPENCODE_CONFIG_CONTENT"] = _opencode_policy_config(
         mint_env.get("OPENCODE_CONFIG_CONTENT"),
@@ -11304,6 +11304,10 @@ def _opencode_prefork_mint(
         opencode_agent_mode=opencode_agent_mode,
         extra_agent_names=extra_agent_names,
     )
+    # Last statement before the constructor that can create a process in the
+    # worktree; everything above it can still fail with nothing to own the tree.
+    if launch_args is not None:
+        launch_args._worktree_process_started = True
     try:
         proc = subprocess.Popen(
             ["opencode", "--port", str(port), "--auto"],
