@@ -11281,12 +11281,13 @@ def _opencode_prefork_mint(
     launch_args, when given, is the same Namespace cmd_launch reads for
     ``_worktree_process_started``. It is set immediately before the ``Popen``
     below -- the temporary process's cwd is the launch worktree -- and is
-    cleared only when ``Popen`` itself raises, proving no child was created.
-    Reaping the direct child does not prove its descendants are dead: a
-    descendant inherits the worktree as cwd and can outlive that reap, so a
-    successful wait must never clear the mark.
+    never cleared afterwards. Neither exit from ``Popen`` proves no process
+    holds the worktree: with a non-None cwd CPython forks before the parent
+    closes descriptors and reads the exec-error pipe, so an ``OSError`` from
+    those later steps can escape while the child is alive and unreaped.
+    Reaping the direct child proves no more: a descendant inherits the
+    worktree as cwd and can outlive that reap.
     """
-    mark_was_set = bool(getattr(launch_args, "_worktree_process_started", False))
     if launch_args is not None:
         launch_args._worktree_process_started = True
     mint_env = dict(os.environ)
@@ -11307,8 +11308,6 @@ def _opencode_prefork_mint(
         )
     except OSError as exc:
         _acquire_log_write(acquire_log, f"could not start opencode for mint: {exc}")
-        if launch_args is not None and not mark_was_set:
-            launch_args._worktree_process_started = False
         return None
 
     # SIGTERM/SIGINT/SIGHUP (the same set _runner's _on_signal handles) must kill
