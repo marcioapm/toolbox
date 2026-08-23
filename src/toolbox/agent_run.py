@@ -12755,6 +12755,10 @@ def _parse_launch_argv(raw: Sequence[str]) -> _LaunchArgv:
             if tokens[0] == name_:
                 if len(tokens) < 2:
                     raise _LaunchArgvError(f"agent-run: {name_} requires a value")
+                if tokens[1].startswith("--"):
+                    raise _LaunchArgvError(
+                        f"agent-run: {name_} requires a value, got the flag {tokens[1]!r}"
+                    )
                 worktree_flag, value, tokens = dest, tokens[1], tokens[2:]
                 break
             if tokens[0].startswith(name_ + "="):
