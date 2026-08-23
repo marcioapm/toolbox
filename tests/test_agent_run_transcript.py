@@ -251,6 +251,131 @@ class TestOpencodeReader:
 
 
 # ---------------------------------------------------------------------------
+# count_transcript
+# ---------------------------------------------------------------------------
+
+class TestCountTranscript:
+    def test_opencode_counts_raw_part_rows_and_finds_newest_time(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
+            parts=[{"type": "text", "text": "hi"}],
+        )
+        _opencode_insert(
+            db, message_id="m2", session_id="ses_1", role="assistant", time_created=2000,
+            parts=[{"type": "text", "text": "ok"}, {"type": "step-start"}],
+        )
+        count, newest = transcript.count_transcript("opencode", "ses_1", None)
+        # Two messages, three parts total (one is bookkeeping and would be
+        # filtered by read_transcript, but the raw count still includes it).
+        assert count == 3
+        assert newest is not None
+        entries, _ = transcript.read_transcript("opencode", "ses_1", None)
+        assert count >= len(entries)
+
+    def test_opencode_absent_session_counts_zero_with_no_newest(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        count, newest = transcript.count_transcript("opencode", "ses_nonexistent", None)
+        assert count == 0
+        assert newest is None
+
+    def test_opencode_missing_store_raises_source_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", tmp_path / "does-not-exist.db")
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("opencode", "ses_1", None)
+        assert exc_info.value.code == "store_missing"
+
+    def test_opencode_held_lock_raises_locked_code(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        locker = sqlite3.connect(db)
+        locker.execute("begin exclusive")
+        locker.execute("insert into message (id, session_id, time_created, data) values ('x', 'ses_1', 1, '{}')")
+        try:
+            with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+                transcript.count_transcript("opencode", "ses_1", None)
+            assert exc_info.value.code == "store_locked"
+        finally:
+            locker.rollback()
+            locker.close()
+
+    def test_opencode_corrupt_database_raises_unreadable_code(self, tmp_path, monkeypatch):
+        db = tmp_path / "garbage.db"
+        db.write_bytes(b"not a sqlite database")
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("opencode", "ses_1", None)
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_unknown_harness_raises_unknown_harness_code(self):
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("some-future-harness", "ses_1", None)
+        assert exc_info.value.code == "unknown_harness"
+
+    def test_claude_count_matches_read_transcript_entry_count(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        cwd = "/Users/x/proj"
+        session_id = "sess-count"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "hi"},
+                },
+                {
+                    "type": "assistant", "sessionId": session_id, "timestamp": "2026-08-16T00:00:01Z",
+                    "message": {"role": "assistant", "content": "hello back"},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("claude", session_id, cwd)
+        entries, _ = transcript.read_transcript("claude", session_id, cwd)
+        assert count == len(entries) == 2
+        assert newest == "2026-08-16T00:00:01Z"
+
+    def test_claude_missing_store_raises_store_missing_code(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("claude", "no-such-session", "/nonexistent/cwd")
+        assert exc_info.value.code == "store_missing"
+
+    def test_codex_count_matches_read_transcript_entry_count(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "count-session"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "timestamp": "2026-08-19T00:00:00Z", "type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                },
+                {
+                    "timestamp": "2026-08-19T00:00:01Z", "type": "response_item",
+                    "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hey"}]},
+                },
+            ],
+        )
+        count, newest = transcript.count_transcript("codex", session_id, None)
+        entries, _ = transcript.read_transcript("codex", session_id, None)
+        assert count == len(entries) == 2
+        assert newest == "2026-08-19T00:00:01Z"
+
+    def test_codex_missing_store_raises_store_missing_code(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_transcript("codex", "no-such-session", None)
+        assert exc_info.value.code == "store_missing"
+
+
+# ---------------------------------------------------------------------------
 # claude reader
 # ---------------------------------------------------------------------------
 

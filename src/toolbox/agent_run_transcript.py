@@ -35,7 +35,18 @@ CODEX_SESSIONS_DIR = Path(
 class TranscriptSourceError(Exception):
     """The harness store for a session could not be located or opened at
     all -- as opposed to an individual unparseable record, which readers
-    skip and count instead of raising."""
+    skip and count instead of raising.
+
+    ``code`` is one of the short snake_case discriminators the watch
+    contract's ``transcript.error`` field surfaces to a poller:
+    ``unknown_harness``, ``store_missing``, ``store_locked``,
+    ``store_unreadable``. Every raise site in this module sets it
+    explicitly; it defaults to ``store_unreadable`` only as a backstop.
+    """
+
+    def __init__(self, message: str, code: str = "store_unreadable") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass
@@ -122,11 +133,51 @@ def read_transcript(
     elif harness == "codex":
         entries, skipped = _read_codex(session_id)
     else:
-        raise TranscriptSourceError(f"unrecognised harness {harness!r} in session.json")
+        raise TranscriptSourceError(f"unrecognised harness {harness!r} in session.json", code="unknown_harness")
     for entry in entries:
         if entry.tool_output:
             entry.tool_output = _bound_tool_output(entry.tool_output)
     return entries, skipped
+
+
+def count_transcript(
+    harness: str, session_id: str, cwd: Optional[str]
+) -> tuple[int, Optional[str]]:
+    """Cheaply answer "how many records does this session's store hold,
+    and how fresh is the newest one" without materializing entries.
+
+    Raises ``TranscriptSourceError`` under the same conditions as
+    ``read_transcript`` (unknown harness, store missing, store unopenable,
+    store locked, store corrupt). Returns (record_count, newest_iso_
+    timestamp_or_None).
+
+    Counting semantics differ by harness and are NOT interchangeable with
+    ``read_transcript``'s rendered entry count:
+
+    - opencode counts raw `part` table rows via an indexed query, never
+      loading `part.data`/`message.data`. `_opencode_entry` filters some
+      parts out when rendering (bookkeeping types, blank text), so this
+      count is >= the count `read_transcript` would render for the same
+      session. A raw count of 0 guarantees a rendered count of 0; a
+      nonzero raw count does not guarantee anything renders. Callers may
+      treat 0 as "definitely nothing" and must not treat nonzero as
+      "definitely something renderable".
+    - claude/codex are file-backed JSONL with no index to count against
+      independently of parsing; counting cheaply would mean re-implementing
+      the readers' record-selection logic in parallel, so this calls the
+      existing reader and returns len(entries) directly. This is exact,
+      not an over-count, unlike opencode's raw count. Acceptable only
+      because these stores are per-session files, not a single store
+      shared by every run on the machine.
+    """
+    if harness == "opencode":
+        return _count_opencode(session_id)
+    elif harness == "claude":
+        return _count_claude(session_id, cwd)
+    elif harness == "codex":
+        return _count_codex(session_id)
+    else:
+        raise TranscriptSourceError(f"unrecognised harness {harness!r} in session.json", code="unknown_harness")
 
 
 def _iso_from_epoch_ms(value: Any) -> Optional[str]:
@@ -142,29 +193,64 @@ def _iso_from_epoch_ms(value: Any) -> Optional[str]:
 # opencode: SQLite at ~/.local/share/opencode/opencode.db
 # ---------------------------------------------------------------------------
 
-def _read_opencode(session_id: str) -> tuple[list[TranscriptEntry], int]:
-    """Read the `part`/`message` tables for one session.
+def _opencode_connect() -> sqlite3.Connection:
+    """Open the opencode store read-only with a non-blocking busy handler.
 
-    Opened read-only (`file:...?mode=ro`, `uri=True`): a live opencode run
-    holds this database open under WAL, and this reader must never write to
-    it or trigger a checkpoint. `part.data` carries the event; the joined
-    `message.data` supplies the role (user/assistant) and fallback
-    timestamp a `text`/`reasoning` part does not itself carry.
+    `file:...?mode=ro`, `uri=True`: a live opencode run holds this database
+    open under WAL, and no reader may write to it or trigger a checkpoint.
 
     `timeout=0` plus an explicit `PRAGMA busy_timeout=0` (the latter for
     SQLite builds where the connect-time timeout does not bind the busy
     handler) make a held write lock fail immediately instead of blocking
     for the default 5s: `mode=ro` stops this reader from writing, but it
     does not make lock acquisition non-blocking.
+
+    Raises TranscriptSourceError when the file does not exist or the
+    connection itself cannot be opened.
     """
     if not OPENCODE_DB_PATH.exists():
-        raise TranscriptSourceError(f"opencode session store not found at {OPENCODE_DB_PATH}")
+        raise TranscriptSourceError(f"opencode session store not found at {OPENCODE_DB_PATH}", code="store_missing")
     try:
         conn = sqlite3.connect(f"file:{OPENCODE_DB_PATH}?mode=ro", uri=True, timeout=0)
         conn.execute("pragma busy_timeout=0")
     except sqlite3.OperationalError as exc:
-        raise TranscriptSourceError(f"cannot open opencode session store at {OPENCODE_DB_PATH}: {exc}") from exc
+        raise TranscriptSourceError(
+            f"cannot open opencode session store at {OPENCODE_DB_PATH}: {exc}", code="store_unreadable"
+        ) from exc
+    return conn
 
+
+def _opencode_query_error(exc: sqlite3.Error) -> TranscriptSourceError:
+    """Classify a query-time sqlite3 error as a locked store (retryable by a
+    caller) versus an unreadable one (not).
+
+    sqlite3 in this Python version exposes no reliable error code on
+    OperationalError (sqlite_errorcode is CPython 3.11+ only and not
+    guaranteed populated), so "locked"/"busy" substring matching on the
+    lowercased message is the only portable way to tell a held write lock
+    apart from a broken store (e.g. a missing table) -- both raise
+    OperationalError. DatabaseError covers a file that opens but is not a
+    valid/complete sqlite database (mid-write copy, truncated backup): the
+    store as a whole is unusable, not one bad row.
+    """
+    if isinstance(exc, sqlite3.OperationalError):
+        message = str(exc).lower()
+        if "locked" in message or "busy" in message:
+            return TranscriptSourceError(
+                f"opencode session store at {OPENCODE_DB_PATH} is locked by another writer: {exc}",
+                code="store_locked",
+            )
+    return TranscriptSourceError(f"opencode session store unreadable: {exc}", code="store_unreadable")
+
+
+def _read_opencode(session_id: str) -> tuple[list[TranscriptEntry], int]:
+    """Read the `part`/`message` tables for one session.
+
+    `part.data` carries the event; the joined `message.data` supplies the
+    role (user/assistant) and fallback timestamp a `text`/`reasoning` part
+    does not itself carry.
+    """
+    conn = _opencode_connect()
     entries: list[TranscriptEntry] = []
     skipped = 0
     try:
@@ -187,28 +273,35 @@ def _read_opencode(session_id: str) -> tuple[list[TranscriptEntry], int]:
             entry = _opencode_entry(part, message)
             if entry is not None:
                 entries.append(entry)
-    except sqlite3.OperationalError as exc:
-        # sqlite3 in this Python version exposes no reliable error code on
-        # OperationalError (sqlite_errorcode is CPython 3.11+ only and not
-        # guaranteed populated), so "locked"/"busy" substring matching on
-        # the lowercased message is the only portable way to tell a held
-        # write lock apart from a broken store (e.g. a missing table) --
-        # both raise this same exception class.
-        message = str(exc).lower()
-        if "locked" in message or "busy" in message:
-            raise TranscriptSourceError(
-                f"opencode session store at {OPENCODE_DB_PATH} is locked by another writer: {exc}"
-            ) from exc
-        raise TranscriptSourceError(f"opencode session store unreadable: {exc}") from exc
-    except sqlite3.DatabaseError as exc:
-        # A file that opens but isn't a valid/complete sqlite database (mid-
-        # write copy, truncated backup): the store as a whole is unusable,
-        # not one bad row -- surface it as a source error rather than
-        # silently returning an empty transcript.
-        raise TranscriptSourceError(f"opencode session store unreadable: {exc}") from exc
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+        raise _opencode_query_error(exc) from exc
     finally:
         conn.close()
     return entries, skipped
+
+
+def _count_opencode(session_id: str) -> tuple[int, Optional[str]]:
+    """Count `part` rows for one session, using the `part_session_idx`
+    index on `session_id`, without loading or parsing any row's `data`.
+
+    This is the raw row count, not the count `read_transcript` would
+    render: `_opencode_entry` drops bookkeeping parts (patch/step-start/
+    step-finish/compaction) and blank text, so a nonzero raw count can
+    still render to zero entries. A raw count of 0 does guarantee a
+    rendered count of 0 -- nothing to filter if there is no row at all.
+    """
+    conn = _opencode_connect()
+    try:
+        cursor = conn.execute(
+            "select count(*), max(time_created) from part where session_id = ?",
+            (session_id,),
+        )
+        count, newest_raw = cursor.fetchone()
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+        raise _opencode_query_error(exc) from exc
+    finally:
+        conn.close()
+    return count, _iso_from_epoch_ms(newest_raw)
 
 
 def _opencode_entry(part: dict, message: dict) -> Optional[TranscriptEntry]:
@@ -287,7 +380,8 @@ def _claude_session_path(session_id: str, cwd: Optional[str]) -> Path:
         matches = []
     if not matches:
         raise TranscriptSourceError(
-            f"no claude session transcript found for session {session_id!r} under {CLAUDE_PROJECTS_DIR}"
+            f"no claude session transcript found for session {session_id!r} under {CLAUDE_PROJECTS_DIR}",
+            code="store_missing",
         )
     # The cwd-derived path missed (wrong or unknown cwd), so the filename
     # alone is the only lead -- and a filename collision across project
@@ -295,13 +389,15 @@ def _claude_session_path(session_id: str, cwd: Optional[str]) -> Path:
     verified = [path for path in matches if _claude_file_matches_session(path, session_id)]
     if not verified:
         raise TranscriptSourceError(
-            f"no claude session transcript found for session {session_id!r} under {CLAUDE_PROJECTS_DIR}"
+            f"no claude session transcript found for session {session_id!r} under {CLAUDE_PROJECTS_DIR}",
+            code="store_missing",
         )
     if len(verified) > 1:
         joined = ", ".join(str(path) for path in verified)
         raise TranscriptSourceError(
             f"ambiguous claude session transcript for session {session_id!r}: "
-            f"{len(verified)} candidates carry matching records: {joined}"
+            f"{len(verified)} candidates carry matching records: {joined}",
+            code="store_unreadable",
         )
     return verified[0]
 
@@ -327,14 +423,41 @@ def _read_claude(session_id: str, cwd: Optional[str]) -> "tuple[list[TranscriptE
     return _merge_claude_entries(sources), skipped
 
 
-def _parse_claude_timestamp(value: Optional[str]) -> Optional[datetime]:
-    """Parse a claude record timestamp to an aware UTC datetime.
+def _newest_entry_timestamp(entries: list[TranscriptEntry]) -> Optional[str]:
+    """Latest of the entries' own timestamps, reformatted to the same
+    ``%Y-%m-%dT%H:%M:%SZ`` shape ``_iso_from_epoch_ms`` produces, so a
+    caller comparing ages across harnesses gets a uniform format."""
+    parsed = [_parse_iso_timestamp(entry.time) for entry in entries]
+    present = [p for p in parsed if p is not None]
+    if not present:
+        return None
+    return max(present).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _count_claude(session_id: str, cwd: Optional[str]) -> tuple[int, Optional[str]]:
+    """Count claude transcript entries.
+
+    No index exists to count JSONL records without parsing them, and this
+    store is a per-session file rather than a store shared by every run on
+    the machine, so re-using the full reader and taking len(entries) is
+    cheap enough: calling the existing reader's locating logic
+    (_claude_session_path) plus its parse is the whole cost of a normal
+    `transcript` read, bounded by one session's file size, not the whole
+    store.
+    """
+    entries, _skipped = _read_claude(session_id, cwd)
+    return len(entries), _newest_entry_timestamp(entries)
+
+
+def _parse_iso_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """Parse a record timestamp (claude or codex; both store ISO-8601
+    strings) to an aware UTC datetime.
 
     A store quirk can leave one record's timestamp missing its offset
     while a neighbour's carries `Z`; `datetime.fromisoformat` happily
     returns a naive datetime for the former, and comparing that against an
-    aware one raises TypeError during the merge sort. A naive result is
-    assumed UTC (every claude timestamp this reader has seen is UTC, `Z`
+    aware one raises TypeError during a merge sort. A naive result is
+    assumed UTC (every claude/codex timestamp seen in practice is UTC, `Z`
     suffix or not) and given that tzinfo explicitly rather than discarded,
     since it still carries real ordering information.
     """
@@ -368,7 +491,7 @@ def _merge_claude_entries(sources: list[list[TranscriptEntry]]) -> list[Transcri
     """
     keyed: list[tuple[Optional[datetime], int, int, TranscriptEntry]] = []
     for file_index, entries in enumerate(sources):
-        own = [_parse_claude_timestamp(entry.time) for entry in entries]
+        own = [_parse_iso_timestamp(entry.time) for entry in entries]
         n = len(own)
 
         preceding_time: list[Optional[datetime]] = [None] * n
@@ -451,7 +574,7 @@ def _read_jsonl_objects(path: Path) -> tuple[list[dict], int]:
                 else:
                     skipped += 1
     except OSError as exc:
-        raise TranscriptSourceError(f"cannot read {path}: {exc}") from exc
+        raise TranscriptSourceError(f"cannot read {path}: {exc}", code="store_unreadable") from exc
     return records, skipped
 
 
@@ -592,7 +715,8 @@ def _read_codex(session_id: str) -> tuple[list[TranscriptEntry], int]:
         matches = []
     if not matches:
         raise TranscriptSourceError(
-            f"no codex session transcript found for session {session_id!r} under {CODEX_SESSIONS_DIR}"
+            f"no codex session transcript found for session {session_id!r} under {CODEX_SESSIONS_DIR}",
+            code="store_missing",
         )
     path = matches[0]
     records, skipped = _read_jsonl_objects(path)
@@ -657,6 +781,19 @@ def _read_codex(session_id: str) -> tuple[list[TranscriptEntry], int]:
                     TranscriptEntry(type="tool", harness="codex", time=timestamp, tool_name=None, tool_output=output_text)
                 )
     return entries, skipped
+
+
+def _count_codex(session_id: str) -> tuple[int, Optional[str]]:
+    """Count codex transcript entries.
+
+    Codex rollout files have no index and no cheap way to count records
+    without parsing the file, so this locates the file exactly as
+    `_read_codex` does and returns len(entries) from the full read. A
+    session's rollout file is bounded by that session's own history, not
+    by every run on the machine.
+    """
+    entries, _skipped = _read_codex(session_id)
+    return len(entries), _newest_entry_timestamp(entries)
 
 
 # ---------------------------------------------------------------------------
