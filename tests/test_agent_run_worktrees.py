@@ -4061,6 +4061,30 @@ class TestLaunchCreatesWorktree:
         assert (state_dir / "cwd").read_text().strip() == str(wt.resolve())
         assert not (state_dir / "worktree_created").exists()
 
+    def test_reuse_accepts_a_branch_shadowed_by_a_same_named_tag(
+        self, isolated_runs_root, isolated_log_root, git_root
+    ):
+        """M1: `git symbolic-ref --quiet --short HEAD` returns the shortest
+        *unambiguous* name, which is "heads/release" rather than "release"
+        whenever a tag named "release" also exists -- a legitimate reuse of
+        a worktree genuinely on branch "release" must not be refused just
+        because a same-named tag happens to exist."""
+        repo = _make_repo(git_root)
+        wt = _add_worktree(repo, git_root / "wt-shadowed", "release")
+        _git(repo, "tag", "release")
+        name = "shadowed-branch-reuse"
+        args = _launch_args(
+            name=name, worktree=str(wt), worktree_base="main",
+            worktree_branch="release", worktree_repo=str(repo), worktree_reuse=True,
+        )
+
+        rc = agent_run.cmd_launch(args)
+        assert rc == 0
+
+        state_dir = isolated_runs_root / name
+        assert _wait_terminal(state_dir) == "done"
+        assert (state_dir / "cwd").read_text().strip() == str(wt.resolve())
+
     def test_reuse_rollback_on_launch_failure_never_removes_the_worktree(
         self, isolated_runs_root, isolated_log_root, git_root
     ):

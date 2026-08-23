@@ -7204,14 +7204,21 @@ def _create_launch_worktree(args: argparse.Namespace) -> Optional[_CreatedWorktr
         # while silently running on whatever branch happens to be checked out
         # is exactly the cross-contamination this feature exists to prevent.
         # A detached HEAD is rejected outright rather than guessed at.
-        branch_probe = _watch_run_git_checked(worktree_dir, ["symbolic-ref", "--quiet", "--short", "HEAD"])
-        current_branch = branch_probe.stdout.strip() if branch_probe.stdout is not None else None
-        if current_branch is None:
+        # Comparison uses the full ref, not --short: --short returns the
+        # shortest *unambiguous* name, which is "heads/<branch>" whenever a
+        # tag shares the branch's name, breaking equality against a bare
+        # branch name for no reason visible to the operator. Same form
+        # _worktree_branch_checked_out already uses for this reason.
+        branch_probe = _watch_run_git_checked(worktree_dir, ["symbolic-ref", "--quiet", "HEAD"])
+        current_ref = branch_probe.stdout.strip() if branch_probe.stdout is not None else None
+        if current_ref is None:
             sys.exit(
                 f"agent-run: --worktree {worktree_dir} has a detached HEAD; "
                 f"refusing to attach with --worktree-reuse"
             )
-        if current_branch != branch:
+        target_ref = f"refs/heads/{branch}"
+        if current_ref != target_ref:
+            current_branch = current_ref.removeprefix("refs/heads/")
             sys.exit(
                 f"agent-run: --worktree {worktree_dir} is on branch {current_branch!r}, "
                 f"not {branch!r}; refusing to attach with --worktree-reuse"
