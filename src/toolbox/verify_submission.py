@@ -595,6 +595,18 @@ def _cleanup() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _uniform_row(
+    harness: str, version: str, verdict: str, state: _State
+) -> _HarnessRow:
+    """Return a row where all four cells share the same verdict and count it."""
+    row = _HarnessRow(
+        harness=harness, version=version, c1=verdict, c2=verdict, c3=verdict, c4=verdict
+    )
+    for v in (row.c1, row.c2, row.c3, row.c4):
+        state.count(v)
+    return row
+
+
 def _run_harness_version(harness: str, version_file: str) -> int:
     """Write harness --version output to version_file; return exit code or 124."""
     with open(version_file, "w") as fh:
@@ -621,17 +633,7 @@ def run_harness_cells(
 
     if not shutil.which(harness):
         _log(f"harness '{harness}' not installed — SKIP")
-        row = _HarnessRow(
-            harness=harness,
-            version="-",
-            c1="SKIP(not installed)",
-            c2="SKIP(not installed)",
-            c3="SKIP(not installed)",
-            c4="SKIP(not installed)",
-        )
-        for v in (row.c1, row.c2, row.c3, row.c4):
-            state.count(v)
-        return row
+        return _uniform_row(harness, "-", "SKIP(not installed)", state)
 
     version_file = os.path.join(work_dir, f"{harness}-version.txt")
     version_rc = _run_bounded(
@@ -650,32 +652,12 @@ def run_harness_cells(
         _log(
             f"harness '{harness}' --version did not answer within {_VERSION_PROBE_LIMIT}s — FAIL"
         )
-        row = _HarnessRow(
-            harness=harness,
-            version="unresponsive",
-            c1="FAIL(version hung)",
-            c2="FAIL(version hung)",
-            c3="FAIL(version hung)",
-            c4="FAIL(version hung)",
-        )
-        for v in (row.c1, row.c2, row.c3, row.c4):
-            state.count(v)
-        return row
+        return _uniform_row(harness, "unresponsive", "FAIL(version hung)", state)
     if version_rc != 0:
         _log(
             f"harness '{harness}' --version exited {version_rc} — FAIL: {version_line}"
         )
-        row = _HarnessRow(
-            harness=harness,
-            version="broken",
-            c1=f"FAIL(version rc={version_rc})",
-            c2=f"FAIL(version rc={version_rc})",
-            c3=f"FAIL(version rc={version_rc})",
-            c4=f"FAIL(version rc={version_rc})",
-        )
-        for v in (row.c1, row.c2, row.c3, row.c4):
-            state.count(v)
-        return row
+        return _uniform_row(harness, "broken", f"FAIL(version rc={version_rc})", state)
 
     _log(f"=== harness={harness} version={version_line} run={run_name} ===")
 
@@ -684,17 +666,7 @@ def run_harness_cells(
     _init_test_repo(repo_dir)
     if harness == "claude" and not _claude_trust_dir(os.path.realpath(repo_dir)):
         _log("C1 FAIL: could not pre-trust the temp repo for claude")
-        row = _HarnessRow(
-            harness=harness,
-            version=version_line,
-            c1="FAIL(claude trust failed)",
-            c2="FAIL(claude trust failed)",
-            c3="FAIL(claude trust failed)",
-            c4="FAIL(claude trust failed)",
-        )
-        for v in (row.c1, row.c2, row.c3, row.c4):
-            state.count(v)
-        return row
+        return _uniform_row(harness, version_line, "FAIL(claude trust failed)", state)
 
     sentinel1 = f"SENTINEL1_{harness}_{os.getpid()}"
     sentinel2 = f"SENTINEL2_{harness}_{os.getpid()}"
@@ -796,8 +768,8 @@ def run_harness_cells(
 
     if c1 == "PASS":
         _kill_run_and_wait(run_name)
-    state.count(c2)
     state.count(c1)
+    state.count(c2)
 
     # --- C3: anti-vacuity negative control -----------------------------------
     c3_run = f"{run_name}-neg"
