@@ -94,17 +94,6 @@ def test_main_rejects_invalid_submit_mode(mode):
         agent_run.main([f"--submit-mode={mode}", "run", "opencode"])
 
 
-def test_prompt_submission_writes_use_selected_sequence():
-    assert agent_run._prompt_submission_writes(b"prompt", agent_run.SUBMIT_MODE_CRLF) == (
-        b"prompt\r\n",
-        b"\r\n",
-    )
-    assert agent_run._prompt_submission_writes(b"prompt", agent_run.SUBMIT_MODE_CR) == (
-        b"prompt\r",
-        b"\r",
-    )
-
-
 def _seed_live_interactive_run(root: Path, name: str, mode: str) -> tuple[Path, int]:
     state = root / name
     state.mkdir()
@@ -201,10 +190,7 @@ def test_steer_unverified_exits_nonzero_and_writes_no_marker(
 def test_raw_interactive_launch_still_stamps_prompt_submitted(
     isolated_runs_root, isolated_log_root, tmp_path
 ):
-    """A raw interactive run (`agent-run -i -f prompt.txt name -- <cmd>`) has
-    no session.json and so no witness. Verification must not turn a
-    documented mode into one whose prompt is never marked delivered: the
-    marker keeps its original "bytes written" meaning here."""
+    """An unmanaged launch stamps delivery after a successful prompt write."""
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("hello from a raw run\n")
     name = "raw-prompt-marker"
@@ -618,11 +604,8 @@ def test_teardown_deduplicates_and_reaps_tracked_children(tmp_path, monkeypatch)
 # _submit_and_verify: the verified-submission witness + retry helper
 # ---------------------------------------------------------------------------
 
-def _witness_sequence(monkeypatch, counts: list) -> list:
-    """Patch the pinned witness source to return successive values from
-    *counts* (repeating the last value once exhausted) and return the list
-    of (state_dir, log_dir) argument pairs it was called with, for callers
-    that want to assert call counts."""
+def _witness_sequence(monkeypatch, counts: list) -> None:
+    """Return successive witness counts, repeating the last after exhaustion."""
     calls: list = []
 
     def fake(state_dir, log_dir):
@@ -634,7 +617,6 @@ def _witness_sequence(monkeypatch, counts: list) -> list:
         return agent_run._WitnessSource("fake", count)
 
     monkeypatch.setattr(agent_run, "_resolve_witness_source", fake)
-    return calls
 
 
 def _witness_counter(monkeypatch, count: "callable") -> None:

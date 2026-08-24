@@ -1149,9 +1149,7 @@ LAUNCH_ERROR_MAX_CHARS = 500
 
 PROMPT_UNSUBMITTED_ERROR = "agent exited before its prompt file was submitted"
 
-# The interactive prompt helper waits this long for the TUI to enter raw mode
-# before submitting; it also bounds how late an unsubmitted prompt still counts
-# as a launch failure.
+# Delay initial TUI submission until raw mode is active.
 PROMPT_SUBMISSION_DELAY_SECONDS = 4.0
 
 # Submission verification (launch prompt + steer): total time budget across
@@ -2467,12 +2465,6 @@ def _persist_submit_mode(
     mode = override or _submit_mode_for_argv(argv)
     _write(state_dir / "submit_mode", mode + "\n")
     return mode
-
-
-def _prompt_submission_writes(data: bytes, mode: str) -> tuple[bytes, bytes]:
-    """Return the two FIFO writes used to submit an initial prompt file."""
-    submit = _submit_bytes(mode)
-    return data + submit, submit
 
 
 # ---------------------------------------------------------------------------
@@ -4430,15 +4422,10 @@ def _opencode_http_message_count(port: int, session_id: str) -> Optional[int]:
 
 
 class _WitnessSource:
-    """One pinned place to count this run's user records.
+    """A user-record counter pinned for one verification call.
 
-    Resolved once per _submit_and_verify call and never re-resolved: mixing
-    two sources within one verification compares counts that measure
-    different things (opencode's HTTP endpoint reports single-digit user
-    messages, the transcript store hundreds of records), which would let a
-    read from the second source look like a rise over the first's baseline.
-    A pinned source that stops answering is an unreadable witness, never a
-    reason to consult another one.
+    Counts from different sources are not comparable, so a read failure never
+    causes fallback to another source.
     """
 
     def __init__(self, name: str, count: Callable[[], Optional[int]]) -> None:
@@ -4492,21 +4479,6 @@ def _transcript_user_count(harness: str, session_id: str, cwd: Optional[str]) ->
     return count
 
 
-def _submission_witness_count(state_dir: Path, log_dir: Optional[Path]) -> Optional[int]:
-    """User-record count for the run's session from its pinned witness
-    source, or None when the run has no witness or the source is
-    unreadable.
-
-    Resolves the source per call, so it is only for a one-off read;
-    _submit_and_verify pins one _WitnessSource for the whole verification
-    instead.
-    """
-    source = _resolve_witness_source(state_dir, log_dir)
-    if source is None:
-        return None
-    return source.user_count()
-
-
 @dataclass(frozen=True)
 class SubmissionOutcome:
     """Result of one _submit_and_verify call. verified=False always carries
@@ -4534,13 +4506,6 @@ class _SubmissionRejected(Exception):
     submission outright, distinct from a low-level transport failure.
     _submit_and_verify treats this as immediate and non-retryable: an
     explicit rejection is not evidence a resend might succeed."""
-
-
-def _run_is_managed(log_dir: Optional[Path]) -> bool:
-    """True when the run was launched under --harness and therefore has a
-    harness session, and so a transcript store, to witness against. A raw
-    run (`agent-run NAME -- <cmd>`) never produces session.json."""
-    return log_dir is not None and _read_session_json(log_dir) is not None
 
 
 def _submit_via_http(port: int, session_id: str, text: str) -> None:
@@ -4640,57 +4605,12 @@ def _submit_and_verify(
     transport: Optional[str] = None,
     fresh_session: bool = False,
 ) -> SubmissionOutcome:
-    """Submit *text* and confirm a new user record appeared in the session,
-    resubmitting up to max_attempts times on a verified timeout.
+    """Submit text and verify that the pinned witness gained a user record.
 
-    The witness source is resolved once, before the baseline, and pinned for
-    the whole call; only user-role records are counted, so an assistant
-    reply or a tool call in the current turn can never be mistaken for a
-    delivered prompt. An unmanaged run has no session to witness against and
-    returns ``detail="unwitnessed"`` with ``delivered=True`` after one
-    successful write.
-
-    *fresh_session* declares that this session was minted by this launch and
-    held no records before this submission. Only then can an unreadable
-    baseline be upgraded to proof by a later readable, nonzero count. A
-    steer runs against an established session whose history predates it, so
-    it must pass fresh_session=False and reports ``witness_unreadable``
-    instead.
-
-    *submit*, when given, replaces the built-in HTTP/keystroke transports
-    entirely -- callers with a non-file, non-HTTP channel (codex's
-    JSON-RPC ``turn/start``) supply their own send function instead of a
-    third transport branch here. It may raise ``_SubmissionRejected`` for
-    an outright, non-retryable refusal (e.g. an RPC error response),
-    returned immediately as ``detail="rejected: ..."`` without waiting out
-    deadline_s or consuming further attempts, or ``OSError`` for a
-    transport failure treated like the built-in transports' own failures
-    (retried on the next attempt). *transport* names the resulting
-    SubmissionOutcome.transport; defaults to "rpc" when *submit* is given.
-    submit_mode is ignored when *submit* is given.
-
-    A witness that stays unreadable for an entire attempt stops the loop at
-    one submission regardless of max_attempts: an unreadable store carries
-    no evidence the submission failed, so retrying cannot add information
-    and risks a real duplicate prompt (messageID is not idempotent). Only a
-    witness that is readable but flat -- proof the user-record count truly
-    did not rise -- earns a retry. The one exception is a keystroke retry
-    whose payload is the submit terminator alone: carrying no prompt text,
-    it cannot duplicate anything, and a swallowed launch prompt is itself a
-    reason the harness has not yet created a transcript to read. Because no
-    transport here offers idempotent submission, a submission that lands
-    between the final read and the resend is still duplicated; the pre-send
-    re-check narrows that window without closing it.
-
-    Never raises for a submission failure: an unreadable witness, a
-    transport failure, or exhausted attempts all surface as
-    SubmissionOutcome.verified=False with a reason in .detail -- a
-    verification bug must not kill an otherwise working run. A TimeoutError
-    from a caller's own watchdog (cmd_steer's SIGALRM) propagates.
-
-    text carries no submit-sequence framing; the keystroke transport frames
-    each attempt itself (see _keystroke_payload), HTTP submits text verbatim
-    as the message body.
+    Only a fresh session can prove delivery from a nonzero count after an
+    unreadable baseline. An unreadable witness permits no retry except the
+    keystroke ladder's terminator-only second attempt. A custom *submit* may
+    reject immediately or raise OSError; out-of-band TimeoutError propagates.
     """
     if submit is not None:
         transport = transport or "rpc"
@@ -11060,10 +10980,7 @@ def _run_interactive(
             os._exit(127)
     # Full interactive relay is now established: PTY forked and keeper holds
     # FIFO open.  Finish the descriptor setup before declaring readiness.
-    # If a prompt file was provided, fork a helper that waits for the TUI to
-    # finish initializing (so the PTY is in raw mode and Enter is recognized),
-    # then writes the prompt + selected Enter sequence to the FIFO so the agent
-    # human had typed it. Same pattern as `agent-run steer`.
+    # Fork a helper that waits for raw mode, then submits and verifies the prompt.
     if prompt_file:
         with _block_handled_runner_signals():
             helper = os.fork()

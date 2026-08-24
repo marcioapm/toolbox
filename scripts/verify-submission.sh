@@ -71,6 +71,10 @@ export AGENT_RUN_STATE_DIR="$STATE_DIR"
 export AGENT_RUN_LOG_DIR="$LOG_DIR"
 
 RUN_MODEL="${VERIFY_SUBMISSION_MODEL:-}"
+MODEL_ARGS=()
+if [ -n "$RUN_MODEL" ]; then
+  MODEL_ARGS=(--model "$RUN_MODEL")
+fi
 
 LAUNCHED_RUNS=()
 TEMP_REPOS=()
@@ -133,7 +137,7 @@ cleanup() {
   local run
   for run in "${LAUNCHED_RUNS[@]:-}"; do
     [ -z "$run" ] && continue
-    agent_run kill "$run" >/dev/null 2>&1 || true
+    kill_run "$run"
   done
   # Give TERM a moment before the temp dirs (and their FIFOs/sockets) vanish
   # under a still-tearing-down runner.
@@ -178,9 +182,8 @@ OVERALL_FAIL=0
 OVERALL_CHECKS=0
 OVERALL_SKIPS=0
 
-# Longest any single wait_for predicate may run before it is killed and the
-# round counts as unsatisfied. Comfortably above a healthy store read or
-# --max-time-bounded curl, far below any wait_for's own timeout.
+# Caps one blocking predicate invocation. Shorter waits may overrun their
+# nominal timeout by up to this bound.
 WAIT_FOR_PREDICATE_LIMIT_SECONDS=15
 # Longest `<harness> --version` may take. A shim that sleeps forever must be
 # reported as a broken harness, not left to block the whole run.
@@ -188,12 +191,8 @@ HARNESS_VERSION_PROBE_SECONDS=15
 
 log() { echo "verify-submission: $*" >&2; }
 
-# run_bounded <limit_s> <cmd...>: run cmd under a wall-clock bound.
-# Exits with the command's own status, or 124 if the bound elapsed first.
-# timeout(1) is not present on a stock macOS, so the bound is enforced with
-# a background child and a polled wait. The kill path silences bash's own
-# "Terminated" job notice; the command's stdout and stderr pass through
-# untouched either way.
+# Run a command under a wall-clock bound, returning 124 when it elapses.
+# Stock macOS lacks timeout(1), so use a background child and polled wait.
 #
 # Redirect this to a file rather than capturing it with $(...): killing the
 # child does not reap a grandchild it spawned, and a surviving grandchild
@@ -230,8 +229,12 @@ init_test_repo() {
 }
 
 kill_run_and_wait() {
-  agent_run kill "$1" >/dev/null 2>&1 || true
+  kill_run "$1"
   sleep 0.3
+}
+
+kill_run() {
+  agent_run kill "$1" >/dev/null 2>&1 || true
 }
 
 # wait_for <timeout_s> <poll_interval_s> <description> <cmd...>
@@ -320,6 +323,24 @@ post_json() {
     "$@" "$url" 2>/dev/null
 }
 
+file_nonempty() { [ -s "$1" ]; }
+
+submission_verdict_exists() {
+  [ -f "$1/prompt_submitted" ] || [ -f "$1/prompt_unverified" ]
+}
+
+submission_verified() {
+  [ -f "$1/prompt_submitted" ] && [ ! -f "$1/prompt_unverified" ]
+}
+
+run_is_running() {
+  grep -qx running "$1/status" 2>/dev/null
+}
+
+url_answers() {
+  curl -fsS --max-time 2 -o /dev/null "$1" 2>/dev/null
+}
+
 # message_count <url>: number of message records at a /session/{id}/message URL,
 # or -1 when the response is not a JSON array (unreachable server, error body).
 message_count() {
@@ -334,10 +355,7 @@ else:
 ' 2>/dev/null || echo -1
 }
 
-# distinct_user_messages_containing <url> <text_a> <text_b>: how many of the
-# two texts appear in a user-role message, counting each message id at most
-# once. 2 means the duplicated messageID produced two separate records rather
-# than one deduplicated or overwritten one.
+# Count per-text user-message matches, deduplicated by message id for each text.
 distinct_user_messages_containing() {
   curl -sS --max-time 5 "$1" 2>/dev/null | TEXT_A="$2" TEXT_B="$3" python3 -c '
 import json, os, sys
@@ -392,6 +410,12 @@ record_row() {
   RESULTS_C4+=("$6")
 }
 
+record_uniform_harness_row() {
+  local harness="$1" version="$2" result="$3" _
+  record_row "$harness" "$version" "$result" "$result" "$result" "$result"
+  for _ in 1 2 3 4; do count_check "$result"; done
+}
+
 count_check() {
   # $1 = PASS/FAIL/SKIP(...)
   case "$1" in
@@ -405,6 +429,23 @@ set_all_http_results() {
   local result="$1" _
   H_RESULTS=("$result" "$result" "$result" "$result" "$result")
   for _ in 1 2 3 4 5; do count_check "$result"; done
+}
+
+fail_http_contract() {
+  local message="$1" run_name="${2:-}"
+  log "$message; all of H1-H5 FAIL"
+  set_all_http_results "FAIL"
+  [ -z "$run_name" ] || kill_run "$run_name"
+}
+
+launch_interactive_run() {
+  local repo_dir="$1" harness="$2" run_name="$3" prompt="$4"
+  if agent_run --cwd "$repo_dir" --harness "$harness" -i --prompt "$prompt" \
+      ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} "$run_name" >/dev/null 2>&1; then
+    LAUNCHED_RUNS+=("$run_name")
+    return 0
+  fi
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -422,12 +463,7 @@ run_harness_cells() {
 
   if ! command -v "$harness" >/dev/null 2>&1; then
     log "harness '$harness' not installed — SKIP"
-    record_row "$harness" "-" "SKIP(not installed)" "SKIP(not installed)" \
-      "SKIP(not installed)" "SKIP(not installed)"
-    count_check "SKIP"
-    count_check "SKIP"
-    count_check "SKIP"
-    count_check "SKIP"
+    record_uniform_harness_row "$harness" "-" "SKIP(not installed)"
     return 0
   fi
 
@@ -442,16 +478,12 @@ run_harness_cells() {
   version="$(head -1 "$version_file" 2>/dev/null | tr -d '\r')"
   if [ "$version_rc" -eq 124 ]; then
     log "harness '$harness' --version did not answer within ${HARNESS_VERSION_PROBE_SECONDS}s — FAIL"
-    record_row "$harness" "unresponsive" "FAIL(version hung)" "FAIL(version hung)" \
-      "FAIL(version hung)" "FAIL(version hung)"
-    count_check "FAIL"; count_check "FAIL"; count_check "FAIL"; count_check "FAIL"
+    record_uniform_harness_row "$harness" "unresponsive" "FAIL(version hung)"
     return 0
   fi
   if [ "$version_rc" -ne 0 ]; then
     log "harness '$harness' --version exited ${version_rc} — FAIL: ${version}"
-    record_row "$harness" "broken" "FAIL(version rc=${version_rc})" "FAIL(version rc=${version_rc})" \
-      "FAIL(version rc=${version_rc})" "FAIL(version rc=${version_rc})"
-    count_check "FAIL"; count_check "FAIL"; count_check "FAIL"; count_check "FAIL"
+    record_uniform_harness_row "$harness" "broken" "FAIL(version rc=${version_rc})"
     return 0
   fi
   log "=== harness=${harness} version=${version} run=${run_name} ==="
@@ -464,22 +496,16 @@ run_harness_cells() {
     claude_trust_dir "$(cd -- "$repo_dir" && pwd -P)"
   fi
 
-  local -a model_args=()
-  if [ -n "$RUN_MODEL" ]; then
-    model_args=(--model "$RUN_MODEL")
-  fi
   local -a launch_args=(--cwd "$repo_dir" --harness "$harness" -i)
 
   # --- C1: prompt lands and is verified ------------------------------------
   log "C1: launching interactive ${harness} run with sentinel prompt"
-  if agent_run "${launch_args[@]}" \
-      --prompt "Reply with exactly this word and nothing else: ${sentinel1}" \
-      ${model_args[@]+"${model_args[@]}"} "$run_name" >/dev/null 2>&1; then
-    LAUNCHED_RUNS+=("$run_name")
+  if launch_interactive_run "$repo_dir" "$harness" "$run_name" \
+      "Reply with exactly this word and nothing else: ${sentinel1}"; then
     local state_dir="${STATE_DIR}/${run_name}"
     # Allow for harness startup and raw-mode readiness under load.
     if wait_for 60 0.5 "prompt_submitted appears, prompt_unverified absent" \
-        bash -c "[ -f '${state_dir}/prompt_submitted' ] && [ ! -f '${state_dir}/prompt_unverified' ]"; then
+        submission_verified "$state_dir"; then
       if wait_for 30 0.5 "sentinel1 reaches the transcript" \
           transcript_contains "$run_name" "$sentinel1"; then
         c1="PASS"
@@ -530,12 +556,8 @@ run_harness_cells() {
   # Break each transport's witness independently to prove prompt_submitted is
   # delivery-gated: unreadable rollout, unreachable HTTP port, or tiny timeout.
   #
-  # A negative control that merely observes "something went wrong" proves
-  # nothing -- a failed launch or an unrelated error would pass it just as
-  # well. Every branch below therefore asserts three things: the run actually
-  # started (so the fault is what stopped verification), the injected fault
-  # demonstrably took effect, and prompt_unverified names the reason that
-  # fault produces rather than any reason at all.
+  # Each branch confirms launch, session creation, the injected fault, marker
+  # gating, and the fault-specific prompt_unverified reason.
   local c3_run="${run_name}-neg"
   local c3_state="${STATE_DIR}/${c3_run}"
   local c3_fault_landed=0        # the injected fault was confirmed in place
@@ -548,12 +570,10 @@ run_harness_cells() {
     if AGENT_RUN_CODEX_SESSIONS_DIR="$c3_sessions_dir" \
         agent_run "${launch_args[@]}" \
         --prompt "Reply with exactly this word and nothing else: ${sentinel1}_neg" \
-        ${model_args[@]+"${model_args[@]}"} "$c3_run" >/dev/null 2>&1; then
+        ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} "$c3_run" >/dev/null 2>&1; then
       LAUNCHED_RUNS+=("$c3_run")
       c3_launched=1
-      # The fault is the override pointing at a directory holding no rollout
-      # for this session, so every witness read must fail. Confirm that is
-      # still true rather than assuming the env var reached the runner.
+      # Confirm the override target still contains no rollout.
       if [ -z "$(find "$c3_sessions_dir" -name 'rollout-*.jsonl' 2>/dev/null | head -1)" ]; then
         c3_fault_landed=1
       else
@@ -561,30 +581,28 @@ run_harness_cells() {
       fi
       # The unreadable store uses the full default verification window.
       wait_for 20 0.5 "prompt_submitted or prompt_unverified appears" \
-        bash -c "[ -f '${c3_state}/prompt_submitted' ] || [ -f '${c3_state}/prompt_unverified' ]" || true
+        submission_verdict_exists "$c3_state" || true
     else
       log "C3 FAIL: launch itself failed"
     fi
   elif [ "$harness" = "opencode" ]; then
     log "C3: negative control via an unreachable opencode_port (HTTP witness lands too fast for a timing control)"
-    # Port 1 refuses both the witness read and the HTTP submission itself, so
-    # the reason is whichever the run reaches first: a refused POST reports
-    # transport_error, a POST that somehow succeeded leaves the witness
-    # unreadable. Neither is a rejection, a timeout or an unwitnessed run.
+    # Port 1 yields transport_error or, if submission appears accepted while
+    # the witness remains unreachable, witness_unreadable.
     c3_expected_reasons=(transport_error witness_unreadable)
     if agent_run "${launch_args[@]}" \
         --prompt "Reply with exactly this word and nothing else: ${sentinel1}_neg" \
-        ${model_args[@]+"${model_args[@]}"} "$c3_run" >/dev/null 2>&1; then
+        ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} "$c3_run" >/dev/null 2>&1; then
       LAUNCHED_RUNS+=("$c3_run")
       c3_launched=1
       if wait_for 10 0.1 "opencode_port file appears" \
-          bash -c "[ -s '${c3_state}/opencode_port' ]"; then
+          file_nonempty "${c3_state}/opencode_port"; then
         # Corrupt the port before the delayed prompt helper submits.
         echo 1 > "${c3_state}/opencode_port"
         # Every attempt against a refused port still polls its full verify
         # window before the next, so allow the whole retry budget.
         wait_for 60 0.5 "prompt_submitted or prompt_unverified appears" \
-          bash -c "[ -f '${c3_state}/prompt_submitted' ] || [ -f '${c3_state}/prompt_unverified' ]" || true
+          submission_verdict_exists "$c3_state" || true
         # The fault is the witness pointing at a port nothing serves. Confirm
         # the corrupted value survived to submission time and that nothing
         # answers there, so an unrelated failure cannot pass this control.
@@ -604,22 +622,19 @@ run_harness_cells() {
     fi
   else
     log "C3: negative control with AGENT_RUN_SUBMIT_VERIFY_TIMEOUT=0.01"
-    # A 10ms window ends before any store read can confirm delivery. Whether
-    # the store was readable-but-flat (timeout) or not yet created
-    # (witness_unreadable) depends on how fast the harness materialises its
-    # transcript file; both are this fault's signature, and neither is a
-    # transport error, a rejection or an unwitnessed run.
+    # Depending on whether the store exists in the 10ms window, the expected
+    # reason is timeout or witness_unreadable.
     c3_expected_reasons=(timeout witness_unreadable)
     local c3_start c3_elapsed
     c3_start=$(date +%s.%N)
     if AGENT_RUN_SUBMIT_VERIFY_TIMEOUT=0.01 AGENT_RUN_SUBMIT_ATTEMPTS=1 \
         agent_run "${launch_args[@]}" \
         --prompt "Reply with exactly this word and nothing else: ${sentinel1}_neg" \
-        ${model_args[@]+"${model_args[@]}"} "$c3_run" >/dev/null 2>&1; then
+        ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} "$c3_run" >/dev/null 2>&1; then
       LAUNCHED_RUNS+=("$c3_run")
       c3_launched=1
       wait_for 20 0.2 "prompt_submitted or prompt_unverified appears" \
-        bash -c "[ -f '${c3_state}/prompt_submitted' ] || [ -f '${c3_state}/prompt_unverified' ]" || true
+        submission_verdict_exists "$c3_state" || true
       # The fault is the shortened deadline. Its observable effect is that
       # the verdict lands far sooner than the default window could produce
       # one: the fixed pre-submit delay plus a 10ms verify, not 10s.
@@ -661,13 +676,11 @@ run_harness_cells() {
   # --- C4: --raw steer is exempt from verification --------------------------
   local c4_run="${run_name}-raw"
   log "C4: --raw steer exemption"
-  if agent_run "${launch_args[@]}" \
-      --prompt "Reply with exactly this word and nothing else: ${sentinel1}_raw" \
-      ${model_args[@]+"${model_args[@]}"} "$c4_run" >/dev/null 2>&1; then
-    LAUNCHED_RUNS+=("$c4_run")
+  if launch_interactive_run "$repo_dir" "$harness" "$c4_run" \
+      "Reply with exactly this word and nothing else: ${sentinel1}_raw"; then
     local c4_state="${STATE_DIR}/${c4_run}"
     wait_for 30 0.5 "run reaches running" \
-      bash -c "grep -qx running '${c4_state}/status' 2>/dev/null" || true
+      run_is_running "$c4_state" || true
     local raw_out raw_rc=0
     raw_out="$(agent_run steer --raw "$c4_run" $'\033[Z' 2>&1)" || raw_rc=$?
     if [ "$harness" = "codex" ]; then
@@ -714,28 +727,18 @@ run_opencode_http_contract() {
   TEMP_REPOS+=("$repo_dir")
   init_test_repo "$repo_dir"
 
-  local -a model_args=()
-  if [ -n "$RUN_MODEL" ]; then
-    model_args=(--model "$RUN_MODEL")
-  fi
-
   log "=== opencode HTTP contract: launching ${run_name} ==="
   local h1="FAIL" h2="FAIL" h3="FAIL" h4="FAIL" h5="FAIL"
-  if ! agent_run --cwd "$repo_dir" --harness opencode -i \
-      --prompt "Reply with exactly this word and nothing else: ${sentinel}" \
-      ${model_args[@]+"${model_args[@]}"} "$run_name" >/dev/null 2>&1; then
-    log "HTTP contract: launch failed; all of H1-H5 FAIL"
-    set_all_http_results "FAIL"
+  if ! launch_interactive_run "$repo_dir" opencode "$run_name" \
+      "Reply with exactly this word and nothing else: ${sentinel}"; then
+    fail_http_contract "HTTP contract: launch failed"
     return 0
   fi
-  LAUNCHED_RUNS+=("$run_name")
   local state_dir="${STATE_DIR}/${run_name}"
 
   if ! wait_for 30 0.5 "opencode_port file appears" \
-      bash -c "[ -s '${state_dir}/opencode_port' ]"; then
-    log "HTTP contract: opencode_port never appeared; all of H1-H5 FAIL"
-    set_all_http_results "FAIL"
-    agent_run kill "$run_name" >/dev/null 2>&1 || true
+      file_nonempty "${state_dir}/opencode_port"; then
+    fail_http_contract "HTTP contract: opencode_port never appeared" "$run_name"
     return 0
   fi
   local port session_id
@@ -745,9 +748,7 @@ import json
 print(json.load(open('${LOG_DIR}/${run_name}/session.json'))['session_id'])
 " 2>/dev/null || true)"
   if [ -z "$session_id" ]; then
-    log "HTTP contract: could not resolve session_id from session.json; all of H1-H5 FAIL"
-    set_all_http_results "FAIL"
-    agent_run kill "$run_name" >/dev/null 2>&1 || true
+    fail_http_contract "HTTP contract: could not resolve session_id from session.json" "$run_name"
     return 0
   fi
   local base="http://127.0.0.1:${port}"
@@ -758,10 +759,8 @@ print(json.load(open('${LOG_DIR}/${run_name}/session.json'))['session_id'])
   # any check against it, so H1-H5 measure the harness contract, not a launch
   # race.
   if ! wait_for 30 0.5 "opencode HTTP API answers GET /doc" \
-      bash -c "curl -fsS --max-time 2 -o /dev/null '${base}/doc' 2>/dev/null"; then
-    log "HTTP contract: opencode HTTP API never came up; all of H1-H5 FAIL"
-    set_all_http_results "FAIL"
-    agent_run kill "$run_name" >/dev/null 2>&1 || true
+      url_answers "${base}/doc"; then
+    fail_http_contract "HTTP contract: opencode HTTP API never came up" "$run_name"
     return 0
   fi
 
@@ -771,9 +770,7 @@ print(json.load(open('${LOG_DIR}/${run_name}/session.json'))['session_id'])
   # is still generating.
   if ! wait_for 30 0.5 "launch turn settles (2 message records)" \
       bash -c "[ \"\$(curl -fsS --max-time 2 '${message_url}' 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d))' 2>/dev/null)\" = 2 ]"; then
-    log "HTTP contract: launch turn never settled; all of H1-H5 FAIL"
-    set_all_http_results "FAIL"
-    agent_run kill "$run_name" >/dev/null 2>&1 || true
+    fail_http_contract "HTTP contract: launch turn never settled" "$run_name"
     return 0
   fi
 
@@ -819,10 +816,8 @@ sys.exit(0 if key and 'post' in paths[key] else 1)
   # connection was actually aborted (curl exit 28, no http_code) *and* that
   # the turn still ran to completion afterwards.
   #
-  # How long a turn takes is the model's business, so a fixed client timeout
-  # cannot guarantee an abort. Shorten it until one happens: the request is
-  # written to loopback in well under a millisecond, so even the shortest
-  # bound here still delivers it.
+  # Shorten the bound until the client aborts; the transcript then checks that
+  # a request carrying the sentinel completed server-side.
   local h3_code="" h3_rc=0 h3_aborted=0 h3_limit
   for h3_limit in 2 0.5 0.2; do
     h3_rc=0
@@ -871,11 +866,8 @@ except (json.JSONDecodeError, IndexError, KeyError):
 
   # H5: messageID is not idempotent.
   log "H5: POST the same messageID twice, expect two distinct results"
-  # This is the property the whole retry design rests on: a resubmission
-  # duplicates rather than deduplicates. Ignoring both POST statuses would let
-  # H5 pass on a server that rejected the second request outright, which is
-  # the *opposite* finding. Assert both POSTs returned 200 and that two
-  # distinct user messages exist.
+  # Both statuses must be 200: rejecting the duplicate is not evidence that
+  # repeated message IDs create repeated user-message content.
   # opencode validates messageID as a string with a "msg" prefix; anything
   # else is a 400 before the duplication behavior under test even runs.
   local mid="msgverifysubmissionh5$$"
@@ -899,7 +891,7 @@ except (json.JSONDecodeError, IndexError, KeyError):
     log "H5 FAIL: expected 2 distinct user messages for the duplicated messageID, got ${h5_distinct}"
   fi
 
-  agent_run kill "$run_name" >/dev/null 2>&1 || true
+  kill_run "$run_name"
 
   H_RESULTS=("$h1" "$h2" "$h3" "$h4" "$h5")
   for r in "${H_RESULTS[@]}"; do count_check "$r"; done
@@ -938,12 +930,10 @@ fi
 # ---------------------------------------------------------------------------
 
 printf '%-10s %-14s %-6s %-6s %-6s %-6s\n' harness version C1 C2 C3 C4
-i=0
-while [ "$i" -lt "${#RESULTS_HARNESS[@]}" ]; do
+for i in "${!RESULTS_HARNESS[@]}"; do
   printf '%-10s %-14s %-6s %-6s %-6s %-6s\n' \
     "${RESULTS_HARNESS[$i]}" "${RESULTS_VERSION[$i]}" \
     "${RESULTS_C1[$i]}" "${RESULTS_C2[$i]}" "${RESULTS_C3[$i]}" "${RESULTS_C4[$i]}"
-  i=$((i + 1))
 done
 echo
 
