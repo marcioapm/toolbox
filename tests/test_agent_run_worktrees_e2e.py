@@ -24,6 +24,10 @@ E2E4 -- the leaked-worktree cleanup commands, captured from real stderr and
 E2E5 -- collision/reuse refusals through the real CLI, checked against real
         exit codes, real stderr, and real untouched filesystem state.
 E2E6 -- `du` and `reap --include-worktrees` against a real linked worktree.
+E2E7 -- claude and codex acquire a managed session id with no process created
+        in the worktree before the runner fork, unlike opencode's prefork
+        mint; this section proves the resulting rollback contract holds for
+        every harness, not just opencode.
 """
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -787,3 +792,82 @@ class TestE2E6DuAndReapAccountForRealWorktree:
             if launcher.returncode is None:
                 launcher.kill()
                 launcher.wait(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# E2E7: managed-harness worktree coverage (claude, codex) plus the rollback
+# contract common to every harness that acquires its session id without a
+# pre-fork process.
+# ---------------------------------------------------------------------------
+
+_FAKE_CLAUDE_SCRIPT = """#!/bin/sh
+: > {argv_file}
+for arg in "$@"; do
+    printf '%s\\n' "$arg" >> {argv_file}
+done
+exit 0
+"""
+
+
+@live_only
+class TestE2E7ClaudeWorktreeLaunch:
+    """A real `agent-run --harness claude --worktree ...` launch through the
+    real CLI, a real git worktree, and a real forked runner -- only the
+    `claude` binary itself is substituted, with a real shell script that
+    records its own argv. This proves two things through one real launch:
+    the worktree/branch/cwd machinery a raw launch already exercises (E2E1)
+    behaves identically in managed mode, and agent-run's push-acquired
+    UUID4 session id actually reaches the harness's argv as --session-id
+    and is the same id recorded in session.json.
+    """
+
+    def test_worktree_created_and_session_id_pushed_via_argv(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        repo = _make_repo(tmp_path, "repo-claude-wt")
+        base_oid = _git(repo, "rev-parse", "main").strip()
+        wt = tmp_path / "wt-claude"
+        name = "e2e7-claude-happy"
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        argv_capture = tmp_path / "claude-argv.txt"
+        fake_claude = bin_dir / "claude"
+        fake_claude.write_text(_FAKE_CLAUDE_SCRIPT.format(argv_file=argv_capture))
+        fake_claude.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+        argv = [
+            "--harness", "claude", "--prompt", "hi",
+            "--worktree", str(wt), "--worktree-base", base_oid,
+            "--worktree-repo", str(repo),
+            name,
+        ]
+        rc = agent_run.main(argv)
+        assert rc == 0
+
+        state_dir = isolated_runs_root / name
+        status = _wait_terminal(state_dir)
+        assert status == "done"
+
+        # The same worktree/branch/cwd contract E2E1 checks for a raw launch.
+        porcelain = _git(repo, "worktree", "list", "--porcelain")
+        assert str(wt.resolve()) in porcelain
+        assert _git(wt, "rev-parse", "HEAD").strip() == base_oid
+        assert name in _git(repo, "branch", "--list", name)
+        assert (state_dir / "cwd").read_text().strip() == str(wt.resolve())
+
+        # Proof agent-run passed --session-id: the fake's own recorded argv.
+        recorded_argv = argv_capture.read_text().splitlines()
+        assert "--session-id" in recorded_argv, f"argv missing --session-id: {recorded_argv!r}"
+        session_id_flag_idx = recorded_argv.index("--session-id")
+        pushed_session_id = recorded_argv[session_id_flag_idx + 1]
+        parsed = uuid.UUID(pushed_session_id)
+        assert parsed.version == 4, f"session id is not a UUID4: {pushed_session_id!r}"
+
+        session = agent_run._read_session_json(isolated_log_root / name)
+        assert session is not None
+        assert session["harness"] == "claude"
+        assert session["acquisition"] == "pushed"
+        assert session["confidence"] == "certain"
+        assert session["session_id"] == pushed_session_id
