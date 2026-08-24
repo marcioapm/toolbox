@@ -331,6 +331,13 @@ def h3_client_aborted(curl_rc: int, http_code: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _message_texts(message: dict):
+    """Yield the text of each text-part in a message record."""
+    for part in message.get("parts") or []:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            yield part["text"]
+
+
 def h4_record_inserted(messages: list, sentinel: str, before_count: int) -> bool:
     """Return True when exactly one new user-role record carrying sentinel was
     appended and nothing generated a reply afterwards.
@@ -344,18 +351,13 @@ def h4_record_inserted(messages: list, sentinel: str, before_count: int) -> bool
     if before_count < 0 or len(messages) != before_count + 1:
         return False
 
-    def _texts(message: dict):
-        for part in message.get("parts") or []:
-            if isinstance(part, dict) and isinstance(part.get("text"), str):
-                yield part["text"]
-
     carrier = None
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             return False
         if (message.get("info") or {}).get("role") != "user":
             continue
-        if sentinel in "\n".join(_texts(message)):
+        if sentinel in "\n".join(_message_texts(message)):
             carrier = index
 
     if carrier is None:
@@ -364,7 +366,8 @@ def h4_record_inserted(messages: list, sentinel: str, before_count: int) -> bool
     return carrier == len(messages) - 1
 
 
-def _h4_record_inserted_from_url(url: str, sentinel: str, before_count: int) -> bool:
+def _fetch_messages(url: str):
+    """Fetch the message list at url; return parsed JSON or [] on failure."""
     cp = subprocess.run(
         ["curl", "-sS", "--max-time", "5", url],
         capture_output=True,
@@ -372,10 +375,13 @@ def _h4_record_inserted_from_url(url: str, sentinel: str, before_count: int) -> 
         check=False,
     )
     try:
-        data = json.loads(cp.stdout)
+        return json.loads(cp.stdout)
     except json.JSONDecodeError:
-        return False
-    return h4_record_inserted(data, sentinel, before_count)
+        return []
+
+
+def _h4_record_inserted_from_url(url: str, sentinel: str, before_count: int) -> bool:
+    return h4_record_inserted(_fetch_messages(url), sentinel, before_count)
 
 
 # ---------------------------------------------------------------------------
@@ -391,12 +397,6 @@ def duplicated_prompt_texts_present(messages: list, text_a: str, text_b: str) ->
     is whether the second POST's content survived at all: 2 = duplicate kept,
     1 = dropped.
     """
-
-    def _texts(message: dict):
-        for part in message.get("parts") or []:
-            if isinstance(part, dict) and isinstance(part.get("text"), str):
-                yield part["text"]
-
     if not isinstance(messages, list):
         return 0
     wanted = (text_a, text_b)
@@ -406,7 +406,7 @@ def duplicated_prompt_texts_present(messages: list, text_a: str, text_b: str) ->
             continue
         if (message.get("info") or {}).get("role") != "user":
             continue
-        blob = "\n".join(_texts(message))
+        blob = "\n".join(_message_texts(message))
         for needle in wanted:
             if needle in blob:
                 found.add(needle)
@@ -414,17 +414,7 @@ def duplicated_prompt_texts_present(messages: list, text_a: str, text_b: str) ->
 
 
 def _duplicated_prompt_texts_from_url(url: str, text_a: str, text_b: str) -> int:
-    cp = subprocess.run(
-        ["curl", "-sS", "--max-time", "5", url],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    try:
-        data = json.loads(cp.stdout)
-    except json.JSONDecodeError:
-        return 0
-    return duplicated_prompt_texts_present(data, text_a, text_b)
+    return duplicated_prompt_texts_present(_fetch_messages(url), text_a, text_b)
 
 
 # ---------------------------------------------------------------------------
