@@ -608,7 +608,7 @@ def _witness_sequence(monkeypatch, counts: list) -> None:
     """Return successive witness counts, repeating the last after exhaustion."""
     calls: list = []
 
-    def fake(state_dir, log_dir):
+    def fake(state_dir, log_dir, _prompt):
         def count() -> "int | None":
             calls.append((state_dir, log_dir))
             index = min(len(calls) - 1, len(counts) - 1)
@@ -621,7 +621,7 @@ def _witness_sequence(monkeypatch, counts: list) -> None:
 
 def _witness_counter(monkeypatch, count: "callable") -> None:
     """Pin every _submit_and_verify call to a witness source whose
-    user_count is *count*."""
+    prompt_turn_count is *count*."""
     monkeypatch.setattr(
         agent_run, "_resolve_witness_source",
         lambda *_a: agent_run._WitnessSource("fake", count),
@@ -671,7 +671,7 @@ class _CoupledHarness:
         monkeypatch.setattr(agent_run, "_submit_via_keystroke", self._submit)
         monkeypatch.setattr(
             agent_run, "_resolve_witness_source",
-            lambda *_a: agent_run._WitnessSource("coupled", self.user_count),
+            lambda *_a: agent_run._WitnessSource("coupled", self.prompt_turn_count),
         )
         monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
 
@@ -685,7 +685,7 @@ class _CoupledHarness:
         self.delivered.append(payload)
         self.landed.append(payload)
 
-    def user_count(self) -> int:
+    def prompt_turn_count(self) -> int:
         return len(self.landed)
 
 
@@ -770,7 +770,7 @@ def test_submit_and_verify_late_lander_skips_second_submission(tmp_path, monkeyp
 
 
 def test_submit_and_verify_witness_unreadable_never_resends_the_prompt_text(tmp_path, monkeypatch):
-    """count_user_records raising TranscriptSourceError (via the real
+    """count_prompt_turns raising TranscriptSourceError (via the real
     witness-source implementation) must degrade to verified=False with
     detail=witness_unreadable, never propagate.
 
@@ -786,11 +786,11 @@ def test_submit_and_verify_witness_unreadable_never_resends_the_prompt_text(tmp_
         lambda _log_dir: {"session_id": "s1", "harness": "codex"},
     )
 
-    def raise_source_error(_harness, _session_id, _cwd):
+    def raise_source_error(_harness, _session_id, _cwd, _prompt):
         raise agent_run_transcript.TranscriptSourceError("boom", code="store_missing")
 
     monkeypatch.setattr(
-        agent_run._agent_run_transcript, "count_user_records", raise_source_error
+        agent_run._agent_run_transcript, "count_prompt_turns", raise_source_error
     )
     submissions = []
     monkeypatch.setattr(
@@ -862,7 +862,7 @@ def test_submit_and_verify_transport_selection(
 
 
 # ---------------------------------------------------------------------------
-# The witness predicate: one pinned source, user records only, fresh sessions
+# The witness predicate: one pinned source, our own content, fresh sessions
 # ---------------------------------------------------------------------------
 
 def test_witness_source_pinned_to_opencode_http_never_falls_back_to_the_store(
@@ -885,11 +885,11 @@ def test_witness_source_pinned_to_opencode_http_never_falls_back_to_the_store(
     )
     http_reads = {"n": 0}
 
-    def flaky_http(_port, _session):
+    def flaky_http(_port, _session, _prompt):
         http_reads["n"] += 1
         return 2 if http_reads["n"] == 1 else None  # baseline only, then dead
 
-    monkeypatch.setattr(agent_run, "_opencode_http_message_count", flaky_http)
+    monkeypatch.setattr(agent_run, "_opencode_http_prompt_turn_count", flaky_http)
     store_reads = {"n": 0}
 
     def store_count(*_a, **_k):
@@ -897,7 +897,7 @@ def test_witness_source_pinned_to_opencode_http_never_falls_back_to_the_store(
         return 340  # would tower over the HTTP baseline of 2
 
     monkeypatch.setattr(
-        agent_run._agent_run_transcript, "count_user_records", store_count
+        agent_run._agent_run_transcript, "count_prompt_turns", store_count
     )
 
     outcome = agent_run._submit_and_verify(
@@ -919,13 +919,13 @@ def test_witness_source_pinned_to_the_store_never_reaches_for_http(tmp_path, mon
     )
     monkeypatch.setattr(agent_run, "_submit_via_keystroke", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        agent_run._agent_run_transcript, "count_user_records", lambda *_a: 4,
+        agent_run._agent_run_transcript, "count_prompt_turns", lambda *_a: 4,
     )
 
     def http_would_verify(*_a, **_k):
         raise AssertionError("a pinned store witness must never query the HTTP endpoint")
 
-    monkeypatch.setattr(agent_run, "_opencode_http_message_count", http_would_verify)
+    monkeypatch.setattr(agent_run, "_opencode_http_prompt_turn_count", http_would_verify)
 
     outcome = agent_run._submit_and_verify(
         tmp_path, tmp_path, b"hello", deadline_s=0.05, max_attempts=1,
@@ -935,20 +935,20 @@ def test_witness_source_pinned_to_the_store_never_reaches_for_http(tmp_path, mon
     assert outcome.detail == "timeout"
 
 
-def test_witness_counts_user_records_only_so_an_assistant_reply_cannot_verify(
+def test_witness_counts_prompt_turns_only_so_an_assistant_reply_cannot_verify(
     tmp_path, monkeypatch
 ):
     """A swallowed prompt whose session emits an assistant record must stay
-    unverified: the witness reads count_user_records, not every record."""
+    unverified: the witness reads count_prompt_turns, not every record."""
     submissions = _no_transport_side_effects(monkeypatch)
     monkeypatch.setattr(
         agent_run, "_read_session_json",
         lambda _log_dir: {"session_id": "s1", "harness": "claude"},
     )
-    # The full record count climbs from the assistant's own reply; the
-    # user-record count does not move, because nothing was delivered.
+    # The full record count climbs from the assistant's own reply; the count
+    # of turns carrying this prompt does not, because nothing was delivered.
     monkeypatch.setattr(
-        agent_run._agent_run_transcript, "count_user_records",
+        agent_run._agent_run_transcript, "count_prompt_turns",
         lambda *_a: 1,
     )
 
@@ -1002,7 +1002,7 @@ def test_resolve_witness_source_prefers_opencode_http_over_the_store(tmp_path):
         json.dumps({"session_id": "ses_1", "harness": "opencode"})
     )
 
-    source = agent_run._resolve_witness_source(tmp_path, tmp_path)
+    source = agent_run._resolve_witness_source(tmp_path, tmp_path, "the prompt")
 
     assert source is not None
     assert source.name == "opencode_http"
@@ -1013,7 +1013,7 @@ def test_resolve_witness_source_names_the_harness_store_without_a_port(tmp_path)
         json.dumps({"session_id": "ses_1", "harness": "claude"})
     )
 
-    source = agent_run._resolve_witness_source(tmp_path, tmp_path)
+    source = agent_run._resolve_witness_source(tmp_path, tmp_path, "the prompt")
 
     assert source is not None
     assert source.name == "claude_transcript"
@@ -1021,8 +1021,8 @@ def test_resolve_witness_source_names_the_harness_store_without_a_port(tmp_path)
 
 def test_resolve_witness_source_is_none_for_an_unmanaged_run(tmp_path):
     """No session.json means a raw run: there is no store to witness."""
-    assert agent_run._resolve_witness_source(tmp_path, tmp_path) is None
-    assert agent_run._resolve_witness_source(tmp_path, None) is None
+    assert agent_run._resolve_witness_source(tmp_path, tmp_path, "p") is None
+    assert agent_run._resolve_witness_source(tmp_path, None, "p") is None
 
 
 @pytest.mark.parametrize(
@@ -1039,7 +1039,7 @@ def test_run_is_managed_separates_a_failed_mint_from_a_raw_run(tmp_path, session
     managed run's session.json exists and a raw run's never does."""
     (tmp_path / "session.json").write_text(session_json)
 
-    assert agent_run._resolve_witness_source(tmp_path, tmp_path) is None
+    assert agent_run._resolve_witness_source(tmp_path, tmp_path, "p") is None
     assert agent_run._run_is_managed(tmp_path) is True
     assert agent_run._run_is_managed(tmp_path / "nonexistent") is False
     assert agent_run._run_is_managed(None) is False
@@ -1832,7 +1832,227 @@ def test_opencode_http_count_reports_a_malformed_response_as_unreadable(
     _submit_and_verify's promise never to raise for a submission failure."""
     port = http_witness_server(raw_response)
 
-    assert agent_run._opencode_http_message_count(port, "ses_1") is None, label
+    assert agent_run._opencode_http_prompt_turn_count(port, "ses_1", "hello") is None, label
+
+
+# ---------------------------------------------------------------------------
+# Content attribution: a count that rises without our prompt is not proof
+# ---------------------------------------------------------------------------
+
+def _http_message(role: str, *texts: str, message_id: str = "m") -> dict:
+    return {
+        "info": {"id": message_id, "role": role},
+        "parts": [{"type": "text", "text": text} for text in texts],
+    }
+
+
+@pytest.fixture
+def opencode_message_endpoint():
+    """A loopback /session/<id>/message endpoint serving a mutable message
+    list, so a POST's side effect on the store is what verification sees.
+
+    Yields a factory taking the initial messages and a callable invoked on
+    each POST; returns the port.
+    """
+    import http.server
+    import threading
+
+    servers = []
+
+    def serve(messages: list, on_post) -> int:
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps(messages).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                on_post(messages)
+                try:
+                    self.send_response(200)
+                    self.end_headers()
+                except OSError:
+                    pass
+
+            def log_message(self, *_a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        servers.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server.server_address[1]
+
+    yield serve
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+def _http_witness_run(tmp_path, port: int) -> tuple[Path, Path]:
+    """State and log dirs for a managed opencode run pointed at *port*."""
+    state, log = tmp_path / "state", tmp_path / "log"
+    state.mkdir(exist_ok=True)
+    log.mkdir(exist_ok=True)
+    (state / "opencode_port").write_text(f"{port}\n")
+    (log / "session.json").write_text(
+        json.dumps({"harness": "opencode", "session_id": "ses_1"})
+    )
+    return state, log
+
+
+def test_http_witness_rejects_a_user_envelope_with_no_prompt_part(
+    tmp_path, opencode_message_endpoint
+):
+    """opencode persists MessageUpdated and PartUpdated separately, so a
+    user-role row appears before it holds any text. A bare count rise there
+    is not this submission landing."""
+    messages = [_http_message("assistant", "earlier reply", message_id="m0")]
+    port = opencode_message_endpoint(
+        messages, lambda msgs: msgs.append(_http_message("user", message_id="m1"))
+    )
+    state, log = _http_witness_run(tmp_path, port)
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"THE PROMPT", deadline_s=0.3, max_attempts=1,
+    )
+
+    assert sum(1 for m in messages if m["info"]["role"] == "user") == 1, (
+        "the user-role count did rise -- a bare count would have verified"
+    )
+    assert outcome.verified is False
+
+
+def test_http_witness_rejects_a_synthetic_user_message(
+    tmp_path, opencode_message_endpoint
+):
+    """opencode adds user-role messages of its own. One arriving while the
+    prompt was swallowed must not read as the prompt landing."""
+    messages = [_http_message("user", "an earlier turn", message_id="m0")]
+    port = opencode_message_endpoint(
+        messages,
+        lambda msgs: msgs.append(
+            _http_message("user", "Session summary requested", message_id="sum")
+        ),
+    )
+    state, log = _http_witness_run(tmp_path, port)
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"THE PROMPT", deadline_s=0.3, max_attempts=1,
+    )
+
+    assert sum(1 for m in messages if m["info"]["role"] == "user") == 2
+    assert outcome.verified is False
+
+
+def test_http_witness_verifies_a_prompt_that_actually_landed(
+    tmp_path, opencode_message_endpoint
+):
+    """The control for the two above: the same machinery must still verify a
+    genuine landing, or content attribution has simply broken verification."""
+    messages = [_http_message("user", "an earlier turn", message_id="m0")]
+    port = opencode_message_endpoint(
+        messages,
+        lambda msgs: msgs.append(_http_message("user", "THE PROMPT", message_id="m1")),
+    )
+    state, log = _http_witness_run(tmp_path, port)
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"THE PROMPT", deadline_s=5.0, max_attempts=1,
+    )
+
+    assert outcome.verified is True
+
+
+def _sqlite_witness_run(tmp_path, monkeypatch) -> tuple[Path, Path, Path]:
+    """State/log dirs plus an opencode SQLite store for a run with no port,
+    so the witness falls back to reading the store directly."""
+    import sqlite3
+
+    db = tmp_path / "opencode.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "create table message (id text primary key, session_id text, "
+        "time_created integer, data text)"
+    )
+    conn.execute(
+        "create table part (id text primary key, message_id text, session_id text, "
+        "time_created integer, data text)"
+    )
+    conn.execute("create index part_session_idx on part (session_id)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(agent_run_transcript, "OPENCODE_DB_PATH", db)
+
+    state, log = tmp_path / "state", tmp_path / "log"
+    state.mkdir(exist_ok=True)
+    log.mkdir(exist_ok=True)
+    (log / "session.json").write_text(
+        json.dumps({"harness": "opencode", "session_id": "ses_1"})
+    )
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+    return state, log, db
+
+
+def _sqlite_insert(db: Path, message_id: str, role: str, *texts: str) -> None:
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "insert into message values (?, 'ses_1', 1, ?)",
+            (message_id, json.dumps({"role": role})),
+        )
+        for i, text in enumerate(texts):
+            conn.execute(
+                "insert into part values (?, ?, 'ses_1', ?, ?)",
+                (f"{message_id}-p{i}", message_id, i, json.dumps({"type": "text", "text": text})),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sqlite_witness_rejects_a_user_envelope_with_no_prompt_part(
+    tmp_path, monkeypatch
+):
+    """The SQLite fallback must apply the same predicate as the HTTP path:
+    an envelope row without its text part is not our prompt."""
+    state, log, db = _sqlite_witness_run(tmp_path, monkeypatch)
+    _sqlite_insert(db, "m0", "assistant", "earlier reply")
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"THE PROMPT", deadline_s=0.3, max_attempts=1,
+        submit=lambda _text: _sqlite_insert(db, "m1", "user"),
+    )
+
+    assert outcome.verified is False
+
+
+def test_sqlite_witness_rejects_a_synthetic_user_message(tmp_path, monkeypatch):
+    state, log, db = _sqlite_witness_run(tmp_path, monkeypatch)
+    _sqlite_insert(db, "m0", "user", "an earlier turn")
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"THE PROMPT", deadline_s=0.3, max_attempts=1,
+        submit=lambda _text: _sqlite_insert(db, "sum", "user", "Session summary requested"),
+    )
+
+    assert outcome.verified is False
+
+
+def test_sqlite_witness_verifies_a_prompt_that_actually_landed(tmp_path, monkeypatch):
+    state, log, db = _sqlite_witness_run(tmp_path, monkeypatch)
+    _sqlite_insert(db, "m0", "user", "an earlier turn")
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"THE PROMPT", deadline_s=5.0, max_attempts=1,
+        submit=lambda text: _sqlite_insert(db, "m1", "user", text.decode()),
+    )
+
+    assert outcome.verified is True
 
 
 def test_witness_source_treats_a_raising_counter_as_unreadable():
@@ -1841,7 +2061,7 @@ def test_witness_source_treats_a_raising_counter_as_unreadable():
     def explode():
         raise RuntimeError("counter blew up")
 
-    assert agent_run._WitnessSource("boom", explode).user_count() is None
+    assert agent_run._WitnessSource("boom", explode).prompt_turn_count() is None
 
 
 def test_submit_and_verify_survives_a_witness_that_raises(tmp_path, monkeypatch):
@@ -1938,14 +2158,7 @@ def test_a_transcript_caught_mid_append_never_causes_a_resend(
     log_dir = tmp_path / "log"
     log_dir.mkdir()
     session_id = "sess-mid-append"
-    if harness == "claude":
-        monkeypatch.setattr(agent_run_transcript, "CLAUDE_PROJECTS_DIR", tmp_path / "projects")
-        store = tmp_path / "projects" / "-tmp-proj" / f"{session_id}.jsonl"
-    else:
-        monkeypatch.setattr(agent_run_transcript, "CODEX_SESSIONS_DIR", tmp_path / "sessions")
-        store = (tmp_path / "sessions" / "2026" / "08" / "19"
-                 / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl")
-    store.parent.mkdir(parents=True, exist_ok=True)
+    store = _seed_store_path(tmp_path, monkeypatch, harness, session_id)
     store.write_text(partial_line)
     (log_dir / "session.json").write_text(
         json.dumps({"harness": harness, "session_id": session_id})
@@ -1967,6 +2180,77 @@ def test_a_transcript_caught_mid_append_never_causes_a_resend(
     # The terminator-only rung is the one permitted follow-up; the composer
     # reset that carries the text again must never be reached.
     assert submissions == [b"PROMPT" + cr, cr]
+
+
+def _seed_store_path(tmp_path, monkeypatch, harness: str, session_id: str) -> Path:
+    """Point the named harness's reader at a fixture store under tmp_path and
+    return the session file's path (parents created, file not written)."""
+    if harness == "claude":
+        monkeypatch.setattr(agent_run_transcript, "CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+        store = tmp_path / "projects" / "-tmp-proj" / f"{session_id}.jsonl"
+    else:
+        monkeypatch.setattr(agent_run_transcript, "CODEX_SESSIONS_DIR", tmp_path / "sessions")
+        store = (tmp_path / "sessions" / "2026" / "08" / "19"
+                 / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl")
+    store.parent.mkdir(parents=True, exist_ok=True)
+    return store
+
+
+def _complete_user_record(harness: str, session_id: str, text: str) -> str:
+    if harness == "claude":
+        return json.dumps({
+            "type": "user", "sessionId": session_id,
+            "message": {"role": "user", "content": text},
+        })
+    return json.dumps({
+        "timestamp": "2026-08-19T00:00:00Z", "type": "response_item",
+        "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": text}]},
+    })
+
+
+@pytest.mark.parametrize("harness", ["claude", "codex"])
+def test_a_partial_record_in_an_established_transcript_never_causes_a_resend(
+    tmp_path, monkeypatch, harness
+):
+    """A steer of a message this session has already received leaves a
+    transcript whose readable records do carry this prompt. When the new
+    submission's own record is caught half-written, those readable records
+    still parse -- but the count they yield is not the answer, since the
+    partial line may be this very submission. A number that looks flat there
+    licenses a resend of a prompt already delivered.
+    """
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    session_id = "sess-established"
+    store = _seed_store_path(tmp_path, monkeypatch, harness, session_id)
+    store.write_text(_complete_user_record(harness, session_id, "THE PROMPT") + "\n")
+    (log_dir / "session.json").write_text(
+        json.dumps({"harness": harness, "session_id": session_id})
+    )
+    (log_dir / "run.json").write_text(json.dumps({"cwd": "/tmp/proj"}))
+
+    submissions: list = []
+
+    def submit_appending_a_partial_record(text):
+        submissions.append(text)
+        # The submission lands, and the store is caught mid-append: this
+        # prompt's own record is only half on disk.
+        complete = _complete_user_record(harness, session_id, text.decode())
+        with store.open("a") as f:
+            f.write(complete[: len(complete) // 2])
+
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, log_dir, b"THE PROMPT", deadline_s=0.0, max_attempts=3,
+        submit=submit_appending_a_partial_record,
+    )
+
+    assert outcome.detail == "witness_unreadable", (
+        "a partial record makes the count unknown however many earlier ones parsed"
+    )
+    assert submissions == [b"THE PROMPT"], "an unknown count licenses no resend"
 
 
 # ---------------------------------------------------------------------------

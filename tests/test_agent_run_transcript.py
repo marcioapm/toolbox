@@ -719,13 +719,15 @@ class TestCountTranscript:
 
 
 # ---------------------------------------------------------------------------
-# count_user_records: the submission witness's predicate
+# count_prompt_turns: the submission-verification predicate
 # ---------------------------------------------------------------------------
 
-class TestCountUserRecords:
-    """Only user-role records count. A verification predicate that also
-    counted assistant/reasoning/tool records would be satisfied by the
-    current turn's own reply, with no new input delivered at all."""
+class TestCountPromptTurns:
+    """Only a user-role turn whose own text carries the submitted prompt
+    counts. A predicate that also counted assistant/reasoning/tool records
+    would be satisfied by the current turn's own reply; one that counted bare
+    user-role envelopes would be satisfied by a message the harness wrote
+    itself, or by a row persisted before its text part exists."""
 
     def test_opencode_ignores_assistant_and_tool_records(self, tmp_path, monkeypatch):
         db = tmp_path / "opencode.db"
@@ -735,24 +737,51 @@ class TestCountUserRecords:
             db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
             parts=[{"type": "text", "text": "do it"}],
         )
-        assert transcript.count_user_records("opencode", "ses_1", None) == 1
+        assert transcript.count_prompt_turns("opencode", "ses_1", None, "do it") == 1
 
         _opencode_insert(
             db, message_id="m2", session_id="ses_1", role="assistant", time_created=2000,
             parts=[
-                {"type": "text", "text": "on it"},
-                {"type": "reasoning", "text": "thinking"},
+                {"type": "text", "text": "do it"},
+                {"type": "reasoning", "text": "do it"},
                 {"type": "tool", "tool": "bash", "state": {"status": "completed"}},
             ],
         )
-        assert transcript.count_user_records("opencode", "ses_1", None) == 1
+        assert transcript.count_prompt_turns("opencode", "ses_1", None, "do it") == 1
         assert transcript.count_transcript("opencode", "ses_1", None)[0] > 1
 
         _opencode_insert(
             db, message_id="m3", session_id="ses_1", role="user", time_created=3000,
-            parts=[{"type": "text", "text": "and again"}],
+            parts=[{"type": "text", "text": "do it"}],
         )
-        assert transcript.count_user_records("opencode", "ses_1", None) == 2
+        assert transcript.count_prompt_turns("opencode", "ses_1", None, "do it") == 2
+
+    def test_opencode_user_envelope_without_a_text_part_does_not_count(
+        self, tmp_path, monkeypatch
+    ):
+        """opencode persists MessageUpdated and PartUpdated as separate
+        events, so a user-role row exists before it holds anything. Counting
+        it would verify a submission whose text never arrived."""
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000, parts=[],
+        )
+        assert transcript.count_prompt_turns("opencode", "ses_1", None, "the prompt") == 0
+
+    def test_opencode_synthetic_user_message_does_not_count(self, tmp_path, monkeypatch):
+        """opencode adds user-role messages of its own (e.g. its summary
+        message); one arriving while the prompt was swallowed must not read
+        as the prompt landing."""
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
+            parts=[{"type": "text", "text": "Session summary requested"}],
+        )
+        assert transcript.count_prompt_turns("opencode", "ses_1", None, "the prompt") == 0
 
     def test_opencode_scopes_to_one_session(self, tmp_path, monkeypatch):
         db = tmp_path / "opencode.db"
@@ -760,18 +789,18 @@ class TestCountUserRecords:
         monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
         _opencode_insert(
             db, message_id="m1", session_id="ses_a", role="user", time_created=1,
-            parts=[{"type": "text", "text": "for a"}],
+            parts=[{"type": "text", "text": "shared prompt"}],
         )
         _opencode_insert(
             db, message_id="m2", session_id="ses_b", role="user", time_created=2,
-            parts=[{"type": "text", "text": "for b"}],
+            parts=[{"type": "text", "text": "shared prompt"}],
         )
-        assert transcript.count_user_records("opencode", "ses_a", None) == 1
+        assert transcript.count_prompt_turns("opencode", "ses_a", None, "shared prompt") == 1
 
     def test_opencode_missing_store_raises_rather_than_counting_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", tmp_path / "absent.db")
         with pytest.raises(transcript.TranscriptSourceError):
-            transcript.count_user_records("opencode", "ses_1", None)
+            transcript.count_prompt_turns("opencode", "ses_1", None, "the prompt")
 
     def test_claude_ignores_assistant_and_tool_result_records(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
@@ -789,7 +818,7 @@ class TestCountUserRecords:
                     "message": {
                         "role": "assistant",
                         "content": [
-                            {"type": "text", "text": "replying"},
+                            {"type": "text", "text": "the prompt"},
                             {"type": "tool_use", "id": "tu1", "name": "Bash", "input": {}},
                         ],
                     },
@@ -799,13 +828,30 @@ class TestCountUserRecords:
                     "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:02Z",
                     "message": {
                         "role": "user",
-                        "content": [{"type": "tool_result", "tool_use_id": "tu1", "content": "out"}],
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "tu1", "content": "the prompt"}
+                        ],
                     },
                 },
             ],
         )
-        assert transcript.count_user_records("claude", session_id, "/Users/x/proj") == 1
+        assert transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "the prompt") == 1
         assert transcript.count_transcript("claude", session_id, "/Users/x/proj")[0] > 1
+
+    def test_claude_an_unrelated_user_turn_does_not_count(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-unrelated"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
+                    "message": {"role": "user", "content": "something else entirely"},
+                },
+            ],
+        )
+        assert transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "the prompt") == 0
 
     def test_claude_skips_records_naming_another_session(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
@@ -816,21 +862,21 @@ class TestCountUserRecords:
             [
                 {
                     "type": "user", "sessionId": session_id, "timestamp": "2026-08-16T00:00:00Z",
-                    "message": {"role": "user", "content": "mine"},
+                    "message": {"role": "user", "content": "the prompt"},
                 },
                 {
                     "type": "user", "sessionId": "some-other-session",
                     "timestamp": "2026-08-16T00:00:01Z",
-                    "message": {"role": "user", "content": "not mine"},
+                    "message": {"role": "user", "content": "the prompt"},
                 },
             ],
         )
-        assert transcript.count_user_records("claude", session_id, "/Users/x/proj") == 1
+        assert transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "the prompt") == 1
 
     def test_claude_missing_store_raises_rather_than_counting_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         with pytest.raises(transcript.TranscriptSourceError):
-            transcript.count_user_records("claude", "no-such-session", "/nonexistent/cwd")
+            transcript.count_prompt_turns("claude", "no-such-session", "/nonexistent/cwd", "p")
 
     def test_codex_ignores_assistant_reasoning_and_function_call_records(
         self, tmp_path, monkeypatch
@@ -852,21 +898,39 @@ class TestCountUserRecords:
                     "timestamp": "2026-08-19T00:00:01Z", "type": "response_item",
                     "payload": {
                         "type": "message", "role": "assistant",
-                        "content": [{"type": "output_text", "text": "replying"}],
+                        "content": [{"type": "output_text", "text": "the prompt"}],
                     },
                 },
                 {
                     "timestamp": "2026-08-19T00:00:02Z", "type": "response_item",
-                    "payload": {"type": "reasoning", "summary": [{"text": "thinking"}]},
+                    "payload": {"type": "reasoning", "summary": [{"text": "the prompt"}]},
                 },
                 {
                     "timestamp": "2026-08-19T00:00:03Z", "type": "response_item",
-                    "payload": {"type": "function_call", "call_id": "c1", "name": "shell"},
+                    "payload": {"type": "function_call", "call_id": "c1", "name": "the prompt"},
                 },
             ],
         )
-        assert transcript.count_user_records("codex", session_id, None) == 1
+        assert transcript.count_prompt_turns("codex", session_id, None, "the prompt") == 1
         assert transcript.count_transcript("codex", session_id, None)[0] > 1
+
+    def test_codex_an_unrelated_user_turn_does_not_count(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-unrelated"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "timestamp": "2026-08-19T00:00:00Z", "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "something else entirely"}],
+                    },
+                },
+            ],
+        )
+        assert transcript.count_prompt_turns("codex", session_id, None, "the prompt") == 0
 
     def test_codex_ignores_the_harness_injected_context_preamble(self, tmp_path, monkeypatch):
         """codex writes <environment_context> as a user message at thread
@@ -890,25 +954,49 @@ class TestCountUserRecords:
                 },
             ],
         )
-        assert transcript.count_user_records("codex", session_id, None) == 0
+        assert transcript.count_prompt_turns("codex", session_id, None, "cwd=/tmp") == 0
 
     def test_codex_missing_store_raises_rather_than_counting_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
         with pytest.raises(transcript.TranscriptSourceError):
-            transcript.count_user_records("codex", "no-such-session", None)
+            transcript.count_prompt_turns("codex", "no-such-session", None, "the prompt")
 
     def test_unknown_harness_raises_unknown_harness_code(self):
         with pytest.raises(transcript.TranscriptSourceError) as exc_info:
-            transcript.count_user_records("some-future-harness", "ses_1", None)
+            transcript.count_prompt_turns("some-future-harness", "ses_1", None, "p")
         assert exc_info.value.code == "unknown_harness"
 
 
-class TestCountUserRecordsUnparseableIsUnknown:
+class TestPromptAttribution:
+    """The content half of the predicate, isolated from any store."""
+
+    def test_whitespace_differences_do_not_defeat_attribution(self):
+        """A TUI re-wraps a long prompt before the harness records the turn,
+        so the recorded text differs from the submitted bytes by whitespace
+        alone. That is the same prompt."""
+        prompt = transcript.normalize_prompt_text("fix the parser\nand run the tests")
+        assert transcript.turn_carries_prompt("fix the parser  and\n  run the tests", prompt)
+
+    def test_a_different_prompt_does_not_match(self):
+        prompt = transcript.normalize_prompt_text("fix the parser")
+        assert not transcript.turn_carries_prompt("fix the renderer", prompt)
+
+    def test_an_empty_prompt_matches_nothing(self):
+        """An empty prompt would otherwise match every turn, degrading the
+        predicate back to a bare user-record count."""
+        assert not transcript.turn_carries_prompt("anything at all", "")
+        assert not transcript.turn_carries_prompt("", "")
+
+    def test_absent_turn_text_does_not_match(self):
+        assert not transcript.turn_carries_prompt(None, "the prompt")
+
+
+class TestCountPromptTurnsUnparseableIsUnknown:
     """A file caught mid-append has an unterminated trailing line, which is
-    exactly the state a transcript is in during the seconds after a launch
-    prompt is submitted. Counting 0 there converts "unknown" into "proof it
-    did not land", and that proof is what licenses a resend -- of a prompt
-    the partial line may well be."""
+    exactly the state a transcript is in during the seconds after a prompt is
+    submitted. Counting the readable records there converts "unknown" into an
+    observation, and a flat observation is what licenses a resend -- of a
+    prompt the partial line may well be."""
 
     def test_claude_wholly_unparseable_file_is_unreadable_not_empty(
         self, tmp_path, monkeypatch
@@ -920,7 +1008,7 @@ class TestCountUserRecordsUnparseableIsUnknown:
         path.write_text('{"type":"user","message":{"role":"user","conte')
 
         with pytest.raises(transcript.TranscriptSourceError) as exc_info:
-            transcript.count_user_records("claude", session_id, "/Users/x/proj")
+            transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "the prompt")
         assert exc_info.value.code == "store_unreadable"
 
     def test_codex_wholly_unparseable_file_is_unreadable_not_empty(
@@ -933,15 +1021,17 @@ class TestCountUserRecordsUnparseableIsUnknown:
         path.write_text('{"type":"response_item","payload":{"type":"mess')
 
         with pytest.raises(transcript.TranscriptSourceError) as exc_info:
-            transcript.count_user_records("codex", session_id, None)
+            transcript.count_prompt_turns("codex", session_id, None, "the prompt")
         assert exc_info.value.code == "store_unreadable"
 
-    def test_claude_a_counted_record_makes_a_trailing_partial_line_harmless(
+    def test_claude_a_partial_record_beside_a_counted_one_is_still_unknown(
         self, tmp_path, monkeypatch
     ):
-        """The guard is "counted nothing while skipping something", not "any
-        skip at all": a readable user record next to a partial append is
-        still a usable count."""
+        """A transcript that already holds a turn carrying this prompt (a
+        repeated steer of the same message) plus a partially appended record:
+        the partial line may be this submission's own record, so however many
+        earlier turns matched, the answer is unknown rather than the number
+        counted -- which would read as flat and license a resend."""
         monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
         session_id = "sess-partial-tail"
         path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
@@ -950,12 +1040,14 @@ class TestCountUserRecordsUnparseableIsUnknown:
             json.dumps({
                 "type": "user", "sessionId": session_id,
                 "message": {"role": "user", "content": "the prompt"},
-            }) + "\n" + '{"type":"assistant","mess'
+            }) + "\n" + '{"type":"user","message":{"role":"user","conte'
         )
 
-        assert transcript.count_user_records("claude", session_id, "/Users/x/proj") == 1
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "the prompt")
+        assert exc_info.value.code == "store_unreadable"
 
-    def test_codex_a_counted_record_makes_a_trailing_partial_line_harmless(
+    def test_codex_a_partial_record_beside_a_counted_one_is_still_unknown(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
@@ -972,7 +1064,9 @@ class TestCountUserRecordsUnparseableIsUnknown:
             }) + "\n" + '{"type":"response_item","pay'
         )
 
-        assert transcript.count_user_records("codex", session_id, None) == 1
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("codex", session_id, None, "the prompt")
+        assert exc_info.value.code == "store_unreadable"
 
     def test_a_readable_empty_file_still_counts_zero(self, tmp_path, monkeypatch):
         """The control: nothing skipped means 0 is a real observation, which
@@ -983,7 +1077,31 @@ class TestCountUserRecordsUnparseableIsUnknown:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("")
 
-        assert transcript.count_user_records("claude", session_id, "/Users/x/proj") == 0
+        assert transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "the prompt") == 0
+
+    def test_a_fully_readable_file_holding_the_prompt_still_counts_it(
+        self, tmp_path, monkeypatch
+    ):
+        """The other control: with nothing skipped, a landed prompt verifies
+        normally -- the unreadable rule must not swallow the success path."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-readable"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id,
+                    "message": {"role": "user", "content": "an earlier turn"},
+                },
+                {
+                    "type": "user", "sessionId": session_id,
+                    "message": {"role": "user", "content": "the prompt"},
+                },
+            ],
+        )
+
+        assert transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "the prompt") == 1
 
 
 # ---------------------------------------------------------------------------

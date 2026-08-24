@@ -247,20 +247,64 @@ def count_transcript(
     raise TranscriptSourceError(f"unrecognised harness {harness!r} in session.json", code="unknown_harness")
 
 
-def count_user_records(harness: str, session_id: str, cwd: Optional[str]) -> int:
-    """Return the number of user-role records for one session.
+# ---------------------------------------------------------------------------
+# The submission-verification predicate
+# ---------------------------------------------------------------------------
+#
+# THE PREDICATE. A submission counts as delivered only when the session's
+# conversation store gained a **user-role turn whose own text carries the
+# submitted prompt**. Three conditions, all required:
+#
+#   1. user role -- an assistant reply, a reasoning trace or a tool record in
+#      the current turn must never satisfy it, since none of them implies new
+#      input reached the harness;
+#   2. our content -- a bare user-role envelope with no text part yet, or a
+#      user-role message the harness synthesised for itself, is not our
+#      prompt, however much it moves a record count;
+#   3. observed, not assumed -- a store that cannot be fully read yields no
+#      number at all (``TranscriptSourceError``), never a zero, because a zero
+#      is read as proof the prompt did not land and licenses a resend.
+#
+# Every witness source -- opencode's HTTP endpoint, its SQLite store, and the
+# claude/codex JSONL rollouts -- implements exactly this, so "verified" means
+# one thing across every transport.
 
-    Only records the *user* produced are counted: assistant text, reasoning,
-    tool calls and tool results are all excluded, so a rise in this number
-    can only come from new input reaching the harness. Failures raise
-    ``TranscriptSourceError`` rather than returning 0.
+def normalize_prompt_text(text: str) -> str:
+    """Collapse every whitespace run to a single space and strip the ends.
+
+    A TUI re-wraps a long prompt before its harness records the turn, so a
+    byte-exact comparison would miss a prompt that plainly did land. Nothing
+    but whitespace is normalised: the words themselves must match.
     """
+    return " ".join(text.split())
+
+
+def turn_carries_prompt(turn_text: Optional[str], normalized_prompt: str) -> bool:
+    """True when one turn's text carries *normalized_prompt* (already passed
+    through ``normalize_prompt_text``).
+
+    An empty prompt matches nothing: it would otherwise degrade the predicate
+    back to a bare user-record count, which is what content attribution
+    exists to replace.
+    """
+    if not normalized_prompt or not isinstance(turn_text, str):
+        return False
+    return normalized_prompt in normalize_prompt_text(turn_text)
+
+
+def count_prompt_turns(harness: str, session_id: str, cwd: Optional[str], prompt: str) -> int:
+    """Return how many user-role turns in one session carry *prompt*.
+
+    Implements THE PREDICATE above for the harness's own store. Failures
+    raise ``TranscriptSourceError`` rather than returning 0.
+    """
+    normalized = normalize_prompt_text(prompt)
     if harness == "opencode":
-        return _count_opencode_user(session_id)
+        return _count_opencode_prompt_turns(session_id, normalized)
     if harness == "claude":
-        return _count_claude_user(session_id, cwd)
+        return _count_claude_prompt_turns(session_id, cwd, normalized)
     if harness == "codex":
-        return _count_codex_user(session_id)
+        return _count_codex_prompt_turns(session_id, normalized)
     raise TranscriptSourceError(f"unrecognised harness {harness!r} in session.json", code="unknown_harness")
 
 
@@ -395,40 +439,49 @@ def _count_opencode(session_id: str) -> tuple[int, Optional[str]]:
     return count, _iso_from_epoch_ms(newest_raw)
 
 
-def _count_opencode_user(session_id: str) -> int:
-    """User-role `message` rows for one session.
+def _count_opencode_prompt_turns(session_id: str, normalized_prompt: str) -> int:
+    """User-role `message` rows for one session whose text parts carry the
+    prompt.
 
-    Counted on the `message` table rather than `part`: one row per turn
-    instead of one per event, and `message.data` carries the role directly.
-    `json_extract` does the filtering inside sqlite when the build has the
-    JSON1 extension; otherwise the session's message rows (tens, not
-    thousands) are decoded here. Raises the same errors as
-    `_opencode_connect`/query execution (missing/locked/unreadable store).
+    Role comes from `message.data`, but the prompt itself lives in the turn's
+    `part` rows, and opencode persists the envelope and its parts as separate
+    events -- so a row that exists proves nothing about what it will
+    eventually hold. Both tables are read in one pass and joined here rather
+    than per message, which would issue a query per turn. Raises the same
+    errors as `_opencode_connect`/query execution (missing/locked/unreadable
+    store).
     """
     conn = _opencode_connect()
     try:
-        try:
-            cursor = conn.execute(
-                "select count(*) from message "
-                "where session_id = ? and json_extract(data, '$.role') = 'user'",
-                (session_id,),
-            )
-            return cursor.fetchone()[0]
-        except sqlite3.OperationalError as exc:
-            if "json_extract" not in str(exc).lower():
-                raise
-        cursor = conn.execute(
-            "select data from message where session_id = ?", (session_id,)
-        )
-        count = 0
-        for (raw,) in cursor:
+        user_message_ids = set()
+        for message_id, raw in conn.execute(
+            "select id, data from message where session_id = ?", (session_id,)
+        ):
             try:
                 data = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
                 continue
             if isinstance(data, dict) and data.get("role") == "user":
-                count += 1
-        return count
+                user_message_ids.add(message_id)
+
+        texts_by_message: dict[str, list[str]] = {}
+        for message_id, raw in conn.execute(
+            "select message_id, data from part where session_id = ? order by time_created",
+            (session_id,),
+        ):
+            if message_id not in user_message_ids:
+                continue
+            try:
+                part = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                texts_by_message.setdefault(message_id, []).append(part["text"])
+
+        return sum(
+            1 for message_id in user_message_ids
+            if turn_carries_prompt("\n".join(texts_by_message.get(message_id, ())), normalized_prompt)
+        )
     except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
         raise _opencode_query_error(exc) from exc
     finally:
@@ -700,54 +753,56 @@ def _count_claude(session_id: str, cwd: Optional[str]) -> tuple[int, Optional[st
     return total.entries, _iso_utc_z(total.newest) if total.newest is not None else None
 
 
-def _claude_record_is_user_input(record: dict, session_id: str) -> bool:
-    """True when one claude JSONL record is a user turn rather than a tool
-    result, an assistant record, or another session's record.
+def _claude_user_input_text(record: dict, session_id: str) -> Optional[str]:
+    """The text of one claude JSONL record when it is a user turn, else None.
 
     A `tool_result` block also arrives as a ``type: "user"`` record with
     ``role: "user"``; only text content counts as input the user supplied.
     """
     if record.get("type") != "user":
-        return False
+        return None
     record_session_id = record.get("sessionId")
     if record_session_id is not None and record_session_id != session_id:
-        return False
+        return None
     message = record.get("message")
     if not isinstance(message, dict) or message.get("role") != "user":
-        return False
+        return None
     content = message.get("content")
     if isinstance(content, str):
-        return bool(content)
+        return content or None
     if not isinstance(content, list):
-        return False
-    return any(
-        isinstance(block, dict) and block.get("type") == "text" and block.get("text")
-        for block in content
-    )
+        return None
+    texts = [
+        block["text"] for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+        and isinstance(block.get("text"), str) and block["text"]
+    ]
+    return "\n".join(texts) if texts else None
 
 
-def _count_claude_user(session_id: str, cwd: Optional[str]) -> int:
-    """User turns in a claude session, main file only.
+def _count_claude_prompt_turns(session_id: str, cwd: Optional[str], normalized_prompt: str) -> int:
+    """User turns in a claude session carrying the prompt, main file only.
 
     Subagent files are skipped: they carry the parent agent's prompts to a
     subagent, not input delivered to this session. Streaming the JSONL and
     testing each record beats a full `_read_claude` parse, which also builds
     and merges every assistant/tool entry.
 
-    Counting nothing while skipping something is unreadable, not empty: a
-    file caught mid-append has an unterminated trailing line, and that line
-    may be the very user record being counted.
+    Any skipped record makes the answer unknown rather than low: a file
+    caught mid-append has an unterminated trailing line, and that line may be
+    the very record carrying this prompt.
     """
     path = _claude_session_path(session_id, cwd)
     skip_counter = _JsonlSkipCounter()
-    count = sum(
-        1 for record in _iter_jsonl_objects(path, skip_counter)
-        if _claude_record_is_user_input(record, session_id)
-    )
-    if count == 0 and skip_counter.skipped > 0:
+    count = 0
+    for record in _iter_jsonl_objects(path, skip_counter):
+        if turn_carries_prompt(_claude_user_input_text(record, session_id), normalized_prompt):
+            count += 1
+    if skip_counter.skipped > 0:
         raise TranscriptSourceError(
             f"claude session transcript for {session_id!r} at {path} is unreadable: "
-            f"{skip_counter.skipped} record(s) unparseable, 0 user record(s) counted",
+            f"{skip_counter.skipped} record(s) unparseable, {count} prompt turn(s) counted "
+            f"among the readable ones",
             code="store_unreadable",
         )
     return count
@@ -1155,17 +1210,17 @@ def _count_codex(session_id: str) -> tuple[int, Optional[str]]:
     return stats.entries, _iso_utc_z(stats.newest) if stats.newest is not None else None
 
 
-def _count_codex_user(session_id: str) -> int:
-    """User turns in a codex rollout.
+def _count_codex_prompt_turns(session_id: str, normalized_prompt: str) -> int:
+    """User turns in a codex rollout carrying the prompt.
 
     Uses the same `_is_codex_injected_context` filter as `_count_codex`, so
     the harness's own `<environment_context>`/`<user_instructions>` preamble
-    -- written at thread/start, before any prompt is submitted -- is not
+    -- written at thread start, before any prompt is submitted -- is not
     mistaken for a delivered user turn.
 
-    Counting nothing while skipping something is unreadable, not empty: a
-    rollout caught mid-append has an unterminated trailing line, and that
-    line may be the very user record being counted.
+    Any skipped record makes the answer unknown rather than low: a rollout
+    caught mid-append has an unterminated trailing line, and that line may be
+    the very record carrying this prompt.
     """
     path = _codex_session_path(session_id)
     skip_counter = _JsonlSkipCounter()
@@ -1179,12 +1234,13 @@ def _count_codex_user(session_id: str) -> int:
         if payload.get("role") != "user":
             continue
         text = _codex_message_text(payload.get("content"))
-        if text and not _is_codex_injected_context(text):
+        if text and not _is_codex_injected_context(text) and turn_carries_prompt(text, normalized_prompt):
             count += 1
-    if count == 0 and skip_counter.skipped > 0:
+    if skip_counter.skipped > 0:
         raise TranscriptSourceError(
             f"codex session transcript for {session_id!r} at {path} is unreadable: "
-            f"{skip_counter.skipped} record(s) unparseable, 0 user record(s) counted",
+            f"{skip_counter.skipped} record(s) unparseable, {count} prompt turn(s) counted "
+            f"among the readable ones",
             code="store_unreadable",
         )
     return count

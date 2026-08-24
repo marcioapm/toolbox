@@ -4409,10 +4409,17 @@ def _opencode_http_endpoint(state_dir: Path, log_dir: Path) -> Optional[tuple[in
     return port, session_id
 
 
-def _opencode_http_message_count(port: int, session_id: str) -> Optional[int]:
-    """GET /session/<id>/message and count user-role entries. None on any
-    failure (unreachable server, non-200, malformed body): an unreadable
-    witness is unknown, never zero.
+def _opencode_http_prompt_turn_count(
+    port: int, session_id: str, normalized_prompt: str
+) -> Optional[int]:
+    """GET /session/<id>/message and count user turns carrying the prompt.
+    None on any failure (unreachable server, non-200, malformed body): an
+    unreadable witness is unknown, never zero.
+
+    Implements ``agent_run_transcript``'s submission-verification predicate
+    over the HTTP view of the store: role *and* content, because opencode
+    persists a message envelope and its text parts as separate events, and
+    adds user-role messages of its own.
 
     http.client.HTTPException covers the failures urllib does not wrap:
     resp.read() raises IncompleteRead for a body shorter than Content-Length
@@ -4434,23 +4441,40 @@ def _opencode_http_message_count(port: int, session_id: str) -> Optional[int]:
         return None
     return sum(
         1 for item in data
-        if isinstance(item, dict) and (item.get("info") or {}).get("role") == "user"
+        if isinstance(item, dict)
+        and (item.get("info") or {}).get("role") == "user"
+        and _agent_run_transcript.turn_carries_prompt(
+            _opencode_http_message_text(item), normalized_prompt
+        )
+    )
+
+
+def _opencode_http_message_text(message: dict) -> str:
+    """Concatenate one HTTP message record's text parts."""
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    return "\n".join(
+        part["text"] for part in parts
+        if isinstance(part, dict) and isinstance(part.get("text"), str)
     )
 
 
 class _WitnessSource:
-    """A user-record counter pinned for one verification call.
+    """A prompt-turn counter pinned for one verification call.
 
     Counts from different sources are not comparable, so a read failure never
-    causes fallback to another source.
+    causes fallback to another source. What is counted is
+    ``agent_run_transcript``'s submission-verification predicate: user-role
+    turns whose own text carries the submitted prompt.
     """
 
     def __init__(self, name: str, count: Callable[[], Optional[int]]) -> None:
         self.name = name
         self._count = count
 
-    def user_count(self) -> Optional[int]:
-        """User-record count, or None when this source cannot be read.
+    def prompt_turn_count(self) -> Optional[int]:
+        """Prompt-turn count, or None when this source cannot be read.
 
         Any exception from the underlying counter is an unreadable witness:
         _submit_and_verify promises never to raise for a submission failure,
@@ -4485,9 +4509,11 @@ def _run_is_managed(log_dir: Optional[Path]) -> bool:
     return True
 
 
-def _resolve_witness_source(state_dir: Path, log_dir: Optional[Path]) -> Optional[_WitnessSource]:
+def _resolve_witness_source(
+    state_dir: Path, log_dir: Optional[Path], prompt: str
+) -> Optional[_WitnessSource]:
     """Pick the witness source for a run, or None when no usable session id
-    is available to count records for.
+    is available to count *prompt*'s turns in.
 
     None covers both an unmanaged run (no session.json) and a managed run
     whose session id could not be acquired; ``_run_is_managed`` separates
@@ -4498,11 +4524,13 @@ def _resolve_witness_source(state_dir: Path, log_dir: Optional[Path]) -> Optiona
     """
     if log_dir is None:
         return None
+    normalized = _agent_run_transcript.normalize_prompt_text(prompt)
     endpoint = _opencode_http_endpoint(state_dir, log_dir)
     if endpoint is not None:
         port, session_id = endpoint
         return _WitnessSource(
-            "opencode_http", lambda: _opencode_http_message_count(port, session_id)
+            "opencode_http",
+            lambda: _opencode_http_prompt_turn_count(port, session_id, normalized),
         )
     session_data = _read_session_json(log_dir)
     if not isinstance(session_data, dict):
@@ -4514,16 +4542,18 @@ def _resolve_witness_source(state_dir: Path, log_dir: Optional[Path]) -> Optiona
     cwd = _run_json_cwd(log_dir)
     return _WitnessSource(
         f"{harness}_transcript",
-        lambda: _transcript_user_count(harness, session_id, cwd),
+        lambda: _transcript_prompt_turn_count(harness, session_id, cwd, prompt),
     )
 
 
-def _transcript_user_count(harness: str, session_id: str, cwd: Optional[str]) -> Optional[int]:
-    """User-record count from the harness transcript store, or None when the
+def _transcript_prompt_turn_count(
+    harness: str, session_id: str, cwd: Optional[str], prompt: str
+) -> Optional[int]:
+    """Prompt-turn count from the harness transcript store, or None when the
     store cannot be read. Never raises: every store failure is an unreadable
     witness, the same fail-closed rule the watch contract uses."""
     try:
-        count = _agent_run_transcript.count_user_records(harness, session_id, cwd)
+        count = _agent_run_transcript.count_prompt_turns(harness, session_id, cwd, prompt)
     except Exception:  # noqa: BLE001
         return None
     if not isinstance(count, int) or isinstance(count, bool) or count < 0:
@@ -4698,30 +4728,32 @@ def _submit_and_verify(
     transport: Optional[str] = None,
     fresh_session: bool = False,
 ) -> SubmissionOutcome:
-    """Submit text and verify that the pinned witness gained a user record.
+    """Submit text and verify that the pinned witness gained a turn carrying it.
 
-    Only a fresh session can prove delivery from a nonzero count after an
-    unreadable baseline. On an unreadable witness the only permitted resends
-    are ones that cannot duplicate a prompt that may already have landed:
-    the keystroke ladder's terminator-only rung over a composer known to
-    hold this text, and a repeat of a write that provably delivered no
-    bytes. A custom *submit* may reject immediately or raise OSError;
-    out-of-band TimeoutError propagates.
+    Verification follows ``agent_run_transcript``'s submission-verification
+    predicate: a user-role turn whose own text carries this prompt. Only a
+    fresh session can prove delivery from a nonzero count after an unreadable
+    baseline. On an unreadable witness the only permitted resends are ones
+    that cannot duplicate a prompt that may already have landed: the
+    keystroke ladder's terminator-only rung over a composer known to hold
+    this text, and a repeat of a write that provably delivered no bytes. A
+    custom *submit* may reject immediately or raise OSError; out-of-band
+    TimeoutError propagates.
     """
     if submit is not None:
         transport = transport or "rpc"
     else:
         endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
         transport = "http" if endpoint is not None else "keystroke"
-    witness = _resolve_witness_source(state_dir, log_dir)
+    witness = _resolve_witness_source(state_dir, log_dir, text.decode("utf-8", errors="replace"))
     # No witness has two causes that must not be conflated: a raw run, for
     # which "written" has always been the only available evidence, and a
     # managed run whose session id could not be acquired, which is a failed
     # mint and must never read as a success.
     unwitnessed_detail = "no_session_id" if _run_is_managed(log_dir) else "unwitnessed"
-    baseline = witness.user_count() if witness is not None else None
+    baseline = witness.prompt_turn_count() if witness is not None else None
     # Without a baseline, a count is evidence only for a session this launch
-    # just minted, which held no user records before this submission. An
+    # just minted, which held no turns at all before this submission. An
     # established session's existing history makes any count unattributable.
     comparable = witness is not None and (baseline is not None or fresh_session)
     # Whether a read taken *after* the current attempt's write succeeded.
@@ -4733,7 +4765,7 @@ def _submit_and_verify(
         nonlocal readable_after_write
         if not comparable:
             return False
-        current = witness.user_count()
+        current = witness.prompt_turn_count()
         if current is None:
             return False
         if post_write:

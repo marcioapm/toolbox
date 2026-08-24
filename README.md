@@ -1054,35 +1054,57 @@ single-directory layout for runs launched before the state/log split.
 ### Verified submission
 
 An interactive launch prompt and every `steer` are self-verifying: delivery
-is confirmed by a **new user-role record** appearing in the harness's own
-conversation store, not merely by a successful FIFO/HTTP write. Counting
-only user records matters — an assistant reply or a tool call in the
-current turn would otherwise satisfy a raw record count with nothing
-delivered.
+is confirmed by the harness's own conversation store gaining a **user-role
+turn whose own text carries the submitted prompt**, not merely by a
+successful FIFO/HTTP write. All three conditions are required:
 
-The source of that count is resolved once per submission and pinned for the
-whole verification: opencode's HTTP `/session/<id>/message` endpoint when a
+- **user role** — an assistant reply, a reasoning trace or a tool record in
+  the current turn would otherwise satisfy a raw record count with nothing
+  delivered;
+- **our content** — a bare user-role envelope with no text part yet
+  (opencode persists the message and its parts as separate events) or a
+  user-role message the harness synthesised for itself is not our prompt,
+  however much it moves a count;
+- **observed, not assumed** — a store that cannot be fully read yields no
+  number at all, never a zero, because a zero reads as proof the prompt did
+  not land and licenses a resend. Any skipped JSONL record makes the answer
+  unknown, whatever the readable ones say: the unterminated trailing line of
+  a file caught mid-append may be this prompt's own record.
+
+The predicate is written once, as a docstring in
+`toolbox/agent_run_transcript.py`, and every witness source — opencode's
+HTTP endpoint, its SQLite store, and the claude/codex JSONL rollouts —
+implements exactly that, so "verified" means one thing across every
+transport. Prompt text is compared with whitespace runs collapsed, since a
+TUI re-wraps a long prompt before the harness records the turn.
+
+The source is resolved once per submission and pinned for the whole
+verification: opencode's HTTP `/session/<id>/message` endpoint when a
 port is known, otherwise the harness transcript store. A pinned source that
 stops answering is an *unreadable witness*, never a reason to fall back to
 the other one — the two count different things and comparing across them
 proves nothing.
 
-`steer` prints `verified` and exits 0 only once the user-record count has
-risen above its pre-submit baseline. A submission that cannot be verified
-within the default 10 seconds is retried once (two attempts total) when the
-witness was readable but stayed flat — proof the prompt did not land. A
-witness that was never readable carries no evidence the prompt failed, so
-the only resends permitted are ones that cannot duplicate it (`messageID`
-is not idempotent): the keystroke terminator sent alone over a composer this
-call is known to have filled, and a repeat of a write that provably put no
-submittable input in front of the harness. Anything else stops at a single
-submission. The retry re-reads the witness immediately before resending,
-which narrows but cannot close the window between the last read and the
-resend; no transport here offers idempotent submission. A keystroke retry
-sends the submit terminator alone first, submitting a prompt the TUI
-buffered but never sent, rather than doubling it — but only after a write
-that delivered the whole payload, since terminating a truncated composer
-would submit a partial prompt as a complete message.
+`steer` prints `verified` and exits 0 only once the count of turns carrying
+this prompt has risen above its pre-submit baseline. A submission that
+cannot be verified within the default 10 seconds is retried once (two
+attempts total) when a read taken *after* that attempt's own write was
+readable but stayed flat — proof the prompt did not land. Reads from before
+the write cannot supply that proof, however readable they were: the pre-
+resend re-check happens before the next payload is sent and says nothing
+about it. A witness that was never readable after the write carries no
+evidence the prompt failed, so the only resends permitted are ones that
+cannot duplicate it (`messageID` is not idempotent): the keystroke
+terminator sent alone over a composer this call is known to have filled, and
+a repeat of a write that provably put no submittable input in front of the
+harness. Anything else stops at a single submission. The retry re-reads the
+witness immediately before resending, which narrows but cannot close the
+window between the last read and the resend; no transport here offers
+idempotent submission. A keystroke retry sends the submit terminator alone
+first, submitting a prompt the TUI buffered but never sent, rather than
+doubling it — but only after a write that delivered the whole payload, since
+terminating a truncated composer would submit a partial prompt as a complete
+message.
 
 An unreadable *baseline* is only ever upgraded to proof for a session this
 launch minted, which held no records beforehand. A `steer` runs against an
