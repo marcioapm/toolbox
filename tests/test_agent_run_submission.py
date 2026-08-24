@@ -661,6 +661,48 @@ def _no_transport_side_effects(monkeypatch) -> list:
     return submissions
 
 
+class _CoupledHarness:
+    """A witness driven *by* the transport, so the count can only rise
+    because a submission actually happened.
+
+    An independent witness mock and transport mock let a success-path test
+    pass on polling alone: the witness would rise on schedule whether or not
+    _submit_and_verify ever called the transport. Here every accepted
+    submission appends a user record, and the witness reports how many exist.
+
+    accept_from bounds which attempts land: attempts before it raise or are
+    silently swallowed, modelling a TUI that took the text and dropped the
+    Enter. delivered records every payload the transport saw, landed only
+    those that produced a record.
+    """
+
+    def __init__(self, monkeypatch, *, accept_from: int = 1, raise_before: bool = False):
+        self.delivered: list = []
+        self.landed: list = []
+        self._accept_from = accept_from
+        self._raise_before = raise_before
+        monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+        monkeypatch.setattr(agent_run, "_submit_via_keystroke", self._submit)
+        monkeypatch.setattr(
+            agent_run, "_resolve_witness_source",
+            lambda *_a: agent_run._WitnessSource("coupled", self.user_count),
+        )
+        monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+
+    def _submit(self, _state_dir, payload) -> None:
+        attempt = len(self.delivered) + 1
+        if attempt < self._accept_from:
+            if self._raise_before:
+                raise ConnectionResetError("transport failed")
+            self.delivered.append(payload)  # written, but swallowed downstream
+            return
+        self.delivered.append(payload)
+        self.landed.append(payload)
+
+    def user_count(self) -> int:
+        return len(self.landed)
+
+
 def test_submit_and_verify_swallowed_input_exhausts_attempts(tmp_path, monkeypatch):
     """A flat witness exhausts max_attempts and reports a timeout."""
     submissions = _no_transport_side_effects(monkeypatch)
@@ -814,10 +856,20 @@ def test_witness_source_pinned_to_opencode_http_never_falls_back_to_the_store(
     tmp_path, monkeypatch
 ):
     """An opencode run whose HTTP endpoint stops answering must report an
-    unreadable witness, not silently start reading the transcript store:
-    the store's much larger count would clear the HTTP baseline instantly."""
+    unreadable witness, not silently start reading the transcript store.
+
+    The store counts a different thing on a different scale, so its number
+    clears an HTTP baseline on sight -- which is exactly the false
+    verification this pins against. The store here therefore returns a
+    plausible larger count rather than raising: a raise would be indis-
+    tinguishable from the unreadable-witness result under test.
+    """
     monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: (41234, "ses_1"))
     monkeypatch.setattr(agent_run, "_submit_via_http", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        agent_run, "_read_session_json",
+        lambda _log_dir: {"session_id": "ses_1", "harness": "opencode"},
+    )
     http_reads = {"n": 0}
 
     def flaky_http(_port, _session):
@@ -825,18 +877,21 @@ def test_witness_source_pinned_to_opencode_http_never_falls_back_to_the_store(
         return 2 if http_reads["n"] == 1 else None  # baseline only, then dead
 
     monkeypatch.setattr(agent_run, "_opencode_http_message_count", flaky_http)
+    store_reads = {"n": 0}
 
-    def store_would_verify(*_a, **_k):
-        raise AssertionError("a pinned HTTP witness must never read the transcript store")
+    def store_count(*_a, **_k):
+        store_reads["n"] += 1
+        return 340  # would tower over the HTTP baseline of 2
 
     monkeypatch.setattr(
-        agent_run._agent_run_transcript, "count_user_records", store_would_verify
+        agent_run._agent_run_transcript, "count_user_records", store_count
     )
 
     outcome = agent_run._submit_and_verify(
         tmp_path, tmp_path, b"hello", deadline_s=0.05, max_attempts=1,
     )
 
+    assert store_reads["n"] == 0, "a pinned HTTP witness must never read the store"
     assert outcome.verified is False
     assert outcome.detail == "witness_unreadable"
 
@@ -1200,6 +1255,85 @@ def test_submit_via_http_reports_a_socket_timeout_as_a_connection_error(monkeypa
 
     with pytest.raises(ConnectionError):
         agent_run._submit_via_http(41234, "ses_1", "hello")
+
+
+# ---------------------------------------------------------------------------
+# Causally-coupled success paths: the witness rises only from a real submission
+# ---------------------------------------------------------------------------
+
+def test_coupled_first_attempt_verifies_off_its_own_submission(tmp_path, monkeypatch):
+    """With the witness driven by the transport, verification can only come
+    from the submission this call made -- not from polling long enough."""
+    harness = _CoupledHarness(monkeypatch)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=5.0, max_attempts=2,
+    )
+
+    assert outcome.verified is True
+    assert outcome.attempts == 1
+    assert harness.landed == [b"hello" + agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)]
+
+
+def test_coupled_swallowed_first_attempt_verifies_off_the_retry(tmp_path, monkeypatch):
+    """The TUI takes attempt 1's text and drops the Enter, so no record
+    appears. Attempt 2 sends the terminator alone, which submits the buffered
+    text -- and only then does the witness rise."""
+    harness = _CoupledHarness(monkeypatch, accept_from=2)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.05, max_attempts=2,
+    )
+
+    cr = agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)
+    assert outcome.verified is True
+    assert outcome.attempts == 2
+    assert harness.delivered == [b"hello" + cr, cr]
+    assert harness.landed == [cr], "the retry must not resend the prompt text"
+
+
+def test_coupled_nothing_ever_lands_stays_unverified(tmp_path, monkeypatch):
+    """The control for the two above: when no submission ever produces a
+    record, no amount of polling verifies."""
+    harness = _CoupledHarness(monkeypatch, accept_from=99)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.05, max_attempts=3,
+    )
+
+    assert outcome.verified is False
+    assert outcome.detail == "timeout"
+    assert harness.landed == []
+    assert len(harness.delivered) == 3
+
+
+def test_coupled_transport_error_that_actually_landed_is_not_resent(tmp_path, monkeypatch):
+    """A transport that raised after the peer took the request still produces
+    a record. Polling the witness before retrying catches that."""
+    landed: list = []
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(
+        agent_run, "_resolve_witness_source",
+        lambda *_a: agent_run._WitnessSource("coupled", lambda: len(landed)),
+    )
+    calls = {"n": 0}
+
+    def queued_then_reset(text):
+        calls["n"] += 1
+        landed.append(text)  # the peer queued it...
+        raise ConnectionResetError("...then the connection broke")
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello",
+        deadline_s=5.0, max_attempts=3, submit=queued_then_reset,
+    )
+
+    assert outcome.verified is True
+    assert calls["n"] == 1
+    assert len(landed) == 1, "a submission that landed must not be duplicated"
 
 
 # ---------------------------------------------------------------------------

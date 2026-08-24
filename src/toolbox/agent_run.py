@@ -11058,10 +11058,14 @@ def _run_interactive(
                 _reset_runner_signal_handlers()
         if helper == 0:
             _reset_runner_signal_handlers()
-            # Detach from the parent's stdio. Errors are silent (no log to write to).
+            # os._exit in the finally clause: this helper must never fall
+            # through into the parent's select loop, and never run its
+            # cleanup. It keeps the runner's descriptors, log_fd included,
+            # which is where its warning below goes.
             try:
-                # Wait a few seconds for the TUI to enable raw mode. Earlier
-                # tests showed sub-3s delivery races ICRNL CR->LF translation.
+                # Delivering before the TUI enables raw mode leaves the
+                # terminal's ICRNL translation in play, turning the CR
+                # terminator into LF, which the TUI does not treat as submit.
                 time.sleep(PROMPT_SUBMISSION_DELAY_SECONDS)
                 try:
                     data = Path(prompt_file).read_bytes()
@@ -12370,8 +12374,8 @@ def _build_managed_argv(
             # Bare TUI attached to the pre-minted session. --port keeps the HTTP
             # API reachable. --auto approves permissions unattended; omitted when
             # --permissions prompt so the harness's own permission UI is used.
-            # NEVER add --prompt here: --session silently swallows it, which is
-            # how 24 runs were lost.
+            # NEVER add --prompt here: --session silently swallows it, so the
+            # run starts idle with no error and no prompt.
             if opencode_port is not None:
                 argv.extend(["--port", str(opencode_port)])
             if session_id:
