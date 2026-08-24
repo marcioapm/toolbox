@@ -244,6 +244,25 @@ def transcript_contains(run: str, needle: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# H1 route predicate
+# ---------------------------------------------------------------------------
+
+
+def opencode_message_route_present(doc: dict) -> bool:
+    """Return True when doc contains a POST /session/{id}/message route.
+
+    Checks the OpenAPI /doc response for a path matching the session message
+    route pattern and confirms it advertises a POST method.
+    """
+    paths = doc.get("paths", {}) if isinstance(doc, dict) else {}
+    key = next(
+        (k for k in paths if k.startswith("/session/{") and k.endswith("}/message")),
+        None,
+    )
+    return bool(key and "post" in paths[key])
+
+
+# ---------------------------------------------------------------------------
 # HTTP helpers — curl used deliberately (see module docstring re H3 semantics)
 # ---------------------------------------------------------------------------
 
@@ -1110,16 +1129,7 @@ def run_opencode_http_contract(
     )
     try:
         doc = json.loads(cp.stdout)
-        paths = doc.get("paths", {})
-        key = next(
-            (
-                k
-                for k in paths
-                if k.startswith("/session/{") and k.endswith("}/message")
-            ),
-            None,
-        )
-        if key and "post" in paths[key]:
+        if opencode_message_route_present(doc):
             h1 = "PASS"
         else:
             _log("H1 FAIL: /doc missing a POST /session/{sessionID}/message route")

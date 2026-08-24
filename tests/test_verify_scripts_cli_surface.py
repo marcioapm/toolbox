@@ -75,6 +75,7 @@ from toolbox.verify_submission import (
     duplicated_prompt_texts_present,
     h3_client_aborted,
     h4_record_inserted,
+    opencode_message_route_present,
     steer_reported_verified,
 )
 
@@ -372,20 +373,10 @@ def test_c1_anti_vacuity_submission_verified_requires_marker_file(tmp_path):
 
 def test_h1_anti_vacuity_route_check_requires_post_method():
     """The H1 route check must fail when the /doc JSON has no POST method."""
-    paths = {"/session/{sessionID}/message": {"get": {}}}
-    key = next(
-        (k for k in paths if k.startswith("/session/{") and k.endswith("}/message")),
-        None,
-    )
-    assert key is not None
-    assert "post" not in paths[key], "GET-only route must not satisfy H1"
+    doc = {"paths": {"/session/{sessionID}/message": {"get": {}}}}
+    assert not opencode_message_route_present(doc), "GET-only route must not satisfy H1"
 
 
 def test_h1_anti_vacuity_route_check_fails_on_empty_doc():
     """An empty /doc response has no session message route."""
-    paths = {}
-    key = next(
-        (k for k in paths if k.startswith("/session/{") and k.endswith("}/message")),
-        None,
-    )
-    assert key is None
+    assert not opencode_message_route_present({})
