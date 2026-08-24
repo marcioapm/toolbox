@@ -903,6 +903,89 @@ class TestCountUserRecords:
         assert exc_info.value.code == "unknown_harness"
 
 
+class TestCountUserRecordsUnparseableIsUnknown:
+    """A file caught mid-append has an unterminated trailing line, which is
+    exactly the state a transcript is in during the seconds after a launch
+    prompt is submitted. Counting 0 there converts "unknown" into "proof it
+    did not land", and that proof is what licenses a resend -- of a prompt
+    the partial line may well be."""
+
+    def test_claude_wholly_unparseable_file_is_unreadable_not_empty(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-truncated"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"type":"user","message":{"role":"user","conte')
+
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_user_records("claude", session_id, "/Users/x/proj")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_codex_wholly_unparseable_file_is_unreadable_not_empty(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-truncated"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"type":"response_item","payload":{"type":"mess')
+
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_user_records("codex", session_id, None)
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_claude_a_counted_record_makes_a_trailing_partial_line_harmless(
+        self, tmp_path, monkeypatch
+    ):
+        """The guard is "counted nothing while skipping something", not "any
+        skip at all": a readable user record next to a partial append is
+        still a usable count."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-partial-tail"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "type": "user", "sessionId": session_id,
+                "message": {"role": "user", "content": "the prompt"},
+            }) + "\n" + '{"type":"assistant","mess'
+        )
+
+        assert transcript.count_user_records("claude", session_id, "/Users/x/proj") == 1
+
+    def test_codex_a_counted_record_makes_a_trailing_partial_line_harmless(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-partial-tail"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "timestamp": "2026-08-19T00:00:00Z", "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "the prompt"}],
+                },
+            }) + "\n" + '{"type":"response_item","pay'
+        )
+
+        assert transcript.count_user_records("codex", session_id, None) == 1
+
+    def test_a_readable_empty_file_still_counts_zero(self, tmp_path, monkeypatch):
+        """The control: nothing skipped means 0 is a real observation, which
+        is what proves a prompt did not land."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-empty"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+
+        assert transcript.count_user_records("claude", session_id, "/Users/x/proj") == 0
+
+
 # ---------------------------------------------------------------------------
 # counters stream, not materialize
 # ---------------------------------------------------------------------------

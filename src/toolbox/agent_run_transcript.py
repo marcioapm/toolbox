@@ -733,13 +733,24 @@ def _count_claude_user(session_id: str, cwd: Optional[str]) -> int:
     subagent, not input delivered to this session. Streaming the JSONL and
     testing each record beats a full `_read_claude` parse, which also builds
     and merges every assistant/tool entry.
+
+    Counting nothing while skipping something is unreadable, not empty: a
+    file caught mid-append has an unterminated trailing line, and that line
+    may be the very user record being counted.
     """
     path = _claude_session_path(session_id, cwd)
     skip_counter = _JsonlSkipCounter()
-    return sum(
+    count = sum(
         1 for record in _iter_jsonl_objects(path, skip_counter)
         if _claude_record_is_user_input(record, session_id)
     )
+    if count == 0 and skip_counter.skipped > 0:
+        raise TranscriptSourceError(
+            f"claude session transcript for {session_id!r} at {path} is unreadable: "
+            f"{skip_counter.skipped} record(s) unparseable, 0 user record(s) counted",
+            code="store_unreadable",
+        )
+    return count
 
 
 def _parse_iso_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -1151,6 +1162,10 @@ def _count_codex_user(session_id: str) -> int:
     the harness's own `<environment_context>`/`<user_instructions>` preamble
     -- written at thread/start, before any prompt is submitted -- is not
     mistaken for a delivered user turn.
+
+    Counting nothing while skipping something is unreadable, not empty: a
+    rollout caught mid-append has an unterminated trailing line, and that
+    line may be the very user record being counted.
     """
     path = _codex_session_path(session_id)
     skip_counter = _JsonlSkipCounter()
@@ -1166,6 +1181,12 @@ def _count_codex_user(session_id: str) -> int:
         text = _codex_message_text(payload.get("content"))
         if text and not _is_codex_injected_context(text):
             count += 1
+    if count == 0 and skip_counter.skipped > 0:
+        raise TranscriptSourceError(
+            f"codex session transcript for {session_id!r} at {path} is unreadable: "
+            f"{skip_counter.skipped} record(s) unparseable, 0 user record(s) counted",
+            code="store_unreadable",
+        )
     return count
 
 
