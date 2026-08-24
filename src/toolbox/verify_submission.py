@@ -164,12 +164,12 @@ def _predicate_run_is_running(state_dir: str) -> int:
 
 
 def _predicate_url_answers(url: str) -> int:
-    rc = subprocess.run(
+    return subprocess.run(
         ["curl", "-fsS", "--max-time", "2", "-o", "/dev/null", url],
-        capture_output=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         check=False,
     ).returncode
-    return rc
 
 
 def _predicate_message_count_equals(url: str, expected: int) -> int:
