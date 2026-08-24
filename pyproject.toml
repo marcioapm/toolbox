@@ -38,6 +38,7 @@ gemini-vision = "toolbox.gemini_vision:main"
 slackcli = "toolbox.slackcli:main"
 llm-usage = "toolbox.llm_usage:main"
 agent-run = "toolbox.agent_run:main"
+verify-submission = "toolbox.verify_submission:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -53,4 +54,5 @@ timeout = 120
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ruff>=0.16.4",
 ]

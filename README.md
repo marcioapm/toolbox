@@ -1140,7 +1140,7 @@ listening on, so the witness can query it directly; a caller's
 `--harness-arg=--port` override wins, and the effective port is what gets
 persisted.
 
-`scripts/verify-submission.sh [--harness opencode|claude|codex] [--keep]`
+`verify-submission [--harness opencode|claude|codex] [--keep]`
 runs the end-to-end compatibility checks against installed harnesses and
 prints their PASS/FAIL/SKIP results.
 

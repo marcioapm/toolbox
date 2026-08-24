@@ -1,23 +1,28 @@
-"""Regression guard: the standalone `scripts/verify-*` diagnostics shell out to
-`agent-run` as a subprocess and are not imported or exercised by the pytest
-suite, so a CLI rename here silently breaks them. Assert their argv strings
-track the current subcommand surface directly against the source text.
+"""CLI-surface and anti-vacuity tests for the verify-* diagnostics.
 
-The verify-submission.sh checks are also guarded against becoming vacuous:
-a check that cannot fail proves nothing about the harness it targets, so the
-shapes each one must reject are asserted here against the extracted check.
+The verify-session-attribution and verify-hook-delivery tests guard against
+subcommand renames that would break those scripts without showing up in the
+pytest suite (they are not imported).
+
+The verify-submission tests are behavioural: each imported check function is
+called directly with fixtures that prove it can fail, and separate
+anti-vacuity tests confirm that a broken subject causes a FAIL result.
 """
+
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+
+
+# ---------------------------------------------------------------------------
+# verify-hook-delivery and verify-session-attribution — source-text guards
+# ---------------------------------------------------------------------------
 
 
 def test_verify_hook_delivery_uses_logs_clean_not_removed_clean_subcommand():
@@ -63,26 +68,19 @@ def test_verify_session_attribution_emits_json_when_an_abort_precedes_cells():
     assert '"aborted": reason' in source
 
 
-def _h5_counter_source() -> str:
-    """The inline python3 program `duplicated_prompt_texts_present` pipes a
-    /session/<id>/message response through. Extracted from the script rather
-    than duplicated, so a change to the check is a change to what is tested."""
-    source = (SCRIPTS_DIR / "verify-submission.sh").read_text()
-    body = source[source.index("duplicated_prompt_texts_present() {"):]
-    body = body[: body.index("\n}\n")]
-    return body[body.index("python3 -c '") + len("python3 -c '") : body.rindex("'")]
+# ---------------------------------------------------------------------------
+# verify-submission — imported behavioural tests (H5)
+# ---------------------------------------------------------------------------
 
-
-def _count_distinct(payload: str, text_a: str = "TEXT-A", text_b: str = "TEXT-B") -> int:
-    result = subprocess.run(
-        [sys.executable, "-c", _h5_counter_source()],
-        input=payload,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "TEXT_A": text_a, "TEXT_B": text_b},
-        check=True,
-    )
-    return int(result.stdout.strip())
+from toolbox.verify_submission import (
+    duplicated_prompt_texts_present,
+    h3_client_aborted,
+    h4_record_inserted,
+    opencode_message_route_present,
+    reason_matches,
+    steer_reported_verified,
+    transcript_contains,
+)
 
 
 def _user_message(message_id: str, *texts: str) -> dict:
@@ -92,71 +90,74 @@ def _user_message(message_id: str, *texts: str) -> dict:
     }
 
 
+def _count_distinct(
+    messages: list, text_a: str = "TEXT-A", text_b: str = "TEXT-B"
+) -> int:
+    return duplicated_prompt_texts_present(messages, text_a, text_b)
+
+
 def test_h5_counts_both_texts_when_they_land_in_separate_records():
     """Two POSTs under one messageID stored as two records: both texts
     survived, so the id did not deduplicate the content."""
-    payload = json.dumps([
+    messages = [
         _user_message("msg_a", "TEXT-A"),
         _user_message("msg_b", "TEXT-B"),
-    ])
-    assert _count_distinct(payload) == 2
+    ]
+    assert _count_distinct(messages) == 2
 
 
 def test_h5_counts_both_texts_when_opencode_merges_them_into_one_record():
     """Measured opencode 1.18.21 behaviour: a repeated messageID appends a part
     to the existing record. Both texts are stored, so the duplication H5 tests
     for is real even though only one record exists."""
-    payload = json.dumps([_user_message("msg_merged", "TEXT-A", "TEXT-B")])
-    assert _count_distinct(payload) == 2
+    messages = [_user_message("msg_merged", "TEXT-A", "TEXT-B")]
+    assert _count_distinct(messages) == 2
 
 
 def test_h5_fails_when_the_duplicate_post_is_dropped():
     """The regression H5 must catch: were a repeated messageID to become
     idempotent, retries would silently deduplicate and only one text remains."""
-    payload = json.dumps([_user_message("msg_only", "TEXT-A")])
-    assert _count_distinct(payload) < 2
+    messages = [_user_message("msg_only", "TEXT-A")]
+    assert _count_distinct(messages) < 2
 
 
 def test_h5_fails_when_only_one_of_the_two_texts_is_present():
     """A response missing one POST's text is not evidence of duplication,
     however many records carry the other one."""
-    one_needle_twice = json.dumps([
+    one_needle_twice = [
         _user_message("msg_a", "TEXT-A"),
         _user_message("msg_b", "TEXT-A"),
-    ])
+    ]
     assert _count_distinct(one_needle_twice) < 2
-    assert _count_distinct(json.dumps([_user_message("msg_a", "TEXT-A")])) < 2
-    assert _count_distinct(json.dumps([])) < 2
-    assert _count_distinct("not json at all") < 2
+    assert _count_distinct([_user_message("msg_a", "TEXT-A")]) < 2
+    assert _count_distinct([]) < 2
+    assert duplicated_prompt_texts_present("not a list", "TEXT-A", "TEXT-B") < 2  # type: ignore[arg-type]
 
 
 def test_h5_ignores_assistant_records():
     """An assistant reply echoing both texts is not a user message."""
-    payload = json.dumps([
+    messages = [
         {
             "info": {"id": "msg_reply", "role": "assistant"},
-            "parts": [{"type": "text", "text": "TEXT-A"}, {"type": "text", "text": "TEXT-B"}],
+            "parts": [
+                {"type": "text", "text": "TEXT-A"},
+                {"type": "text", "text": "TEXT-B"},
+            ],
         },
-    ])
-    assert _count_distinct(payload) < 2
+    ]
+    assert _count_distinct(messages) < 2
 
 
-def _shell_function_source(name: str) -> str:
-    """The named bash function, extracted from verify-submission.sh so a
-    change to the check is a change to what is tested."""
-    source = (SCRIPTS_DIR / "verify-submission.sh").read_text()
-    body = source[source.index(f"{name}() {{"):]
-    return body[: body.index("\n}\n") + 2]
+# Anti-vacuity: the check can fail when both texts are absent.
+def test_h5_anti_vacuity_fails_when_no_texts_are_stored():
+    """If neither text survives, H5 must report a count below 2 (failure path)."""
+    messages = [_user_message("msg_empty", "something else entirely")]
+    assert duplicated_prompt_texts_present(messages, "TEXT-A", "TEXT-B") < 2
 
 
-def _steer_reported_verified(steer_output: str) -> bool:
-    result = subprocess.run(
-        ["bash", "-c", f'{_shell_function_source("steer_reported_verified")}\n'
-                       f'steer_reported_verified "$1"', "_", steer_output],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
+# ---------------------------------------------------------------------------
+# verify-submission — imported behavioural tests (C2 / steer_reported_verified)
+# ---------------------------------------------------------------------------
 
 
 def test_c2_rejects_the_failure_message_that_contains_the_word_verified():
@@ -164,45 +165,41 @@ def test_c2_rejects_the_failure_message_that_contains_the_word_verified():
     verified as delivered" contains "verified", so a substring match passes
     on the very output reporting failure -- the check would be vacuous even
     if unverified steer regressed to exit 0."""
-    assert not _steer_reported_verified(
+    assert not steer_reported_verified(
         "agent-run: steer to 'x' could not be verified as delivered "
         "(timeout, 2 attempt(s) via keystroke)"
     )
 
 
 def test_c2_accepts_only_the_positive_success_form():
-    assert _steer_reported_verified("agent-run: steered 'run-1' (37 bytes, verified)")
+    assert steer_reported_verified("agent-run: steered 'run-1' (37 bytes, verified)")
 
 
 @pytest.mark.parametrize(
     "steer_output",
     [
         pytest.param("agent-run: steered 'x' (5 bytes, raw, unverified)", id="raw"),
-        pytest.param("agent-run: steered 'x' (5 bytes, unwitnessed — raw run)", id="unwitnessed"),
+        pytest.param(
+            "agent-run: steered 'x' (5 bytes, unwitnessed — raw run)", id="unwitnessed"
+        ),
         pytest.param("", id="no_output"),
         pytest.param("verified", id="bare_word"),
     ],
 )
 def test_c2_rejects_every_non_success_steer_output(steer_output):
-    assert not _steer_reported_verified(steer_output)
+    assert not steer_reported_verified(steer_output)
 
 
-def _h4_verifier_source() -> str:
-    """The inline python3 program `h4_record_inserted` pipes a
-    /session/<id>/message response through."""
-    body = _shell_function_source("h4_record_inserted")
-    return body[body.index("python3 -c '") + len("python3 -c '") : body.rindex("'")]
+# Anti-vacuity: the check fails when the steer output is empty (no reply at all).
+def test_c2_anti_vacuity_fails_on_absent_output():
+    """An absent steer output must not be treated as success."""
+    assert not steer_reported_verified("")
+    assert not steer_reported_verified("some unrelated output")
 
 
-def _h4_inserted(payload: str, sentinel: str = "H4-SENTINEL", before: int = 1) -> bool:
-    result = subprocess.run(
-        [sys.executable, "-c", _h4_verifier_source()],
-        input=payload,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "H4_SENTINEL": sentinel, "H4_BEFORE_COUNT": str(before)},
-    )
-    return result.returncode == 0
+# ---------------------------------------------------------------------------
+# verify-submission — imported behavioural tests (H4 / h4_record_inserted)
+# ---------------------------------------------------------------------------
 
 
 def _h4_message(role: str, *texts: str) -> dict:
@@ -212,67 +209,85 @@ def _h4_message(role: str, *texts: str) -> dict:
     }
 
 
+def _h4_inserted(
+    messages: list, sentinel: str = "H4-SENTINEL", before: int = 1
+) -> bool:
+    return h4_record_inserted(messages, sentinel, before)
+
+
 def test_h4_accepts_exactly_one_new_user_record_carrying_the_sentinel():
     """The behaviour H4 exists to confirm: noReply inserts the message and
     suppresses generation."""
-    payload = json.dumps([_h4_message("user", "earlier"), _h4_message("user", "H4-SENTINEL")])
-    assert _h4_inserted(payload)
+    messages = [_h4_message("user", "earlier"), _h4_message("user", "H4-SENTINEL")]
+    assert _h4_inserted(messages)
 
 
 def test_h4_rejects_an_unrelated_user_record():
     """A user record that arrived from something other than the H4 POST is
     not evidence the POST inserted anything: without a content check H4
     passes on a rejected POST plus unrelated traffic."""
-    payload = json.dumps([_h4_message("user", "earlier"), _h4_message("user", "something else")])
-    assert not _h4_inserted(payload)
+    messages = [_h4_message("user", "earlier"), _h4_message("user", "something else")]
+    assert not _h4_inserted(messages)
 
 
 def test_h4_rejects_an_assistant_reply_after_the_sentinel():
     """noReply must suppress generation; a reply following the record means
     it did not."""
-    payload = json.dumps([
+    messages = [
         _h4_message("user", "earlier"),
         _h4_message("user", "H4-SENTINEL"),
         _h4_message("assistant", "replying anyway"),
-    ])
-    assert not _h4_inserted(payload)
+    ]
+    assert not _h4_inserted(messages)
 
 
 def test_h4_rejects_a_sentinel_echoed_only_by_an_assistant():
-    payload = json.dumps([_h4_message("user", "earlier"), _h4_message("assistant", "H4-SENTINEL")])
-    assert not _h4_inserted(payload)
+    messages = [_h4_message("user", "earlier"), _h4_message("assistant", "H4-SENTINEL")]
+    assert not _h4_inserted(messages)
 
 
 @pytest.mark.parametrize(
-    ("payload", "label"),
+    ("messages_json", "label"),
     [
         pytest.param(json.dumps([]), "empty response", id="empty"),
         pytest.param("not json at all", "unparseable response", id="not_json"),
         pytest.param(json.dumps({"error": "nope"}), "error object", id="error_object"),
     ],
 )
-def test_h4_rejects_a_response_that_is_not_a_message_list(payload, label):
-    assert not _h4_inserted(payload), label
+def test_h4_rejects_a_response_that_is_not_a_message_list(messages_json, label):
+    try:
+        messages = json.loads(messages_json)
+    except json.JSONDecodeError:
+        messages = messages_json  # pass invalid input directly
+    assert not _h4_inserted(messages), label  # type: ignore[arg-type]
 
 
 def test_h4_rejects_a_count_that_did_not_rise_by_exactly_one():
     """Two new records means something other than the H4 POST also wrote."""
-    payload = json.dumps([
+    messages = [
         _h4_message("user", "earlier"),
         _h4_message("user", "unrelated"),
         _h4_message("user", "H4-SENTINEL"),
-    ])
-    assert not _h4_inserted(payload, before=1)
+    ]
+    assert not _h4_inserted(messages, before=1)
 
 
-def _h3_client_aborted(curl_rc: int, http_code: str = "") -> bool:
-    result = subprocess.run(
-        ["bash", "-c", f'{_shell_function_source("h3_client_aborted")}\n'
-                       f'h3_client_aborted "$1" "$2"', "_", str(curl_rc), http_code],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
+# Anti-vacuity: an empty message list must fail.
+def test_h4_anti_vacuity_fails_on_empty_list():
+    """h4_record_inserted must return False when no records are present."""
+    assert not h4_record_inserted([], "H4-SENTINEL", 0)
+
+
+# Anti-vacuity: a list where count did not rise must fail.
+def test_h4_anti_vacuity_fails_when_count_unchanged():
+    messages = [_h4_message("user", "H4-SENTINEL")]
+    # before=1 means we expected 2 records, got 1 — must fail.
+    assert not h4_record_inserted(messages, "H4-SENTINEL", 1)
+
+
+# ---------------------------------------------------------------------------
+# verify-submission — imported behavioural tests (H3 / h3_client_aborted)
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -288,7 +303,7 @@ def test_h3_accepts_a_client_timeout_however_far_the_response_got(http_code):
     streams the turn afterwards, so curl reports a status *and* times out
     waiting for the body. That is the client-side disconnect H3 exercises;
     requiring an empty %{http_code} fails H3 on correct behaviour."""
-    assert _h3_client_aborted(28, http_code)
+    assert h3_client_aborted(28, http_code)
 
 
 @pytest.mark.parametrize(
@@ -303,7 +318,7 @@ def test_h3_accepts_a_client_timeout_however_far_the_response_got(http_code):
 def test_h3_rejects_every_exit_that_is_not_a_client_timeout(curl_rc, http_code):
     """The check must stay able to fail: a POST that completed, or failed for
     an unrelated reason, never exercised a mid-turn disconnect."""
-    assert not _h3_client_aborted(curl_rc, http_code)
+    assert not h3_client_aborted(curl_rc, http_code)
 
 
 @pytest.mark.parametrize(
@@ -317,6 +332,155 @@ def test_h3_rejects_every_exit_that_is_not_a_client_timeout(curl_rc, http_code):
 def test_h3_rejects_a_timeout_after_a_rejected_request(http_code):
     """A request the server refused never started a turn, so a timeout after
     it is not the mid-turn disconnect H3 is asserting survives."""
-    assert not _h3_client_aborted(28, http_code)
+    assert not h3_client_aborted(28, http_code)
 
 
+# Anti-vacuity: a non-28 curl rc must never be accepted.
+def test_h3_anti_vacuity_fails_when_curl_completed_normally():
+    """curl rc=0 means the request completed; the client never disconnected."""
+    assert not h3_client_aborted(0, "200")
+    assert not h3_client_aborted(0, "")
+
+
+# ---------------------------------------------------------------------------
+# verify-submission — C1 anti-vacuity
+# ---------------------------------------------------------------------------
+
+
+def test_c1_anti_vacuity_submission_verified_requires_marker_file(tmp_path):
+    """prompt_submitted must exist and prompt_unverified must be absent for
+    a verified result; either condition violated must fail."""
+    from toolbox.verify_submission import _predicate_submission_verified
+
+    state_dir = str(tmp_path)
+    # Nothing present: not verified.
+    assert _predicate_submission_verified(state_dir) != 0
+
+    # Only prompt_unverified: not verified.
+    (tmp_path / "prompt_unverified").write_text("timeout")
+    assert _predicate_submission_verified(state_dir) != 0
+
+    # Both files: not verified (unverified takes precedence).
+    (tmp_path / "prompt_submitted").write_text("")
+    assert _predicate_submission_verified(state_dir) != 0
+
+    # Only prompt_submitted: verified.
+    (tmp_path / "prompt_unverified").unlink()
+    assert _predicate_submission_verified(state_dir) == 0
+
+
+# ---------------------------------------------------------------------------
+# verify-submission — H1 anti-vacuity (route presence check)
+# ---------------------------------------------------------------------------
+
+
+def test_h1_anti_vacuity_route_check_requires_post_method():
+    """The H1 route check must fail when the /doc JSON has no POST method."""
+    doc = {"paths": {"/session/{sessionID}/message": {"get": {}}}}
+    assert not opencode_message_route_present(doc), "GET-only route must not satisfy H1"
+
+
+def test_h1_anti_vacuity_route_check_fails_on_empty_doc():
+    """An empty /doc response has no session message route."""
+    assert not opencode_message_route_present({})
+
+
+# ---------------------------------------------------------------------------
+# verify-submission — reason_matches prefix logic (C3 fault classification)
+# ---------------------------------------------------------------------------
+
+
+def test_reason_matches_accepts_exact_kind():
+    """An exact kind string matches without any detail suffix."""
+    assert reason_matches("timeout", "timeout")
+
+
+def test_reason_matches_accepts_kind_with_detail_suffix():
+    """C3 reasons often carry detail after a colon; the prefix must still match.
+
+    For example transport_error reasons from the opencode harness include the
+    errno string: "transport_error: [Errno 61] Connection refused". The check
+    must match on the kind prefix to avoid pinning the errno.
+    """
+    assert reason_matches(
+        "transport_error: [Errno 61] Connection refused", "transport_error"
+    )
+
+
+def test_reason_matches_rejects_unrelated_kind():
+    """A reason that is neither the exact kind nor a prefixed form must fail."""
+    assert not reason_matches("witness_unreadable", "timeout")
+
+
+def test_reason_matches_rejects_partial_prefix_without_colon():
+    """A reason that starts with the kind string but lacks the ': ' separator
+    must not match — 'timeoutX' must not satisfy kind='timeout'."""
+    assert not reason_matches("timeoutX", "timeout")
+
+
+def test_reason_matches_accepts_multiple_expected_kinds():
+    """reason_matches accepts a variadic set; any match is sufficient."""
+    assert reason_matches("witness_unreadable", "transport_error", "witness_unreadable")
+    assert reason_matches("timeout: poll exceeded 20s", "timeout", "witness_unreadable")
+
+
+# ---------------------------------------------------------------------------
+# verify-submission — transcript_contains assistant-only guard
+# ---------------------------------------------------------------------------
+
+
+def _make_transcript_result(*records: dict) -> MagicMock:
+    """Fake _agent_run return value with JSONL stdout."""
+    mock = MagicMock()
+    mock.stdout = "\n".join(json.dumps(r) for r in records)
+    return mock
+
+
+def test_transcript_contains_finds_needle_in_assistant_record():
+    """A needle present in an assistant-role record returns True."""
+    records = [{"type": "assistant", "text": "the answer is SENTINEL"}]
+    with patch(
+        "toolbox.verify_submission._agent_run",
+        return_value=_make_transcript_result(*records),
+    ):
+        assert transcript_contains("run-1", "SENTINEL")
+
+
+def test_transcript_contains_rejects_needle_in_user_record():
+    """A needle that appears only in a user-role record must return False.
+
+    Without the assistant-only guard, a prompt echo in a user record would
+    pass the check before the agent replies, inverting H2's meaning.
+    """
+    records = [{"type": "user", "text": "please reply with SENTINEL"}]
+    with patch(
+        "toolbox.verify_submission._agent_run",
+        return_value=_make_transcript_result(*records),
+    ):
+        assert not transcript_contains("run-1", "SENTINEL")
+
+
+def test_transcript_contains_finds_needle_when_user_and_assistant_both_present():
+    """Needle in an assistant record returns True even when a user record also
+    carries the needle — the assistant-role filter must not discard the match."""
+    records = [
+        {"type": "user", "text": "please reply with SENTINEL"},
+        {"type": "assistant", "text": "SENTINEL"},
+    ]
+    with patch(
+        "toolbox.verify_submission._agent_run",
+        return_value=_make_transcript_result(*records),
+    ):
+        assert transcript_contains("run-1", "SENTINEL")
+
+
+# Anti-vacuity: needle only in a user record must not satisfy the check.
+def test_h2_anti_vacuity_transcript_contains_requires_assistant_record():
+    """If the needle appears only in a user record, transcript_contains must
+    return False — a prompt echo must not count as a harness reply."""
+    records = [{"type": "user", "text": "SENTINEL in user prompt"}]
+    with patch(
+        "toolbox.verify_submission._agent_run",
+        return_value=_make_transcript_result(*records),
+    ):
+        assert not transcript_contains("run-1", "SENTINEL")
