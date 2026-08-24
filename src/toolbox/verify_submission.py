@@ -29,6 +29,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -108,14 +109,12 @@ def _agent_run(*args: str, capture: bool = True) -> subprocess.CompletedProcess:
 
 
 # ---------------------------------------------------------------------------
-# Bounded execution (mirrors run_bounded from the bash version)
+# Bounded execution
 # ---------------------------------------------------------------------------
 
 
 def _run_bounded(limit: float, fn, *args) -> int:
     """Call fn(*args) in a thread; return its exit code or 124 on timeout."""
-    import threading
-
     result_box: list[int] = [-1]
 
     def target():
@@ -131,32 +130,6 @@ def _run_bounded(limit: float, fn, *args) -> int:
     if t.is_alive():
         return 124
     return result_box[0]
-
-
-def _run_bounded_fn(limit: float, fn, *args) -> tuple[int, object]:
-    """Like _run_bounded but returns (rc, return_value) for functions that
-    return a value rather than an exit code."""
-    import threading
-
-    result_box: list = [1, None]
-    done = threading.Event()
-
-    def target():
-        try:
-            val = fn(*args)
-            result_box[0] = 0
-            result_box[1] = val
-        except Exception:  # noqa: BLE001
-            result_box[0] = 1
-        finally:
-            done.set()
-
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    done.wait(timeout=limit)
-    if t.is_alive():
-        return 124, None
-    return result_box[0], result_box[1]
 
 
 # ---------------------------------------------------------------------------
@@ -562,8 +535,6 @@ def _claude_trust_dir(directory: str) -> bool:
     Seeds both the supplied path and its realpath. Returns False when
     ~/.claude.json does not yet exist (first-run case; C1 may hit the dialog).
     """
-    import os.path
-
     resolved = os.path.realpath(directory)
     claude_json = Path.home() / ".claude.json"
     if not claude_json.exists():
