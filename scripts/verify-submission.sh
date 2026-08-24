@@ -355,7 +355,11 @@ else:
 ' 2>/dev/null || echo -1
 }
 
-# Count per-text user-message matches, deduplicated by message id for each text.
+# distinct_user_messages_containing <url> <text_a> <text_b>: how many *distinct*
+# user-message records carry either text. A single record holding both texts as
+# separate parts is the append/merge behaviour and counts 1, not 2; only two
+# separate records count 2. Prints 0 unless both texts were found at all, so a
+# response missing one of them can never reach the >= 2 the caller tests.
 distinct_user_messages_containing() {
   curl -sS --max-time 5 "$1" 2>/dev/null | TEXT_A="$2" TEXT_B="$3" python3 -c '
 import json, os, sys
@@ -383,7 +387,7 @@ for message in data if isinstance(data, list) else []:
     for needle in wanted:
         if needle in blob:
             found.setdefault(needle, set()).add(message_id)
-print(sum(len(ids) for ids in found.values()))
+print(len(set().union(*found.values())) if len(found) == len(wanted) else 0)
 ' 2>/dev/null || echo 0
 }
 
