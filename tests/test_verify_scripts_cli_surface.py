@@ -77,6 +77,7 @@ from toolbox.verify_submission import (
     h3_client_aborted,
     h4_record_inserted,
     opencode_message_route_present,
+    reason_matches,
     steer_reported_verified,
     transcript_contains,
 )
@@ -382,6 +383,43 @@ def test_h1_anti_vacuity_route_check_requires_post_method():
 def test_h1_anti_vacuity_route_check_fails_on_empty_doc():
     """An empty /doc response has no session message route."""
     assert not opencode_message_route_present({})
+
+
+# ---------------------------------------------------------------------------
+# verify-submission — reason_matches prefix logic (C3 fault classification)
+# ---------------------------------------------------------------------------
+
+
+def test_reason_matches_accepts_exact_kind():
+    """An exact kind string matches without any detail suffix."""
+    assert reason_matches("timeout", "timeout")
+
+
+def test_reason_matches_accepts_kind_with_detail_suffix():
+    """C3 reasons often carry detail after a colon; the prefix must still match.
+
+    For example transport_error reasons from the opencode harness include the
+    errno string: "transport_error: [Errno 61] Connection refused". The check
+    must match on the kind prefix to avoid pinning the errno.
+    """
+    assert reason_matches("transport_error: [Errno 61] Connection refused", "transport_error")
+
+
+def test_reason_matches_rejects_unrelated_kind():
+    """A reason that is neither the exact kind nor a prefixed form must fail."""
+    assert not reason_matches("witness_unreadable", "timeout")
+
+
+def test_reason_matches_rejects_partial_prefix_without_colon():
+    """A reason that starts with the kind string but lacks the ': ' separator
+    must not match — 'timeoutX' must not satisfy kind='timeout'."""
+    assert not reason_matches("timeoutX", "timeout")
+
+
+def test_reason_matches_accepts_multiple_expected_kinds():
+    """reason_matches accepts a variadic set; any match is sufficient."""
+    assert reason_matches("witness_unreadable", "transport_error", "witness_unreadable")
+    assert reason_matches("timeout: poll exceeded 20s", "timeout", "witness_unreadable")
 
 
 # ---------------------------------------------------------------------------
