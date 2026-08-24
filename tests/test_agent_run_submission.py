@@ -1863,6 +1863,60 @@ def test_submit_and_verify_survives_a_witness_that_raises(tmp_path, monkeypatch)
     assert outcome.detail == "witness_unreadable"
 
 
+def test_a_pre_send_witness_read_never_licenses_a_text_bearing_resend(
+    tmp_path, monkeypatch
+):
+    """The pre-resend re-check happens *before* the current attempt's write,
+    so its readability says nothing about whether that write landed. Treating
+    it as post-send proof lets a third rung resend the text over a composer
+    the terminator-only rung already submitted -- a real duplicate prompt.
+
+    A TUI that buffers attempt 1's text, swallows its Enter, and is submitted
+    by attempt 2's bare terminator, with every read after attempt 2's write
+    unreadable.
+    """
+    submissions: list = []
+    tui_composer = [b""]
+    tui_submitted: list = []
+
+    def buffering_tui(_state_dir, payload):
+        submissions.append(payload)
+        if payload == b"PROMPT\r":
+            tui_composer[0] += b"PROMPT"          # the Enter is swallowed
+        elif payload == b"\r":
+            tui_submitted.append(tui_composer[0])  # submits what was buffered
+            tui_composer[0] = b""
+        else:
+            tui_submitted.append(b"PROMPT")        # composer reset + full text
+
+    reads = {"n": 0}
+
+    def witness():
+        reads["n"] += 1
+        # The baseline, attempt 1's post-send poll and attempt 2's pre-send
+        # re-check all read 0; every read after attempt 2's write fails.
+        return 0 if reads["n"] <= 3 else None
+
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+    monkeypatch.setattr(agent_run, "_submit_via_keystroke", buffering_tui)
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+    _witness_counter(monkeypatch, witness)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"PROMPT", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.0, max_attempts=3,
+    )
+
+    cr = agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)
+    assert submissions == [b"PROMPT" + cr, cr], (
+        "the ladder must stop after the terminator-only rung"
+    )
+    assert sum(1 for payload in submissions if b"PROMPT" in payload) == 1
+    assert tui_submitted == [b"PROMPT"], "the TUI must record the prompt exactly once"
+    assert outcome.verified is False
+    assert outcome.detail == "witness_unreadable"
+
+
 @pytest.mark.parametrize(
     ("harness", "partial_line"),
     [

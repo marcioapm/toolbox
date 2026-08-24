@@ -4724,16 +4724,20 @@ def _submit_and_verify(
     # just minted, which held no user records before this submission. An
     # established session's existing history makes any count unattributable.
     comparable = witness is not None and (baseline is not None or fresh_session)
-    readable_this_attempt = False
+    # Whether a read taken *after* the current attempt's write succeeded.
+    # Only such a read can prove the current payload did not land; a read
+    # from before the write says nothing about it.
+    readable_after_write = False
 
-    def _witness_rose() -> bool:
-        nonlocal readable_this_attempt
+    def _witness_rose(*, post_write: bool) -> bool:
+        nonlocal readable_after_write
         if not comparable:
             return False
         current = witness.user_count()
         if current is None:
             return False
-        readable_this_attempt = True
+        if post_write:
+            readable_after_write = True
         return current > baseline if baseline is not None else current > 0
 
     detail: Optional[str] = None
@@ -4746,9 +4750,9 @@ def _submit_and_verify(
 
     for attempt in range(1, max_attempts + 1):
         attempts = attempt
-        # Scoped per attempt: the guard below asks whether *this* attempt saw
-        # a readable witness, not whether any attempt ever did.
-        readable_this_attempt = False
+        # Scoped per attempt: the guard below asks whether *this* attempt's
+        # own write was followed by a readable witness.
+        readable_after_write = False
         if attempt > 1:
             # A backoff between attempts, so a brief transport blip cannot
             # burn the whole attempt budget in milliseconds.
@@ -4756,8 +4760,9 @@ def _submit_and_verify(
                            SUBMISSION_RETRY_BACKOFF_MAX_SECONDS))
             # The previous attempt's last read is already stale. Re-read
             # immediately before sending so a witness that rose in between is
-            # not answered with a duplicate submission.
-            if _witness_rose():
+            # not answered with a duplicate submission. This read predates
+            # the write below, so it must not mark the witness readable.
+            if _witness_rose(post_write=False):
                 return SubmissionOutcome(True, attempts, transport, None, delivered=True)
         delivered_this_attempt = False
         # Set when a failure provably put no submittable input in front of the
@@ -4818,25 +4823,27 @@ def _submit_and_verify(
         # transport here is idempotent, so a failed attempt gets the same
         # verification window as a successful one before a resend is
         # considered.
-        if _poll_witness(_witness_rose, deadline_s):
+        if _poll_witness(lambda: _witness_rose(post_write=True), deadline_s):
             return SubmissionOutcome(True, attempts, transport, None, delivered=True)
 
         if delivered_this_attempt:
-            detail = "timeout" if readable_this_attempt else "witness_unreadable"
+            detail = "timeout" if readable_after_write else "witness_unreadable"
             step = min(step + 1, _KEYSTROKE_LADDER_RESET_STEP)
 
-        # A readable-but-flat witness is proof the submission did not land,
-        # which licenses any resend. Without that proof the next send must be
-        # incapable of duplicating: either it carries no prompt text (the
-        # terminator-only rung, over a composer this call is known to have
-        # filled), or the failed attempt delivered no bytes at all.
+        # A witness read after this attempt's write, and still flat, is proof
+        # the submission did not land, which licenses any resend. Reads taken
+        # before the write cannot supply that proof, so they never set the
+        # flag. Without it the next send must be incapable of duplicating:
+        # either it carries no prompt text (the terminator-only rung, over a
+        # composer this call is known to have filled), or the failed attempt
+        # delivered no bytes at all.
         next_step_is_terminator_only = (
             submit is None
             and transport == "keystroke"
             and _keystroke_payload(step, text, submit_mode) == _submit_bytes(submit_mode)
         )
         if not (
-            readable_this_attempt
+            readable_after_write
             or resend_cannot_duplicate
             or (next_step_is_terminator_only and delivered_this_attempt)
         ):
