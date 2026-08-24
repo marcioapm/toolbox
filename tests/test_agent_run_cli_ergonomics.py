@@ -872,3 +872,75 @@ class TestParseLaunchArgv:
                     f"main() produced {captured[key]!r} for {key!r}, "
                     f"helper produced {val!r}"
                 )
+
+    # --- --worktree* flags: argv-level parsing ---
+
+    def test_worktree_flags_space_form(self):
+        r = self._parse([
+            "--worktree", "/tmp/wt", "--worktree-base", "main",
+            "--worktree-branch", "feature", "--worktree-repo", "/tmp/repo",
+            "--worktree-reuse", "myrun", "cmd",
+        ])
+        assert r.worktree == "/tmp/wt"
+        assert r.worktree_base == "main"
+        assert r.worktree_branch == "feature"
+        assert r.worktree_repo == "/tmp/repo"
+        assert r.worktree_reuse is True
+        assert r.name == "myrun"
+        assert r.command == ["cmd"]
+
+    def test_worktree_flags_equals_form(self):
+        r = self._parse([
+            "--worktree=/tmp/wt", "--worktree-base=main",
+            "--worktree-branch=feature", "--worktree-repo=/tmp/repo",
+            "myrun", "cmd",
+        ])
+        assert r.worktree == "/tmp/wt"
+        assert r.worktree_base == "main"
+        assert r.worktree_branch == "feature"
+        assert r.worktree_repo == "/tmp/repo"
+
+    def test_worktree_flags_default_to_none_or_false(self):
+        r = self._parse(["myrun", "cmd"])
+        assert r.worktree is None
+        assert r.worktree_base is None
+        assert r.worktree_branch is None
+        assert r.worktree_repo is None
+        assert r.worktree_reuse is False
+
+    def test_worktree_flag_reaches_main_and_cmd_launch(self, monkeypatch):
+        """The five --worktree* fields survive the full main() -> cmd_launch
+        Namespace path, not only the pure parser."""
+        captured = {}
+        monkeypatch.setattr(
+            agent_run, "cmd_launch", lambda args: captured.update(vars(args)) or 0
+        )
+        agent_run.main([
+            "--worktree", "/tmp/wt", "--worktree-base", "main",
+            "--worktree-branch", "feature", "--worktree-repo", "/tmp/repo",
+            "--worktree-reuse", "myrun", "cmd",
+        ])
+        assert captured["worktree"] == "/tmp/wt"
+        assert captured["worktree_base"] == "main"
+        assert captured["worktree_branch"] == "feature"
+        assert captured["worktree_repo"] == "/tmp/repo"
+        assert captured["worktree_reuse"] is True
+
+    @pytest.mark.parametrize("flag", [
+        "--worktree", "--worktree-base", "--worktree-branch", "--worktree-repo",
+    ])
+    def test_worktree_value_flag_missing_value_is_rejected(self, flag):
+        with pytest.raises(agent_run._LaunchArgvError):
+            self._parse([flag])
+
+    @pytest.mark.parametrize("flag", [
+        "--worktree", "--worktree-base", "--worktree-branch", "--worktree-repo",
+    ])
+    def test_worktree_value_flag_swallowing_next_flag_is_rejected(self, flag):
+        """A typo omitting DIR (e.g. `--worktree --worktree-base main n -- cmd`)
+        must not silently take the next flag as this flag's value and then
+        fail pointing at the wrong flag."""
+        with pytest.raises(agent_run._LaunchArgvError) as exc:
+            self._parse([flag, "--worktree-base", "n", "--", "true"])
+        assert flag in str(exc.value)
+        assert "requires a value" in str(exc.value)

@@ -514,6 +514,10 @@ agent-run --harness claude --prompt 'Refactor X' build
 agent-run --harness opencode --model llmproxy-anthropic/claude-sonnet-4.6 --prompt 'Refactor X' build
 agent-run --harness codex --model o4-mini --prompt 'Refactor X' build
 agent-run -i --harness claude --prompt 'Start task' chat   # interactive; steer after launch
+
+# Launch in a fresh git worktree it creates (and rolls back if launch fails)
+agent-run --worktree /tmp/wt-fix --worktree-base main --worktree-repo ~/git/myrepo \
+  --harness claude --prompt 'Fix the bug' fixrun
 ```
 
 ---
@@ -613,6 +617,69 @@ relative to `DIR` — that is what makes `--cwd` useful for repo-local scripts. 
 relative `-f/--prompt-file` names a file the caller typed at their shell, so it
 is resolved against the invocation directory before the chdir; the recorded
 `<state_dir>/prompt_file` is the resulting absolute path.
+
+#### Launch worktree (`--worktree DIR`)
+
+```bash
+agent-run --worktree /tmp/wt-fix --worktree-base main --worktree-repo ~/git/myrepo \
+  --harness claude --prompt 'Fix the bug' fixrun
+
+# Branch name defaults to the run name; override it:
+agent-run --worktree /tmp/wt-fix --worktree-base v2.1.0 --worktree-branch hotfix/parser \
+  --harness opencode --prompt 'Patch the parser' fixrun
+```
+
+`--worktree DIR` creates a linked git worktree at `DIR` and runs the command in
+it, removing the manual `git worktree add` step before a background run. It is
+mutually exclusive with `--cwd`, and `--worktree-base REF` is required — there
+is no implicit base, since branching from whatever HEAD happens to be is rarely
+what a background agent wants.
+
+- **`--worktree-base REF`** (required) — the commit to branch from. Any
+  committish: branch, tag, or OID. An annotated tag is peeled to its commit, so
+  the worktree lands on the commit the tag points at rather than the tag object.
+- **`--worktree-branch NAME`** — branch to create. Defaults to the run name.
+- **`--worktree-repo DIR`** — the repository to create the worktree from.
+  Defaults to the invocation directory's repository.
+- **`--worktree-reuse`** — attach to an existing worktree at `DIR` instead of
+  refusing it.
+
+Creation happens under the same publication lock the rest of launch uses, before
+the working directory is applied, so `<state_dir>/cwd` and
+`<state_dir>/launch_head` record the worktree the command actually runs in. The
+path is also recorded at `<state_dir>/worktree_created` and shown by
+`agent-run status`, which is what marks the tree as this invocation's to clean
+up.
+
+Collisions fail loudly rather than guessing: a non-empty directory, an already
+registered worktree, or a branch checked out in another worktree each exit
+non-zero and leave the filesystem untouched. `--worktree-reuse` opts into
+attaching to an existing tree; a prefix match against an existing path is still
+refused, since `/tmp/wt` and `/tmp/wt2` are different worktrees.
+
+##### The rollback contract
+
+If launch fails, whether the new worktree is removed depends on one question:
+**could a process already be holding it?**
+
+- **Failure before any process could exist** — worktree and branch are both
+  removed, leaving no trace of the attempt.
+- **Once a process may hold the worktree as its cwd** — neither is removed.
+  agent-run prints the exact `git worktree remove` / `git branch -D` commands
+  and leaves the tree in place.
+
+The asymmetry is deliberate. Leaking a worktree costs one printed command;
+deleting one out from under a live agent destroys uncommitted work. Only the
+managed OpenCode path creates a process before the runner forks (a temporary
+`opencode --port N` started with the worktree as its cwd to mint the session),
+and it marks ownership as the last statement before that process is created —
+never clearing it afterwards, because a `Popen` with a non-`None` `cwd` can fork
+a child and still raise in the parent. Managed claude mints its session id
+without starting anything, and managed codex mints post-fork, so a preflight
+failure under either always rolls back.
+
+`agent-run du` and `agent-run reap --include-worktrees` account for a worktree
+created this way like any other linked worktree; see the reap section below.
 
 ### Managed mode
 
