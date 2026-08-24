@@ -402,7 +402,9 @@ def test_reason_matches_accepts_kind_with_detail_suffix():
     errno string: "transport_error: [Errno 61] Connection refused". The check
     must match on the kind prefix to avoid pinning the errno.
     """
-    assert reason_matches("transport_error: [Errno 61] Connection refused", "transport_error")
+    assert reason_matches(
+        "transport_error: [Errno 61] Connection refused", "transport_error"
+    )
 
 
 def test_reason_matches_rejects_unrelated_kind():
@@ -437,7 +439,10 @@ def _make_transcript_result(*records: dict) -> MagicMock:
 def test_transcript_contains_finds_needle_in_assistant_record():
     """A needle present in an assistant-role record returns True."""
     records = [{"type": "assistant", "text": "the answer is SENTINEL"}]
-    with patch("toolbox.verify_submission._agent_run", return_value=_make_transcript_result(*records)):
+    with patch(
+        "toolbox.verify_submission._agent_run",
+        return_value=_make_transcript_result(*records),
+    ):
         assert transcript_contains("run-1", "SENTINEL")
 
 
@@ -448,7 +453,10 @@ def test_transcript_contains_rejects_needle_in_user_record():
     pass the check before the agent replies, inverting H2's meaning.
     """
     records = [{"type": "user", "text": "please reply with SENTINEL"}]
-    with patch("toolbox.verify_submission._agent_run", return_value=_make_transcript_result(*records)):
+    with patch(
+        "toolbox.verify_submission._agent_run",
+        return_value=_make_transcript_result(*records),
+    ):
         assert not transcript_contains("run-1", "SENTINEL")
 
 
@@ -459,7 +467,10 @@ def test_transcript_contains_finds_needle_when_user_and_assistant_both_present()
         {"type": "user", "text": "please reply with SENTINEL"},
         {"type": "assistant", "text": "SENTINEL"},
     ]
-    with patch("toolbox.verify_submission._agent_run", return_value=_make_transcript_result(*records)):
+    with patch(
+        "toolbox.verify_submission._agent_run",
+        return_value=_make_transcript_result(*records),
+    ):
         assert transcript_contains("run-1", "SENTINEL")
 
 
@@ -468,5 +479,8 @@ def test_h2_anti_vacuity_transcript_contains_requires_assistant_record():
     """If the needle appears only in a user record, transcript_contains must
     return False — a prompt echo must not count as a harness reply."""
     records = [{"type": "user", "text": "SENTINEL in user prompt"}]
-    with patch("toolbox.verify_submission._agent_run", return_value=_make_transcript_result(*records)):
+    with patch(
+        "toolbox.verify_submission._agent_run",
+        return_value=_make_transcript_result(*records),
+    ):
         assert not transcript_contains("run-1", "SENTINEL")

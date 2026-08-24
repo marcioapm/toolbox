@@ -106,9 +106,13 @@ def _agent_run_bin() -> list[str]:
     return [sys.executable, str(_AGENT_RUN_SCRIPT)]
 
 
-def _agent_run(*args: str, capture: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess:
+def _agent_run(
+    *args: str, capture: bool = True, timeout: float | None = None
+) -> subprocess.CompletedProcess:
     cmd = [*_agent_run_bin(), *args]
-    return subprocess.run(cmd, capture_output=capture, text=True, check=False, timeout=timeout)
+    return subprocess.run(
+        cmd, capture_output=capture, text=True, check=False, timeout=timeout
+    )
 
 
 # ---------------------------------------------------------------------------
