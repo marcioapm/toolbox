@@ -12,7 +12,9 @@ anti-vacuity tests confirm that a broken subject causes a FAIL result.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -77,6 +79,7 @@ from toolbox.verify_submission import (
     h4_record_inserted,
     opencode_message_route_present,
     steer_reported_verified,
+    transcript_contains,
 )
 
 
@@ -380,3 +383,53 @@ def test_h1_anti_vacuity_route_check_requires_post_method():
 def test_h1_anti_vacuity_route_check_fails_on_empty_doc():
     """An empty /doc response has no session message route."""
     assert not opencode_message_route_present({})
+
+
+# ---------------------------------------------------------------------------
+# verify-submission — transcript_contains assistant-only guard
+# ---------------------------------------------------------------------------
+
+
+def _make_transcript_result(*records: dict) -> MagicMock:
+    """Fake _agent_run return value with JSONL stdout."""
+    mock = MagicMock()
+    mock.stdout = "\n".join(json.dumps(r) for r in records)
+    return mock
+
+
+def test_transcript_contains_finds_needle_in_assistant_record():
+    """A needle present in an assistant-role record returns True."""
+    records = [{"type": "assistant", "text": "the answer is SENTINEL"}]
+    with patch("toolbox.verify_submission._agent_run", return_value=_make_transcript_result(*records)):
+        assert transcript_contains("run-1", "SENTINEL")
+
+
+def test_transcript_contains_rejects_needle_in_user_record():
+    """A needle that appears only in a user-role record must return False.
+
+    Without the assistant-only guard, a prompt echo in a user record would
+    pass the check before the agent replies, inverting H2's meaning.
+    """
+    records = [{"type": "user", "text": "please reply with SENTINEL"}]
+    with patch("toolbox.verify_submission._agent_run", return_value=_make_transcript_result(*records)):
+        assert not transcript_contains("run-1", "SENTINEL")
+
+
+def test_transcript_contains_finds_needle_when_user_and_assistant_both_present():
+    """Needle in an assistant record returns True even when a user record also
+    carries the needle — the assistant-role filter must not discard the match."""
+    records = [
+        {"type": "user", "text": "please reply with SENTINEL"},
+        {"type": "assistant", "text": "SENTINEL"},
+    ]
+    with patch("toolbox.verify_submission._agent_run", return_value=_make_transcript_result(*records)):
+        assert transcript_contains("run-1", "SENTINEL")
+
+
+# Anti-vacuity: needle only in a user record must not satisfy the check.
+def test_h2_anti_vacuity_transcript_contains_requires_assistant_record():
+    """If the needle appears only in a user record, transcript_contains must
+    return False — a prompt echo must not count as a harness reply."""
+    records = [{"type": "user", "text": "SENTINEL in user prompt"}]
+    with patch("toolbox.verify_submission._agent_run", return_value=_make_transcript_result(*records)):
+        assert not transcript_contains("run-1", "SENTINEL")
