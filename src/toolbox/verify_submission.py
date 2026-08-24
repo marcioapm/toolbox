@@ -500,9 +500,15 @@ def _kill_run_and_wait(run_name: str) -> None:
     time.sleep(0.3)
 
 
-def _launch_interactive_run(
-    repo_dir: str, harness: str, run_name: str, prompt: str, model_args: list[str]
+def _launch_run(
+    repo_dir: str,
+    harness: str,
+    run_name: str,
+    prompt: str,
+    model_args: list[str],
+    env: dict,
 ) -> bool:
+    """Launch an interactive agent run; return True when agent-run exits 0."""
     cmd = [
         *_agent_run_bin(),
         "--cwd",
@@ -515,8 +521,7 @@ def _launch_interactive_run(
         *model_args,
         run_name,
     ]
-    cp = subprocess.run(cmd, capture_output=True, check=False)
-    return cp.returncode == 0
+    return subprocess.run(cmd, capture_output=True, env=env, check=False).returncode == 0
 
 
 def _claude_trust_dir(directory: str) -> bool:
@@ -675,28 +680,18 @@ def run_harness_cells(
     c3 = "FAIL"
     c4 = "FAIL"
 
+    env = {**os.environ, "AGENT_RUN_STATE_DIR": state_dir, "AGENT_RUN_LOG_DIR": log_dir}
+
     # --- C1: prompt lands and is verified ------------------------------------
     _log(f"C1: launching interactive {harness} run with sentinel prompt")
-    env = {**os.environ, "AGENT_RUN_STATE_DIR": state_dir, "AGENT_RUN_LOG_DIR": log_dir}
-    launch_env = {**env}  # inherited by subprocess below
-
-    def _do_launch():
-        cmd = [
-            *_agent_run_bin(),
-            "--cwd",
-            repo_dir,
-            "--harness",
-            harness,
-            "-i",
-            "--prompt",
-            f"Reply with exactly this word and nothing else: {sentinel1}",
-            *model_args,
-            run_name,
-        ]
-        cp = subprocess.run(cmd, capture_output=True, env=launch_env, check=False)
-        return cp.returncode
-
-    launched_ok = _do_launch() == 0
+    launched_ok = _launch_run(
+        repo_dir,
+        harness,
+        run_name,
+        f"Reply with exactly this word and nothing else: {sentinel1}",
+        model_args,
+        env,
+    )
     if launched_ok:
         _launched_runs.append(run_name)
         run_state = os.path.join(state_dir, run_name)
@@ -785,20 +780,14 @@ def run_harness_cells(
         c3_sessions_dir = os.path.join(work_dir, "empty-codex-sessions")
         c3_expected_reasons = ("witness_unreadable",)
         c3_env = {**env, "AGENT_RUN_CODEX_SESSIONS_DIR": c3_sessions_dir}
-        cmd = [
-            *_agent_run_bin(),
-            "--cwd",
+        if _launch_run(
             repo_dir,
-            "--harness",
             harness,
-            "-i",
-            "--prompt",
-            f"Reply with exactly this word and nothing else: {sentinel1}_neg",
-            *model_args,
             c3_run,
-        ]
-        cp = subprocess.run(cmd, capture_output=True, env=c3_env, check=False)
-        if cp.returncode == 0:
+            f"Reply with exactly this word and nothing else: {sentinel1}_neg",
+            model_args,
+            c3_env,
+        ):
             _launched_runs.append(c3_run)
             c3_launched = True
             rollouts = (
@@ -827,20 +816,14 @@ def run_harness_cells(
             "C3: negative control via an unreachable opencode_port (HTTP witness lands too fast for a timing control)"
         )
         c3_expected_reasons = ("transport_error", "witness_unreadable")
-        cmd = [
-            *_agent_run_bin(),
-            "--cwd",
+        if _launch_run(
             repo_dir,
-            "--harness",
             harness,
-            "-i",
-            "--prompt",
-            f"Reply with exactly this word and nothing else: {sentinel1}_neg",
-            *model_args,
             c3_run,
-        ]
-        cp = subprocess.run(cmd, capture_output=True, env=env, check=False)
-        if cp.returncode == 0:
+            f"Reply with exactly this word and nothing else: {sentinel1}_neg",
+            model_args,
+            env,
+        ):
             _launched_runs.append(c3_run)
             c3_launched = True
             port_file = os.path.join(c3_state, "opencode_port")
@@ -899,21 +882,15 @@ def run_harness_cells(
             "AGENT_RUN_SUBMIT_VERIFY_TIMEOUT": "0.01",
             "AGENT_RUN_SUBMIT_ATTEMPTS": "1",
         }
-        cmd = [
-            *_agent_run_bin(),
-            "--cwd",
-            repo_dir,
-            "--harness",
-            harness,
-            "-i",
-            "--prompt",
-            f"Reply with exactly this word and nothing else: {sentinel1}_neg",
-            *model_args,
-            c3_run,
-        ]
         c3_start = time.monotonic()
-        cp = subprocess.run(cmd, capture_output=True, env=c3_env, check=False)
-        if cp.returncode == 0:
+        if _launch_run(
+            repo_dir,
+            harness,
+            c3_run,
+            f"Reply with exactly this word and nothing else: {sentinel1}_neg",
+            model_args,
+            c3_env,
+        ):
             _launched_runs.append(c3_run)
             c3_launched = True
             _wait_for(
@@ -974,8 +951,13 @@ def run_harness_cells(
     # --- C4: --raw steer is exempt from verification -------------------------
     c4_run = f"{run_name}-raw"
     _log("C4: --raw steer exemption")
-    c4_launched = _do_launch_for_c4(
-        repo_dir, harness, c4_run, sentinel1, model_args, env
+    c4_launched = _launch_run(
+        repo_dir,
+        harness,
+        c4_run,
+        f"Reply with exactly this word and nothing else: {sentinel1}_raw",
+        model_args,
+        env,
     )
     if c4_launched:
         _launched_runs.append(c4_run)
@@ -1008,30 +990,6 @@ def run_harness_cells(
     return _HarnessRow(
         harness=harness, version=version_line, c1=c1, c2=c2, c3=c3, c4=c4
     )
-
-
-def _do_launch_for_c4(
-    repo_dir: str,
-    harness: str,
-    run_name: str,
-    sentinel1: str,
-    model_args: list[str],
-    env: dict,
-) -> bool:
-    cmd = [
-        *_agent_run_bin(),
-        "--cwd",
-        repo_dir,
-        "--harness",
-        harness,
-        "-i",
-        "--prompt",
-        f"Reply with exactly this word and nothing else: {sentinel1}_raw",
-        *model_args,
-        run_name,
-    ]
-    cp = subprocess.run(cmd, capture_output=True, env=env, check=False)
-    return cp.returncode == 0
 
 
 def _agent_run_with_env(*args: str, env: dict) -> subprocess.CompletedProcess:
@@ -1080,20 +1038,14 @@ def run_opencode_http_contract(
             state.count(r)
         return results
 
-    cmd = [
-        *_agent_run_bin(),
-        "--cwd",
+    if not _launch_run(
         repo_dir,
-        "--harness",
         "opencode",
-        "-i",
-        "--prompt",
-        f"Reply with exactly this word and nothing else: {sentinel}",
-        *model_args,
         run_name,
-    ]
-    cp = subprocess.run(cmd, capture_output=True, env=env, check=False)
-    if cp.returncode != 0:
+        f"Reply with exactly this word and nothing else: {sentinel}",
+        model_args,
+        env,
+    ):
         return _fail_all("HTTP contract: launch failed")
     _launched_runs.append(run_name)
 
