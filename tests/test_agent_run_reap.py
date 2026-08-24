@@ -835,11 +835,19 @@ class TestReapIdleKill:
         """A runner that ignores SIGTERM must still end up killed once the
         escalation window expires — exercises _force_kill's grace→SIGKILL
         escalation from within reap's idle-kill path."""
+        # The shell must keep ignoring SIGTERM to exercise the escalation, so
+        # it cannot exec the sleep away; it publishes the forked descendant's
+        # pid instead. _force_kill signals only verified and recorded pids, so
+        # that descendant outlives the run by design and this test owns it.
+        script = "trap '' TERM\nsleep 600 &\necho $!\nwait\n"
         proc = subprocess.Popen(
-            ["bash", "-c", "trap '' TERM; sleep 600"],
+            ["bash", "-c", script],
+            stdout=subprocess.PIPE,
+            text=True,
             start_new_session=True,
         )
         pid = proc.pid
+        descendant_pid = int(proc.stdout.readline().strip())
         try:
             threshold = 3600.0
             monkeypatch.setattr(agent_run, "IDLE_STALL_SECONDS", threshold)
@@ -867,14 +875,16 @@ class TestReapIdleKill:
             assert sd.joinpath("status").read_text().strip() == "killed"
             assert _wait_until(lambda: _process_gone(pid), timeout=5)
         finally:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+            for p in (pid, descendant_pid):
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except OSError:
+                    pass
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+            _wait_until(lambda: _process_gone(descendant_pid), timeout=5)
 
 
 # ---------------------------------------------------------------------------
