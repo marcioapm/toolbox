@@ -24,7 +24,7 @@ WATCH_CONTRACT_KEYS = {
     "schema", "agent_run_version", "name", "observed_at", "status", "exit_code", "pid",
     "interactive", "started_at", "ended_at", "elapsed_s", "terminal",
     "launch_error", "log", "repo", "git", "git_error", "signals", "observation_error",
-    "session", "scratch", "hooks", "transcript",
+    "session", "prompt_unverified", "scratch", "hooks", "transcript",
 }
 
 # The `signals` object emitted whenever the log could not be read at all.
@@ -3466,6 +3466,100 @@ class TestTranscriptFacts:
     # ------------------------------------------------------------------
     # end-to-end tests through cmd_watch
     # ------------------------------------------------------------------
+
+    def test_prompt_unverified_key_carries_the_reason_end_to_end(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        """An explicitly-unverified prompt must be distinguishable from one
+        that has not been submitted yet: without a field for it, both project
+        as prompt_submitted absent and nothing else."""
+        sd, _ld = _make_run(
+            isolated_runs_root, isolated_log_root, "unver",
+            status="running", pid=111, log_age_secs=1, interactive="1",
+        )
+        (sd / "prompt_unverified").write_text("witness_unreadable\n")
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+
+        agent_run.cmd_watch(_watch_args("unver"))
+        payload = json.loads(capsys.readouterr().out)
+
+        assert set(payload.keys()) == WATCH_CONTRACT_KEYS
+        assert payload["prompt_unverified"] == "witness_unreadable"
+
+    def test_prompt_unverified_is_null_for_a_verified_prompt(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        sd, _ld = _make_run(
+            isolated_runs_root, isolated_log_root, "ver",
+            status="running", pid=111, log_age_secs=1, interactive="1",
+        )
+        (sd / "prompt_submitted").write_text(agent_run._now_iso() + "\n")
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+
+        agent_run.cmd_watch(_watch_args("ver"))
+        payload = json.loads(capsys.readouterr().out)
+
+        assert payload["prompt_unverified"] is None
+
+    def test_prompt_unverified_is_null_when_nothing_has_been_submitted(
+        self, isolated_runs_root, isolated_log_root, monkeypatch, capsys
+    ):
+        _sd, _ld = _make_run(
+            isolated_runs_root, isolated_log_root, "pending",
+            status="running", pid=111, log_age_secs=1, interactive="1",
+        )
+        monkeypatch.setattr(agent_run, "_pid_alive", lambda _p: True)
+
+        agent_run.cmd_watch(_watch_args("pending"))
+        payload = json.loads(capsys.readouterr().out)
+
+        assert payload["prompt_unverified"] is None
+
+    def test_prompt_unverified_survives_the_state_dir_on_a_preserved_log(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """After a reboot or state GC the state dir is gone but the log dir
+        survives. Without a durable copy the reason vanishes and a postmortem
+        cannot tell an unconfirmed submission from one never attempted."""
+        _sd, ld = _make_run(
+            isolated_runs_root, isolated_log_root, "unver-preserved",
+            write_state=False,
+        )
+        (ld / "prompt_unverified").write_text("witness_unreadable\n")
+
+        agent_run.cmd_watch(_watch_args("unver-preserved"))
+        payload = json.loads(capsys.readouterr().out)
+
+        assert payload["status"] == agent_run.WATCH_STATUS_LOG_PRESERVED
+        assert payload["prompt_unverified"] == "witness_unreadable"
+
+    def test_prompt_unverified_is_null_on_a_preserved_log_that_never_recorded_one(
+        self, isolated_runs_root, isolated_log_root, capsys
+    ):
+        """The control: a preserved log with no durable copy must still
+        report null, not a stale or invented reason."""
+        _make_run(
+            isolated_runs_root, isolated_log_root, "pending-preserved",
+            write_state=False,
+        )
+
+        agent_run.cmd_watch(_watch_args("pending-preserved"))
+        payload = json.loads(capsys.readouterr().out)
+
+        assert payload["status"] == agent_run.WATCH_STATUS_LOG_PRESERVED
+        assert payload["prompt_unverified"] is None
+
+    def test_an_unverified_launch_prompt_writes_the_durable_copy(self, tmp_path):
+        """The write side of the same guarantee: whatever records the reason
+        must put it where it outlives the state dir."""
+        state, log = tmp_path / "state", tmp_path / "log"
+        state.mkdir()
+        log.mkdir()
+
+        agent_run._record_prompt_unverified(state, log, "witness_unreadable")
+
+        assert (state / "prompt_unverified").read_text().strip() == "witness_unreadable"
+        assert (log / "prompt_unverified").read_text().strip() == "witness_unreadable"
 
     def test_transcript_key_present_in_normal_branch(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, capsys

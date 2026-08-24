@@ -1,10 +1,21 @@
 """Regression guard: the standalone `scripts/verify-*` diagnostics shell out to
 `agent-run` as a subprocess and are not imported or exercised by the pytest
 suite, so a CLI rename here silently breaks them. Assert their argv strings
-track the current subcommand surface directly against the source text."""
+track the current subcommand surface directly against the source text.
+
+The verify-submission.sh checks are also guarded against becoming vacuous:
+a check that cannot fail proves nothing about the harness it targets, so the
+shapes each one must reject are asserted here against the extracted check.
+"""
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 
@@ -50,3 +61,262 @@ def test_verify_session_attribution_emits_json_when_an_abort_precedes_cells():
     # database check.
     assert source.count("_emit_abort_json(args.json,") == 2
     assert '"aborted": reason' in source
+
+
+def _h5_counter_source() -> str:
+    """The inline python3 program `duplicated_prompt_texts_present` pipes a
+    /session/<id>/message response through. Extracted from the script rather
+    than duplicated, so a change to the check is a change to what is tested."""
+    source = (SCRIPTS_DIR / "verify-submission.sh").read_text()
+    body = source[source.index("duplicated_prompt_texts_present() {"):]
+    body = body[: body.index("\n}\n")]
+    return body[body.index("python3 -c '") + len("python3 -c '") : body.rindex("'")]
+
+
+def _count_distinct(payload: str, text_a: str = "TEXT-A", text_b: str = "TEXT-B") -> int:
+    result = subprocess.run(
+        [sys.executable, "-c", _h5_counter_source()],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TEXT_A": text_a, "TEXT_B": text_b},
+        check=True,
+    )
+    return int(result.stdout.strip())
+
+
+def _user_message(message_id: str, *texts: str) -> dict:
+    return {
+        "info": {"id": message_id, "role": "user"},
+        "parts": [{"type": "text", "text": text} for text in texts],
+    }
+
+
+def test_h5_counts_both_texts_when_they_land_in_separate_records():
+    """Two POSTs under one messageID stored as two records: both texts
+    survived, so the id did not deduplicate the content."""
+    payload = json.dumps([
+        _user_message("msg_a", "TEXT-A"),
+        _user_message("msg_b", "TEXT-B"),
+    ])
+    assert _count_distinct(payload) == 2
+
+
+def test_h5_counts_both_texts_when_opencode_merges_them_into_one_record():
+    """Measured opencode 1.18.21 behaviour: a repeated messageID appends a part
+    to the existing record. Both texts are stored, so the duplication H5 tests
+    for is real even though only one record exists."""
+    payload = json.dumps([_user_message("msg_merged", "TEXT-A", "TEXT-B")])
+    assert _count_distinct(payload) == 2
+
+
+def test_h5_fails_when_the_duplicate_post_is_dropped():
+    """The regression H5 must catch: were a repeated messageID to become
+    idempotent, retries would silently deduplicate and only one text remains."""
+    payload = json.dumps([_user_message("msg_only", "TEXT-A")])
+    assert _count_distinct(payload) < 2
+
+
+def test_h5_fails_when_only_one_of_the_two_texts_is_present():
+    """A response missing one POST's text is not evidence of duplication,
+    however many records carry the other one."""
+    one_needle_twice = json.dumps([
+        _user_message("msg_a", "TEXT-A"),
+        _user_message("msg_b", "TEXT-A"),
+    ])
+    assert _count_distinct(one_needle_twice) < 2
+    assert _count_distinct(json.dumps([_user_message("msg_a", "TEXT-A")])) < 2
+    assert _count_distinct(json.dumps([])) < 2
+    assert _count_distinct("not json at all") < 2
+
+
+def test_h5_ignores_assistant_records():
+    """An assistant reply echoing both texts is not a user message."""
+    payload = json.dumps([
+        {
+            "info": {"id": "msg_reply", "role": "assistant"},
+            "parts": [{"type": "text", "text": "TEXT-A"}, {"type": "text", "text": "TEXT-B"}],
+        },
+    ])
+    assert _count_distinct(payload) < 2
+
+
+def _shell_function_source(name: str) -> str:
+    """The named bash function, extracted from verify-submission.sh so a
+    change to the check is a change to what is tested."""
+    source = (SCRIPTS_DIR / "verify-submission.sh").read_text()
+    body = source[source.index(f"{name}() {{"):]
+    return body[: body.index("\n}\n") + 2]
+
+
+def _steer_reported_verified(steer_output: str) -> bool:
+    result = subprocess.run(
+        ["bash", "-c", f'{_shell_function_source("steer_reported_verified")}\n'
+                       f'steer_reported_verified "$1"', "_", steer_output],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def test_c2_rejects_the_failure_message_that_contains_the_word_verified():
+    """C2's whole purpose is catching an unverified steer. "could not be
+    verified as delivered" contains "verified", so a substring match passes
+    on the very output reporting failure -- the check would be vacuous even
+    if unverified steer regressed to exit 0."""
+    assert not _steer_reported_verified(
+        "agent-run: steer to 'x' could not be verified as delivered "
+        "(timeout, 2 attempt(s) via keystroke)"
+    )
+
+
+def test_c2_accepts_only_the_positive_success_form():
+    assert _steer_reported_verified("agent-run: steered 'run-1' (37 bytes, verified)")
+
+
+@pytest.mark.parametrize(
+    "steer_output",
+    [
+        pytest.param("agent-run: steered 'x' (5 bytes, raw, unverified)", id="raw"),
+        pytest.param("agent-run: steered 'x' (5 bytes, unwitnessed — raw run)", id="unwitnessed"),
+        pytest.param("", id="no_output"),
+        pytest.param("verified", id="bare_word"),
+    ],
+)
+def test_c2_rejects_every_non_success_steer_output(steer_output):
+    assert not _steer_reported_verified(steer_output)
+
+
+def _h4_verifier_source() -> str:
+    """The inline python3 program `h4_record_inserted` pipes a
+    /session/<id>/message response through."""
+    body = _shell_function_source("h4_record_inserted")
+    return body[body.index("python3 -c '") + len("python3 -c '") : body.rindex("'")]
+
+
+def _h4_inserted(payload: str, sentinel: str = "H4-SENTINEL", before: int = 1) -> bool:
+    result = subprocess.run(
+        [sys.executable, "-c", _h4_verifier_source()],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "H4_SENTINEL": sentinel, "H4_BEFORE_COUNT": str(before)},
+    )
+    return result.returncode == 0
+
+
+def _h4_message(role: str, *texts: str) -> dict:
+    return {
+        "info": {"id": f"msg_{role}", "role": role},
+        "parts": [{"type": "text", "text": text} for text in texts],
+    }
+
+
+def test_h4_accepts_exactly_one_new_user_record_carrying_the_sentinel():
+    """The behaviour H4 exists to confirm: noReply inserts the message and
+    suppresses generation."""
+    payload = json.dumps([_h4_message("user", "earlier"), _h4_message("user", "H4-SENTINEL")])
+    assert _h4_inserted(payload)
+
+
+def test_h4_rejects_an_unrelated_user_record():
+    """A user record that arrived from something other than the H4 POST is
+    not evidence the POST inserted anything: without a content check H4
+    passes on a rejected POST plus unrelated traffic."""
+    payload = json.dumps([_h4_message("user", "earlier"), _h4_message("user", "something else")])
+    assert not _h4_inserted(payload)
+
+
+def test_h4_rejects_an_assistant_reply_after_the_sentinel():
+    """noReply must suppress generation; a reply following the record means
+    it did not."""
+    payload = json.dumps([
+        _h4_message("user", "earlier"),
+        _h4_message("user", "H4-SENTINEL"),
+        _h4_message("assistant", "replying anyway"),
+    ])
+    assert not _h4_inserted(payload)
+
+
+def test_h4_rejects_a_sentinel_echoed_only_by_an_assistant():
+    payload = json.dumps([_h4_message("user", "earlier"), _h4_message("assistant", "H4-SENTINEL")])
+    assert not _h4_inserted(payload)
+
+
+@pytest.mark.parametrize(
+    ("payload", "label"),
+    [
+        pytest.param(json.dumps([]), "empty response", id="empty"),
+        pytest.param("not json at all", "unparseable response", id="not_json"),
+        pytest.param(json.dumps({"error": "nope"}), "error object", id="error_object"),
+    ],
+)
+def test_h4_rejects_a_response_that_is_not_a_message_list(payload, label):
+    assert not _h4_inserted(payload), label
+
+
+def test_h4_rejects_a_count_that_did_not_rise_by_exactly_one():
+    """Two new records means something other than the H4 POST also wrote."""
+    payload = json.dumps([
+        _h4_message("user", "earlier"),
+        _h4_message("user", "unrelated"),
+        _h4_message("user", "H4-SENTINEL"),
+    ])
+    assert not _h4_inserted(payload, before=1)
+
+
+def _h3_client_aborted(curl_rc: int, http_code: str = "") -> bool:
+    result = subprocess.run(
+        ["bash", "-c", f'{_shell_function_source("h3_client_aborted")}\n'
+                       f'h3_client_aborted "$1" "$2"', "_", str(curl_rc), http_code],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "http_code",
+    [
+        pytest.param("200", id="headers_arrived"),
+        pytest.param("", id="no_status_line"),
+        pytest.param("000", id="zero_status"),
+    ],
+)
+def test_h3_accepts_a_client_timeout_however_far_the_response_got(http_code):
+    """opencode answers 200 headers as soon as it accepts the message and
+    streams the turn afterwards, so curl reports a status *and* times out
+    waiting for the body. That is the client-side disconnect H3 exercises;
+    requiring an empty %{http_code} fails H3 on correct behaviour."""
+    assert _h3_client_aborted(28, http_code)
+
+
+@pytest.mark.parametrize(
+    ("curl_rc", "http_code"),
+    [
+        pytest.param(0, "200", id="completed_normally"),
+        pytest.param(7, "", id="connection_refused"),
+        pytest.param(52, "", id="empty_reply"),
+        pytest.param(56, "200", id="recv_failure"),
+    ],
+)
+def test_h3_rejects_every_exit_that_is_not_a_client_timeout(curl_rc, http_code):
+    """The check must stay able to fail: a POST that completed, or failed for
+    an unrelated reason, never exercised a mid-turn disconnect."""
+    assert not _h3_client_aborted(curl_rc, http_code)
+
+
+@pytest.mark.parametrize(
+    "http_code",
+    [
+        pytest.param("400", id="bad_request"),
+        pytest.param("404", id="route_gone"),
+        pytest.param("500", id="server_error"),
+    ],
+)
+def test_h3_rejects_a_timeout_after_a_rejected_request(http_code):
+    """A request the server refused never started a turn, so a timeout after
+    it is not the mid-turn disconnect H3 is asserting survives."""
+    assert not _h3_client_aborted(28, http_code)
+
+

@@ -120,7 +120,12 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     pid          runner process id
     pgid         process group id (also the `kill --force` fallback target)
     launch_error first output line of a run that failed at launch
-    prompt_submitted  written once an interactive prompt file was delivered
+    prompt_submitted  interactive prompt submission was verified (or, for an
+                 unmanaged run with no session to witness, was written)
+    prompt_unverified  verification failed; contains the reason. Surfaced on
+                 the watch contract as the `prompt_unverified` key. Mirrored
+                 into the log dir, which survives this directory.
+    opencode_port  managed interactive opencode HTTP API port used by the witness
     idle_timeout      idle-timeout seconds this run was launched with
     idle_timeout_fired  idle seconds measured when the watchdog fired
     process_identity  platform-specific runner birth token (kill verification)
@@ -156,6 +161,9 @@ Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs):
 
     log          captured stdout+stderr (PTY-captured when interactive)
     prompt       copy of the -f/--prompt-file input, if one was given
+    prompt_unverified  durable copy of the state-dir file of the same name, so
+                 a postmortem on a preserved log can still tell an
+                 unconfirmed submission from one never attempted
     session.json session attribution (managed mode only): session_id, harness,
                  acquisition, confidence, observed_at; absent for raw runs
     run.json     immutable launch facts + exit facts (all modes): name, argv,
@@ -350,6 +358,7 @@ import codecs
 from contextlib import contextmanager
 import errno
 import fcntl
+import http.client
 import json
 import math
 import os
@@ -371,13 +380,15 @@ import traceback
 import tty
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import platform
+from dataclasses import dataclass
 from wcwidth import wcwidth
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, List, NamedTuple, NoReturn, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Callable, Iterable, List, NamedTuple, NoReturn, Optional, Sequence, Tuple
 from toolbox import __version__ as TOOLBOX_VERSION
 from toolbox import agent_run_transcript as _agent_run_transcript
 
@@ -1151,10 +1162,20 @@ LAUNCH_ERROR_MAX_CHARS = 500
 
 PROMPT_UNSUBMITTED_ERROR = "agent exited before its prompt file was submitted"
 
-# The interactive prompt helper waits this long for the TUI to enter raw mode
-# before submitting; it also bounds how late an unsubmitted prompt still counts
-# as a launch failure.
+# Delay initial TUI submission until raw mode is active.
 PROMPT_SUBMISSION_DELAY_SECONDS = 4.0
+
+# Submission verification (launch prompt + steer): total time budget across
+# every attempt, poll cadence while waiting for the transcript witness to
+# rise, and the number of submit attempts before giving up. Overridable via
+# AGENT_RUN_SUBMIT_VERIFY_TIMEOUT / AGENT_RUN_SUBMIT_ATTEMPTS.
+SUBMISSION_VERIFY_TIMEOUT_SECONDS = 10.0
+SUBMISSION_VERIFY_POLL_INTERVAL_SECONDS = 0.25
+SUBMISSION_MAX_ATTEMPTS = 2
+# Slept before attempt N+1, scaled by attempt number and capped, so a
+# sub-second transport blip does not consume every attempt instantly.
+SUBMISSION_RETRY_BACKOFF_SECONDS = 0.5
+SUBMISSION_RETRY_BACKOFF_MAX_SECONDS = 2.0
 
 
 # Off by default, unlike the thresholds above. An invalid flag value is a hard
@@ -2457,12 +2478,6 @@ def _persist_submit_mode(
     mode = override or _submit_mode_for_argv(argv)
     _write(state_dir / "submit_mode", mode + "\n")
     return mode
-
-
-def _prompt_submission_writes(data: bytes, mode: str) -> tuple[bytes, bytes]:
-    """Return the two FIFO writes used to submit an initial prompt file."""
-    submit = _submit_bytes(mode)
-    return data + submit, submit
 
 
 # ---------------------------------------------------------------------------
@@ -4314,14 +4329,648 @@ def _watch_transcript_facts(
         return _transcript_unknown("store_unreadable", submitted_age_s)
 
 
+# ---------------------------------------------------------------------------
+# Submission verification (launch prompt + steer)
+# ---------------------------------------------------------------------------
+
+def _submission_verify_timeout_seconds() -> float:
+    """Parse AGENT_RUN_SUBMIT_VERIFY_TIMEOUT; unset or malformed falls back
+    to SUBMISSION_VERIFY_TIMEOUT_SECONDS without raising."""
+    raw = os.environ.get("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT")
+    if raw is None:
+        return SUBMISSION_VERIFY_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(raw)
+    except ValueError:
+        return SUBMISSION_VERIFY_TIMEOUT_SECONDS
+    return value
+
+
+def _submission_max_attempts() -> int:
+    """Parse AGENT_RUN_SUBMIT_ATTEMPTS; unset or malformed falls back to
+    SUBMISSION_MAX_ATTEMPTS without raising."""
+    raw = os.environ.get("AGENT_RUN_SUBMIT_ATTEMPTS")
+    if raw is None:
+        return SUBMISSION_MAX_ATTEMPTS
+    try:
+        value = int(raw)
+        if value < 1:
+            raise ValueError(raw)
+    except ValueError:
+        return SUBMISSION_MAX_ATTEMPTS
+    return value
+
+
+def _effective_argv_port(argv: Sequence[str]) -> Optional[int]:
+    """Return the ``--port`` an argv actually takes effect with.
+
+    The last occurrence wins, matching how the harness CLIs parse repeated
+    flags: agent-run's managed ``--port`` is appended before harness_args, so
+    ``--harness-arg=--port --harness-arg=48002`` overrides it and the run
+    listens on 48002. Both ``--port N`` and ``--port=N`` spellings are read.
+    """
+    port: Optional[int] = None
+    for i, token in enumerate(argv):
+        if not isinstance(token, str):
+            continue
+        if token == "--port" and i + 1 < len(argv):
+            port = _safe_int(argv[i + 1]) or port
+        elif token.startswith("--port="):
+            port = _safe_int(token[len("--port="):]) or port
+    return port
+
+
+def _opencode_argv_port(state_dir: Path) -> Optional[int]:
+    """Recover the effective --port from the persisted argv, for a run
+    launched before opencode_port was written directly."""
+    try:
+        argv = json.loads((state_dir / "argv").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(argv, list):
+        return None
+    return _effective_argv_port(argv)
+
+
+def _opencode_http_endpoint(state_dir: Path, log_dir: Path) -> Optional[tuple[int, str]]:
+    """(port, session_id) for a managed interactive opencode run whose HTTP
+    API is expected to be reachable, else None.
+
+    Port comes from state_dir/opencode_port, falling back to parsing --port
+    out of the persisted argv for runs launched before that file existed.
+    """
+    session_data = _read_session_json(log_dir)
+    if not isinstance(session_data, dict) or session_data.get("harness") != "opencode":
+        return None
+    session_id = session_data.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    port = _safe_int(_read(state_dir / "opencode_port")) or _opencode_argv_port(state_dir)
+    if port is None or port <= 0:
+        return None
+    return port, session_id
+
+
+def _opencode_http_prompt_turn_count(
+    port: int, session_id: str, normalized_prompt: str
+) -> Optional[int]:
+    """GET /session/<id>/message and count user turns carrying the prompt.
+    None on any failure (unreachable server, non-200, malformed body): an
+    unreadable witness is unknown, never zero.
+
+    Implements ``agent_run_transcript``'s submission-verification predicate
+    over the HTTP view of the store: role *and* content, because opencode
+    persists a message envelope and its text parts as separate events, and
+    adds user-role messages of its own. A record of this session whose
+    envelope does not validate makes the whole read unknown, for the same
+    reason a store read raises rather than counting the readable rows.
+
+    http.client.HTTPException covers the failures urllib does not wrap:
+    resp.read() raises IncompleteRead for a body shorter than Content-Length
+    and BadStatusLine for non-HTTP bytes, neither of which is an OSError.
+    """
+    url = f"http://127.0.0.1:{port}/session/{urllib.parse.quote(session_id, safe='')}/message"
+    try:
+        with urllib.request.urlopen(url, timeout=2.0) as resp:
+            if resp.status != 200:
+                return None
+            body = resp.read().decode("utf-8", errors="replace")
+    except (OSError, http.client.HTTPException, ValueError):
+        return None
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    count = 0
+    for item in data:
+        if not isinstance(item, dict):
+            return None
+        info = item.get("info")
+        if not isinstance(info, dict) or not isinstance(info.get("role"), str):
+            return None
+        if info["role"] != "user":
+            continue
+        texts = _opencode_http_message_texts(item)
+        if texts is None:
+            return None
+        if _agent_run_transcript.turn_parts_carry_prompt(texts, normalized_prompt):
+            count += 1
+    return count
+
+
+def _opencode_http_message_texts(message: dict) -> Optional[list[str]]:
+    """One HTTP message record's text parts, or None when its `parts` do not
+    match the schema and so cannot be read."""
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return None
+    texts = []
+    for part in parts:
+        if not isinstance(part, dict):
+            return None
+        if part.get("type") != "text":
+            continue  # file/agent/compaction parts carry no submitted text
+        if not isinstance(part.get("text"), str):
+            return None
+        texts.append(part["text"])
+    return texts
+
+
+class _WitnessSource:
+    """A prompt-turn counter pinned for one verification call.
+
+    Counts from different sources are not comparable, so a read failure never
+    causes fallback to another source. What is counted is
+    ``agent_run_transcript``'s submission-verification predicate: user-role
+    turns whose own text carries the submitted prompt.
+    """
+
+    def __init__(self, name: str, count: Callable[[], Optional[int]]) -> None:
+        self.name = name
+        self._count = count
+
+    def prompt_turn_count(self) -> Optional[int]:
+        """Prompt-turn count, or None when this source cannot be read.
+
+        Any exception from the underlying counter is an unreadable witness:
+        _submit_and_verify promises never to raise for a submission failure,
+        and a verification bug must not kill an otherwise working run.
+        """
+        try:
+            return self._count()
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def _run_is_managed(log_dir: Optional[Path]) -> bool:
+    """True when the run was launched under --harness and therefore has a
+    harness session, and so a transcript store, to witness against.
+
+    Keyed on session.json existing rather than parsing: ``_record_session``
+    writes it for every managed launch, including one whose session id could
+    not be acquired (``session_id: null``, ``acquisition: "missing"``) and
+    one whose contents are truncated. A raw run (`agent-run NAME -- <cmd>`)
+    never produces the file at all.
+    """
+    if log_dir is None:
+        return False
+    try:
+        os.stat(log_dir / "session.json")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # Unstatable: assume managed, so an unverifiable submission is
+        # reported rather than falsely stamped as delivered.
+        return True
+    return True
+
+
+def _resolve_witness_source(
+    state_dir: Path, log_dir: Optional[Path], prompt: str
+) -> Optional[_WitnessSource]:
+    """Pick the witness source for a run, or None when no usable session id
+    is available to count *prompt*'s turns in.
+
+    None covers both an unmanaged run (no session.json) and a managed run
+    whose session id could not be acquired; ``_run_is_managed`` separates
+    them, and only the former may treat a write as delivery.
+
+    opencode's own HTTP endpoint wins when a port is known: it reports what
+    the TUI ingested, without the store's write lag.
+    """
+    if log_dir is None:
+        return None
+    normalized = _agent_run_transcript.normalize_prompt_text(prompt)
+    endpoint = _opencode_http_endpoint(state_dir, log_dir)
+    if endpoint is not None:
+        port, session_id = endpoint
+        return _WitnessSource(
+            "opencode_http",
+            lambda: _opencode_http_prompt_turn_count(port, session_id, normalized),
+        )
+    session_data = _read_session_json(log_dir)
+    if not isinstance(session_data, dict):
+        return None
+    session_id = session_data.get("session_id")
+    harness = session_data.get("harness")
+    if not isinstance(session_id, str) or not session_id or not isinstance(harness, str):
+        return None
+    cwd = _run_json_cwd(log_dir)
+    return _WitnessSource(
+        f"{harness}_transcript",
+        lambda: _transcript_prompt_turn_count(harness, session_id, cwd, prompt),
+    )
+
+
+def _transcript_prompt_turn_count(
+    harness: str, session_id: str, cwd: Optional[str], prompt: str
+) -> Optional[int]:
+    """Prompt-turn count from the harness transcript store, or None when the
+    store cannot be read. Never raises: every store failure is an unreadable
+    witness, the same fail-closed rule the watch contract uses."""
+    try:
+        count = _agent_run_transcript.count_prompt_turns(harness, session_id, cwd, prompt)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        return None
+    return count
+
+
+@dataclass(frozen=True)
+class SubmissionOutcome:
+    """Result of one _submit_and_verify call. verified=False always carries
+    a human-readable reason in detail:
+
+    ``rejected: ...``   the transport itself refused the submission (e.g. a
+                        JSON-RPC error response) -- fast and non-retryable,
+                        not a verification timeout.
+    ``unwitnessed``     the run is unmanaged, so no harness session exists to
+                        witness against. delivered still reports whether the
+                        bytes were written.
+    ``no_session_id``   the run *is* managed but its session id could not be
+                        acquired, so there is a session and no handle on it.
+                        Never a success: unlike ``unwitnessed`` this is a
+                        failed mint, not a mode without verification.
+    ``witness_unreadable`` / ``timeout`` / ``transport_error: ...``
+    """
+    verified: bool
+    attempts: int
+    transport: str          # "http" | "keystroke" | "rpc"
+    detail: Optional[str]   # why unverified; None when verified
+    # Whether the transport accepted the last submission without raising.
+    # Weaker than verified: proof the bytes left, not that they arrived.
+    delivered: bool = False
+
+
+class _SubmissionRejected(Exception):
+    """Raised by a submit callable when the transport rejected the
+    submission outright, distinct from a low-level transport failure.
+    _submit_and_verify treats this as immediate and non-retryable: an
+    explicit rejection is not evidence a resend might succeed."""
+
+
+def _submit_via_http(port: int, session_id: str, text: str) -> None:
+    """POST *text* to opencode's message endpoint without waiting for a
+    response. A normal POST blocks until the whole turn completes; dropping
+    the connection right after the request is written is safe -- the turn
+    still runs to completion server-side.
+
+    Raises OSError on a connection failure, which the caller treats as a
+    failed attempt, not a crash. A socket timeout is re-raised as a
+    ConnectionError: TimeoutError is reserved for the caller's own
+    out-of-band deadlines, which must never be mistaken for a retryable
+    transport failure.
+    """
+    path = f"/session/{urllib.parse.quote(session_id, safe='')}/message"
+    body = json.dumps({"parts": [{"type": "text", "text": text}]}).encode("utf-8")
+    request = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("ascii") + body
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+    except TimeoutError as exc:
+        raise ConnectionError(f"connect to 127.0.0.1:{port} timed out: {exc}") from exc
+    try:
+        sock.sendall(request)
+    except TimeoutError as exc:
+        raise ConnectionError(f"send to 127.0.0.1:{port} timed out: {exc}") from exc
+    finally:
+        sock.close()
+
+
+class _PartialFifoWrite(OSError):
+    """A FIFO write that failed after some bytes of the payload had landed.
+
+    The TUI has ingested a prefix of the payload without its submit
+    terminator, so the composer holds a truncated prompt. Sending the
+    terminator alone next would submit that truncation as a complete
+    message; the composer must be cleared and the text re-sent in full.
+    """
+
+    def __init__(self, written: int, cause: OSError) -> None:
+        super().__init__(f"wrote {written} byte(s) of the payload before failing: {cause}")
+        self.written = written
+
+
+def _write_all_to_fifo(fd: int, payload: bytes) -> None:
+    """Write every byte of *payload* to *fd*, retrying short writes.
+
+    A pipe guarantees atomicity only up to PIPE_BUF; past that a single
+    os.write can truncate the text or drop the submit terminator, leaving
+    the composer holding a partial prompt. EINTR retries. A failure once
+    bytes have already landed raises _PartialFifoWrite carrying the count,
+    so the caller knows the composer is dirty; a failure at offset 0
+    propagates unchanged, meaning nothing reached the TUI at all.
+    """
+    written = 0
+    while written < len(payload):
+        try:
+            written += os.write(fd, payload[written:])
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            if written:
+                raise _PartialFifoWrite(written, exc) from exc
+            raise
+
+
+def _submit_via_keystroke(state_dir: Path, payload: bytes) -> None:
+    """Write *payload* to the run's stdin FIFO. Raises OSError if the FIFO
+    cannot be opened or the write fails; the caller treats that as a failed
+    attempt, not a crash. _PartialFifoWrite, a subclass, additionally means
+    a prefix of the payload did reach the TUI.
+
+    A close() failure is swallowed: every byte is already in the pipe by
+    then, so it says nothing about delivery and must not be mistaken for a
+    write that never landed."""
+    fd = os.open(str(state_dir / "stdin"), os.O_WRONLY)
+    try:
+        _write_all_to_fifo(fd, payload)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# Sent alone to clear a TUI composer that may still hold a previous
+# attempt's text: ESC leaves any mode the previous keystrokes entered,
+# ctrl-u kills the line readline-style.
+_COMPOSER_RESET_BYTES = b"\x1b\x15"
+
+# The ladder rung that assumes the composer holds something unusable: clear
+# it and re-send the text in full. The last rung, repeated while attempts
+# remain.
+_KEYSTROKE_LADDER_RESET_STEP = 3
+
+
+def _keystroke_payload(step: int, text: bytes, submit_mode: str) -> bytes:
+    """FIFO bytes for one rung of the keystroke ladder.
+
+    Step 1 sends the text and the Enter sequence. The failure a retry
+    exists for is "the TUI took the text but swallowed the Enter", which
+    leaves step 1's text sitting in the composer -- so step 2 sends the
+    terminator alone, submitting what is already buffered rather than
+    doubling the prompt. Only step 3 and later assume the composer is
+    holding something unusable and clear it before re-sending in full.
+
+    The step is not the attempt number: it advances only when an attempt
+    delivered its whole payload (see _submit_and_verify), because step 2
+    only makes sense once step 1's text is known to be buffered.
+    """
+    terminator = _submit_bytes(submit_mode)
+    if step == 1:
+        return text + terminator
+    if step == 2:
+        return terminator
+    return _COMPOSER_RESET_BYTES + text + terminator
+
+
+def _submit_and_verify(
+    state_dir: Path,
+    log_dir: Optional[Path],
+    text: bytes,
+    *,
+    submit_mode: str = SUBMIT_MODE_CR,
+    deadline_s: float = SUBMISSION_VERIFY_TIMEOUT_SECONDS,
+    max_attempts: int = SUBMISSION_MAX_ATTEMPTS,
+    submit: Optional[Callable[[bytes], None]] = None,
+    transport: Optional[str] = None,
+    fresh_session: bool = False,
+) -> SubmissionOutcome:
+    """Submit text and verify that the pinned witness gained a turn carrying it.
+
+    Verification follows ``agent_run_transcript``'s submission-verification
+    predicate: a user-role turn whose own text carries this prompt. Only a
+    fresh session can prove delivery from a nonzero count after an unreadable
+    baseline. On an unreadable witness the only permitted resends are ones
+    that cannot duplicate a prompt that may already have landed: the
+    keystroke ladder's terminator-only rung over a composer known to hold
+    this text, and a repeat of a write that provably delivered no bytes. A
+    custom *submit* may reject immediately or raise OSError; out-of-band
+    TimeoutError propagates.
+    """
+    if submit is not None:
+        transport = transport or "rpc"
+    else:
+        endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
+        transport = "http" if endpoint is not None else "keystroke"
+    witness = _resolve_witness_source(state_dir, log_dir, text.decode("utf-8", errors="replace"))
+    # No witness has two causes that must not be conflated: a raw run, for
+    # which "written" has always been the only available evidence, and a
+    # managed run whose session id could not be acquired, which is a failed
+    # mint and must never read as a success.
+    unwitnessed_detail = "no_session_id" if _run_is_managed(log_dir) else "unwitnessed"
+    baseline = witness.prompt_turn_count() if witness is not None else None
+    # Without a baseline, a count is evidence only for a session this launch
+    # just minted, which held no turns at all before this submission. An
+    # established session's existing history makes any count unattributable.
+    comparable = witness is not None and (baseline is not None or fresh_session)
+    # Whether a read taken *after* the current attempt's write succeeded.
+    # Only such a read can prove the current payload did not land; a read
+    # from before the write says nothing about it.
+    readable_after_write = False
+
+    def _witness_rose(*, post_write: bool) -> bool:
+        nonlocal readable_after_write
+        if not comparable:
+            return False
+        current = witness.prompt_turn_count()
+        if current is None:
+            return False
+        if post_write:
+            readable_after_write = True
+        return current > baseline if baseline is not None else current > 0
+
+    detail: Optional[str] = None
+    attempts = 0
+    delivered = False
+    # Which rung of the keystroke ladder to send next. Advances only on a
+    # fully delivered write, so a rung that never reached the TUI is re-sent
+    # rather than skipped (see _keystroke_payload).
+    step = 1
+
+    for attempt in range(1, max_attempts + 1):
+        attempts = attempt
+        # Scoped per attempt: the guard below asks whether *this* attempt's
+        # own write was followed by a readable witness.
+        readable_after_write = False
+        if attempt > 1:
+            # A backoff between attempts, so a brief transport blip cannot
+            # burn the whole attempt budget in milliseconds.
+            time.sleep(min(SUBMISSION_RETRY_BACKOFF_SECONDS * (attempt - 1),
+                           SUBMISSION_RETRY_BACKOFF_MAX_SECONDS))
+            # The previous attempt's last read is already stale. Re-read
+            # immediately before sending so a witness that rose in between is
+            # not answered with a duplicate submission. This read predates
+            # the write below, so it must not mark the witness readable.
+            if _witness_rose(post_write=False):
+                return SubmissionOutcome(True, attempts, transport, None, delivered=True)
+        delivered_this_attempt = False
+        # Set when a failure provably put no submittable input in front of the
+        # harness, which makes re-sending duplication-free.
+        resend_cannot_duplicate = False
+        step_sent = step
+        try:
+            if submit is not None:
+                submit(text)
+            elif transport == "http":
+                port, session_id = endpoint
+                _submit_via_http(port, session_id, text.decode("utf-8", errors="replace"))
+            else:
+                _submit_via_keystroke(state_dir, _keystroke_payload(step_sent, text, submit_mode))
+            delivered = delivered_this_attempt = True
+        except _SubmissionRejected as exc:
+            return SubmissionOutcome(False, attempts, transport, f"rejected: {exc}")
+        except TimeoutError:
+            # TimeoutError subclasses OSError, so the arm below would swallow
+            # cmd_steer's SIGALRM watchdog and retry against the same stuck
+            # FIFO forever. Transport-level timeouts are re-raised as
+            # non-TimeoutError OSErrors by the transports themselves, so
+            # anything reaching here is an out-of-band deadline.
+            raise
+        except _PartialFifoWrite as exc:
+            # The composer now holds a prefix of the payload. Terminating that
+            # prefix would submit a truncated prompt as a complete message, so
+            # the next rung must clear the composer and re-send in full.
+            detail = f"transport_error: {exc}"
+            step = _KEYSTROKE_LADDER_RESET_STEP
+            # That resend duplicates nothing only if no byte of the trailing
+            # terminator landed: with none of it in the TUI's hands the prefix
+            # was never submitted. A partial terminator (CRLF short-written
+            # after its CR) may already have submitted the truncation.
+            payload_length = len(_keystroke_payload(step_sent, text, submit_mode))
+            resend_cannot_duplicate = (
+                exc.written <= payload_length - len(_submit_bytes(submit_mode))
+            )
+        except OSError as exc:
+            detail = f"transport_error: {exc}"
+            # A keystroke write that failed before its first byte left the
+            # composer exactly as the previous rung left it, so re-sending
+            # the same rung is both correct and duplication-free. HTTP and
+            # RPC offer no such guarantee: the peer may have queued the
+            # request before the connection broke.
+            resend_cannot_duplicate = submit is None and transport == "keystroke"
+
+        if witness is None and delivered_this_attempt:
+            # Nothing to verify against, so one write is the whole story.
+            # Retrying could only duplicate. Callers decide whether the
+            # detail is a legitimate outcome (raw run) or a failure.
+            return SubmissionOutcome(
+                False, attempts, transport, unwitnessed_detail, delivered=True
+            )
+
+        # The peer may well have queued the request before a connection broke
+        # (an HTTP reset after the write, an equivalent RPC write), and no
+        # transport here is idempotent, so a failed attempt gets the same
+        # verification window as a successful one before a resend is
+        # considered.
+        if _poll_witness(lambda: _witness_rose(post_write=True), deadline_s):
+            return SubmissionOutcome(True, attempts, transport, None, delivered=True)
+
+        if delivered_this_attempt:
+            detail = "timeout" if readable_after_write else "witness_unreadable"
+            step = min(step + 1, _KEYSTROKE_LADDER_RESET_STEP)
+
+        # A witness read after this attempt's write, and still flat, is proof
+        # the submission did not land, which licenses any resend. Reads taken
+        # before the write cannot supply that proof, so they never set the
+        # flag. Without it the next send must be incapable of duplicating:
+        # either it carries no prompt text (the terminator-only rung, over a
+        # composer this call is known to have filled), or the failed attempt
+        # delivered no bytes at all.
+        next_step_is_terminator_only = (
+            submit is None
+            and transport == "keystroke"
+            and _keystroke_payload(step, text, submit_mode) == _submit_bytes(submit_mode)
+        )
+        if not (
+            readable_after_write
+            or resend_cannot_duplicate
+            or (next_step_is_terminator_only and delivered_this_attempt)
+        ):
+            break
+
+    return SubmissionOutcome(False, attempts, transport, detail, delivered=delivered)
+
+
+def _poll_witness(witness_rose: Callable[[], bool], deadline_s: float) -> bool:
+    """Poll *witness_rose* for deadline_s, then once more.
+
+    The trailing read catches an update that landed between the last poll
+    and the deadline expiring.
+    """
+    poll_deadline = time.monotonic() + deadline_s
+    while time.monotonic() < poll_deadline:
+        if witness_rose():
+            return True
+        time.sleep(SUBMISSION_VERIFY_POLL_INTERVAL_SECONDS)
+    return witness_rose()
+
+
+def _record_prompt_unverified(
+    state_dir: Path, log_dir: Optional[Path], reason: Optional[str]
+) -> None:
+    """Record why a prompt's delivery could not be verified, in both the
+    ephemeral state dir and the durable log dir.
+
+    The state dir is what a live `watch`/`_finalize` reads, but it is gone
+    after a reboot or a state GC. Without the log-dir copy a postmortem on a
+    preserved log cannot tell an unconfirmed submission from one that was
+    never attempted -- the two look identical once `prompt_submitted` is
+    simply absent.
+    """
+    text = f"{reason}\n"
+    _write(state_dir / "prompt_unverified", text)
+    if log_dir is None:
+        return
+    try:
+        _write(log_dir / "prompt_unverified", text)
+    except OSError:
+        # The state-dir copy is what gates this run's own behaviour; losing
+        # the durable copy costs postmortem detail, not correctness.
+        pass
+
+
+def _read_prompt_unverified(state_dir: Optional[Path], log_dir: Optional[Path] = None) -> Optional[str]:
+    """The reason an interactive prompt's delivery could not be verified, or
+    None when it was verified or no submission has resolved yet.
+
+    A run that received its prompt and failed later projects differently
+    from one that never got it: without this, both look identical to a
+    consumer that only sees the absence of prompt_submitted. The state dir
+    is preferred when present; the log-dir copy keeps that distinction
+    readable after the state dir has been reclaimed.
+    """
+    for directory in (state_dir, log_dir):
+        if directory is None:
+            continue
+        reason = _read(directory / "prompt_unverified")
+        if reason:
+            return reason
+    return None
+
+
 def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
     """Build the watch contract with every field at its null/unknown default,
     overridden by *fields*. The key set is fixed here so it cannot vary
     between the normal, missing-state-dir and observation-error branches, and
     ``terminal`` is always derived from ``status`` rather than passed in.
 
-    ``session`` is a new additive field (spec §7): a dict when session.json is
-    present in the run's log dir, null otherwise. Existing keys are unchanged.
+    ``session`` is a dict when session.json is present in the run's log dir,
+    null otherwise. ``prompt_unverified`` carries the reason an interactive
+    prompt's delivery could not be verified, null when it was verified or
+    nothing has been submitted yet.
     """
     payload = {
         "schema": "agent-run.watch.v2",
@@ -4348,6 +4997,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
         },
         "observation_error": None,
         "session": None,
+        "prompt_unverified": None,
         "scratch": _scratch_unknown("not_observed"),
         "hooks": None,
         "transcript": _transcript_unknown("not_observed"),
@@ -4434,6 +5084,9 @@ def _cmd_watch_observe(
             name, observed_at, WATCH_STATUS_LOG_PRESERVED,
             **observed(repo_arg, None, repo_arg, session_data, None),
             session=session_data,
+            # The state dir is gone; the log dir's durable copy is what keeps
+            # an unconfirmed submission distinguishable from an unattempted one.
+            prompt_unverified=_read_prompt_unverified(None, log_dir),
             hooks=_read_hooks_jsonl(log_dir),
         )
         _watch_emit(
@@ -4474,6 +5127,7 @@ def _cmd_watch_observe(
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
         session=session_data,
+        prompt_unverified=_read_prompt_unverified(state_dir, log_dir),
         hooks=_read_hooks_jsonl(log_dir),
         # repo_str is for git-fact attribution; recorded_cwd is for scratch so
         # that --repo (correcting which repo to inspect) does not silently move
@@ -8730,60 +9384,86 @@ def _reject_raw_steer_for_codex(name: str) -> None:
 
 def cmd_steer(args: argparse.Namespace) -> int:
     name = _validate_run_name(args.name)
-    d, pid = _require_live_interactive_run(name)
+    d, _ = _require_live_interactive_run(name)
     if args.raw:
         _reject_raw_steer_for_codex(name)
     fifo = d / "stdin"
     if not fifo.is_fifo():
         sys.exit(f"agent-run: no stdin FIFO at {fifo}")
     msg = " ".join(args.message)
+
+    def _write_with_timeout(seconds: float, write: "callable") -> Any:
+        # A healthy run has the keeper holding the FIFO open for reading, so
+        # a write returns immediately; this guards only against a genuinely
+        # stuck agent, not against expected verification polling.
+        def _alarm(_sig, _frame):
+            raise TimeoutError("write timed out")
+        signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(int(seconds))
+        try:
+            return write()
+        except TimeoutError:
+            sys.exit("agent-run: steer timed out writing to FIFO — is the agent alive?")
+        finally:
+            signal.alarm(0)
+
     if args.raw:
-        # Caller knows what they want — send bytes verbatim.
+        # Caller knows what they want — send bytes verbatim. Arbitrary raw
+        # bytes (e.g. an escape sequence) leave nothing in the transcript for
+        # a witness to observe, so verification is skipped entirely.
         data = msg.encode()
-        esc_payload: Optional[bytes] = None
-        submit = b""
-    else:
-        # Most PTY + raw-mode TUIs use CR for Enter. OpenCode's Bubble Tea
-        # TUI needs CRLF; the mode was selected from launch argv and persisted.
-        submit = _submit_bytes(_submit_mode_from_state(d))
-        data = msg.encode() + submit
-        # --esc: send ESC first as its own write so the TUI has time to
-        # exit generation mode before the new prompt + Enter arrive. Sending
-        # ESC + text in one chunk races the TUI's mode switch and Enter can
-        # end up dropped while the input buffer is still being reset.
-        esc_payload = b"\x1b" if args.esc else None
-    send_separate_submit = not args.raw and args.esc
-    # Write with a timeout guard: a healthy run has the keeper holding the
-    # FIFO open for reading, so this returns immediately.
-    def _alarm(_sig, _frame):
-        raise TimeoutError("write timed out")
-    signal.signal(signal.SIGALRM, _alarm)
-    signal.alarm(10)
-    try:
-        with fifo.open("wb") as f:
-            if esc_payload is not None:
-                f.write(esc_payload)
+
+        def _write_raw() -> None:
+            with fifo.open("wb") as f:
+                f.write(data)
                 f.flush()
-                # Give the TUI ~600ms to register the interrupt, reset the
-                # input buffer, and switch back to input mode before the new
-                # prompt arrives.
-                time.sleep(0.6)
-            f.write(data)
-            f.flush()
-            if send_separate_submit:
-                # Belt-and-braces: send a final Enter as its own write after a
-                # brief settle so the TUI is guaranteed to see it even if it
-                # briefly flushed input while exiting generation mode.
-                time.sleep(0.2)
-                f.write(submit)
+
+        _write_with_timeout(10, _write_raw)
+        print(f"agent-run: steered '{args.name}' ({len(data)} bytes, raw, unverified)")
+        return 0
+
+    if args.esc:
+        # Send ESC first as its own write so the TUI has time to exit
+        # generation mode before the new prompt + Enter arrive. Sending ESC
+        # and text in one chunk races the TUI's mode switch and Enter can
+        # end up dropped while the input buffer is still being reset. ESC is
+        # a control byte, not conversation text, so it has no witness of its
+        # own -- only the text submitted below is verified.
+        def _write_esc() -> None:
+            with fifo.open("wb") as f:
+                f.write(b"\x1b")
                 f.flush()
-    except TimeoutError:
-        sys.exit("agent-run: steer timed out writing to FIFO — is the agent alive?")
-    finally:
-        signal.alarm(0)
-    sent = len(data) + (len(esc_payload) if esc_payload else 0) + (len(submit) if send_separate_submit else 0)
-    print(f"agent-run: steered '{args.name}' ({sent} bytes)")
-    return 0
+
+        _write_with_timeout(10, _write_esc)
+        time.sleep(0.6)
+
+    submit_mode = _submit_mode_from_state(d)
+    verify_timeout = _submission_verify_timeout_seconds()
+    max_attempts = _submission_max_attempts()
+    data = msg.encode()
+    outcome = _write_with_timeout(
+        10 + verify_timeout * max_attempts + 5,
+        lambda: _submit_and_verify(
+            d, _log_dir(name), data, submit_mode=submit_mode,
+            deadline_s=verify_timeout, max_attempts=max_attempts,
+        ),
+    )
+
+    sent = len(data)
+    if outcome.verified:
+        print(f"agent-run: steered '{args.name}' ({sent} bytes, verified)")
+        return 0
+    if outcome.detail == "unwitnessed" and outcome.delivered:
+        # A raw run has no harness session to witness against, so "written"
+        # is all the evidence this mode has ever offered. Not a failure.
+        print(f"agent-run: steered '{args.name}' ({sent} bytes, unwitnessed — raw run)")
+        return 0
+    print(
+        f"agent-run: steer to '{args.name}' could not be verified as delivered "
+        f"({outcome.detail}, {outcome.attempts} attempt(s) via {outcome.transport})",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _signal_by_name(name: str) -> int:
@@ -9436,8 +10116,8 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
     managed_harness_args: List[str] = []
     managed_agent_mode: Optional[str] = None
     opencode_extra_agent_names: set[str] = set()
+    opencode_port: Optional[int] = None
     if is_managed:
-        opencode_port: Optional[int] = None
         managed_prompt = getattr(args, "prompt", None)
         managed_model = getattr(args, "model", None)
         managed_agent_mode = getattr(args, "agent_mode", None)
@@ -9535,6 +10215,32 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         d, argv, getattr(args, "submit_mode", None)
     )
 
+    def _fail_launch_after_starting(message: str) -> None:
+        """Resolve a run that has already published "starting" but has no
+        runner behind it to a terminal state, so it is never a phantom
+        active run."""
+        for fd in (r_ack, w_ack):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        _write(d / "exit_code", "1\n")
+        _write(d / "ended_at", _now_iso() + "\n")
+        _write(d / "status", "failed\n")
+        sys.exit(message)
+
+    if opencode_port is not None:
+        # The submission witness reads this to reach opencode's own HTTP
+        # message endpoint. Persist the port the harness will actually listen
+        # on: a caller's --harness-arg=--port overrides the managed one.
+        effective_port = _effective_argv_port(argv) or opencode_port
+        try:
+            _write(d / "opencode_port", f"{effective_port}\n")
+        except OSError as exc:
+            _fail_launch_after_starting(
+                f"agent-run: failed to record opencode port: {exc}"
+            )
+
     # Copy the launch facts into the persistent log dir so postmortem survives a
     # reboot that wipes the ephemeral /tmp state. Never a liveness signal.
     launch_run_json: dict = {
@@ -9570,12 +10276,7 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
         # "starting" is already published with no runner behind it: unlike
         # the fifo/pipe failures above, this must explicitly resolve to a
         # terminal state rather than leaving a phantom active run.
-        os.close(r_ack)
-        os.close(w_ack)
-        _write(d / "exit_code", "1\n")
-        _write(d / "ended_at", _now_iso() + "\n")
-        _write(d / "status", "failed\n")
-        sys.exit(f"agent-run: failed to start agent: {exc}")
+        _fail_launch_after_starting(f"agent-run: failed to start agent: {exc}")
     if child_pid != 0:
         # Parent: wait for the grandchild to publish its pid, then return.
         os.close(w_ack)
@@ -10179,21 +10880,30 @@ def _runner(
                 return
 
     def _prompt_was_required_but_unsubmitted() -> bool:
-        """True when an interactive prompt file never reached the agent. The
-        submission helper publishes its marker only after both FIFO writes.
+        """True when an interactive prompt never reached the agent at all.
 
-        Bounded by the helper's own delay plus the launch grace: past that, the
-        run may have been steered manually and done real work, which must not
-        be recorded as a launch failure.
+        prompt_submitted means delivery was verified; prompt_unverified means
+        the submission was made and its delivery could not be confirmed. Only
+        the absence of both is evidence the agent never received its task --
+        a run that got the prompt and failed later is a run failure, not a
+        launch failure.
+
+        Bounded by the helper's own pre-submit delay plus its full
+        verify/retry budget: past that, the run may have been steered
+        manually and done real work, which must not be recorded as a launch
+        failure.
         """
         if not (interactive and prompt_file is not None):
             return False
         if (state_dir / "prompt_submitted").exists():
             return False
+        if (state_dir / "prompt_unverified").exists():
+            return False
         if agent_started_monotonic is None:
             return False
         elapsed = time.monotonic() - agent_started_monotonic
-        return elapsed <= LAUNCH_GRACE_SECONDS + PROMPT_SUBMISSION_DELAY_SECONDS
+        verify_budget = _submission_verify_timeout_seconds() * _submission_max_attempts()
+        return elapsed <= LAUNCH_GRACE_SECONDS + PROMPT_SUBMISSION_DELAY_SECONDS + verify_budget
 
     def _finalize(code: int) -> None:
         if not (state_dir / "exit_code").exists():
@@ -10911,10 +11621,7 @@ def _run_interactive(
             os._exit(127)
     # Full interactive relay is now established: PTY forked and keeper holds
     # FIFO open.  Finish the descriptor setup before declaring readiness.
-    # If a prompt file was provided, fork a helper that waits for the TUI to
-    # finish initializing (so the PTY is in raw mode and Enter is recognized),
-    # then writes the prompt + selected Enter sequence to the FIFO so the agent
-    # human had typed it. Same pattern as `agent-run steer`.
+    # Fork a helper that waits for raw mode, then submits and verifies the prompt.
     if prompt_file:
         with _block_handled_runner_signals():
             helper = os.fork()
@@ -10924,38 +11631,47 @@ def _run_interactive(
                 _reset_runner_signal_handlers()
         if helper == 0:
             _reset_runner_signal_handlers()
-            # Detach from the parent's stdio. Errors are silent (no log to write to).
+            # os._exit in the finally clause: this helper must never fall
+            # through into the parent's select loop, and never run its
+            # cleanup. It keeps the runner's descriptors, log_fd included,
+            # which is where its warning below goes.
             try:
-                # Wait a few seconds for the TUI to enable raw mode. Earlier
-                # tests showed sub-3s delivery races ICRNL CR->LF translation.
+                # Delivering before the TUI enables raw mode leaves the
+                # terminal's ICRNL translation in play, turning the CR
+                # terminator into LF, which the TUI does not treat as submit.
                 time.sleep(PROMPT_SUBMISSION_DELAY_SECONDS)
                 try:
                     data = Path(prompt_file).read_bytes()
                 except OSError:
                     os._exit(0)
-                # Submit with the launch-selected Enter sequence. Trailing
-                # Enter is unconditional so the agent treats the file as a
-                # single submitted message. Send a second separate Enter
-                # after a brief settle so the TUI is guaranteed to see it
-                # even if the first one races input-buffer reset.
-                submit_writes = _prompt_submission_writes(data, submit_mode)
-                try:
-                    fd = os.open(str(stdin_path), os.O_WRONLY)
-                    try:
-                        os.write(fd, submit_writes[0])
-                    finally:
-                        os.close(fd)
-                    time.sleep(0.5)
-                    fd = os.open(str(stdin_path), os.O_WRONLY)
-                    try:
-                        os.write(fd, submit_writes[1])
-                    finally:
-                        os.close(fd)
+                # _submit_and_verify appends its own submit sequence; strip a
+                # trailing newline from the file content first so the agent
+                # does not see two Enters in a row.
+                outcome = _submit_and_verify(
+                    state_dir, log_dir, data.rstrip(b"\r\n"), submit_mode=submit_mode,
+                    deadline_s=_submission_verify_timeout_seconds(),
+                    max_attempts=_submission_max_attempts(),
+                    fresh_session=True,
+                )
+                if outcome.verified:
                     # Marks delivery for `_finalize`; absence means the agent
-                    # died before its task ever reached it.
+                    # never actually received its task.
                     _write(state_dir / "prompt_submitted", _now_iso() + "\n")
-                except OSError:
-                    pass
+                elif outcome.detail == "unwitnessed" and outcome.delivered:
+                    # A raw interactive run has no harness session, so the
+                    # marker keeps the weaker meaning it always had for this
+                    # mode: the prompt bytes were written. A managed run whose
+                    # witness failed or whose session id was never acquired
+                    # (no_session_id) stays unverified instead.
+                    _write(state_dir / "prompt_submitted", _now_iso() + "\n")
+                else:
+                    _record_prompt_unverified(state_dir, log_dir, outcome.detail)
+                    _log_write(
+                        log_fd,
+                        f"\r\nagent-run: WARNING: initial prompt could not be verified "
+                        f"as delivered ({outcome.detail}, {outcome.attempts} attempt(s) "
+                        f"via {outcome.transport}) -- the agent may be idle\r\n".encode(),
+                    )
             finally:
                 os._exit(0)
 
@@ -11147,6 +11863,11 @@ _CODEX_APPSERVER_TIMEOUT = 20.0
 
 # Cap on the rendered thread/start error text stored in session.json's reason field.
 _THREAD_START_ERROR_REASON_MAX = 300
+
+# How long turn_start_error polls for a same-id turn/start response before
+# giving up and letting the caller's normal frame loop pick up a delayed one.
+_TURN_START_ERROR_POLL_SECONDS = 0.5
+
 
 _CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 
@@ -11637,6 +12358,10 @@ class _CodexAppServer:
         self.thread_id: Optional[str] = None
         self._buf = b""
         self._rpc_id = 0
+        # Frames consumed by turn_start_error while scanning for one specific
+        # rpc id, but not matching it -- requeued here so the caller's own
+        # frame loop still sees them on its next read_frames call.
+        self._pending_frames: list[dict] = []
 
     def log(self, message: str) -> None:
         _acquire_log_write(self.acquire_log, f"{self.tag}: {message}")
@@ -11701,15 +12426,20 @@ class _CodexAppServer:
 
         ``saw_lines`` is reported separately from the frame list so callers can
         tell "nothing arrived" from "a frame arrived but did not decode".
+        Frames requeued by turn_start_error are drained first, ahead of
+        anything newly read this call, preserving arrival order.
         """
+        requeued = self._pending_frames
+        if requeued:
+            self._pending_frames = []
         lines, self._buf, eof = _appserver_read_lines(self.out_fd, self._buf, timeout)
-        frames: list[dict] = []
+        frames: list[dict] = list(requeued)
         for line_bytes in lines:
             try:
                 frames.append(json.loads(line_bytes.decode("utf-8", errors="replace")))
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except json.JSONDecodeError:
                 continue
-        return frames, bool(lines), eof
+        return frames, bool(lines) or bool(requeued), eof
 
     def mint_thread(self, cwd: str, model: Optional[str] = None) -> Optional[str]:
         """Run initialize + thread/start and write session.json. Returns the thread id.
@@ -11781,6 +12511,53 @@ class _CodexAppServer:
             "threadId": self.thread_id,
             "input": [{"type": "text", "text": text}],
         }, rpc_id=rpc_id)
+
+    def turn_start_result(
+        self, rpc_id: int, timeout_s: float = _TURN_START_ERROR_POLL_SECONDS
+    ) -> "tuple[str, Optional[str]]":
+        """Poll briefly for the turn/start response matching rpc_id.
+
+        Returns one of:
+        ``("accepted", None)``   the server answered with a result.
+        ``("rejected", msg)``    the server answered with an error.
+        ``("pending", None)``    no answer within timeout_s, or the process
+                                 exited / hit EOF first.
+
+        "pending" must not be read as acceptance: a rejection arriving after
+        this window would otherwise stamp a prompt as delivered that the
+        server went on to refuse.
+
+        turn/start otherwise has no matcher for its response frame: nothing
+        else notices a server-side rejection, so a lost turn looks identical
+        to one that is merely slow. Every frame read here -- including the
+        matching one -- is requeued onto self._pending_frames so the caller's
+        own frame loop still processes it (e.g. to capture the turn id from a
+        successful result) on its next read_frames call; nothing is dropped.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.proc is not None and self.proc.poll() is not None:
+                return "pending", None
+            frames, _, eof = self.read_frames(0.05)
+            self._pending_frames.extend(frames)
+            for msg in frames:
+                if msg.get("id") != rpc_id:
+                    continue
+                if "error" in msg:
+                    return "rejected", str(msg["error"])
+                if "result" in msg:
+                    return "accepted", None
+            if eof:
+                return "pending", None
+        return "pending", None
+
+    def turn_start_error(self, rpc_id: int, timeout_s: float = _TURN_START_ERROR_POLL_SECONDS) -> Optional[str]:
+        """The rejection message for a turn/start response matching rpc_id,
+        or None when it was accepted, is still pending, or the process
+        already exited. Callers that must distinguish acceptance from a
+        pending answer use turn_start_result instead."""
+        status, message = self.turn_start_result(rpc_id, timeout_s)
+        return message if status == "rejected" else None
 
     def steer_turn(self, text: str, expected_turn_id: str, rpc_id: Optional[int] = None) -> int:
         return self.call("turn/steer", {
@@ -11855,6 +12632,15 @@ def _run_managed_oneshot_codex_appserver(
     Agent text from item/agentMessage/delta is written to log_fd so tail, watch
     and the idle timeout observe incremental progress. session.json is written
     after thread/start, before the first model call.
+
+    prompt_submitted here is gated on the app-server's own turn/start ack
+    rather than the transcript witness _submit_and_verify uses for the
+    interactive codex launch path: a one-shot run's single turn already blocks
+    this function until turn/completed, so the witness would add a redundant
+    poll around a call that is about to be awaited in full regardless. The ack
+    must be positive -- a response that has not arrived yet is not acceptance,
+    and stamping on it would mark a prompt delivered that the server goes on
+    to reject.
     """
     server = _CodexAppServer(state_dir, log_dir, acquire_log, "codex app-server")
     if not server.start(harness_args, cwd, ready):
@@ -11866,13 +12652,23 @@ def _run_managed_oneshot_codex_appserver(
 
         _write(state_dir / "status", "running\n")
         ready()
-        # The prompt goes out via turn/start below; mark it now so _finalize does
-        # not misclassify a codex failure as a launch failure.
-        _write(state_dir / "prompt_submitted", "1\n")
         if thread_id is None:
             return 1
 
         turn_rpc_id = server.start_turn(_managed_prompt_text(prompt, prompt_file))
+        turn_start_status, early_error = server.turn_start_result(turn_rpc_id)
+        if turn_start_status == "rejected":
+            server.log(f"turn/start rejected immediately: {early_error}")
+            return 1
+
+        def _stamp_prompt_submitted() -> None:
+            # Prevents a later failure from being misclassified as
+            # launch_failed. Written only once turn/start is acknowledged.
+            _write(state_dir / "prompt_submitted", _now_iso() + "\n")
+
+        prompt_stamped = turn_start_status == "accepted"
+        if prompt_stamped:
+            _stamp_prompt_submitted()
 
         turn_done = False
         deadline = time.monotonic() + 600  # hard cap for a one-shot turn
@@ -11892,6 +12688,11 @@ def _run_managed_oneshot_codex_appserver(
                     server.log(f"turn/start error: {msg['error']}")
                     turn_done = True
                     exit_code = 1
+                elif msg.get("id") == turn_rpc_id and "result" in msg and not prompt_stamped:
+                    # The ack that had not arrived within turn_start_result's
+                    # window; the prompt is delivered only now.
+                    prompt_stamped = True
+                    _stamp_prompt_submitted()
             # Drain before checking process exit, otherwise frames still buffered
             # in the pipe after the app-server exits are discarded.
             if eof or (not saw_lines and server.proc.poll() is not None):
@@ -11972,13 +12773,56 @@ def _run_managed_interactive_codex_appserver(
             ready()
             return 1
 
-        turn_rpc_id = server.start_turn(_managed_prompt_text(prompt, prompt_file))
-
         _write(state_dir / "status", "running\n")
         ready()
-        # The prompt went out via turn/start; mark it so _finalize does not
-        # misclassify a failure as launch_failed.
-        _write(state_dir / "prompt_submitted", "1\n")
+
+        # Publishing running/ready happens before the turn is sent, exactly
+        # like the PTY runners publish readiness before their async prompt
+        # helper submits: the run is controllable as soon as the app-server
+        # process exists, independent of whether its first turn ever lands.
+        turn_rpc_id_holder: List[Optional[int]] = [None]
+        # rpc ids of initial-turn attempts a retry superseded. A late response
+        # for one of these names an abandoned turn: its turn id must not
+        # become active_turn_id, or the next steer would carry a stale
+        # expectedTurnId.
+        superseded_turn_rpc_ids: set = set()
+
+        def _send_initial_turn(payload: bytes) -> None:
+            previous = turn_rpc_id_holder[0]
+            if previous is not None:
+                superseded_turn_rpc_ids.add(previous)
+            rpc_id = server.start_turn(payload.decode("utf-8", errors="replace"))
+            turn_rpc_id_holder[0] = rpc_id
+            # Fail fast on an immediate turn/start rejection.
+            early_error = server.turn_start_error(rpc_id)
+            if early_error is not None:
+                raise _SubmissionRejected(early_error)
+
+        outcome = _submit_and_verify(
+            state_dir, log_dir, _managed_prompt_text(prompt, prompt_file).encode("utf-8"),
+            deadline_s=_submission_verify_timeout_seconds(),
+            max_attempts=_submission_max_attempts(),
+            submit=_send_initial_turn,
+            fresh_session=True,
+        )
+        turn_rpc_id = turn_rpc_id_holder[0] if turn_rpc_id_holder[0] is not None else -1
+        if outcome.detail is not None and outcome.detail.startswith("rejected: "):
+            server.log(f"turn/start rejected immediately: {outcome.detail[len('rejected: '):]}")
+            return 1
+        if outcome.verified:
+            _write(state_dir / "prompt_submitted", _now_iso() + "\n")
+        else:
+            # The turn was sent and never rejected outright, but the
+            # transcript witness never confirmed delivery; the run keeps
+            # going -- `watch`/`transcript` still verify the turn's actual
+            # content uniformly -- but _finalize must not misclassify a
+            # later failure as launch_failed on a turn that plausibly did
+            # not land.
+            _record_prompt_unverified(state_dir, log_dir, outcome.detail)
+            server.log(
+                f"turn/start could not be verified as delivered "
+                f"({outcome.detail}, {outcome.attempts} attempt(s))"
+            )
 
         steer_buf = b""
         # Distinguishes a clean app-server exit from a mid-session transport failure.
@@ -11996,7 +12840,12 @@ def _run_managed_interactive_codex_appserver(
                     continue
                 break
 
-            if server.out_fd in readable:
+            # A frame requeued by turn_start_error sits in server._pending_frames
+            # until the next read_frames call; select() only reports out_fd
+            # readable on new socket data, so a pending frame with no new data
+            # behind it would otherwise stall until the app-server's next
+            # message, ignored by select above. Force it into this iteration.
+            if server.out_fd in readable or server._pending_frames:
                 frames, _, eof = server.read_frames(0)
                 for msg in frames:
                     msg_id = msg.get("id")
@@ -12019,6 +12868,14 @@ def _run_managed_interactive_codex_appserver(
                             exit_code = 0
                             had_completed_turn = True
                         _log_write(log_fd, b"\n")
+
+                    elif msg_id is not None and msg_id in superseded_turn_rpc_ids:
+                        # A late response for an initial-turn attempt a retry
+                        # abandoned. Its turn id names a turn nothing is
+                        # tracking, so adopting it would misattribute every
+                        # later steer.
+                        superseded_turn_rpc_ids.discard(msg_id)
+                        server.log(f"discarding response for superseded turn/start id={msg_id}")
 
                     elif "error" in msg and msg_id is not None:
                         server.log(f"rpc error id={msg_id} error={msg['error']!r}")
@@ -12191,8 +13048,8 @@ def _build_managed_argv(
             # Bare TUI attached to the pre-minted session. --port keeps the HTTP
             # API reachable. --auto approves permissions unattended; omitted when
             # --permissions prompt so the harness's own permission UI is used.
-            # NEVER add --prompt here: --session silently swallows it, which is
-            # how 24 runs were lost.
+            # NEVER add --prompt here: --session silently swallows it, so the
+            # run starts idle with no error and no prompt.
             if opencode_port is not None:
                 argv.extend(["--port", str(opencode_port)])
             if session_id:

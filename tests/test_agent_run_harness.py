@@ -975,6 +975,26 @@ def _wait_terminal(state_dir: Path, timeout: float = 15.0) -> str:
     return status
 
 
+def _mock_witness_rises_after_baseline(monkeypatch) -> None:
+    """Pin every _submit_and_verify call to a witness source with a strictly
+    increasing counter, so its very first post-submit poll reads as a rise
+    over whatever baseline it captured. Fake codex/claude/opencode binaries
+    in this file have no real transcript store to witness against, so tests
+    exercising launch/steer dispatch (not verification itself) use this to
+    clear the witness gate on both the launch and any later steer in the
+    same test, without burning the poll/retry budget."""
+    calls = {"n": 0}
+
+    def fake_witness():
+        calls["n"] += 1
+        return calls["n"]
+
+    monkeypatch.setattr(
+        agent_run, "_resolve_witness_source",
+        lambda *_a: agent_run._WitnessSource("fake", fake_witness),
+    )
+
+
 
 def _launch_and_wait(
     state_root: Path,
@@ -1361,6 +1381,131 @@ class TestManagedCodexOneShotAppServer:
         params = json.loads(params_file.read_text())
         assert params["model"] == "gpt-5.6-luna"
 
+    def _make_fake_codex_delayed_turn_start(
+        self, tmp_path: Path, *, thread_id: str, delay_s: float, reject: bool
+    ) -> str:
+        """Fake app-server that withholds its turn/start response for
+        delay_s, then answers with an error (reject) or a result.
+
+        delay_s longer than _TURN_START_ERROR_POLL_SECONDS drives the case
+        where the early check has no answer yet: "pending", not "accepted".
+        """
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        response = (
+            "{'id': turn_msg['id'], 'error': {'code': -32602, 'message': 'bad turn'}}"
+            if reject else
+            "{'id': turn_msg['id'], 'result': {'turn': {'id': 'turn-001', 'status': 'inProgress'}}}"
+        )
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            f"THREAD_ID = {thread_id!r}\n"
+            f"DELAY = {delay_s}\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()  # initialized\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'result': {'thread': {\n"
+            "    'id': THREAD_ID, 'sessionId': THREAD_ID, 'path': 'r.jsonl',\n"
+            "}}})\n"
+            "turn_msg = recv()\n"
+            "time.sleep(DELAY)\n"
+            f"send({response})\n"
+            "send({'method': 'turn/completed', 'params': {\n"
+            "    'threadId': THREAD_ID,\n"
+            "    'turn': {'id': 'turn-001', 'status': 'failed'},\n"
+            "}})\n"
+            "time.sleep(1)\n"
+        )
+        fake.chmod(0o755)
+        return str(fake_dir)
+
+    def test_codex_oneshot_does_not_stamp_before_turn_start_is_accepted(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """A turn/start response that has not arrived within the early-check
+        window is pending, not accepted: stamping there marks a prompt
+        delivered that the server goes on to reject."""
+        bin_dir = self._make_fake_codex_delayed_turn_start(
+            tmp_path, thread_id="oneshot-late-reject", delay_s=1.5, reject=True
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "codex-oneshot-late-reject"
+        _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="codex", interactive=False, prompt="what is 6*7",
+        )
+
+        state_dir = isolated_runs_root / name
+        assert not (state_dir / "prompt_submitted").exists(), (
+            "prompt_submitted must not be stamped on a turn/start the server rejected"
+        )
+
+    def test_codex_oneshot_stamps_once_a_late_turn_start_is_accepted(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """The pending case is not a failure either: an ack that arrives after
+        the early-check window still stamps, just later."""
+        bin_dir = self._make_fake_codex_delayed_turn_start(
+            tmp_path, thread_id="oneshot-late-accept", delay_s=1.5, reject=False
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        name = "codex-oneshot-late-accept"
+        _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="codex", interactive=False, prompt="what is 6*7",
+        )
+
+        state_dir = isolated_runs_root / name
+        assert (state_dir / "prompt_submitted").exists(), (
+            "a late but positive turn/start ack must still stamp prompt_submitted"
+        )
+
+    def test_codex_oneshot_prompt_submitted_needs_no_transcript_witness(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """One-shot codex stamps prompt_submitted from the app-server's own
+        turn/start ack, never consulting the transcript witness -- unlike the
+        interactive launch path, a one-shot run already blocks on
+        turn/completed before returning, so a witness poll would be
+        redundant. A witness that can never verify anything must therefore
+        make no difference to the marker."""
+        bin_dir = self._make_fake_codex_suite(tmp_path, thread_id="oneshot-witness-tid")
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        witness_reads = {"n": 0}
+
+        def counting_flat_witness(*_a, **_k):
+            witness_reads["n"] += 1
+            return agent_run._WitnessSource("fake", lambda: 0)
+
+        monkeypatch.setattr(agent_run, "_resolve_witness_source", counting_flat_witness)
+        name = "codex-oneshot-witness"
+        status, session = _launch_and_wait(
+            isolated_runs_root, isolated_log_root, name,
+            harness="codex",
+            interactive=False,
+            prompt="what is 6*7",
+        )
+        assert session is not None
+        assert session["confidence"] == "certain"
+        state_dir = isolated_runs_root / name
+        assert (state_dir / "prompt_submitted").exists(), (
+            "a flat witness must not block the one-shot marker"
+        )
+        assert not (state_dir / "prompt_unverified").exists()
+        assert witness_reads["n"] == 0, (
+            "the one-shot path must not resolve a witness source at all"
+        )
+
     def test_codex_log_contains_readable_output_not_jsonl(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
     ):
@@ -1578,6 +1723,125 @@ class TestMintThreadModelParam:
         assert len(reason) <= agent_run._THREAD_START_ERROR_REASON_MAX
         assert "\n" not in reason
         assert reason.endswith("...")
+
+
+# ---------------------------------------------------------------------------
+# _CodexAppServer.turn_start_error: early rejection detection for turn/start
+# ---------------------------------------------------------------------------
+
+class TestTurnStartError:
+    def _server_pair(self, tmp_path: Path, monkeypatch, script: str) -> "agent_run._CodexAppServer":
+        """Spawn a fake codex app-server that performs the initialize
+        handshake, then runs *script* (already-indented Python source)."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, time\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()  # initialized\n"
+            + script
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        state_dir = tmp_path / "state"
+        log_dir = tmp_path / "log"
+        state_dir.mkdir()
+        log_dir.mkdir()
+        server = agent_run._CodexAppServer(state_dir, log_dir, log_dir / "acquire.log", "test")
+        assert server.start([], str(tmp_path), lambda: None)
+        # Perform the same initialize handshake mint_thread does, so the fake
+        # server's first real request is turn/start, matching the protocol
+        # order turn_start_error is used under in practice.
+        server.call("initialize", {"clientInfo": {"name": "test", "title": "test", "version": "0"}})
+        server.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            frames, saw_lines, _eof = server.read_frames(0.2)
+            if any(f.get("id") == 1 for f in frames):
+                break
+        return server
+
+    def test_turn_start_error_reports_rejection(self, tmp_path, monkeypatch):
+        """A turn/start response carrying an error is surfaced promptly."""
+        server = self._server_pair(
+            tmp_path, monkeypatch,
+            "msg = recv()  # turn/start\n"
+            "send({'id': msg['id'], 'error': {'code': -32602, 'message': 'bad turn params'}})\n"
+            "time.sleep(30)\n",
+        )
+        try:
+            rpc_id = server.start_turn("hello")
+            start = time.monotonic()
+            error = server.turn_start_error(rpc_id, timeout_s=5.0)
+            elapsed = time.monotonic() - start
+        finally:
+            server.close()
+        assert error is not None and "bad turn params" in error
+        assert elapsed < 5.0, f"turn_start_error took {elapsed:.1f}s, expected well under 5s"
+
+    def test_turn_start_error_returns_none_on_success(self, tmp_path, monkeypatch):
+        """A normal turn/start result is not mistaken for a rejection, and the
+        result frame remains available to the caller's own frame loop."""
+        server = self._server_pair(
+            tmp_path, monkeypatch,
+            "msg = recv()  # turn/start\n"
+            "send({'id': msg['id'], 'result': {'turn': {'id': 'turn-ok', 'status': 'inProgress'}}})\n"
+            "time.sleep(30)\n",
+        )
+        try:
+            rpc_id = server.start_turn("hello")
+            error = server.turn_start_error(rpc_id, timeout_s=5.0)
+            # The success frame must be requeued, not dropped.
+            frames, _, _ = server.read_frames(0.5)
+        finally:
+            server.close()
+        assert error is None
+        assert any(f.get("id") == rpc_id and "result" in f for f in frames)
+
+    def test_turn_start_error_none_when_still_pending(self, tmp_path, monkeypatch):
+        """A slow server that never responds within the poll window reports
+        None (unknown), not a false rejection."""
+        server = self._server_pair(
+            tmp_path, monkeypatch,
+            "recv()  # turn/start received but never answered\n"
+            "time.sleep(30)\n",
+        )
+        try:
+            rpc_id = server.start_turn("hello")
+            error = server.turn_start_error(rpc_id, timeout_s=0.3)
+        finally:
+            server.close()
+        assert error is None
+
+    def test_turn_start_error_requeues_unrelated_frames(self, tmp_path, monkeypatch):
+        """A delta frame arriving before the matching response is preserved
+        for the caller's frame loop rather than discarded."""
+        server = self._server_pair(
+            tmp_path, monkeypatch,
+            "msg = recv()  # turn/start\n"
+            "send({'method': 'item/agentMessage/delta', 'params': {'delta': 'stray'}})\n"
+            "send({'id': msg['id'], 'result': {'turn': {'id': 't', 'status': 'inProgress'}}})\n"
+            "time.sleep(30)\n",
+        )
+        try:
+            rpc_id = server.start_turn("hello")
+            error = server.turn_start_error(rpc_id, timeout_s=5.0)
+            frames, _, _ = server.read_frames(0.5)
+        finally:
+            server.close()
+        assert error is None
+        deltas = [agent_run._turn_delta_text(f) for f in frames]
+        assert "stray" in deltas
 
 
 # ---------------------------------------------------------------------------
@@ -1821,6 +2085,10 @@ class TestManagedCodexInteractiveAppServer:
             tmp_path, thread_id="iact-thread-0002", steer_wait_seconds=0.5
         )
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        # The fake app-server has no real codex rollout store to witness
+        # against; simulate one rising right after turn/start so the launch
+        # path's witness gate does not burn its full verify/retry budget.
+        _mock_witness_rises_after_baseline(monkeypatch)
         name = "codex-iact-log"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
@@ -1853,6 +2121,12 @@ class TestManagedCodexInteractiveAppServer:
             tmp_path, thread_id="iact-thread-0003", steer_wait_seconds=5.0
         )
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        # The fake app-server has no real codex rollout store to witness
+        # against; simulate one rising right after each submit so neither the
+        # launch turn/start nor the steer burns the full verify/retry budget
+        # -- the transport behavior under test (dispatch and response landing
+        # in the log) is independent of which store backs the witness.
+        _mock_witness_rises_after_baseline(monkeypatch)
         name = "codex-iact-steer"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
@@ -1870,7 +2144,6 @@ class TestManagedCodexInteractiveAppServer:
         assert reached, "Run must reach running before steer"
         time.sleep(0.8)  # let initial turn complete so the agent is idle
 
-        # Send steer via cmd_steer.
         steer_ns = argparse.Namespace(name=name, message=["STEER_MSG"], raw=False, esc=False)
         rc = agent_run.cmd_steer(steer_ns)
         assert rc == 0, "steer must exit 0 on an interactive run"
@@ -1883,6 +2156,214 @@ class TestManagedCodexInteractiveAppServer:
         assert "steered response" in log_content, (
             f"Log must contain the steered response, got: {log_content!r}"
         )
+
+    def test_interactive_codex_launch_witness_never_rises_leaves_prompt_unverified(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """A witness that never rises must leave prompt_submitted absent and
+        prompt_unverified present, exactly like opencode/claude -- codex's
+        launch marker is gated by the transcript witness, not merely by
+        turn/start returning without an RPC error."""
+        bin_dir = self._make_fake_codex_interactive(
+            tmp_path, thread_id="iact-unverified", steer_wait_seconds=0.5
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        monkeypatch.setattr(
+            agent_run, "_resolve_witness_source",
+            lambda *_a: agent_run._WitnessSource("fake", lambda: 0),
+        )
+        monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "0.05")
+        monkeypatch.setenv("AGENT_RUN_SUBMIT_ATTEMPTS", "1")
+        name = "codex-iact-unverified"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="say hi", model=None, agent_mode=None,
+            harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+
+        self._wait_for_terminal(state_dir, timeout=10.0)
+
+        assert not (state_dir / "prompt_submitted").exists()
+        unverified = state_dir / "prompt_unverified"
+        assert unverified.exists()
+        assert unverified.read_text().strip() == "timeout"
+
+    def test_interactive_codex_launch_verified_on_rising_witness(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """A witness that rises after turn/start stamps prompt_submitted with
+        transport recorded as rpc, not http/keystroke."""
+        bin_dir = self._make_fake_codex_interactive(
+            tmp_path, thread_id="iact-verified", steer_wait_seconds=0.5
+        )
+        monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        _mock_witness_rises_after_baseline(monkeypatch)
+        name = "codex-iact-verified"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="say hi", model=None, agent_mode=None,
+            harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+
+        self._wait_for_running(state_dir, timeout=10.0)
+        assert self._wait_for(
+            lambda: (state_dir / "prompt_submitted").exists(), timeout=10.0
+        ), "prompt_submitted must be stamped once the witness rises"
+        assert not (state_dir / "prompt_unverified").exists()
+
+        self._wait_for_terminal(state_dir, timeout=10.0)
+
+    def test_interactive_codex_discards_a_superseded_turn_start_response(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """A retried initial turn abandons the previous attempt's rpc id. A
+        late response for that id names a turn nothing is tracking and must
+        be discarded explicitly, not dispatched through the generic rpc-error
+        arm where it reads as an unrelated failure."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        steer_out = tmp_path / "steer-params.json"
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json, select\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv(timeout=None):\n"
+            "    if timeout is not None:\n"
+            "        ready, _, _ = select.select([sys.stdin], [], [], timeout)\n"
+            "        if not ready:\n"
+            "            return None\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()  # initialized\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'result': {'thread': {\n"
+            "    'id': 'sup-tid', 'sessionId': 'sup-tid', 'path': 'r.jsonl',\n"
+            "}}})\n"
+            "# Attempt 1: swallow turn/start, answer nothing, so the flat\n"
+            "# witness makes the runner retry.\n"
+            "first = recv()\n"
+            "second = recv()\n"
+            "# Late answer for the abandoned attempt, then the live one.\n"
+            "send({'id': first['id'], 'result': {'turn': {'id': 'turn-ORPHAN', 'status': 'inProgress'}}})\n"
+            "send({'id': second['id'], 'result': {'turn': {'id': 'turn-002', 'status': 'inProgress'}}})\n"
+            "steer = recv(timeout=20)\n"
+            "if steer is not None:\n"
+            f"    open({str(steer_out)!r}, 'w').write(json.dumps(steer))\n"
+            "    send({'id': steer['id'], 'result': {'turn': {'id': 'turn-003', 'status': 'inProgress'}}})\n"
+            "import time; time.sleep(1)\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        # Readable but flat: proof the record count did not rise, which is
+        # what earns the initial turn a second attempt.
+        monkeypatch.setattr(
+            agent_run, "_resolve_witness_source",
+            lambda *_a: agent_run._WitnessSource("fake", lambda: 0),
+        )
+        monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "0.2")
+        monkeypatch.setenv("AGENT_RUN_SUBMIT_ATTEMPTS", "2")
+
+        name = "codex-iact-superseded"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="say hi", model=None, agent_mode=None,
+            harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+        acquire_log = isolated_log_root / name / "session-acquire.log"
+        try:
+            self._wait_for_running(state_dir, timeout=10.0)
+            assert self._wait_for(
+                lambda: acquire_log.exists()
+                and "discarding response for superseded turn/start" in acquire_log.read_text(),
+                timeout=15.0,
+            ), (
+                "the abandoned attempt's response must be discarded by id, not "
+                f"left to the generic dispatch: {acquire_log.read_text() if acquire_log.exists() else '(no log)'}"
+            )
+            agent_run.cmd_steer(
+                argparse.Namespace(name=name, message=["follow up"], esc=False, raw=False)
+            )
+            assert self._wait_for(lambda: steer_out.exists(), timeout=15.0)
+            steer = json.loads(steer_out.read_text())
+            assert steer["method"] == "turn/steer"
+            assert steer["params"]["expectedTurnId"] == "turn-002", (
+                "the steer must target the live turn, never the abandoned one"
+            )
+        finally:
+            self._wait_for_terminal(state_dir, timeout=15.0)
+
+    def test_interactive_codex_turn_start_rejection_fails_fast_without_witness_wait(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        """turn/start rejected by the app-server must fail the launch
+        immediately, without waiting out the full verify window."""
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake = fake_dir / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            "def send(obj):\n"
+            "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "def recv():\n"
+            "    line = sys.stdin.readline()\n"
+            "    return json.loads(line.strip()) if line.strip() else None\n"
+            "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+            "    sys.exit(1)\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'userAgent': 'test'}})\n"
+            "recv()\n"
+            "msg = recv(); send({'id': msg['id'], 'result': {'thread': {'id': 'rej-tid', 'sessionId': 'rej-tid', 'path': 'r.jsonl'}}})\n"
+            "msg = recv()\n"
+            "send({'id': msg['id'], 'error': {'code': -32602, 'message': 'bad turn params'}})\n"
+            "import time; time.sleep(30)\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+        monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "30")
+        name = "codex-iact-turn-reject"
+        ns = argparse.Namespace(
+            name=name, command=[], interactive=True, prompt_file=None,
+            submit_mode=None, idle_timeout=None,
+            harness="codex", prompt="say hi", model=None, agent_mode=None,
+            harness_args=[],
+        )
+        agent_run.cmd_launch(ns)
+        state_dir = isolated_runs_root / name
+
+        start = time.monotonic()
+        status = self._wait_for_terminal(state_dir, timeout=15.0)
+        elapsed = time.monotonic() - start
+
+        assert status == "launch_failed"
+        assert not (state_dir / "prompt_submitted").exists()
+        assert elapsed < 15.0, (
+            f"turn/start rejection took {elapsed:.1f}s, expected an immediate "
+            f"failure well under the 30s verify window"
+        )
+
+    def _wait_for(self, predicate, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
 
     def test_interactive_codex_fallback_to_missing_when_appserver_fails(
         self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
@@ -3838,6 +4319,9 @@ class TestCodexRpcEdgeCases:
         """
         bin_dir = self._make_null_result_codex(tmp_path)
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        # The fake app-server has no real codex rollout store to witness
+        # against; simulate one rising right after turn/start.
+        _mock_witness_rises_after_baseline(monkeypatch)
         name = "null-result-test"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
@@ -3877,6 +4361,11 @@ class TestCodexRpcEdgeCases:
         """
         bin_dir = self._make_active_turn_steer_rejecting_codex(tmp_path)
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        # No real codex rollout file exists for the fake server to witness
+        # against; simulate one rising after every submit so neither the
+        # launch nor the steer burns its full verify/retry budget on an
+        # assertion that only cares about the acquire log content.
+        _mock_witness_rises_after_baseline(monkeypatch)
         name = "steer-error-test"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,
@@ -3922,6 +4411,11 @@ class TestCodexRpcEdgeCases:
         # the adapter sends turn/start (the idle path) and the server can respond normally.
         bin_dir = self._make_steer_error_codex(tmp_path, thread_id="clear-active-tid")
         monkeypatch.setenv("PATH", bin_dir + ":" + os.environ.get("PATH", ""))
+        # No real codex rollout file exists for the fake server; simulate one
+        # rising after every submit so neither the launch nor the steer burns
+        # its verify/retry budget on an assertion that only cares about the
+        # dispatch method.
+        _mock_witness_rises_after_baseline(monkeypatch)
         name = "clear-active-tid-test"
         ns = argparse.Namespace(
             name=name, command=[], interactive=True, prompt_file=None,

@@ -897,14 +897,31 @@ past `watch`'s never-raise boundary; any read failure, including an
 unexpected exception type from the count call, degrades to the unavailable
 form.
 
-`submitted_age_s` is seconds since `state_dir/prompt_submitted` was written
-— the moment the prompt was actually delivered to the PTY — not since
-process launch (`elapsed_s`), which also counts harness boot, session mint
-and TUI readiness. Populated only for interactive runs (`interactive: true`)
+`submitted_age_s` is seconds since `state_dir/prompt_submitted` was written,
+when initial-prompt submission was confirmed, not since process launch
+(`elapsed_s`), which also counts harness boot, session mint and TUI readiness.
+Populated only for interactive runs (`interactive: true`)
 that have written the marker; `null` otherwise, including when the run is
 still starting up, is not interactive, or the marker is unreadable. Computed
 independently of the store read, so it survives a transcript-store failure
 that nulls out `entries`.
+
+#### `watch --json` — additive `prompt_unverified` key
+
+`agent-run watch <name> --json` gained a top-level `prompt_unverified`
+field: the reason an interactive prompt's delivery could not be verified
+(`witness_unreadable`, `timeout`, `transport_error: ...`, `rejected: ...`,
+`unwitnessed`), or `null` when it was verified or nothing has been submitted
+yet. Every pre-existing key is unchanged in name and meaning. It is served
+from the state dir while the run's state survives, and from the log dir's
+durable copy afterwards, so a preserved-log postmortem still reports it.
+
+Without it, "the prompt was submitted and delivery could not be confirmed"
+and "no prompt has been submitted yet" project identically — both are just
+the absence of `prompt_submitted` — so a consumer cannot tell a run that got
+its task and later failed from one that never received it. The same
+distinction is what keeps `_finalize` from recording the former as
+`launch_failed`.
 
 #### `transcript` — the harness's own conversation record
 
@@ -1036,7 +1053,97 @@ When hidden preserved logs exist, a one-line hint is printed to stderr
 `attach` always read the persistent log, falling back to the old
 single-directory layout for runs launched before the state/log split.
 
-### Reaping
+### Verified submission
+
+An interactive launch prompt and every `steer` are self-verifying: delivery
+is confirmed by the harness's own conversation store gaining a **user-role
+turn whose own text carries the submitted prompt**, not merely by a
+successful FIFO/HTTP write. All three conditions are required:
+
+- **user role** — an assistant reply, a reasoning trace or a tool record in
+  the current turn would otherwise satisfy a raw record count with nothing
+  delivered;
+- **our content** — a bare user-role envelope with no text part yet
+  (opencode persists the message and its parts as separate events) or a
+  user-role message the harness synthesised for itself is not our prompt,
+  however much it moves a count;
+- **observed, not assumed** — a store that cannot be fully read yields no
+  number at all, never a zero, because a zero reads as proof the prompt did
+  not land and licenses a resend. Any skipped JSONL record makes the answer
+  unknown, whatever the readable ones say: the unterminated trailing line of
+  a file caught mid-append may be this prompt's own record.
+
+The predicate is written once, as a docstring in
+`toolbox/agent_run_transcript.py`, and every witness source — opencode's
+HTTP endpoint, its SQLite store, and the claude/codex JSONL rollouts —
+implements exactly that, so "verified" means one thing across every
+transport. Prompt text is compared with whitespace runs collapsed, since a
+TUI re-wraps a long prompt before the harness records the turn.
+
+The source is resolved once per submission and pinned for the whole
+verification: opencode's HTTP `/session/<id>/message` endpoint when a
+port is known, otherwise the harness transcript store. A pinned source that
+stops answering is an *unreadable witness*, never a reason to fall back to
+the other one — the two count different things and comparing across them
+proves nothing.
+
+`steer` prints `verified` and exits 0 only once the count of turns carrying
+this prompt has risen above its pre-submit baseline. A submission that
+cannot be verified within the default 10 seconds is retried once (two
+attempts total) when a read taken *after* that attempt's own write was
+readable but stayed flat — proof the prompt did not land. Reads from before
+the write cannot supply that proof, however readable they were: the pre-
+resend re-check happens before the next payload is sent and says nothing
+about it. A witness that was never readable after the write carries no
+evidence the prompt failed, so the only resends permitted are ones that
+cannot duplicate it (`messageID` is not idempotent): the keystroke
+terminator sent alone over a composer this call is known to have filled, and
+a repeat of a write that provably put no submittable input in front of the
+harness. Anything else stops at a single submission. The retry re-reads the
+witness immediately before resending, which narrows but cannot close the
+window between the last read and the resend; no transport here offers
+idempotent submission. A keystroke retry sends the submit terminator alone
+first, submitting a prompt the TUI buffered but never sent, rather than
+doubling it — but only after a write that delivered the whole payload, since
+terminating a truncated composer would submit a partial prompt as a complete
+message.
+
+An unreadable *baseline* is only ever upgraded to proof for a session this
+launch minted, which held no records beforehand. A `steer` runs against an
+established session whose existing history would otherwise verify a
+swallowed message, so it reports `witness_unreadable` instead.
+
+Either way an unverified submission has `steer` exit 1 with the reason on
+stderr and a launch prompt write `prompt_unverified` instead of stamping
+`prompt_submitted`. The reason is recorded in both the state dir and the log
+dir: the state dir is what a live run reads, and the log dir's copy keeps
+the distinction readable in a postmortem after a reboot or state GC has
+reclaimed it. It is visible on the watch contract's `prompt_unverified` key,
+and keeps a run that received its prompt and later failed from being
+recorded as `launch_failed`.
+
+A **raw** run (`agent-run -i -f prompt.txt name -- <cmd>`) has no harness
+session and so nothing to witness against. Verification does not apply:
+`prompt_submitted` keeps its original "bytes were written" meaning and
+`steer` reports `unwitnessed` and exits 0. A **managed** run whose session
+id could not be acquired (`session.json` with `session_id: null`, or a
+truncated one) equally has nothing to count against, but that is a failed
+mint rather than a mode without verification: it reports `no_session_id`,
+never stamps `prompt_submitted`, and has `steer` exit 1. A managed run whose
+witness merely failed to read stays unverified the same way.
+
+Override the timeout/attempt count with `AGENT_RUN_SUBMIT_VERIFY_TIMEOUT`
+and `AGENT_RUN_SUBMIT_ATTEMPTS`; `--raw` steer skips verification entirely
+(arbitrary bytes leave nothing in the transcript to witness). `opencode_port`
+records the port a managed interactive opencode run's HTTP API is
+listening on, so the witness can query it directly; a caller's
+`--harness-arg=--port` override wins, and the effective port is what gets
+persisted.
+
+`scripts/verify-submission.sh [--harness opencode|claude|codex] [--keep]`
+runs the end-to-end compatibility checks against installed harnesses and
+prints their PASS/FAIL/SKIP results.
+
 
 `agent-run reap` reconciles stale state and cleans up old runs in one pass:
 
