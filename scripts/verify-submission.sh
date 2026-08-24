@@ -391,6 +391,51 @@ print(len(set().union(*found.values())) if len(found) == len(wanted) else 0)
 ' 2>/dev/null || echo 0
 }
 
+# h4_record_inserted <url>: whether the H4 POST inserted exactly its own
+# record and nothing generated a reply to it. Reads H4_SENTINEL and
+# H4_BEFORE_COUNT from the environment.
+#
+# The content check is what stops this passing vacuously: "count rose by one
+# and the last record is user-role" is also satisfied by a rejected POST
+# alongside an unrelated user record arriving from any other source.
+# shellcheck disable=SC2329  # invoked indirectly and from the CLI-surface test
+h4_record_inserted() {
+  curl -sS --max-time 5 "$1" 2>/dev/null | python3 -c '
+import json, os, sys
+
+def texts(message):
+    for part in message.get("parts") or []:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            yield part["text"]
+
+sentinel = os.environ["H4_SENTINEL"]
+try:
+    before = int(os.environ["H4_BEFORE_COUNT"])
+except ValueError:
+    sys.exit(1)
+try:
+    data = json.load(sys.stdin)
+except json.JSONDecodeError:
+    sys.exit(1)
+if not isinstance(data, list) or before < 0 or len(data) != before + 1:
+    sys.exit(1)
+
+carrier = None
+for index, message in enumerate(data):
+    if not isinstance(message, dict):
+        sys.exit(1)
+    if (message.get("info") or {}).get("role") != "user":
+        continue
+    if sentinel in "\n".join(texts(message)):
+        carrier = index
+if carrier is None:
+    sys.exit(1)
+# noReply means nothing generated afterwards, so the sentinel record must be
+# the last one in the session.
+sys.exit(0 if carrier == len(data) - 1 else 1)
+' 2>/dev/null
+}
+
 # reason_matches <reason> <expected...>: whether prompt_unverified's reason is
 # one of the expected kinds. A reason that carries detail after a colon
 # ("transport_error: [Errno 61] ...") matches on the kind before it, so the
@@ -403,6 +448,20 @@ reason_matches() {
     case "$reason" in "${kind}: "*) return 0 ;; esac
   done
   return 1
+}
+
+# steer_reported_verified <steer_output>: whether steer's own output states the
+# submission was verified.
+#
+# Matched against the exact positive form, and the failure message is rejected
+# outright: "could not be verified as delivered" contains the substring
+# "verified", so a plain `grep -q verified` passes on the very output that
+# reports failure, making the check vacuous.
+# shellcheck disable=SC2329  # invoked indirectly and from the CLI-surface test
+steer_reported_verified() {
+  local out="$1"
+  case "$out" in *"could not be verified"*) return 1 ;; esac
+  printf '%s\n' "$out" | grep -Eq "^agent-run: steered '[^']+' \([0-9]+ bytes, verified\)$"
 }
 
 record_row() {
@@ -535,12 +594,12 @@ run_harness_cells() {
     log "C2: steering with sentinel2"
     local steer_out
     if steer_out="$(agent_run steer "$run_name" "Reply with exactly this word and nothing else: ${sentinel2}" 2>&1)"; then
-      if echo "$steer_out" | grep -q "verified" \
+      if steer_reported_verified "$steer_out" \
           && wait_for 30 0.5 "sentinel2 reaches the transcript" \
              transcript_contains "$run_name" "$sentinel2"; then
         c2="PASS"
       else
-        log "C2 FAIL: steer succeeded but 'verified' or the transcript record is missing: ${steer_out}"
+        log "C2 FAIL: steer succeeded but did not report verified, or the transcript record is missing: ${steer_out}"
       fi
     else
       log "C2 FAIL: steer exited non-zero: ${steer_out}"
@@ -810,62 +869,64 @@ sys.exit(0 if key and 'post' in paths[key] else 1)
 
   # H3: fire-and-forget is safe (dropped connection does not abort the turn).
   log "H3: POST with a short client timeout, expect the turn to still complete"
-  local h3_sentinel="H3_${sentinel}"
-  local h3_payload="${WORK_DIR}/h3-payload.json"
-  json_message_payload "$h3_payload" \
-    "Count slowly from one to five, one number per line, then say exactly this word and nothing else: ${h3_sentinel}"
   # The whole point of H3 is that the *client* goes away mid-turn. A POST that
   # completed normally inside the timeout never exercised that, so discarding
   # curl's result would let H3 pass without testing anything: assert the
   # connection was actually aborted (curl exit 28, no http_code) *and* that
   # the turn still ran to completion afterwards.
   #
+  # Each attempt carries its own sentinel. Reusing one across the ladder makes
+  # the transcript check unable to say *which* request produced the record: an
+  # earlier POST that completed normally would satisfy it, and H3 would pass
+  # having proven nothing about the dropped one.
+  #
   # Shorten the bound until the client aborts; the transcript then checks that
-  # a request carrying the sentinel completed server-side.
-  local h3_code="" h3_rc=0 h3_aborted=0 h3_limit
+  # the aborted request's own sentinel completed server-side.
+  local h3_code="" h3_rc=0 h3_aborted=0 h3_limit h3_attempt=0
+  local h3_sentinel="" h3_payload
   for h3_limit in 2 0.5 0.2; do
+    h3_attempt=$((h3_attempt + 1))
+    h3_sentinel="H3_${h3_attempt}_${sentinel}"
+    h3_payload="${WORK_DIR}/h3-payload-${h3_attempt}.json"
+    json_message_payload "$h3_payload" \
+      "Count slowly from one to five, one number per line, then say exactly this word and nothing else: ${h3_sentinel}"
     h3_rc=0
     h3_code="$(post_json "$h3_limit" "$message_url" "$h3_payload" -w '%{http_code}')" || h3_rc=$?
     if [ "$h3_rc" -eq 28 ] && [ -z "${h3_code//0/}" ]; then
       h3_aborted=1
-      log "  client connection aborted at --max-time ${h3_limit}s (curl rc=28)"
+      log "  client connection aborted at --max-time ${h3_limit}s (curl rc=28), sentinel ${h3_sentinel}"
       break
     fi
     log "  POST completed within ${h3_limit}s (rc=${h3_rc} http_code=[${h3_code}]); retrying with a shorter client timeout"
   done
   if [ "$h3_aborted" -ne 1 ]; then
     log "H3 FAIL: the client connection was never aborted (last curl rc=${h3_rc} http_code=[${h3_code}]); fire-and-forget was never exercised"
-  elif wait_for 60 1 "H3 sentinel reaches the transcript after a dropped connection" \
+  elif wait_for 60 1 "the dropped request's own sentinel reaches the transcript" \
       transcript_contains "$run_name" "$h3_sentinel"; then
     h3="PASS"
   else
-    log "H3 FAIL: turn did not complete after the client dropped the connection"
+    log "H3 FAIL: the dropped request's turn (${h3_sentinel}) did not complete after the client disconnected"
   fi
 
   # H4: noReply suppresses generation.
   log "H4: POST with noReply:true, expect the message inserted with no reply"
   local h4_sentinel="H4_${sentinel}"
   local h4_payload="${WORK_DIR}/h4-payload.json"
-  local before_count after_count
+  local before_count h4_code
   before_count="$(message_count "$message_url")"
   json_message_payload "$h4_payload" "$h4_sentinel" noreply
-  post_json 5 "$message_url" "$h4_payload" || true
+  h4_code="$(post_json 5 "$message_url" "$h4_payload" -w '%{http_code}')" || h4_code="000"
   sleep 3
-  after_count="$(message_count "$message_url")"
-  local h4_last_role
-  h4_last_role="$(curl -sS --max-time 5 "$message_url" 2>/dev/null | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-    print(data[-1]["info"]["role"] if data else "")
-except (json.JSONDecodeError, IndexError, KeyError):
-    print("")
-' 2>/dev/null || echo "")"
-  if [ "$before_count" -ge 0 ] 2>/dev/null && [ "$after_count" -eq $((before_count + 1)) ] 2>/dev/null \
-      && [ "$h4_last_role" = "user" ]; then
+  # A rejected POST plus an unrelated user record arriving from anything else
+  # satisfies "count+1, last role user", so both the POST status and the
+  # inserted record's own content have to be checked.
+  if [ "$h4_code" != "200" ]; then
+    log "H4 FAIL: POST returned ${h4_code}; a rejected request cannot demonstrate insertion"
+  elif H4_SENTINEL="$h4_sentinel" H4_BEFORE_COUNT="$before_count" \
+      h4_record_inserted "$message_url"; then
     h4="PASS"
   else
-    log "H4 FAIL: before=${before_count} after=${after_count} last_role=${h4_last_role} (expected exactly one new user record with no trailing assistant reply)"
+    log "H4 FAIL: before=${before_count} — expected exactly one new record, user-role, carrying ${h4_sentinel}, with no assistant reply after it"
   fi
 
   # H5: messageID is not idempotent.
