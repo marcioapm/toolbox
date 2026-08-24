@@ -178,7 +178,46 @@ OVERALL_FAIL=0
 OVERALL_CHECKS=0
 OVERALL_SKIPS=0
 
+# Longest any single wait_for predicate may run before it is killed and the
+# round counts as unsatisfied. Comfortably above a healthy store read or
+# --max-time-bounded curl, far below any wait_for's own timeout.
+WAIT_FOR_PREDICATE_LIMIT_SECONDS=15
+# Longest `<harness> --version` may take. A shim that sleeps forever must be
+# reported as a broken harness, not left to block the whole run.
+HARNESS_VERSION_PROBE_SECONDS=15
+
 log() { echo "verify-submission: $*" >&2; }
+
+# run_bounded <limit_s> <cmd...>: run cmd under a wall-clock bound.
+# Exits with the command's own status, or 124 if the bound elapsed first.
+# timeout(1) is not present on a stock macOS, so the bound is enforced with
+# a background child and a polled wait. The kill path silences bash's own
+# "Terminated" job notice; the command's stdout and stderr pass through
+# untouched either way.
+#
+# Redirect this to a file rather than capturing it with $(...): killing the
+# child does not reap a grandchild it spawned, and a surviving grandchild
+# holding the write end of a command-substitution pipe blocks the read
+# forever, defeating the bound. A file has no such reader.
+run_bounded() {
+  local limit="$1"
+  shift
+  "$@" &
+  local child=$! waited=0 status=0
+  while kill -0 "$child" 2>/dev/null; do
+    if awk -v w="$waited" -v l="$limit" 'BEGIN{exit !(w>=l)}'; then
+      { kill -TERM "$child" 2>/dev/null || true; } 2>/dev/null
+      sleep 0.2
+      { kill -KILL "$child" 2>/dev/null || true; } 2>/dev/null
+      { wait "$child" || true; } 2>/dev/null
+      return 124
+    fi
+    sleep 0.05
+    waited="$(awk -v w="$waited" 'BEGIN{printf "%.2f", w+0.05}')"
+  done
+  wait "$child" || status=$?
+  return "$status"
+}
 
 init_test_repo() {
   local repo_dir="$1"
@@ -199,16 +238,26 @@ kill_run_and_wait() {
 # Polls <cmd...> (a predicate; exit 0 = satisfied) until it succeeds or the
 # timeout elapses. Prints elapsed time on success so a merely-slower harness
 # is visible rather than silently swallowed by a generous timeout.
+#
+# Each predicate invocation is itself bounded, not just the loop: a predicate
+# that blocks (a hung store read, an unanswered socket) would otherwise run
+# past the advertised timeout with nothing to interrupt it. A predicate that
+# exceeds its slice counts as unsatisfied for that round.
 wait_for() {
   local timeout="$1" interval="$2" desc="$3"
   shift 3
-  local start elapsed
+  local start elapsed rc
   start=$(date +%s.%N)
   while true; do
-    if "$@"; then
+    rc=0
+    run_bounded "$WAIT_FOR_PREDICATE_LIMIT_SECONDS" "$@" || rc=$?
+    if [ "$rc" -eq 0 ]; then
       elapsed=$(awk -v s="$start" -v n="$(date +%s.%N)" 'BEGIN{printf "%.2f", n-s}')
       log "  ok (${elapsed}s): ${desc}"
       return 0
+    fi
+    if [ "$rc" -eq 124 ]; then
+      log "  (predicate exceeded ${WAIT_FOR_PREDICATE_LIMIT_SECONDS}s and was killed: ${desc})"
     fi
     elapsed=$(awk -v s="$start" -v n="$(date +%s.%N)" 'BEGIN{print (n-s)}')
     if awk -v e="$elapsed" -v t="$timeout" 'BEGIN{exit !(e>t)}'; then
@@ -285,19 +334,38 @@ else:
 ' 2>/dev/null || echo -1
 }
 
-# message_parts_for_id <url> <message_id>: number of parts recorded under the
-# message whose info.id equals message_id, or 0 when no such message exists.
-message_parts_for_id() {
-  curl -sS --max-time 5 "$1" 2>/dev/null | MSG_ID="$2" python3 -c '
+# distinct_user_messages_containing <url> <text_a> <text_b>: how many of the
+# two texts appear in a user-role message, counting each message id at most
+# once. 2 means the duplicated messageID produced two separate records rather
+# than one deduplicated or overwritten one.
+distinct_user_messages_containing() {
+  curl -sS --max-time 5 "$1" 2>/dev/null | TEXT_A="$2" TEXT_B="$3" python3 -c '
 import json, os, sys
+
+def texts(message):
+    for part in message.get("parts") or []:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            yield part["text"]
+
 try:
     data = json.load(sys.stdin)
 except json.JSONDecodeError:
     print(0)
-else:
-    mid = os.environ["MSG_ID"]
-    msg = next((m for m in data if m.get("info", {}).get("id") == mid), None)
-    print(len(msg["parts"]) if msg else 0)
+    raise SystemExit
+
+wanted = (os.environ["TEXT_A"], os.environ["TEXT_B"])
+found = {}
+for message in data if isinstance(data, list) else []:
+    if not isinstance(message, dict):
+        continue
+    if (message.get("info") or {}).get("role") != "user":
+        continue
+    message_id = (message.get("info") or {}).get("id")
+    blob = "\n".join(texts(message))
+    for needle in wanted:
+        if needle in blob:
+            found.setdefault(needle, set()).add(message_id)
+print(sum(len(ids) for ids in found.values()))
 ' 2>/dev/null || echo 0
 }
 
@@ -348,7 +416,30 @@ run_harness_cells() {
     count_check "SKIP"
     return 0
   fi
-  version="$("$harness" --version 2>&1 | head -1 | tr -d '\r')"
+
+  # An installed-but-broken harness must be a reported FAIL for its own row,
+  # never a hang or a `set -e` abort of the whole run: `--version` is
+  # bounded, and both a timeout and a non-zero exit fall through to the
+  # FAIL row below rather than propagating.
+  local version_rc=0
+  local version_file="${WORK_DIR}/${harness}-version.txt"
+  run_bounded "$HARNESS_VERSION_PROBE_SECONDS" "$harness" --version \
+    > "$version_file" 2>&1 || version_rc=$?
+  version="$(head -1 "$version_file" 2>/dev/null | tr -d '\r')"
+  if [ "$version_rc" -eq 124 ]; then
+    log "harness '$harness' --version did not answer within ${HARNESS_VERSION_PROBE_SECONDS}s — FAIL"
+    record_row "$harness" "unresponsive" "FAIL(version hung)" "FAIL(version hung)" \
+      "FAIL(version hung)" "FAIL(version hung)"
+    count_check "FAIL"; count_check "FAIL"; count_check "FAIL"; count_check "FAIL"
+    return 0
+  fi
+  if [ "$version_rc" -ne 0 ]; then
+    log "harness '$harness' --version exited ${version_rc} — FAIL: ${version}"
+    record_row "$harness" "broken" "FAIL(version rc=${version_rc})" "FAIL(version rc=${version_rc})" \
+      "FAIL(version rc=${version_rc})" "FAIL(version rc=${version_rc})"
+    count_check "FAIL"; count_check "FAIL"; count_check "FAIL"; count_check "FAIL"
+    return 0
+  fi
   log "=== harness=${harness} version=${version} run=${run_name} ==="
 
   local repo_dir
@@ -424,15 +515,36 @@ run_harness_cells() {
   # --- C3: anti-vacuity negative control ------------------------------------
   # Break each transport's witness independently to prove prompt_submitted is
   # delivery-gated: unreadable rollout, unreachable HTTP port, or tiny timeout.
+  #
+  # A negative control that merely observes "something went wrong" proves
+  # nothing -- a failed launch or an unrelated error would pass it just as
+  # well. Every branch below therefore asserts three things: the run actually
+  # started (so the fault is what stopped verification), the injected fault
+  # demonstrably took effect, and prompt_unverified names the reason that
+  # fault produces rather than any reason at all.
   local c3_run="${run_name}-neg"
   local c3_state="${STATE_DIR}/${c3_run}"
+  local c3_fault_landed=0        # the injected fault was confirmed in place
+  local -a c3_expected_reasons=()  # the reason must be one of these
+  local c3_launched=0
   if [ "$harness" = "codex" ]; then
     log "C3: negative control via an unreadable codex rollout store (launch marker)"
-    if AGENT_RUN_CODEX_SESSIONS_DIR="${WORK_DIR}/empty-codex-sessions" \
+    local c3_sessions_dir="${WORK_DIR}/empty-codex-sessions"
+    c3_expected_reasons=(witness_unreadable)
+    if AGENT_RUN_CODEX_SESSIONS_DIR="$c3_sessions_dir" \
         agent_run "${launch_args[@]}" \
         --prompt "Reply with exactly this word and nothing else: ${sentinel1}_neg" \
         ${model_args[@]+"${model_args[@]}"} "$c3_run" >/dev/null 2>&1; then
       LAUNCHED_RUNS+=("$c3_run")
+      c3_launched=1
+      # The fault is the override pointing at a directory holding no rollout
+      # for this session, so every witness read must fail. Confirm that is
+      # still true rather than assuming the env var reached the runner.
+      if [ -z "$(find "$c3_sessions_dir" -name 'rollout-*.jsonl' 2>/dev/null | head -1)" ]; then
+        c3_fault_landed=1
+      else
+        log "C3: rollout override directory unexpectedly holds a rollout — fault did not land"
+      fi
       # The unreadable store uses the full default verification window.
       wait_for 20 0.5 "prompt_submitted or prompt_unverified appears" \
         bash -c "[ -f '${c3_state}/prompt_submitted' ] || [ -f '${c3_state}/prompt_unverified' ]" || true
@@ -441,38 +553,85 @@ run_harness_cells() {
     fi
   elif [ "$harness" = "opencode" ]; then
     log "C3: negative control via an unreachable opencode_port (HTTP witness lands too fast for a timing control)"
+    c3_expected_reasons=(witness_unreadable)
     if agent_run "${launch_args[@]}" \
         --prompt "Reply with exactly this word and nothing else: ${sentinel1}_neg" \
         ${model_args[@]+"${model_args[@]}"} "$c3_run" >/dev/null 2>&1; then
       LAUNCHED_RUNS+=("$c3_run")
+      c3_launched=1
       if wait_for 10 0.1 "opencode_port file appears" \
           bash -c "[ -s '${c3_state}/opencode_port' ]"; then
         # Corrupt the port before the delayed prompt helper submits.
         echo 1 > "${c3_state}/opencode_port"
+        sleep 6
+        # The fault is the witness pointing at a port nothing serves. Confirm
+        # the corrupted value survived to submission time and that nothing
+        # answers there, so an unrelated failure cannot pass this control.
+        local c3_port
+        c3_port="$(cat "${c3_state}/opencode_port" 2>/dev/null || echo "")"
+        if [ "$c3_port" = "1" ] \
+            && ! curl -fsS --max-time 2 -o /dev/null "http://127.0.0.1:1/doc" 2>/dev/null; then
+          c3_fault_landed=1
+        else
+          log "C3: opencode_port is [${c3_port}] and/or that port answers — fault did not land"
+        fi
+      else
+        log "C3: opencode_port never appeared — could not inject the fault"
+        sleep 6
       fi
-      sleep 6
     else
       log "C3 FAIL: launch itself failed"
     fi
   else
     log "C3: negative control with AGENT_RUN_SUBMIT_VERIFY_TIMEOUT=0.01"
+    # A 10ms window ends before any store read can confirm delivery. Whether
+    # the store was readable-but-flat (timeout) or not yet created
+    # (witness_unreadable) depends on how fast the harness materialises its
+    # transcript file; both are this fault's signature, and neither is a
+    # transport error, a rejection or an unwitnessed run.
+    c3_expected_reasons=(timeout witness_unreadable)
+    local c3_start c3_elapsed
+    c3_start=$(date +%s.%N)
     if AGENT_RUN_SUBMIT_VERIFY_TIMEOUT=0.01 AGENT_RUN_SUBMIT_ATTEMPTS=1 \
         agent_run "${launch_args[@]}" \
         --prompt "Reply with exactly this word and nothing else: ${sentinel1}_neg" \
         ${model_args[@]+"${model_args[@]}"} "$c3_run" >/dev/null 2>&1; then
       LAUNCHED_RUNS+=("$c3_run")
-      # The fixed pre-write delay is unaffected by the timeout override.
-      sleep 6
+      c3_launched=1
+      wait_for 20 0.2 "prompt_submitted or prompt_unverified appears" \
+        bash -c "[ -f '${c3_state}/prompt_submitted' ] || [ -f '${c3_state}/prompt_unverified' ]" || true
+      # The fault is the shortened deadline. Its observable effect is that
+      # the verdict lands far sooner than the default window could produce
+      # one: the fixed pre-submit delay plus a 10ms verify, not 10s.
+      c3_elapsed=$(awk -v s="$c3_start" -v n="$(date +%s.%N)" 'BEGIN{printf "%.2f", n-s}')
+      if awk -v e="$c3_elapsed" 'BEGIN{exit !(e < 10)}'; then
+        c3_fault_landed=1
+      else
+        log "C3: verdict took ${c3_elapsed}s, no faster than the default window — timeout override did not land"
+      fi
     else
       log "C3 FAIL: launch itself failed"
     fi
   fi
-  if [ -f "${c3_state}/prompt_submitted" ]; then
+
+  local c3_reason=""
+  if [ -f "${c3_state}/prompt_unverified" ]; then
+    c3_reason="$(tr -d '\r\n' < "${c3_state}/prompt_unverified" 2>/dev/null || echo "")"
+  fi
+  if [ "$c3_launched" -ne 1 ]; then
+    log "C3 FAIL: the run never launched, so nothing was controlled for"
+  elif [ ! -s "${LOG_DIR}/${c3_run}/session.json" ]; then
+    log "C3 FAIL: no session.json — the run failed before submission, not because of the injected fault"
+  elif [ "$c3_fault_landed" -ne 1 ]; then
+    log "C3 FAIL: the injected fault could not be confirmed, so an unverified prompt proves nothing"
+  elif [ -f "${c3_state}/prompt_submitted" ]; then
     log "C3 FAIL (VACUOUS): prompt_submitted was stamped despite the negative control -- verification is not gating the marker"
   elif [ ! -f "${c3_state}/prompt_unverified" ]; then
     log "C3 FAIL: neither prompt_submitted nor prompt_unverified is present"
-  elif [ ! -s "${c3_state}/prompt_unverified" ]; then
+  elif [ -z "$c3_reason" ]; then
     log "C3 FAIL: prompt_unverified exists but carries no reason"
+  elif ! printf '%s\n' "${c3_expected_reasons[@]}" | grep -qxF "$c3_reason"; then
+    log "C3 FAIL: prompt_unverified reason is [${c3_reason}], expected one of [${c3_expected_reasons[*]}] for this fault"
   else
     c3="PASS"
   fi
@@ -634,8 +793,20 @@ sys.exit(0 if key and 'post' in paths[key] else 1)
   local h3_payload="${WORK_DIR}/h3-payload.json"
   json_message_payload "$h3_payload" \
     "Count slowly from one to five, one number per line, then say exactly this word and nothing else: ${h3_sentinel}"
-  post_json 2 "$message_url" "$h3_payload" || true
-  if wait_for 60 1 "H3 sentinel reaches the transcript after a dropped connection" \
+  # The whole point of H3 is that the *client* goes away mid-turn. A POST that
+  # completed normally inside the timeout never exercised that, so discarding
+  # curl's result would let H3 pass without testing anything: assert the
+  # connection was actually aborted (curl exit 28, no http_code) *and* that
+  # the turn still ran to completion afterwards.
+  local h3_code="" h3_rc=0
+  h3_code="$(post_json 2 "$message_url" "$h3_payload" -w '%{http_code}')" || h3_rc=$?
+  local h3_aborted=0
+  if [ "$h3_rc" -eq 28 ] && [ -z "${h3_code//0/}" ]; then
+    h3_aborted=1
+  fi
+  if [ "$h3_aborted" -ne 1 ]; then
+    log "H3 FAIL: the client connection was not aborted (curl rc=${h3_rc} http_code=[${h3_code}]); fire-and-forget was never exercised"
+  elif wait_for 60 1 "H3 sentinel reaches the transcript after a dropped connection" \
       transcript_contains "$run_name" "$h3_sentinel"; then
     h3="PASS"
   else
@@ -670,22 +841,32 @@ except (json.JSONDecodeError, IndexError, KeyError):
 
   # H5: messageID is not idempotent.
   log "H5: POST the same messageID twice, expect two distinct results"
+  # This is the property the whole retry design rests on: a resubmission
+  # duplicates rather than deduplicates. Ignoring both POST statuses would let
+  # H5 pass on a server that rejected the second request outright, which is
+  # the *opposite* finding. Assert both POSTs returned 200 and that two
+  # distinct user messages exist.
   # opencode validates messageID as a string with a "msg" prefix; anything
   # else is a 400 before the duplication behavior under test even runs.
   local mid="msgverifysubmissionh5$$"
   local h5_payload_a="${WORK_DIR}/h5-payload-a.json"
   local h5_payload_b="${WORK_DIR}/h5-payload-b.json"
-  json_message_payload "$h5_payload_a" "h5-first" noreply "$mid"
-  json_message_payload "$h5_payload_b" "h5-second" noreply "$mid"
-  post_json 5 "$message_url" "$h5_payload_a" || true
-  post_json 5 "$message_url" "$h5_payload_b" || true
+  local h5_text_a="h5-first-${sentinel}"
+  local h5_text_b="h5-second-${sentinel}"
+  json_message_payload "$h5_payload_a" "$h5_text_a" noreply "$mid"
+  json_message_payload "$h5_payload_b" "$h5_text_b" noreply "$mid"
+  local h5_code_a="000" h5_code_b="000"
+  h5_code_a="$(post_json 5 "$message_url" "$h5_payload_a" -w '%{http_code}')" || h5_code_a="000"
+  h5_code_b="$(post_json 5 "$message_url" "$h5_payload_b" -w '%{http_code}')" || h5_code_b="000"
   sleep 1
-  local after_len
-  after_len="$(message_parts_for_id "$message_url" "$mid")"
-  if [ "$after_len" -ge 2 ] 2>/dev/null; then
+  local h5_distinct
+  h5_distinct="$(distinct_user_messages_containing "$message_url" "$h5_text_a" "$h5_text_b")"
+  if [ "$h5_code_a" != "200" ] || [ "$h5_code_b" != "200" ]; then
+    log "H5 FAIL: expected both POSTs to return 200, got ${h5_code_a} and ${h5_code_b} — a rejected duplicate is not evidence of non-idempotence"
+  elif [ "$h5_distinct" -ge 2 ] 2>/dev/null; then
     h5="PASS"
   else
-    log "H5 FAIL: expected >=2 parts recorded for the duplicated messageID, got ${after_len}"
+    log "H5 FAIL: expected 2 distinct user messages for the duplicated messageID, got ${h5_distinct}"
   fi
 
   agent_run kill "$run_name" >/dev/null 2>&1 || true
