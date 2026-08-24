@@ -263,3 +263,60 @@ def test_h4_rejects_a_count_that_did_not_rise_by_exactly_one():
         _h4_message("user", "H4-SENTINEL"),
     ])
     assert not _h4_inserted(payload, before=1)
+
+
+def _h3_client_aborted(curl_rc: int, http_code: str = "") -> bool:
+    result = subprocess.run(
+        ["bash", "-c", f'{_shell_function_source("h3_client_aborted")}\n'
+                       f'h3_client_aborted "$1" "$2"', "_", str(curl_rc), http_code],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "http_code",
+    [
+        pytest.param("200", id="headers_arrived"),
+        pytest.param("", id="no_status_line"),
+        pytest.param("000", id="zero_status"),
+    ],
+)
+def test_h3_accepts_a_client_timeout_however_far_the_response_got(http_code):
+    """opencode answers 200 headers as soon as it accepts the message and
+    streams the turn afterwards, so curl reports a status *and* times out
+    waiting for the body. That is the client-side disconnect H3 exercises;
+    requiring an empty %{http_code} fails H3 on correct behaviour."""
+    assert _h3_client_aborted(28, http_code)
+
+
+@pytest.mark.parametrize(
+    ("curl_rc", "http_code"),
+    [
+        pytest.param(0, "200", id="completed_normally"),
+        pytest.param(7, "", id="connection_refused"),
+        pytest.param(52, "", id="empty_reply"),
+        pytest.param(56, "200", id="recv_failure"),
+    ],
+)
+def test_h3_rejects_every_exit_that_is_not_a_client_timeout(curl_rc, http_code):
+    """The check must stay able to fail: a POST that completed, or failed for
+    an unrelated reason, never exercised a mid-turn disconnect."""
+    assert not _h3_client_aborted(curl_rc, http_code)
+
+
+@pytest.mark.parametrize(
+    "http_code",
+    [
+        pytest.param("400", id="bad_request"),
+        pytest.param("404", id="route_gone"),
+        pytest.param("500", id="server_error"),
+    ],
+)
+def test_h3_rejects_a_timeout_after_a_rejected_request(http_code):
+    """A request the server refused never started a turn, so a timeout after
+    it is not the mid-turn disconnect H3 is asserting survives."""
+    assert not _h3_client_aborted(28, http_code)
+
+

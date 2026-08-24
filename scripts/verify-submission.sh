@@ -436,6 +436,30 @@ sys.exit(0 if carrier == len(data) - 1 else 1)
 ' 2>/dev/null
 }
 
+# h3_client_aborted <curl_rc> <http_code>: whether curl gave up on the response
+# before the server finished, which is the client-side disconnect H3 exists to
+# exercise. http_code is curl's %{http_code}, empty or 000 when no status line
+# was received.
+#
+# Exit 28 is the abort signal, whether or not a status code arrived first.
+# opencode answers 200 headers as soon as it accepts the message and streams
+# the turn afterwards, so curl routinely reports a status *and then* times out
+# waiting for the body; requiring an empty http_code would reject that abort
+# and fail H3 on correct fire-and-forget behaviour.
+#
+# A status that did arrive is still consulted for one thing: a request the
+# server rejected never started a turn, so a timeout after a 4xx/5xx is not
+# a mid-turn disconnect and must not be accepted as one.
+# shellcheck disable=SC2329  # invoked indirectly and from the CLI-surface test
+h3_client_aborted() {
+  local curl_rc="$1" http_code="$2"
+  [ "$curl_rc" -eq 28 ] || return 1
+  case "$http_code" in
+    ""|000|2??) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # reason_matches <reason> <expected...>: whether prompt_unverified's reason is
 # one of the expected kinds. A reason that carries detail after a colon
 # ("transport_error: [Errno 61] ...") matches on the kind before it, so the
@@ -872,13 +896,14 @@ sys.exit(0 if key and 'post' in paths[key] else 1)
   # The whole point of H3 is that the *client* goes away mid-turn. A POST that
   # completed normally inside the timeout never exercised that, so discarding
   # curl's result would let H3 pass without testing anything: assert the
-  # connection was actually aborted (curl exit 28, no http_code) *and* that
-  # the turn still ran to completion afterwards.
+  # connection was actually aborted (see h3_client_aborted) *and* that the turn
+  # still ran to completion afterwards.
   #
   # Each attempt carries its own sentinel. Reusing one across the ladder makes
   # the transcript check unable to say *which* request produced the record: an
   # earlier POST that completed normally would satisfy it, and H3 would pass
-  # having proven nothing about the dropped one.
+  # having proven nothing about the dropped one. That sentinel, not curl's
+  # status code, is what keeps this check able to fail.
   #
   # Shorten the bound until the client aborts; the transcript then checks that
   # the aborted request's own sentinel completed server-side.
@@ -892,9 +917,9 @@ sys.exit(0 if key and 'post' in paths[key] else 1)
       "Count slowly from one to five, one number per line, then say exactly this word and nothing else: ${h3_sentinel}"
     h3_rc=0
     h3_code="$(post_json "$h3_limit" "$message_url" "$h3_payload" -w '%{http_code}')" || h3_rc=$?
-    if [ "$h3_rc" -eq 28 ] && [ -z "${h3_code//0/}" ]; then
+    if h3_client_aborted "$h3_rc" "$h3_code"; then
       h3_aborted=1
-      log "  client connection aborted at --max-time ${h3_limit}s (curl rc=28), sentinel ${h3_sentinel}"
+      log "  client connection aborted at --max-time ${h3_limit}s (curl rc=28, http_code=[${h3_code}]), sentinel ${h3_sentinel}"
       break
     fi
     log "  POST completed within ${h3_limit}s (rc=${h3_rc} http_code=[${h3_code}]); retrying with a shorter client timeout"
