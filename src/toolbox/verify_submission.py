@@ -734,7 +734,7 @@ def run_harness_cells(
                 detail = Path(unverified_file).read_text().strip()
             except OSError:
                 detail = "(prompt_unverified not written)"
-            trust_note = ""
+            trust_note = " trust_dialog_in_log=no"
             if harness == "claude":
                 log_path = os.path.join(log_dir, run_name, "log")
                 try:
@@ -743,7 +743,7 @@ def run_harness_cells(
                     )
                     trust_note = f" trust_dialog_in_log={'yes' if 'trust' in log_text.lower() else 'no'}"
                 except OSError:
-                    trust_note = ""
+                    pass
             _log(f"C1 FAIL: prompt_unverified detail=[{detail}]{trust_note}")
     else:
         _log("C1 FAIL: launch itself failed")
