@@ -2253,6 +2253,206 @@ def test_a_partial_record_in_an_established_transcript_never_causes_a_resend(
     assert submissions == [b"THE PROMPT"], "an unknown count licenses no resend"
 
 
+def test_an_unrelated_turn_containing_a_short_prompt_never_verifies(
+    tmp_path, monkeypatch
+):
+    """A prompt short enough to occur inside ordinary prose is the case where
+    containment attribution fails: the submit here stores only unrelated text,
+    yet the store's user-turn count rises. Accepting that stamps a swallowed
+    prompt as delivered.
+
+    Wired through the real transcript reader, so the store's own predicate is
+    what is under test.
+    """
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    session_id = "sess-short-prompt"
+    store = _seed_store_path(tmp_path, monkeypatch, "claude", session_id)
+    store.write_text(
+        _complete_user_record("claude", session_id, "this synthetic user turn is unrelated") + "\n"
+    )
+    (log_dir / "session.json").write_text(
+        json.dumps({"harness": "claude", "session_id": session_id})
+    )
+    (log_dir / "run.json").write_text(json.dumps({"cwd": "/tmp/proj"}))
+
+    stored: list = []
+
+    def submit_storing_only_unrelated_text(text):
+        stored.append(text)
+        with store.open("a") as f:
+            f.write(
+                _complete_user_record(
+                    "claude", session_id, "this synthetic user turn is unrelated"
+                ) + "\n"
+            )
+
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, log_dir, b"hi", deadline_s=0.0, max_attempts=3,
+        submit=submit_storing_only_unrelated_text,
+    )
+
+    assert outcome.verified is False, (
+        "the swallowed prompt must not verify off an unrelated turn containing it"
+    )
+    assert outcome.detail == "timeout"
+
+
+def test_a_prompt_the_harness_recorded_verbatim_still_verifies(tmp_path, monkeypatch):
+    """The false-negative control for the test above: whole-turn comparison
+    must still verify a prompt that plainly landed, or the ladder resends and
+    duplicates it. Long enough that a TUI would re-wrap it."""
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    session_id = "sess-verbatim"
+    store = _seed_store_path(tmp_path, monkeypatch, "claude", session_id)
+    store.write_text("")
+    (log_dir / "session.json").write_text(
+        json.dumps({"harness": "claude", "session_id": session_id})
+    )
+    (log_dir / "run.json").write_text(json.dumps({"cwd": "/tmp/proj"}))
+
+    prompt = (
+        b"Read the report at docs/report.md in full, summarise every finding it "
+        b"lists, and open a pull request that fixes the first two."
+    )
+
+    def submit_recording_a_rewrapped_turn(text):
+        rewrapped = text.decode().replace(" ", "\n  ")
+        with store.open("a") as f:
+            f.write(_complete_user_record("claude", session_id, rewrapped) + "\n")
+
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, log_dir, prompt, deadline_s=5.0, max_attempts=3,
+        submit=submit_recording_a_rewrapped_turn,
+    )
+
+    assert outcome.verified is True
+
+
+@pytest.mark.parametrize(
+    ("harness", "malformed_record"),
+    [
+        pytest.param(
+            "claude", '{"type":"user","sessionId":"sess-malformed","message":"not-an-object"}',
+            id="claude",
+        ),
+        pytest.param(
+            "codex", '{"type":"response_item","payload":"not-an-object"}', id="codex",
+        ),
+    ],
+)
+def test_a_malformed_recognised_record_never_causes_a_resend(
+    tmp_path, monkeypatch, harness, malformed_record
+):
+    """A record that parses and is recognised but fails schema validation is
+    as unknown as an unparseable line. Reporting the valid rows instead yields
+    a flat count, and a flat count licenses the ladder's third rung -- sending
+    prompt-bearing text a second time.
+    """
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    session_id = "sess-malformed"
+    store = _seed_store_path(tmp_path, monkeypatch, harness, session_id)
+    store.write_text(malformed_record + "\n")
+    (log_dir / "session.json").write_text(
+        json.dumps({"harness": harness, "session_id": session_id})
+    )
+    (log_dir / "run.json").write_text(json.dumps({"cwd": "/tmp/proj"}))
+
+    submissions = _no_transport_side_effects(monkeypatch)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, log_dir, b"PROMPT", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.0, max_attempts=3, fresh_session=True,
+    )
+
+    cr = agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)
+    assert outcome.detail == "witness_unreadable", (
+        "a malformed recognised record is an unknown count, not an observed zero"
+    )
+    assert sum(1 for payload in submissions if b"PROMPT" in payload) == 1
+    assert submissions == [b"PROMPT" + cr, cr]
+
+
+def test_a_malformed_opencode_part_never_causes_a_resend(tmp_path, monkeypatch):
+    """The opencode arm of the same rule: a persisted part whose JSON is
+    truncated may be this prompt's own text."""
+    state, log, db = _sqlite_witness_run(tmp_path, monkeypatch)
+    _sqlite_insert(db, "m0", "user", "an earlier turn")
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "insert into part values ('p-bad', 'm0', 'ses_1', 9, ?)",
+        ('{"type":"text","text":"PROMPT"',),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+    submissions = []
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"PROMPT", deadline_s=0.0, max_attempts=3,
+        submit=lambda text: submissions.append(text),
+    )
+
+    assert outcome.detail == "witness_unreadable"
+    assert submissions == [b"PROMPT"], "an unknown count licenses no resend"
+
+
+def test_http_witness_rejects_a_record_whose_parts_do_not_validate(
+    tmp_path, opencode_message_endpoint
+):
+    """The HTTP witness applies the same rule as the store readers: a record
+    it cannot read makes the whole count unknown, never zero."""
+    messages = [_http_message("user", "an earlier turn", message_id="m0")]
+    port = opencode_message_endpoint(messages, lambda _msgs: None)
+    state, log = _http_witness_run(tmp_path, port)
+    submissions = []
+
+    def submit_storing_an_unreadable_record(text):
+        submissions.append(text)
+        messages.append(
+            {"info": {"id": "m1", "role": "user"}, "parts": [{"type": "text", "text": None}]}
+        )
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"THE PROMPT", deadline_s=0.0, max_attempts=3,
+        submit=submit_storing_an_unreadable_record,
+    )
+
+    assert outcome.verified is False
+    assert outcome.detail == "witness_unreadable"
+    assert submissions == [b"THE PROMPT"]
+
+
+def test_http_witness_verifies_the_second_text_of_a_merged_duplicate_record(
+    tmp_path, opencode_message_endpoint
+):
+    """opencode merges a repeated messageID into one record carrying both
+    texts as separate parts -- measured against 1.18.21. A steer of a second
+    prompt into such a record must still verify, or the ladder resends it."""
+    messages = [_http_message("user", "the first prompt", message_id="m0")]
+
+    def append_a_part(msgs):
+        msgs[0]["parts"].append({"type": "text", "text": "THE PROMPT"})
+
+    port = opencode_message_endpoint(messages, append_a_part)
+    state, log = _http_witness_run(tmp_path, port)
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"THE PROMPT", deadline_s=5.0, max_attempts=1,
+    )
+
+    assert outcome.verified is True
+
+
 # ---------------------------------------------------------------------------
 # steer exit codes (verified / unverified / --raw) and its write watchdog
 # ---------------------------------------------------------------------------

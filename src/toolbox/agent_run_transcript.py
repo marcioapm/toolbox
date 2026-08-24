@@ -258,9 +258,11 @@ def count_transcript(
 #   1. user role -- an assistant reply, a reasoning trace or a tool record in
 #      the current turn must never satisfy it, since none of them implies new
 #      input reached the harness;
-#   2. our content -- a bare user-role envelope with no text part yet, or a
-#      user-role message the harness synthesised for itself, is not our
-#      prompt, however much it moves a record count;
+#   2. our content -- the turn's whole text must be this prompt. A bare
+#      user-role envelope with no text part yet, a user-role message the
+#      harness synthesised for itself, and an unrelated turn that merely
+#      happens to contain the prompt's characters are all not our prompt,
+#      however much they move a record count;
 #   3. observed, not assumed -- a store that cannot be fully read yields no
 #      number at all (``TranscriptSourceError``), never a zero, because a zero
 #      is read as proof the prompt did not land and licenses a resend.
@@ -280,8 +282,15 @@ def normalize_prompt_text(text: str) -> str:
 
 
 def turn_carries_prompt(turn_text: Optional[str], normalized_prompt: str) -> bool:
-    """True when one turn's text carries *normalized_prompt* (already passed
+    """True when one turn's whole text *is* *normalized_prompt* (already passed
     through ``normalize_prompt_text``).
+
+    Equality, not containment: a short prompt such as ``hi`` occurs inside
+    plenty of unrelated turns, and accepting one of those would stamp a
+    swallowed prompt as delivered. Whitespace normalisation is what keeps a
+    TUI's re-wrap of a long prompt matching; a transport that adds a wrapper
+    of its own has that wrapper stripped by its own reader before it gets
+    here, so no general prefix/suffix trimming happens at this level.
 
     An empty prompt matches nothing: it would otherwise degrade the predicate
     back to a bare user-record count, which is what content attribution
@@ -289,7 +298,23 @@ def turn_carries_prompt(turn_text: Optional[str], normalized_prompt: str) -> boo
     """
     if not normalized_prompt or not isinstance(turn_text, str):
         return False
-    return normalized_prompt in normalize_prompt_text(turn_text)
+    return normalize_prompt_text(turn_text) == normalized_prompt
+
+
+def turn_parts_carry_prompt(part_texts: list[str], normalized_prompt: str) -> bool:
+    """True when a multi-part user turn's own text is *normalized_prompt*.
+
+    opencode stores a turn as a list of text parts, and a repeated messageID
+    appends a part to the existing record rather than creating a second
+    record -- measured against opencode 1.18.21 -- so one turn can hold two
+    independently submitted texts. Both the parts joined and any single part
+    therefore count as "the turn's own text", and either being exactly the
+    prompt is a match. Each candidate is still compared whole, so an
+    unrelated part that merely contains the prompt does not match.
+    """
+    if turn_carries_prompt("\n".join(part_texts), normalized_prompt):
+        return True
+    return any(turn_carries_prompt(text, normalized_prompt) for text in part_texts)
 
 
 def count_prompt_turns(harness: str, session_id: str, cwd: Optional[str], prompt: str) -> int:
@@ -450,8 +475,15 @@ def _count_opencode_prompt_turns(session_id: str, normalized_prompt: str) -> int
     than per message, which would issue a query per turn. Raises the same
     errors as `_opencode_connect`/query execution (missing/locked/unreadable
     store).
+
+    A row of this session that is recognised but does not validate is
+    skipped, and any skip makes the whole answer unknown: an envelope whose
+    role will not parse may be the user turn carrying this prompt, and a part
+    whose payload will not parse may be that turn's text. Reporting the
+    readable rows instead would read as flat and license a resend.
     """
     conn = _opencode_connect()
+    skipped = 0
     try:
         user_message_ids = set()
         for message_id, raw in conn.execute(
@@ -460,8 +492,12 @@ def _count_opencode_prompt_turns(session_id: str, normalized_prompt: str) -> int
             try:
                 data = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
+                skipped += 1
                 continue
-            if isinstance(data, dict) and data.get("role") == "user":
+            if not isinstance(data, dict) or not isinstance(data.get("role"), str):
+                skipped += 1
+                continue
+            if data.get("role") == "user":
                 user_message_ids.add(message_id)
 
         texts_by_message: dict[str, list[str]] = {}
@@ -469,23 +505,41 @@ def _count_opencode_prompt_turns(session_id: str, normalized_prompt: str) -> int
             "select message_id, data from part where session_id = ? order by time_created",
             (session_id,),
         ):
+            # Parts of an assistant turn cannot carry a submitted prompt, so a
+            # malformed one says nothing about this count.
             if message_id not in user_message_ids:
                 continue
             try:
                 part = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
+                skipped += 1
                 continue
-            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
-                texts_by_message.setdefault(message_id, []).append(part["text"])
+            if not isinstance(part, dict) or not isinstance(part.get("type"), str):
+                skipped += 1
+                continue
+            if part.get("type") != "text":
+                continue  # file/compaction/agent: part of the turn, not its text
+            if not isinstance(part.get("text"), str):
+                skipped += 1
+                continue
+            texts_by_message.setdefault(message_id, []).append(part["text"])
 
-        return sum(
+        count = sum(
             1 for message_id in user_message_ids
-            if turn_carries_prompt("\n".join(texts_by_message.get(message_id, ())), normalized_prompt)
+            if turn_parts_carry_prompt(texts_by_message.get(message_id, []), normalized_prompt)
         )
     except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
         raise _opencode_query_error(exc) from exc
     finally:
         conn.close()
+    if skipped > 0:
+        raise TranscriptSourceError(
+            f"opencode session store for {session_id!r} is unreadable: {skipped} record(s) "
+            f"malformed, {count} prompt turn(s) counted among the readable ones",
+            code="store_unreadable",
+        )
+    return count
+
 
 
 def _opencode_entry(part: dict, message: dict) -> Optional[TranscriptEntry]:
@@ -753,11 +807,29 @@ def _count_claude(session_id: str, cwd: Optional[str]) -> tuple[int, Optional[st
     return total.entries, _iso_utc_z(total.newest) if total.newest is not None else None
 
 
+# Returned by a per-record extractor for a record that belongs to this session
+# and is recognised, but whose envelope does not match the schema. Distinct
+# from None, which means "readable, and not a user turn of ours".
+_SCHEMA_INVALID = object()
+
+
 def _claude_user_input_text(record: dict, session_id: str) -> Optional[str]:
     """The text of one claude JSONL record when it is a user turn, else None.
 
     A `tool_result` block also arrives as a ``type: "user"`` record with
     ``role: "user"``; only text content counts as input the user supplied.
+    """
+    text = _claude_user_input_text_or_invalid(record, session_id)
+    return None if text is _SCHEMA_INVALID else text
+
+
+def _claude_user_input_text_or_invalid(record: dict, session_id: str) -> Any:
+    """As ``_claude_user_input_text``, but returns ``_SCHEMA_INVALID`` when a
+    ``type: "user"`` record of this session does not match the schema.
+
+    Only records of this session are judged: a shared project file's
+    unrelated malformed rows must not render the witness permanently
+    unreadable, which would make a launch unverifiable forever.
     """
     if record.get("type") != "user":
         return None
@@ -765,18 +837,28 @@ def _claude_user_input_text(record: dict, session_id: str) -> Optional[str]:
     if record_session_id is not None and record_session_id != session_id:
         return None
     message = record.get("message")
-    if not isinstance(message, dict) or message.get("role") != "user":
+    if not isinstance(message, dict):
+        return _SCHEMA_INVALID
+    role = message.get("role")
+    if not isinstance(role, str):
+        return _SCHEMA_INVALID
+    if role != "user":
         return None
     content = message.get("content")
     if isinstance(content, str):
         return content or None
     if not isinstance(content, list):
-        return None
-    texts = [
-        block["text"] for block in content
-        if isinstance(block, dict) and block.get("type") == "text"
-        and isinstance(block.get("text"), str) and block["text"]
-    ]
+        return _SCHEMA_INVALID
+    texts = []
+    for block in content:
+        if not isinstance(block, dict):
+            return _SCHEMA_INVALID
+        if block.get("type") != "text":
+            continue  # tool_result/image/thinking: not text the user supplied
+        if not isinstance(block.get("text"), str):
+            return _SCHEMA_INVALID
+        if block["text"]:
+            texts.append(block["text"])
     return "\n".join(texts) if texts else None
 
 
@@ -790,19 +872,24 @@ def _count_claude_prompt_turns(session_id: str, cwd: Optional[str], normalized_p
 
     Any skipped record makes the answer unknown rather than low: a file
     caught mid-append has an unterminated trailing line, and that line may be
-    the very record carrying this prompt.
+    the very record carrying this prompt. A record of this session that parses
+    but does not validate is skipped for the same reason -- what it would have
+    held is exactly as unknown.
     """
     path = _claude_session_path(session_id, cwd)
     skip_counter = _JsonlSkipCounter()
     count = 0
     for record in _iter_jsonl_objects(path, skip_counter):
-        if turn_carries_prompt(_claude_user_input_text(record, session_id), normalized_prompt):
+        text = _claude_user_input_text_or_invalid(record, session_id)
+        if text is _SCHEMA_INVALID:
+            skip_counter.skipped += 1
+        elif turn_carries_prompt(text, normalized_prompt):
             count += 1
     if skip_counter.skipped > 0:
         raise TranscriptSourceError(
             f"claude session transcript for {session_id!r} at {path} is unreadable: "
-            f"{skip_counter.skipped} record(s) unparseable, {count} prompt turn(s) counted "
-            f"among the readable ones",
+            f"{skip_counter.skipped} record(s) unparseable or malformed, {count} prompt "
+            f"turn(s) counted among the readable ones",
             code="store_unreadable",
         )
     return count
@@ -1210,37 +1297,69 @@ def _count_codex(session_id: str) -> tuple[int, Optional[str]]:
     return stats.entries, _iso_utc_z(stats.newest) if stats.newest is not None else None
 
 
+def _codex_user_input_text_or_invalid(payload: dict) -> Any:
+    """The text of one codex `message` payload when it is a user turn, else
+    None; ``_SCHEMA_INVALID`` when a user message does not match the schema.
+
+    The harness's own `<environment_context>`/`<user_instructions>` preamble
+    is stripped off the front. It is written at thread start, before any
+    prompt is submitted, and codex can prepend it to the same message that
+    carries the first prompt -- so leaving it in place would either verify off
+    the preamble alone or make a genuine first prompt fail to match.
+    """
+    if payload.get("type") != "message":
+        return None  # reasoning/function_call/tool output: not a user turn
+    role = payload.get("role")
+    if not isinstance(role, str):
+        return _SCHEMA_INVALID
+    if role != "user":
+        return None
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return _SCHEMA_INVALID
+    texts = []
+    for block in content:
+        if not isinstance(block, dict):
+            return _SCHEMA_INVALID
+        if block.get("type") not in ("input_text", "output_text"):
+            continue  # input_image and friends carry no submittable text
+        if not isinstance(block.get("text"), str):
+            return _SCHEMA_INVALID
+        texts.append(block["text"])
+    if not texts:
+        return None
+    return _strip_codex_injected_context("\n".join(texts)) or None
+
+
 def _count_codex_prompt_turns(session_id: str, normalized_prompt: str) -> int:
     """User turns in a codex rollout carrying the prompt.
 
-    Uses the same `_is_codex_injected_context` filter as `_count_codex`, so
-    the harness's own `<environment_context>`/`<user_instructions>` preamble
-    -- written at thread start, before any prompt is submitted -- is not
-    mistaken for a delivered user turn.
-
     Any skipped record makes the answer unknown rather than low: a rollout
     caught mid-append has an unterminated trailing line, and that line may be
-    the very record carrying this prompt.
+    the very record carrying this prompt. A `response_item` that parses but
+    does not validate is skipped for the same reason. A rollout file holds one
+    session, so every record in it is this session's.
     """
     path = _codex_session_path(session_id)
     skip_counter = _JsonlSkipCounter()
     count = 0
     for record in _iter_jsonl_objects(path, skip_counter):
         if record.get("type") != "response_item":
-            continue
+            continue  # session_meta/event_msg/turn_context: not conversation
         payload = record.get("payload")
-        if not isinstance(payload, dict) or payload.get("type") != "message":
+        if not isinstance(payload, dict):
+            skip_counter.skipped += 1
             continue
-        if payload.get("role") != "user":
-            continue
-        text = _codex_message_text(payload.get("content"))
-        if text and not _is_codex_injected_context(text) and turn_carries_prompt(text, normalized_prompt):
+        text = _codex_user_input_text_or_invalid(payload)
+        if text is _SCHEMA_INVALID:
+            skip_counter.skipped += 1
+        elif turn_carries_prompt(text, normalized_prompt):
             count += 1
     if skip_counter.skipped > 0:
         raise TranscriptSourceError(
             f"codex session transcript for {session_id!r} at {path} is unreadable: "
-            f"{skip_counter.skipped} record(s) unparseable, {count} prompt turn(s) counted "
-            f"among the readable ones",
+            f"{skip_counter.skipped} record(s) unparseable or malformed, {count} prompt "
+            f"turn(s) counted among the readable ones",
             code="store_unreadable",
         )
     return count
@@ -1260,22 +1379,20 @@ _CODEX_INJECTED_CONTEXT_TAGS = (
 )
 
 
-def _is_codex_injected_context(text: str) -> bool:
-    """True when a codex user message is wholly one or more harness-injected
-    wrappers, not input the user typed. A real first turn can carry
-    `<environment_context>` immediately followed by `<user_instructions>`
-    in the same message, so this repeatedly peels a leading complete
-    wrapper -- remaining text starts with a recognised opening tag and
-    contains that tag's closing counterpart -- off the front, discarding
-    the block and any whitespace after it, until nothing recognised
-    remains at the front. Suppressed only when that process consumes the
-    entire message; a wrapper followed by genuine text, or text that
-    merely starts with, quotes, or mentions a tag without closing it,
-    leaves something behind and survives."""
+def _strip_codex_injected_context(text: str) -> str:
+    """Return *text* with every leading harness-injected wrapper removed.
+
+    A session's first user message can carry `<environment_context>`
+    immediately followed by `<user_instructions>`, so this repeatedly peels a
+    leading complete wrapper -- remaining text starts with a recognised
+    opening tag and contains that tag's closing counterpart -- off the front,
+    discarding the block and any whitespace after it, until nothing
+    recognised remains at the front. Text that merely starts with, quotes, or
+    mentions a tag without closing it is left alone.
+    """
     stripped = text.strip()
     cursor = 0
     end = len(stripped)
-    consumed_any = False
     progressed = True
     # An integer cursor instead of slicing: re-slicing the suffix per wrapper
     # makes a long run of wrappers quadratic in total bytes.
@@ -1288,10 +1405,19 @@ def _is_codex_injected_context(text: str) -> bool:
                     cursor = close_index + len(close_tag)
                     while cursor < end and stripped[cursor].isspace():
                         cursor += 1
-                    consumed_any = True
                     progressed = True
                     break
-    return consumed_any and cursor >= end
+    return stripped[cursor:]
+
+
+def _is_codex_injected_context(text: str) -> bool:
+    """True when a codex user message is wholly one or more harness-injected
+    wrappers, not input the user typed. Suppressed only when peeling those
+    wrappers consumes the entire message; a wrapper followed by genuine text
+    leaves something behind and survives."""
+    stripped = text.strip()
+    remainder = _strip_codex_injected_context(stripped)
+    return bool(stripped) and not remainder
 
 
 def _fallback_tool_summary(tool_input: Optional[dict]) -> Optional[str]:

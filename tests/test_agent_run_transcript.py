@@ -80,6 +80,37 @@ def _opencode_insert(
         conn.close()
 
 
+def _opencode_insert_raw_part(
+    path: Path, *, part_id: str, message_id: str, session_id: str, time_created: int, raw: str
+) -> None:
+    """Insert a `part` row whose `data` is stored exactly as given, so a
+    persisted-but-malformed payload can be reproduced."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "insert into part (id, message_id, session_id, time_created, data) values (?, ?, ?, ?, ?)",
+            (part_id, message_id, session_id, time_created, raw),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _opencode_insert_raw_message(
+    path: Path, *, message_id: str, session_id: str, time_created: int, raw: str
+) -> None:
+    """Insert a `message` row whose `data` is stored exactly as given."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "insert into message (id, session_id, time_created, data) values (?, ?, ?, ?)",
+            (message_id, session_id, time_created, raw),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _write_jsonl(path: Path, records: list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
@@ -989,6 +1020,407 @@ class TestPromptAttribution:
 
     def test_absent_turn_text_does_not_match(self):
         assert not transcript.turn_carries_prompt(None, "the prompt")
+
+    def test_an_unrelated_turn_merely_containing_the_prompt_does_not_match(self):
+        """A short prompt occurs inside plenty of unrelated turns. Accepting
+        containment stamps a swallowed prompt as delivered whenever any new
+        user turn happens to hold those characters."""
+        assert not transcript.turn_carries_prompt(
+            "this synthetic user turn is unrelated", "hi"
+        )
+
+    def test_the_prompt_with_extra_text_appended_does_not_match(self):
+        """The turn's own text must be the prompt, not the prompt plus a
+        follow-up the user typed after it was swallowed."""
+        prompt = transcript.normalize_prompt_text("fix the parser")
+        assert not transcript.turn_carries_prompt("fix the parser and ship it", prompt)
+        assert not transcript.turn_carries_prompt("please fix the parser", prompt)
+
+    def test_a_rewrapped_long_prompt_still_matches(self):
+        """The false-negative guard: verification failing on a prompt that did
+        land makes the retry ladder resend and duplicate it."""
+        submitted = (
+            "Read the report at docs/report.md in full, summarise every finding "
+            "it lists, and then open a pull request that fixes the first two."
+        )
+        prompt = transcript.normalize_prompt_text(submitted)
+        rewrapped = (
+            "Read the report at docs/report.md in full,\nsummarise every finding it lists,\n"
+            "and then open a pull request\nthat fixes the first two.\n"
+        )
+        assert transcript.turn_carries_prompt(rewrapped, prompt)
+
+    def test_opencode_multi_part_turn_matches_on_a_single_part(self):
+        """opencode merges a repeated messageID into one record holding both
+        texts as separate parts, so a turn's own text can be two independent
+        submissions. Either part being the prompt is this prompt landing."""
+        prompt = transcript.normalize_prompt_text("the second prompt")
+        assert transcript.turn_parts_carry_prompt(
+            ["the first prompt", "the second prompt"], prompt
+        )
+
+    def test_opencode_multi_part_turn_matching_neither_part_does_not_count(self):
+        prompt = transcript.normalize_prompt_text("the third prompt")
+        assert not transcript.turn_parts_carry_prompt(
+            ["the first prompt", "the second prompt"], prompt
+        )
+
+    def test_opencode_a_single_part_turn_matches_whole(self):
+        prompt = transcript.normalize_prompt_text("do the thing")
+        assert transcript.turn_parts_carry_prompt(["do the thing"], prompt)
+        assert not transcript.turn_parts_carry_prompt(["do the thing twice"], prompt)
+
+
+class TestPromptAttributionShortPromptInStores:
+    """F1 end to end: the swallowed short prompt must not verify off an
+    unrelated turn in any harness's own store."""
+
+    def test_claude_unrelated_turn_containing_a_short_prompt_does_not_count(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-short-prompt"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id,
+                    "message": {"role": "user", "content": "this synthetic user turn is unrelated"},
+                },
+            ],
+        )
+        assert transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "hi") == 0
+
+    def test_opencode_unrelated_turn_containing_a_short_prompt_does_not_count(
+        self, tmp_path, monkeypatch
+    ):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
+            parts=[{"type": "text", "text": "this synthetic user turn is unrelated"}],
+        )
+        assert transcript.count_prompt_turns("opencode", "ses_1", None, "hi") == 0
+
+    def test_codex_unrelated_turn_containing_a_short_prompt_does_not_count(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-short-prompt"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "timestamp": "2026-08-19T00:00:00Z", "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "this synthetic user turn is unrelated"}],
+                    },
+                },
+            ],
+        )
+        assert transcript.count_prompt_turns("codex", session_id, None, "hi") == 0
+
+    def test_codex_counts_a_prompt_carried_beside_the_injected_preamble(
+        self, tmp_path, monkeypatch
+    ):
+        """codex prepends `<environment_context>` to the message carrying the
+        session's first prompt. Comparing the whole turn without peeling that
+        documented wrapper off would make every launch fail to verify."""
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-preamble-plus-prompt"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "timestamp": "2026-08-19T00:00:00Z", "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<environment_context>cwd=/tmp</environment_context>\n"
+                                    "<user_instructions>be brief</user_instructions>\n"
+                                    "the prompt",
+                        }],
+                    },
+                },
+            ],
+        )
+        assert transcript.count_prompt_turns("codex", session_id, None, "the prompt") == 1
+        # The wrapper's own text is still not a delivered prompt.
+        assert transcript.count_prompt_turns("codex", session_id, None, "cwd=/tmp") == 0
+
+
+class TestCountPromptTurnsMalformedRecordsAreUnknown:
+    """A record that parses and is recognised but fails schema validation is
+    as unknown as an unparseable line: what it would have held may be this
+    prompt. Counting the valid rows instead reports a flat witness, which is
+    what licenses the ladder to resend prompt-bearing text."""
+
+    def test_opencode_malformed_part_payload_is_unreadable(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000, parts=[],
+        )
+        _opencode_insert_raw_part(
+            db, part_id="p-bad", message_id="m1", session_id="ses_1", time_created=1001,
+            raw='{"type":"text","text":"PROMPT"',
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("opencode", "ses_1", None, "PROMPT")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_opencode_text_part_without_string_text_is_unreadable(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
+            parts=[{"type": "text", "text": {"nested": "object"}}],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("opencode", "ses_1", None, "PROMPT")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_opencode_malformed_message_envelope_is_unreadable(self, tmp_path, monkeypatch):
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert_raw_message(
+            db, message_id="m1", session_id="ses_1", time_created=1000, raw='{"role":"user"'
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("opencode", "ses_1", None, "PROMPT")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_opencode_a_malformed_assistant_part_is_not_fatal(self, tmp_path, monkeypatch):
+        """Scoping: an assistant turn's parts cannot carry a submitted prompt,
+        so one malformed there says nothing about this count. Making every
+        malformed row fatal renders a busy store permanently unreadable, and a
+        permanently unreadable witness can never verify."""
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
+            parts=[{"type": "text", "text": "PROMPT"}],
+        )
+        _opencode_insert(
+            db, message_id="m2", session_id="ses_1", role="assistant", time_created=2000, parts=[],
+        )
+        _opencode_insert_raw_part(
+            db, part_id="p-bad", message_id="m2", session_id="ses_1", time_created=2001,
+            raw='{"type":"text","text":"replying"',
+        )
+        assert transcript.count_prompt_turns("opencode", "ses_1", None, "PROMPT") == 1
+
+    def test_opencode_a_non_text_part_is_not_malformed(self, tmp_path, monkeypatch):
+        """The control: a recognised part type that carries no text is a
+        readable record, not a skip."""
+        db = tmp_path / "opencode.db"
+        _make_opencode_db(db)
+        monkeypatch.setattr(transcript, "OPENCODE_DB_PATH", db)
+        _opencode_insert(
+            db, message_id="m1", session_id="ses_1", role="user", time_created=1000,
+            parts=[{"type": "text", "text": "PROMPT"}, {"type": "compaction"}],
+        )
+        assert transcript.count_prompt_turns("opencode", "ses_1", None, "PROMPT") == 1
+
+    def test_claude_non_object_message_is_unreadable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-bad-message"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(path, [{"type": "user", "sessionId": session_id, "message": "not-an-object"}])
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "PROMPT")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_claude_non_list_non_string_content_is_unreadable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-bad-content"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [{
+                "type": "user", "sessionId": session_id,
+                "message": {"role": "user", "content": 42},
+            }],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "PROMPT")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_claude_text_block_without_string_text_is_unreadable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-bad-block"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [{
+                "type": "user", "sessionId": session_id,
+                "message": {"role": "user", "content": [{"type": "text", "text": None}]},
+            }],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "PROMPT")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_claude_a_malformed_record_of_another_session_is_not_fatal(
+        self, tmp_path, monkeypatch
+    ):
+        """Scoping: claude's project files are shared, and one unrelated
+        session's malformed row must not make this session's witness
+        permanently unreadable."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-shared-file"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id,
+                    "message": {"role": "user", "content": "PROMPT"},
+                },
+                {"type": "user", "sessionId": "some-other-session", "message": "not-an-object"},
+            ],
+        )
+        assert transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "PROMPT") == 1
+
+    def test_claude_a_malformed_assistant_record_is_not_fatal(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-bad-assistant"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id,
+                    "message": {"role": "user", "content": "PROMPT"},
+                },
+                {"type": "assistant", "sessionId": session_id, "message": "not-an-object"},
+            ],
+        )
+        assert transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "PROMPT") == 1
+
+    def test_claude_a_tool_result_record_is_not_malformed(self, tmp_path, monkeypatch):
+        """The control: a `tool_result` block is a valid user record that
+        simply carries no user-supplied text."""
+        monkeypatch.setattr(transcript, "CLAUDE_PROJECTS_DIR", tmp_path)
+        session_id = "sess-tool-result"
+        path = tmp_path / "-Users-x-proj" / f"{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "user", "sessionId": session_id,
+                    "message": {"role": "user", "content": "PROMPT"},
+                },
+                {
+                    "type": "user", "sessionId": session_id,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "out"}],
+                    },
+                },
+            ],
+        )
+        assert transcript.count_prompt_turns("claude", session_id, "/Users/x/proj", "PROMPT") == 1
+
+    def test_codex_non_object_payload_is_unreadable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-bad-payload"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(path, [{"type": "response_item", "payload": "not-an-object"}])
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("codex", session_id, None, "PROMPT")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_codex_user_message_without_list_content_is_unreadable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-bad-content"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [{
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": "not-a-list"},
+            }],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("codex", session_id, None, "PROMPT")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_codex_input_text_block_without_string_text_is_unreadable(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-bad-block"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [{
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": 7}],
+                },
+            }],
+        )
+        with pytest.raises(transcript.TranscriptSourceError) as exc_info:
+            transcript.count_prompt_turns("codex", session_id, None, "PROMPT")
+        assert exc_info.value.code == "store_unreadable"
+
+    def test_codex_a_malformed_assistant_message_is_not_fatal(self, tmp_path, monkeypatch):
+        """Scoping: only a user turn can carry a submitted prompt."""
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-bad-assistant"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "PROMPT"}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "assistant", "content": "not-a-list"},
+                },
+            ],
+        )
+        assert transcript.count_prompt_turns("codex", session_id, None, "PROMPT") == 1
+
+    def test_codex_a_function_call_record_is_not_malformed(self, tmp_path, monkeypatch):
+        """The control: a recognised non-message payload is readable."""
+        monkeypatch.setattr(transcript, "CODEX_SESSIONS_DIR", tmp_path)
+        session_id = "codex-function-call"
+        path = tmp_path / "2026" / "08" / "19" / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl"
+        _write_jsonl(
+            path,
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "PROMPT"}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {"type": "function_call", "call_id": "c1", "name": "bash"},
+                },
+            ],
+        )
+        assert transcript.count_prompt_turns("codex", session_id, None, "PROMPT") == 1
 
 
 class TestCountPromptTurnsUnparseableIsUnknown:

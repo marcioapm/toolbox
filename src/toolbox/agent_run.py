@@ -4423,7 +4423,9 @@ def _opencode_http_prompt_turn_count(
     Implements ``agent_run_transcript``'s submission-verification predicate
     over the HTTP view of the store: role *and* content, because opencode
     persists a message envelope and its text parts as separate events, and
-    adds user-role messages of its own.
+    adds user-role messages of its own. A record of this session whose
+    envelope does not validate makes the whole read unknown, for the same
+    reason a store read raises rather than counting the readable rows.
 
     http.client.HTTPException covers the failures urllib does not wrap:
     resp.read() raises IncompleteRead for a body shorter than Content-Length
@@ -4443,25 +4445,39 @@ def _opencode_http_prompt_turn_count(
         return None
     if not isinstance(data, list):
         return None
-    return sum(
-        1 for item in data
-        if isinstance(item, dict)
-        and (item.get("info") or {}).get("role") == "user"
-        and _agent_run_transcript.turn_carries_prompt(
-            _opencode_http_message_text(item), normalized_prompt
-        )
-    )
+    count = 0
+    for item in data:
+        if not isinstance(item, dict):
+            return None
+        info = item.get("info")
+        if not isinstance(info, dict) or not isinstance(info.get("role"), str):
+            return None
+        if info["role"] != "user":
+            continue
+        texts = _opencode_http_message_texts(item)
+        if texts is None:
+            return None
+        if _agent_run_transcript.turn_parts_carry_prompt(texts, normalized_prompt):
+            count += 1
+    return count
 
 
-def _opencode_http_message_text(message: dict) -> str:
-    """Concatenate one HTTP message record's text parts."""
+def _opencode_http_message_texts(message: dict) -> Optional[list[str]]:
+    """One HTTP message record's text parts, or None when its `parts` do not
+    match the schema and so cannot be read."""
     parts = message.get("parts")
     if not isinstance(parts, list):
-        return ""
-    return "\n".join(
-        part["text"] for part in parts
-        if isinstance(part, dict) and isinstance(part.get("text"), str)
-    )
+        return None
+    texts = []
+    for part in parts:
+        if not isinstance(part, dict):
+            return None
+        if part.get("type") != "text":
+            continue  # file/agent/compaction parts carry no submitted text
+        if not isinstance(part.get("text"), str):
+            return None
+        texts.append(part["text"])
+    return texts
 
 
 class _WitnessSource:
