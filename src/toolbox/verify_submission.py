@@ -526,7 +526,9 @@ def _launch_run(
         *model_args,
         run_name,
     ]
-    return subprocess.run(cmd, capture_output=True, env=env, check=False).returncode == 0
+    return (
+        subprocess.run(cmd, capture_output=True, env=env, check=False).returncode == 0
+    )
 
 
 def _claude_trust_dir(directory: str) -> bool:
