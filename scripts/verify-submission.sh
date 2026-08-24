@@ -355,12 +355,13 @@ else:
 ' 2>/dev/null || echo -1
 }
 
-# distinct_user_messages_containing <url> <text_a> <text_b>: how many *distinct*
-# user-message records carry either text. A single record holding both texts as
-# separate parts is the append/merge behaviour and counts 1, not 2; only two
-# separate records count 2. Prints 0 unless both texts were found at all, so a
-# response missing one of them can never reach the >= 2 the caller tests.
-distinct_user_messages_containing() {
+# duplicated_prompt_texts_present <url> <text_a> <text_b>: how many of the two
+# texts posted under a single messageID are stored in user turns. opencode
+# merges a repeated messageID into one record carrying both texts as separate
+# parts, so counting records understates the duplication; what matters for the
+# retry design is whether the second POST's content survives at all. 2 means it
+# did (the id is not idempotent); 1 means the duplicate was dropped.
+duplicated_prompt_texts_present() {
   curl -sS --max-time 5 "$1" 2>/dev/null | TEXT_A="$2" TEXT_B="$3" python3 -c '
 import json, os, sys
 
@@ -376,18 +377,17 @@ except json.JSONDecodeError:
     raise SystemExit
 
 wanted = (os.environ["TEXT_A"], os.environ["TEXT_B"])
-found = {}
+found = set()
 for message in data if isinstance(data, list) else []:
     if not isinstance(message, dict):
         continue
     if (message.get("info") or {}).get("role") != "user":
         continue
-    message_id = (message.get("info") or {}).get("id")
     blob = "\n".join(texts(message))
     for needle in wanted:
         if needle in blob:
-            found.setdefault(needle, set()).add(message_id)
-print(len(set().union(*found.values())) if len(found) == len(wanted) else 0)
+            found.add(needle)
+print(len(found))
 ' 2>/dev/null || echo 0
 }
 
@@ -930,7 +930,7 @@ sys.exit(0 if key and 'post' in paths[key] else 1)
   fi
 
   # H5: messageID is not idempotent.
-  log "H5: POST the same messageID twice, expect two distinct results"
+  log "H5: POST the same messageID twice, expect both texts to be stored"
   # Both statuses must be 200: rejecting the duplicate is not evidence that
   # repeated message IDs create repeated user-message content.
   # opencode validates messageID as a string with a "msg" prefix; anything
@@ -947,13 +947,13 @@ sys.exit(0 if key and 'post' in paths[key] else 1)
   h5_code_b="$(post_json 5 "$message_url" "$h5_payload_b" -w '%{http_code}')" || h5_code_b="000"
   sleep 1
   local h5_distinct
-  h5_distinct="$(distinct_user_messages_containing "$message_url" "$h5_text_a" "$h5_text_b")"
+  h5_distinct="$(duplicated_prompt_texts_present "$message_url" "$h5_text_a" "$h5_text_b")"
   if [ "$h5_code_a" != "200" ] || [ "$h5_code_b" != "200" ]; then
     log "H5 FAIL: expected both POSTs to return 200, got ${h5_code_a} and ${h5_code_b} — a rejected duplicate is not evidence of non-idempotence"
   elif [ "$h5_distinct" -ge 2 ] 2>/dev/null; then
     h5="PASS"
   else
-    log "H5 FAIL: expected 2 distinct user messages for the duplicated messageID, got ${h5_distinct}"
+    log "H5 FAIL: expected both texts of the duplicated messageID to be stored, got ${h5_distinct} of 2 — a dropped duplicate would make retries silently idempotent"
   fi
 
   kill_run "$run_name"

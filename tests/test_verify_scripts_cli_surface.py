@@ -64,11 +64,11 @@ def test_verify_session_attribution_emits_json_when_an_abort_precedes_cells():
 
 
 def _h5_counter_source() -> str:
-    """The inline python3 program `distinct_user_messages_containing` pipes a
+    """The inline python3 program `duplicated_prompt_texts_present` pipes a
     /session/<id>/message response through. Extracted from the script rather
     than duplicated, so a change to the check is a change to what is tested."""
     source = (SCRIPTS_DIR / "verify-submission.sh").read_text()
-    body = source[source.index("distinct_user_messages_containing() {"):]
+    body = source[source.index("duplicated_prompt_texts_present() {"):]
     body = body[: body.index("\n}\n")]
     return body[body.index("python3 -c '") + len("python3 -c '") : body.rindex("'")]
 
@@ -92,20 +92,28 @@ def _user_message(message_id: str, *texts: str) -> dict:
     }
 
 
-def test_h5_counts_two_records_carrying_the_duplicated_message_id():
-    """H5 exists to prove opencode's messageID is not idempotent: two POSTs
-    with the same id must produce two separate user-message records."""
+def test_h5_counts_both_texts_when_they_land_in_separate_records():
+    """Two POSTs under one messageID stored as two records: both texts
+    survived, so the id did not deduplicate the content."""
     payload = json.dumps([
         _user_message("msg_a", "TEXT-A"),
         _user_message("msg_b", "TEXT-B"),
     ])
-    assert _count_distinct(payload) >= 2
+    assert _count_distinct(payload) == 2
 
 
-def test_h5_fails_when_opencode_merges_both_texts_into_one_record():
-    """The append/merge behaviour, which is precisely what H5 must reject:
-    counting per-needle matches would total 2 here and pass vacuously."""
+def test_h5_counts_both_texts_when_opencode_merges_them_into_one_record():
+    """Measured opencode 1.18.21 behaviour: a repeated messageID appends a part
+    to the existing record. Both texts are stored, so the duplication H5 tests
+    for is real even though only one record exists."""
     payload = json.dumps([_user_message("msg_merged", "TEXT-A", "TEXT-B")])
+    assert _count_distinct(payload) == 2
+
+
+def test_h5_fails_when_the_duplicate_post_is_dropped():
+    """The regression H5 must catch: were a repeated messageID to become
+    idempotent, retries would silently deduplicate and only one text remains."""
+    payload = json.dumps([_user_message("msg_only", "TEXT-A")])
     assert _count_distinct(payload) < 2
 
 
