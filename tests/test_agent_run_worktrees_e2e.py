@@ -976,3 +976,131 @@ class TestE2E7CodexWorktreeLaunch:
         assert session["acquisition"] == "minted"
         assert session["confidence"] == "certain"
         assert session["session_id"] == thread_id
+
+
+@live_only
+class TestE2E7RollbackAppliesToEveryHarness:
+    """The rollback contract E2E2 proves for a raw run applies identically
+    to every managed harness: a preflight failure reached after worktree
+    creation but before ``os.fork()`` removes the worktree and branch this
+    invocation created, and never prints the leaked-worktree warning that
+    only applies once a runner process exists. The trigger -- a missing
+    ``-f/--prompt-file`` -- is rejected inside ``_cmd_launch_locked`` before
+    any harness-specific session acquisition runs (agent_run.py:9200-9202,
+    ahead of the managed-mode block starting at 9351), so the same failure
+    point exercises all three harnesses without needing to fake any of
+    their external binaries.
+    """
+
+    @pytest.mark.parametrize("harness", ["claude", "codex", "opencode"])
+    def test_preflight_failure_after_worktree_creation_removes_worktree_and_branch(
+        self, isolated_runs_root, isolated_log_root, tmp_path, capsys, harness
+    ):
+        repo = _make_repo(tmp_path, f"repo-rollback-{harness}")
+        wt = tmp_path / f"wt-rollback-{harness}"
+        name = f"e2e7-rollback-{harness}"
+        missing_prompt = tmp_path / "no-such-prompt.txt"
+        argv = [
+            "--harness", harness, "-f", str(missing_prompt),
+            "--worktree", str(wt), "--worktree-base", "main",
+            "--worktree-repo", str(repo),
+            name,
+        ]
+
+        with pytest.raises(SystemExit) as exc:
+            agent_run.main(argv)
+        assert "prompt file not found" in str(exc.value)
+
+        assert not wt.exists()
+        porcelain = _git(repo, "worktree", "list", "--porcelain")
+        assert str(wt.resolve()) not in porcelain
+        assert name not in _git(repo, "branch", "--list")
+        assert not (isolated_runs_root / name).exists()
+
+        stderr = capsys.readouterr().err
+        assert "leaving worktree in place" not in stderr, (
+            f"a preflight failure must never print the post-fork leak warning; got: {stderr!r}"
+        )
+
+
+@live_only
+class TestE2E7NoPreforkProcessForClaudeOrCodex:
+    """The audit claim under test: for claude and codex, nothing creates a
+    process in the worktree before the runner fork, so
+    ``args._worktree_process_started`` stays False through a failure
+    reached after session acquisition -- unlike opencode, whose prefork
+    mint sets the mark as the literal last statement before its ``Popen``
+    call (agent_run.py:11215-11224), regardless of whether that Popen ever
+    produces a usable session.
+
+    One failure point -- ``_persist_submit_mode`` raising -- is injected
+    strictly after every harness's session-acquisition block (claude's
+    push, codex's argv stub, opencode's real prefork mint against a fake
+    `opencode` binary) and strictly before the unconditional mark every
+    harness sets right before ``os.fork()`` (agent_run.py:9478). Only a
+    harness's own acquisition path can set the mark before that point, so
+    a difference between harnesses here isolates exactly the claim in
+    question rather than an artifact of where the failure was injected.
+    """
+
+    @pytest.mark.parametrize("harness", ["claude", "codex", "opencode"])
+    def test_prefork_mark_reflects_only_the_harnesss_own_acquisition_path(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, harness
+    ):
+        repo = _make_repo(tmp_path, f"repo-premark-{harness}")
+        wt = tmp_path / f"wt-premark-{harness}"
+        name = f"e2e7-premark-{harness}"
+
+        # opencode's real prefork mint runs against this fake binary; claude
+        # and codex never invoke an external process before the fork, so
+        # its presence on PATH is inert for them.
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_opencode = bin_dir / "opencode"
+        fake_opencode.write_text("#!/bin/sh\ntrap 'exit 0' TERM\nsleep 60\n")
+        fake_opencode.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+        # Short-circuits the up-to-30s health poll: the mark is already set
+        # (it precedes Popen unconditionally), so a fast, deterministic
+        # "never healthy" outcome is all this test needs from the mint.
+        monkeypatch.setattr(agent_run, "_opencode_health_poll", lambda *a, **k: False)
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("forced failure between acquisition and fork")
+        monkeypatch.setattr(agent_run, "_persist_submit_mode", _boom)
+
+        args = argparse.Namespace(
+            name=name, command=[], interactive=False,
+            prompt_file=None, submit_mode=None, idle_timeout=None,
+            harness=harness, prompt="hi", model=None, agent_mode=None,
+            harness_args=[], permissions="bypass", cwd=None,
+            worktree=str(wt), worktree_base="main", worktree_branch=None,
+            worktree_repo=str(repo), worktree_reuse=False,
+            enable_planning=False, enable_questions=False,
+        )
+
+        try:
+            with pytest.raises(RuntimeError, match="forced failure"):
+                agent_run.cmd_launch(args)
+
+            mark = getattr(args, "_worktree_process_started", None)
+            if harness == "opencode":
+                # Non-vacuity: the claude/codex branch's own assertion
+                # (mark is False) is wrong here -- opencode's prefork mint
+                # genuinely ran and set the mark, so asserting False must
+                # itself fail. The inversion is explicit, not a silent if.
+                with pytest.raises(AssertionError):
+                    assert mark is False
+                assert mark is True, "opencode's prefork mint must have set the mark"
+                assert wt.is_dir(), "a set mark must refuse rollback"
+                assert name in _git(repo, "branch", "--list", name)
+            else:
+                assert mark is False, f"{harness} must never set the pre-fork mark"
+                assert not wt.exists(), f"{harness} preflight failure must roll back"
+                porcelain = _git(repo, "worktree", "list", "--porcelain")
+                assert str(wt.resolve()) not in porcelain
+                assert name not in _git(repo, "branch", "--list")
+        finally:
+            if harness == "opencode" and wt.is_dir():
+                _git(repo, "worktree", "remove", "--force", str(wt))
+                _git(repo, "branch", "-D", name)
