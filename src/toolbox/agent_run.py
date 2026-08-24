@@ -4674,10 +4674,13 @@ def _submit_and_verify(
     no evidence the submission failed, so retrying cannot add information
     and risks a real duplicate prompt (messageID is not idempotent). Only a
     witness that is readable but flat -- proof the user-record count truly
-    did not rise -- earns a retry. Because no transport here offers
-    idempotent submission, a submission that lands between the final read
-    and the resend is still duplicated; the pre-send re-check narrows that
-    window without closing it.
+    did not rise -- earns a retry. The one exception is a keystroke retry
+    whose payload is the submit terminator alone: carrying no prompt text,
+    it cannot duplicate anything, and a swallowed launch prompt is itself a
+    reason the harness has not yet created a transcript to read. Because no
+    transport here offers idempotent submission, a submission that lands
+    between the final read and the resend is still duplicated; the pre-send
+    re-check narrows that window without closing it.
 
     Never raises for a submission failure: an unreadable witness, a
     transport failure, or exhausted attempts all surface as
@@ -4773,10 +4776,22 @@ def _submit_and_verify(
 
         detail = "timeout" if readable_this_attempt else "witness_unreadable"
 
-        # No evidence to justify a resend: the witness was never readable
-        # during this attempt, so a second submission could only duplicate
-        # the prompt, never confirm or refute the first one.
-        if not readable_this_attempt:
+        # The rule against resending on an unreadable witness exists to avoid
+        # duplicating a prompt that may already have landed. A terminator-only
+        # keystroke payload carries no prompt text, so it cannot duplicate
+        # anything: it either submits a composer the TUI left buffered or is
+        # a no-op. That is worth doing precisely when the witness is
+        # unreadable, because a swallowed launch prompt is itself why the
+        # harness has not created a transcript yet.
+        next_send_is_terminator_only = (
+            submit is None
+            and transport == "keystroke"
+            and attempt + 1 <= max_attempts
+            and _keystroke_payload(attempt + 1, text, submit_mode) == _submit_bytes(submit_mode)
+        )
+        if not readable_this_attempt and not next_send_is_terminator_only:
+            # No evidence to justify a resend, and the resend would carry the
+            # prompt text: it could only duplicate, never confirm or refute.
             break
 
     return SubmissionOutcome(False, attempts, transport, detail, delivered=delivered)

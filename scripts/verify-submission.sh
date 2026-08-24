@@ -369,6 +369,20 @@ print(sum(len(ids) for ids in found.values()))
 ' 2>/dev/null || echo 0
 }
 
+# reason_matches <reason> <expected...>: whether prompt_unverified's reason is
+# one of the expected kinds. A reason that carries detail after a colon
+# ("transport_error: [Errno 61] ...") matches on the kind before it, so the
+# check stays specific to the fault without pinning an errno string.
+reason_matches() {
+  local reason="$1" kind
+  shift
+  for kind in "$@"; do
+    [ "$reason" = "$kind" ] && return 0
+    case "$reason" in "${kind}: "*) return 0 ;; esac
+  done
+  return 1
+}
+
 record_row() {
   RESULTS_HARNESS+=("$1")
   RESULTS_VERSION+=("$2")
@@ -553,7 +567,11 @@ run_harness_cells() {
     fi
   elif [ "$harness" = "opencode" ]; then
     log "C3: negative control via an unreachable opencode_port (HTTP witness lands too fast for a timing control)"
-    c3_expected_reasons=(witness_unreadable)
+    # Port 1 refuses both the witness read and the HTTP submission itself, so
+    # the reason is whichever the run reaches first: a refused POST reports
+    # transport_error, a POST that somehow succeeded leaves the witness
+    # unreadable. Neither is a rejection, a timeout or an unwitnessed run.
+    c3_expected_reasons=(transport_error witness_unreadable)
     if agent_run "${launch_args[@]}" \
         --prompt "Reply with exactly this word and nothing else: ${sentinel1}_neg" \
         ${model_args[@]+"${model_args[@]}"} "$c3_run" >/dev/null 2>&1; then
@@ -563,7 +581,10 @@ run_harness_cells() {
           bash -c "[ -s '${c3_state}/opencode_port' ]"; then
         # Corrupt the port before the delayed prompt helper submits.
         echo 1 > "${c3_state}/opencode_port"
-        sleep 6
+        # Every attempt against a refused port still polls its full verify
+        # window before the next, so allow the whole retry budget.
+        wait_for 60 0.5 "prompt_submitted or prompt_unverified appears" \
+          bash -c "[ -f '${c3_state}/prompt_submitted' ] || [ -f '${c3_state}/prompt_unverified' ]" || true
         # The fault is the witness pointing at a port nothing serves. Confirm
         # the corrupted value survived to submission time and that nothing
         # answers there, so an unrelated failure cannot pass this control.
@@ -577,7 +598,6 @@ run_harness_cells() {
         fi
       else
         log "C3: opencode_port never appeared — could not inject the fault"
-        sleep 6
       fi
     else
       log "C3 FAIL: launch itself failed"
@@ -630,7 +650,7 @@ run_harness_cells() {
     log "C3 FAIL: neither prompt_submitted nor prompt_unverified is present"
   elif [ -z "$c3_reason" ]; then
     log "C3 FAIL: prompt_unverified exists but carries no reason"
-  elif ! printf '%s\n' "${c3_expected_reasons[@]}" | grep -qxF "$c3_reason"; then
+  elif ! reason_matches "$c3_reason" "${c3_expected_reasons[@]}"; then
     log "C3 FAIL: prompt_unverified reason is [${c3_reason}], expected one of [${c3_expected_reasons[*]}] for this fault"
   else
     c3="PASS"
@@ -798,14 +818,24 @@ sys.exit(0 if key and 'post' in paths[key] else 1)
   # curl's result would let H3 pass without testing anything: assert the
   # connection was actually aborted (curl exit 28, no http_code) *and* that
   # the turn still ran to completion afterwards.
-  local h3_code="" h3_rc=0
-  h3_code="$(post_json 2 "$message_url" "$h3_payload" -w '%{http_code}')" || h3_rc=$?
-  local h3_aborted=0
-  if [ "$h3_rc" -eq 28 ] && [ -z "${h3_code//0/}" ]; then
-    h3_aborted=1
-  fi
+  #
+  # How long a turn takes is the model's business, so a fixed client timeout
+  # cannot guarantee an abort. Shorten it until one happens: the request is
+  # written to loopback in well under a millisecond, so even the shortest
+  # bound here still delivers it.
+  local h3_code="" h3_rc=0 h3_aborted=0 h3_limit
+  for h3_limit in 2 0.5 0.2; do
+    h3_rc=0
+    h3_code="$(post_json "$h3_limit" "$message_url" "$h3_payload" -w '%{http_code}')" || h3_rc=$?
+    if [ "$h3_rc" -eq 28 ] && [ -z "${h3_code//0/}" ]; then
+      h3_aborted=1
+      log "  client connection aborted at --max-time ${h3_limit}s (curl rc=28)"
+      break
+    fi
+    log "  POST completed within ${h3_limit}s (rc=${h3_rc} http_code=[${h3_code}]); retrying with a shorter client timeout"
+  done
   if [ "$h3_aborted" -ne 1 ]; then
-    log "H3 FAIL: the client connection was not aborted (curl rc=${h3_rc} http_code=[${h3_code}]); fire-and-forget was never exercised"
+    log "H3 FAIL: the client connection was never aborted (last curl rc=${h3_rc} http_code=[${h3_code}]); fire-and-forget was never exercised"
   elif wait_for 60 1 "H3 sentinel reaches the transcript after a dropped connection" \
       transcript_contains "$run_name" "$h3_sentinel"; then
     h3="PASS"

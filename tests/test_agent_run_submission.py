@@ -179,19 +179,23 @@ def test_steer_raw_is_verbatim_even_for_opencode_and_esc(isolated_runs_root, mon
 def test_steer_unverified_exits_nonzero_and_writes_no_marker(
     isolated_runs_root, monkeypatch
 ):
-    """An unreadable witness submits once and makes steer report failure."""
+    """An unreadable witness makes steer report failure, and the message text
+    itself reaches the FIFO exactly once (the retry is the bare terminator)."""
     _fifo, reader = _seed_live_interactive_run(
         isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
     )
     monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
     _witness_unreadable(monkeypatch)
     monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "0.05")
     try:
         assert agent_run.cmd_steer(_steer_args("run")) == 1
-        assert os.read(reader, 4096) == b"hello\r"
+        written = os.read(reader, 4096)
     finally:
         os.close(reader)
+    assert written == b"hello\r\r"
+    assert written.count(b"hello") == 1
 
 
 def test_raw_interactive_launch_still_stamps_prompt_submitted(
@@ -783,15 +787,16 @@ def test_submit_and_verify_late_lander_skips_second_submission(tmp_path, monkeyp
     assert len(submissions) == 1
 
 
-def test_submit_and_verify_witness_unreadable_submits_exactly_once(tmp_path, monkeypatch):
+def test_submit_and_verify_witness_unreadable_never_resends_the_prompt_text(tmp_path, monkeypatch):
     """count_user_records raising TranscriptSourceError (via the real
     witness-source implementation) must degrade to verified=False with
     detail=witness_unreadable, never propagate.
 
-    A witness that stays unreadable for the whole attempt gives no evidence
-    the submission failed to land -- resubmitting risks a real duplicate
-    prompt (messageID is not idempotent) for zero informational gain, so
-    max_attempts is never consulted here: exactly one submission is made.
+    A witness that stays unreadable gives no evidence the submission failed
+    to land, so nothing carrying the prompt text may be resent: that would
+    risk a real duplicate prompt (messageID is not idempotent) for zero
+    informational gain. The terminator-only keystroke retry is exempt --
+    it carries no text and so cannot duplicate anything.
     """
     monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
     monkeypatch.setattr(
@@ -808,19 +813,45 @@ def test_submit_and_verify_witness_unreadable_submits_exactly_once(tmp_path, mon
     submissions = []
     monkeypatch.setattr(
         agent_run, "_submit_via_keystroke",
-        lambda *_a, **_k: submissions.append(1),
+        lambda _state_dir, payload: submissions.append(payload),
     )
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
     os.mkfifo(tmp_path / "stdin")
 
     outcome = agent_run._submit_and_verify(
         tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
-        deadline_s=1.0, max_attempts=2,
+        deadline_s=0.05, max_attempts=5,
+    )
+
+    cr = agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)
+    assert outcome.verified is False
+    assert outcome.detail == "witness_unreadable"
+    # Attempt 1 sends the text; attempt 2 sends the terminator alone; the
+    # loop stops rather than reaching attempt 3, which would resend the text.
+    assert submissions == [b"hello" + cr, cr]
+    assert sum(1 for payload in submissions if b"hello" in payload) == 1
+
+
+def test_submit_and_verify_witness_unreadable_submits_once_for_a_texted_transport(
+    tmp_path, monkeypatch
+):
+    """A transport with no terminator-only form (rpc here) has no
+    non-duplicating retry available, so an unreadable witness stops it at
+    exactly one submission."""
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+    _witness_unreadable(monkeypatch)
+    calls = []
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello",
+        deadline_s=0.05, max_attempts=5,
+        submit=lambda text: calls.append(text),
     )
 
     assert outcome.verified is False
     assert outcome.detail == "witness_unreadable"
     assert outcome.attempts == 1
-    assert len(submissions) == 1
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -963,7 +994,9 @@ def test_unreadable_baseline_cannot_verify_without_fresh_session(tmp_path, monke
 
     assert outcome.verified is False
     assert outcome.detail == "witness_unreadable"
-    assert len(submissions) == 1  # no baseline evidence: never resent
+    # Attempt 2 is the terminator alone, which cannot duplicate anything;
+    # the prompt text itself is sent exactly once.
+    assert sum(1 for payload in submissions if b"hello" in payload) == 1
 
 
 def test_unreadable_baseline_verifies_on_a_fresh_session(tmp_path, monkeypatch):
