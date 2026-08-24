@@ -247,6 +247,106 @@ def test_steer_on_a_raw_run_reports_unwitnessed_and_exits_zero(
         os.close(reader)
 
 
+def test_unverified_prompt_is_not_classified_as_a_launch_failure(
+    isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+):
+    """A run that received its prompt and later failed is a run failure. If
+    prompt_unverified counted as never-submitted, an unverifiable witness
+    would relabel every such failure as launch_failed."""
+    fake_dir = tmp_path / "bin"
+    fake_dir.mkdir()
+    fake = fake_dir / "claude"
+    # Exits non-zero past the launch grace window but inside the prompt
+    # classification window, so only the prompt markers decide the status.
+    fake.write_text("#!/bin/sh\nsleep 2\nexit 9\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+    monkeypatch.setattr(agent_run, "LAUNCH_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(agent_run, "PROMPT_SUBMISSION_DELAY_SECONDS", 0.1)
+    # Widens the classification window (grace + delay + verify budget) well
+    # past the agent's exit without making the helper below wait for it.
+    monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "20")
+    monkeypatch.setenv("AGENT_RUN_SUBMIT_ATTEMPTS", "1")
+    # A managed run whose witness never verifies, resolved immediately:
+    # prompt_unverified is written, prompt_submitted is not.
+    monkeypatch.setattr(
+        agent_run, "_submit_and_verify",
+        lambda *_a, **_k: agent_run.SubmissionOutcome(
+            False, 1, "keystroke", "witness_unreadable", delivered=True
+        ),
+    )
+
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("do the thing\n")
+    name = "unverified-not-launch-failed"
+    ns = argparse.Namespace(
+        name=name, command=[], interactive=True, prompt_file=str(prompt),
+        submit_mode=None, idle_timeout=None,
+        harness="claude", prompt=None, model=None, agent_mode=None,
+        harness_args=[], permissions="bypass",
+    )
+    assert agent_run.cmd_launch(ns) == 0
+
+    state = isolated_runs_root / name
+    assert _wait_until(
+        lambda: (state / "status").read_text().strip() in agent_run.TERMINAL_STATUSES,
+        timeout=20.0,
+    )
+    assert (state / "prompt_unverified").exists()
+    assert not (state / "prompt_submitted").exists()
+    assert (state / "status").read_text().strip() == "failed", (
+        "an unverified prompt means submitted-but-unconfirmed, not never-submitted"
+    )
+    assert agent_run.PROMPT_UNSUBMITTED_ERROR not in _read_launch_error(state)
+
+
+def test_missing_prompt_marker_is_still_classified_as_a_launch_failure(
+    isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+):
+    """The counterpart: neither marker present still means the agent never
+    received its task, so the reclassification above must not swallow it."""
+    fake_dir = tmp_path / "bin"
+    fake_dir.mkdir()
+    fake = fake_dir / "claude"
+    fake.write_text("#!/bin/sh\nsleep 2\nexit 9\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+    monkeypatch.setattr(agent_run, "LAUNCH_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(agent_run, "PROMPT_SUBMISSION_DELAY_SECONDS", 0.1)
+    monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "20")
+    monkeypatch.setenv("AGENT_RUN_SUBMIT_ATTEMPTS", "1")
+    # Neither marker is ever written: the submission never resolved at all.
+    monkeypatch.setattr(agent_run, "_submit_and_verify", lambda *_a, **_k: None)
+
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("do the thing\n")
+    name = "no-marker-launch-failed"
+    ns = argparse.Namespace(
+        name=name, command=[], interactive=True, prompt_file=str(prompt),
+        submit_mode=None, idle_timeout=None,
+        harness="claude", prompt=None, model=None, agent_mode=None,
+        harness_args=[], permissions="bypass",
+    )
+    assert agent_run.cmd_launch(ns) == 0
+
+    state = isolated_runs_root / name
+    assert _wait_until(
+        lambda: (state / "status").read_text().strip() in agent_run.TERMINAL_STATUSES,
+        timeout=20.0,
+    )
+    assert not (state / "prompt_unverified").exists()
+    assert not (state / "prompt_submitted").exists()
+    assert (state / "status").read_text().strip() == "launch_failed"
+    assert agent_run.PROMPT_UNSUBMITTED_ERROR in _read_launch_error(state)
+
+
+def _read_launch_error(state_dir: Path) -> str:
+    try:
+        return (state_dir / "launch_error").read_text()
+    except OSError:
+        return ""
+
+
 def test_unexpected_interactive_select_error_marks_run_failed(
     isolated_runs_root, monkeypatch
 ):

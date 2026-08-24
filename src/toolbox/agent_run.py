@@ -117,8 +117,10 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     pid          runner process id
     pgid         process group id (also the `kill --force` fallback target)
     launch_error first output line of a run that failed at launch
-    prompt_submitted  interactive prompt submission was verified
-    prompt_unverified  verification failed; contains the reason
+    prompt_submitted  interactive prompt submission was verified (or, for an
+                 unmanaged run with no session to witness, was written)
+    prompt_unverified  verification failed; contains the reason. Surfaced on
+                 the watch contract as the `prompt_unverified` key.
     opencode_port  managed interactive opencode HTTP API port used by the witness
     idle_timeout      idle-timeout seconds this run was launched with
     idle_timeout_fired  idle seconds measured when the watchdog fired
@@ -4794,14 +4796,30 @@ def _poll_witness(witness_rose: Callable[[], bool], deadline_s: float) -> bool:
     return witness_rose()
 
 
+def _read_prompt_unverified(state_dir: Optional[Path]) -> Optional[str]:
+    """The reason an interactive prompt's delivery could not be verified, or
+    None when it was verified or no submission has resolved yet.
+
+    A run that received its prompt and failed later projects differently
+    from one that never got it: without this, both look identical to a
+    consumer that only sees the absence of prompt_submitted.
+    """
+    if state_dir is None:
+        return None
+    reason = _read(state_dir / "prompt_unverified")
+    return reason or None
+
+
 def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
     """Build the watch contract with every field at its null/unknown default,
     overridden by *fields*. The key set is fixed here so it cannot vary
     between the normal, missing-state-dir and observation-error branches, and
     ``terminal`` is always derived from ``status`` rather than passed in.
 
-    ``session`` is a new additive field (spec §7): a dict when session.json is
-    present in the run's log dir, null otherwise. Existing keys are unchanged.
+    ``session`` is a dict when session.json is present in the run's log dir,
+    null otherwise. ``prompt_unverified`` carries the reason an interactive
+    prompt's delivery could not be verified, null when it was verified or
+    nothing has been submitted yet.
     """
     payload = {
         "schema": "agent-run.watch.v2",
@@ -4828,6 +4846,7 @@ def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
         },
         "observation_error": None,
         "session": None,
+        "prompt_unverified": None,
         "scratch": _scratch_unknown("not_observed"),
         "hooks": None,
         "transcript": _transcript_unknown("not_observed"),
@@ -4954,6 +4973,7 @@ def _cmd_watch_observe(
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
         session=session_data,
+        prompt_unverified=_read_prompt_unverified(state_dir),
         hooks=_read_hooks_jsonl(log_dir),
         # repo_str is for git-fact attribution; recorded_cwd is for scratch so
         # that --repo (correcting which repo to inspect) does not silently move
@@ -10288,9 +10308,13 @@ def _runner(
                 return
 
     def _prompt_was_required_but_unsubmitted() -> bool:
-        """True when an interactive prompt never reached the agent. The
-        submission helper publishes prompt_submitted only after
-        _submit_and_verify confirms the transcript witness rose.
+        """True when an interactive prompt never reached the agent at all.
+
+        prompt_submitted means delivery was verified; prompt_unverified means
+        the submission was made and its delivery could not be confirmed. Only
+        the absence of both is evidence the agent never received its task --
+        a run that got the prompt and failed later is a run failure, not a
+        launch failure.
 
         Bounded by the helper's own pre-submit delay plus its full
         verify/retry budget: past that, the run may have been steered
@@ -10300,6 +10324,8 @@ def _runner(
         if not (interactive and prompt_file is not None):
             return False
         if (state_dir / "prompt_submitted").exists():
+            return False
+        if (state_dir / "prompt_unverified").exists():
             return False
         if agent_started_monotonic is None:
             return False

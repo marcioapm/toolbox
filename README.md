@@ -839,6 +839,21 @@ still starting up, is not interactive, or the marker is unreadable. Computed
 independently of the store read, so it survives a transcript-store failure
 that nulls out `entries`.
 
+#### `watch --json` — additive `prompt_unverified` key
+
+`agent-run watch <name> --json` gained a top-level `prompt_unverified`
+field: the reason an interactive prompt's delivery could not be verified
+(`witness_unreadable`, `timeout`, `transport_error: ...`, `rejected: ...`,
+`unwitnessed`), or `null` when it was verified or nothing has been submitted
+yet. Every pre-existing key is unchanged in name and meaning.
+
+Without it, "the prompt was submitted and delivery could not be confirmed"
+and "no prompt has been submitted yet" project identically — both are just
+the absence of `prompt_submitted` — so a consumer cannot tell a run that got
+its task and later failed from one that never received it. The same
+distinction is what keeps `_finalize` from recording the former as
+`launch_failed`.
+
 #### `transcript` — the harness's own conversation record
 
 ```bash
@@ -972,23 +987,56 @@ single-directory layout for runs launched before the state/log split.
 ### Verified submission
 
 An interactive launch prompt and every `steer` are self-verifying: delivery
-is confirmed against the harness's own transcript record count (opencode's
-HTTP `/session/<id>/message` endpoint when a port is known, else the
-transcript store), not merely by a successful FIFO/HTTP write. `steer`
-prints `verified` and exits 0 only once the record count has risen above
-its pre-submit baseline; a submission that cannot be verified within the
-default 10 seconds is retried once (two attempts total) when the witness was
-readable but stayed flat -- proof the prompt did not land. A witness that never became
-readable through the whole attempt is left at a single submission: it
-carries no evidence the prompt failed to land, so a retry could only
-duplicate it (messageID is not idempotent). Either way an unverified
-submission has `steer` exit 1 with the reason on stderr and a launch prompt
-write `state_dir/prompt_unverified` instead of stamping `prompt_submitted`.
+is confirmed by a **new user-role record** appearing in the harness's own
+conversation store, not merely by a successful FIFO/HTTP write. Counting
+only user records matters — an assistant reply or a tool call in the
+current turn would otherwise satisfy a raw record count with nothing
+delivered.
+
+The source of that count is resolved once per submission and pinned for the
+whole verification: opencode's HTTP `/session/<id>/message` endpoint when a
+port is known, otherwise the harness transcript store. A pinned source that
+stops answering is an *unreadable witness*, never a reason to fall back to
+the other one — the two count different things and comparing across them
+proves nothing.
+
+`steer` prints `verified` and exits 0 only once the user-record count has
+risen above its pre-submit baseline. A submission that cannot be verified
+within the default 10 seconds is retried once (two attempts total) when the
+witness was readable but stayed flat — proof the prompt did not land. A
+witness that was never readable during an attempt is left at a single
+submission: it carries no evidence the prompt failed to land, so a retry
+could only duplicate it (`messageID` is not idempotent). The retry re-reads
+the witness immediately before resending, which narrows but cannot close the
+window between the last read and the resend; no transport here offers
+idempotent submission. A keystroke retry sends the submit terminator alone
+first, submitting a prompt the TUI buffered but never sent, rather than
+doubling it.
+
+An unreadable *baseline* is only ever upgraded to proof for a session this
+launch minted, which held no records beforehand. A `steer` runs against an
+established session whose existing history would otherwise verify a
+swallowed message, so it reports `witness_unreadable` instead.
+
+Either way an unverified submission has `steer` exit 1 with the reason on
+stderr and a launch prompt write `state_dir/prompt_unverified` instead of
+stamping `prompt_submitted`. That distinction is visible on the watch
+contract's `prompt_unverified` key, and keeps a run that received its prompt
+and later failed from being recorded as `launch_failed`.
+
+A **raw** run (`agent-run -i -f prompt.txt name -- <cmd>`) has no harness
+session and so nothing to witness against. Verification does not apply:
+`prompt_submitted` keeps its original "bytes were written" meaning and
+`steer` reports `unwitnessed` and exits 0. This is distinct in code from a
+managed run whose witness failed, which stays unverified.
+
 Override the timeout/attempt count with `AGENT_RUN_SUBMIT_VERIFY_TIMEOUT`
 and `AGENT_RUN_SUBMIT_ATTEMPTS`; `--raw` steer skips verification entirely
 (arbitrary bytes leave nothing in the transcript to witness). `opencode_port`
 records the port a managed interactive opencode run's HTTP API is
-listening on, so the witness can query it directly.
+listening on, so the witness can query it directly; a caller's
+`--harness-arg=--port` override wins, and the effective port is what gets
+persisted.
 
 `scripts/verify-submission.sh [--harness opencode|claude|codex] [--keep]`
 runs the end-to-end compatibility checks against installed harnesses and
