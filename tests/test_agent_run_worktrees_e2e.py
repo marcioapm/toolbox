@@ -1104,3 +1104,163 @@ class TestE2E7NoPreforkProcessForClaudeOrCodex:
             if harness == "opencode" and wt.is_dir():
                 _git(repo, "worktree", "remove", "--force", str(wt))
                 _git(repo, "branch", "-D", name)
+
+
+_FAKE_CLAUDE_INTERACTIVE_SCRIPT = """#!/bin/sh
+trap 'exit 0' TERM
+sleep 60
+"""
+
+
+def _make_fake_codex_appserver_interactive(bin_dir: Path, *, thread_id: str, cwd_file: Path) -> None:
+    """Like `_make_fake_codex_appserver`, but after the initial turn
+    completes it blocks on a further `recv()` instead of exiting -- matching
+    `_run_managed_interactive_codex_appserver`'s session loop, which keeps
+    the app-server process alive across steers until the runner itself
+    kills it. SIGTERM from the runner's `_teardown_children` (which reads
+    `appserver_pid`) terminates it via Python's default signal handler; no
+    handler is installed here.
+    """
+    fake = bin_dir / "codex"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, os, json\n"
+        "def send(obj):\n"
+        "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "def recv():\n"
+        "    line = sys.stdin.readline()\n"
+        "    if not line:\n"
+        "        sys.exit(0)\n"
+        "    return json.loads(line)\n"
+        f"with open({str(cwd_file)!r}, 'w') as f:\n"
+        "    f.write(os.getcwd())\n"
+        "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+        "    sys.exit(1)\n"
+        f"THREAD_ID = {thread_id!r}\n"
+        "msg = recv()  # initialize\n"
+        "send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'userAgent': 'codex_exec/e2e7'}})\n"
+        "recv()  # initialized notification -- no response\n"
+        "msg = recv()  # thread/start\n"
+        "send({'jsonrpc': '2.0', 'id': msg['id'],\n"
+        "      'result': {'thread': {'id': THREAD_ID, 'path': '~/.codex/sessions/e2e7.jsonl'}}})\n"
+        "msg = recv()  # turn/start (initial prompt)\n"
+        "send({'jsonrpc': '2.0', 'id': msg['id'],\n"
+        "      'result': {'turn': {'id': 'turn-1', 'status': 'inProgress'}}})\n"
+        "send({'jsonrpc': '2.0', 'method': 'item/agentMessage/delta',\n"
+        "      'params': {'delta': 'worktree interactive answer'}})\n"
+        "send({'jsonrpc': '2.0', 'method': 'turn/completed',\n"
+        "      'params': {'turn': {'id': 'turn-1', 'status': 'completed'}}})\n"
+        "# Idle between turns, exactly like a real long-lived app-server\n"
+        "# waiting for the next steer; killed by the runner's teardown.\n"
+        "while True:\n"
+        "    if recv() is None:\n"
+        "        sys.exit(0)\n"
+    )
+    fake.chmod(0o755)
+
+
+@live_only
+class TestE2E7InteractiveWorktreeLaunch:
+    """One interactive (-i) launch per harness with --worktree: the
+    worktree/branch/cwd machinery E2E1 and the E2E7 one-shot tests prove
+    for one-shot launches holds identically when the interactive runner
+    (`_run_interactive` for claude, `_run_managed_interactive_codex_appserver`
+    for codex) drives the run instead. Not a full interactive matrix --
+    steering, resize, and prompt delivery are already covered elsewhere.
+    """
+
+    def test_claude_interactive_worktree_created_and_used_as_cwd(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        repo = _make_repo(tmp_path, "repo-claude-iact")
+        base_oid = _git(repo, "rev-parse", "main").strip()
+        wt = tmp_path / "wt-claude-iact"
+        name = "e2e7-claude-interactive"
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_claude = bin_dir / "claude"
+        fake_claude.write_text(_FAKE_CLAUDE_INTERACTIVE_SCRIPT)
+        fake_claude.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+        argv = [
+            "-i", "--harness", "claude", "--prompt", "hi",
+            "--worktree", str(wt), "--worktree-base", base_oid,
+            "--worktree-repo", str(repo),
+            name,
+        ]
+        runner_pid: Optional[int] = None
+        try:
+            rc = agent_run.main(argv)
+            assert rc == 0
+
+            state_dir = isolated_runs_root / name
+            _wait_for(
+                lambda: (state_dir / "status").exists()
+                and (state_dir / "status").read_text().strip() == "running",
+                10.0, "status=running",
+            )
+            runner_pid = _wait_pid_file(state_dir)
+
+            porcelain = _git(repo, "worktree", "list", "--porcelain")
+            assert str(wt.resolve()) in porcelain
+            assert _git(wt, "rev-parse", "HEAD").strip() == base_oid
+            assert name in _git(repo, "branch", "--list", name)
+            assert (state_dir / "cwd").read_text().strip() == str(wt.resolve())
+
+            os.kill(runner_pid, signal.SIGTERM)
+            status = _wait_terminal(state_dir)
+            assert status in agent_run.TERMINAL_STATUSES
+        finally:
+            _kill_and_reap(runner_pid)
+
+    def test_codex_interactive_worktree_created_and_used_as_cwd(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        repo = _make_repo(tmp_path, "repo-codex-iact")
+        base_oid = _git(repo, "rev-parse", "main").strip()
+        wt = tmp_path / "wt-codex-iact"
+        name = "e2e7-codex-interactive"
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        cwd_file = tmp_path / "codex-iact-cwd.txt"
+        _make_fake_codex_appserver_interactive(
+            bin_dir, thread_id="e2e7-thread-interactive", cwd_file=cwd_file
+        )
+        monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+        argv = [
+            "-i", "--harness", "codex", "--prompt", "hi",
+            "--worktree", str(wt), "--worktree-base", base_oid,
+            "--worktree-repo", str(repo),
+            name,
+        ]
+        runner_pid: Optional[int] = None
+        try:
+            rc = agent_run.main(argv)
+            assert rc == 0
+
+            state_dir = isolated_runs_root / name
+            _wait_for(
+                lambda: (state_dir / "status").exists()
+                and (state_dir / "status").read_text().strip() == "running",
+                10.0, "status=running",
+            )
+            runner_pid = _wait_pid_file(state_dir)
+
+            porcelain = _git(repo, "worktree", "list", "--porcelain")
+            assert str(wt.resolve()) in porcelain
+            assert _git(wt, "rev-parse", "HEAD").strip() == base_oid
+            assert name in _git(repo, "branch", "--list", name)
+            assert (state_dir / "cwd").read_text().strip() == str(wt.resolve())
+            _wait_for(cwd_file.exists, 10.0, "fake codex app-server cwd file")
+            assert cwd_file.read_text().strip() == str(wt.resolve())
+
+            os.kill(runner_pid, signal.SIGTERM)
+            status = _wait_terminal(state_dir)
+            assert status in agent_run.TERMINAL_STATUSES
+        finally:
+            _kill_and_reap(runner_pid)
