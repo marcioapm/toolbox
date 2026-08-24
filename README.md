@@ -1004,14 +1004,18 @@ proves nothing.
 risen above its pre-submit baseline. A submission that cannot be verified
 within the default 10 seconds is retried once (two attempts total) when the
 witness was readable but stayed flat — proof the prompt did not land. A
-witness that was never readable during an attempt is left at a single
-submission: it carries no evidence the prompt failed to land, so a retry
-could only duplicate it (`messageID` is not idempotent). The retry re-reads
-the witness immediately before resending, which narrows but cannot close the
-window between the last read and the resend; no transport here offers
-idempotent submission. A keystroke retry sends the submit terminator alone
-first, submitting a prompt the TUI buffered but never sent, rather than
-doubling it.
+witness that was never readable carries no evidence the prompt failed, so
+the only resends permitted are ones that cannot duplicate it (`messageID`
+is not idempotent): the keystroke terminator sent alone over a composer this
+call is known to have filled, and a repeat of a write that provably put no
+submittable input in front of the harness. Anything else stops at a single
+submission. The retry re-reads the witness immediately before resending,
+which narrows but cannot close the window between the last read and the
+resend; no transport here offers idempotent submission. A keystroke retry
+sends the submit terminator alone first, submitting a prompt the TUI
+buffered but never sent, rather than doubling it — but only after a write
+that delivered the whole payload, since terminating a truncated composer
+would submit a partial prompt as a complete message.
 
 An unreadable *baseline* is only ever upgraded to proof for a session this
 launch minted, which held no records beforehand. A `steer` runs against an
@@ -1027,8 +1031,12 @@ and later failed from being recorded as `launch_failed`.
 A **raw** run (`agent-run -i -f prompt.txt name -- <cmd>`) has no harness
 session and so nothing to witness against. Verification does not apply:
 `prompt_submitted` keeps its original "bytes were written" meaning and
-`steer` reports `unwitnessed` and exits 0. This is distinct in code from a
-managed run whose witness failed, which stays unverified.
+`steer` reports `unwitnessed` and exits 0. A **managed** run whose session
+id could not be acquired (`session.json` with `session_id: null`, or a
+truncated one) equally has nothing to count against, but that is a failed
+mint rather than a mode without verification: it reports `no_session_id`,
+never stamps `prompt_submitted`, and has `steer` exit 1. A managed run whose
+witness merely failed to read stays unverified the same way.
 
 Override the timeout/attempt count with `AGENT_RUN_SUBMIT_VERIFY_TIMEOUT`
 and `AGENT_RUN_SUBMIT_ATTEMPTS`; `--raw` steer skips verification entirely
