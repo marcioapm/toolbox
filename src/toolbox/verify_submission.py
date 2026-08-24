@@ -677,8 +677,11 @@ def run_harness_cells(
     _temp_repos.append(repo_dir)
     _init_test_repo(repo_dir)
     if harness == "claude" and not _claude_trust_dir(os.path.realpath(repo_dir)):
-        _log("C1 FAIL: could not pre-trust the temp repo for claude")
-        return _uniform_row(harness, version_line, "FAIL(claude trust failed)", state)
+        _log(
+            "aborting: claude trust setup failed non-recoverably — "
+            "environment is unsound, results would be misleading"
+        )
+        sys.exit(1)
 
     sentinel1 = f"SENTINEL1_{harness}_{os.getpid()}"
     sentinel2 = f"SENTINEL2_{harness}_{os.getpid()}"
