@@ -30,7 +30,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,8 +42,6 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _BRANCH_PYTHON = _REPO_ROOT / ".venv" / "bin" / "python"
 _AGENT_RUN_SCRIPT = _REPO_ROOT / "src" / "toolbox" / "agent_run.py"
 
-# Polling cap per predicate invocation (seconds).
-_PREDICATE_LIMIT = 15.0
 # Wall-clock bound for `<harness> --version` (seconds).
 _VERSION_PROBE_LIMIT = 15.0
 
@@ -108,9 +105,9 @@ def _agent_run_bin() -> list[str]:
     return [sys.executable, str(_AGENT_RUN_SCRIPT)]
 
 
-def _agent_run(*args: str, capture: bool = True) -> subprocess.CompletedProcess:
+def _agent_run(*args: str, capture: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess:
     cmd = [*_agent_run_bin(), *args]
-    return subprocess.run(cmd, capture_output=capture, text=True, check=False)
+    return subprocess.run(cmd, capture_output=capture, text=True, check=False, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -118,23 +115,22 @@ def _agent_run(*args: str, capture: bool = True) -> subprocess.CompletedProcess:
 # ---------------------------------------------------------------------------
 
 
-def _run_bounded(limit: float, fn, *args) -> int:
-    """Call fn(*args) in a thread; return its exit code or 124 on timeout."""
-    result_box: list[int] = [-1]
+def _run_bounded(limit: float, cmd: list[str], **popen_kwargs) -> int:
+    """Run cmd as a subprocess; return its exit code or 124 on timeout.
 
-    def target():
-        try:
-            rc = fn(*args)
-            result_box[0] = rc if isinstance(rc, int) else 0
-        except Exception:  # noqa: BLE001
-            result_box[0] = 1
-
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    t.join(timeout=limit)
-    if t.is_alive():
+    On TimeoutExpired the child receives SIGKILL and is reaped so no orphan
+    remains. stderr and stdout default to DEVNULL unless overridden.
+    """
+    popen_kwargs.setdefault("stdout", subprocess.DEVNULL)
+    popen_kwargs.setdefault("stderr", subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    try:
+        proc.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
         return 124
-    return result_box[0]
+    return proc.returncode
 
 
 # ---------------------------------------------------------------------------
@@ -194,22 +190,16 @@ def _predicate_transcript_contains(run: str, needle: str) -> int:
 def _wait_for(timeout: float, interval: float, desc: str, pred_fn, *args) -> bool:
     """Poll pred_fn(*args) until it returns 0 or timeout elapses.
 
-    Each predicate invocation is itself bounded by _PREDICATE_LIMIT so a hung
-    check (a blocked socket read, a stalled curl) cannot outlive the timeout.
+    Predicates that call subprocesses bound them with their own --max-time
+    flags; no additional thread wrapper is needed and none is used here.
     """
     start = time.monotonic()
     while True:
-
-        def _call():
-            return pred_fn(*args)
-
-        rc = _run_bounded(_PREDICATE_LIMIT, _call)
+        rc = pred_fn(*args)
         if rc == 0:
             elapsed = time.monotonic() - start
             _log(f"  ok ({elapsed:.2f}s): {desc}")
             return True
-        if rc == 124:
-            _log(f"  (predicate exceeded {_PREDICATE_LIMIT}s and was killed: {desc})")
         elapsed = time.monotonic() - start
         if elapsed > timeout:
             _log(f"  TIMEOUT after {timeout}s: {desc}")
@@ -229,7 +219,10 @@ def transcript_contains(run: str, needle: str) -> bool:
     user's prompt, so searching the full transcript would pass the instant the
     prompt is echoed back, before the agent replies.
     """
-    cp = _agent_run("transcript", run, "--json")
+    try:
+        cp = _agent_run("transcript", run, "--json", timeout=15.0)
+    except subprocess.TimeoutExpired:
+        return False
     for line in cp.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -638,19 +631,6 @@ def _uniform_row(
     return row
 
 
-def _run_harness_version(harness: str, version_file: str) -> int:
-    """Write harness --version output to version_file; return exit code or 124."""
-    with open(version_file, "w") as fh:
-        cp = subprocess.run(
-            [harness, "--version"],
-            stdout=fh,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    return cp.returncode
-
-
 def run_harness_cells(
     harness: str,
     state_dir: str,
@@ -667,12 +647,13 @@ def run_harness_cells(
         return _uniform_row(harness, "-", "SKIP(not installed)", state)
 
     version_file = os.path.join(work_dir, f"{harness}-version.txt")
-    version_rc = _run_bounded(
-        _VERSION_PROBE_LIMIT,
-        _run_harness_version,
-        harness,
-        version_file,
-    )
+    with open(version_file, "w") as _vfh:
+        version_rc = _run_bounded(
+            _VERSION_PROBE_LIMIT,
+            [harness, "--version"],
+            stdout=_vfh,
+            stderr=subprocess.STDOUT,
+        )
     version_line = ""
     try:
         version_line = Path(version_file).read_text().splitlines()[0].strip()

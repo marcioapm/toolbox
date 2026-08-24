@@ -12,7 +12,6 @@ anti-vacuity tests confirm that a broken subject causes a FAIL result.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
