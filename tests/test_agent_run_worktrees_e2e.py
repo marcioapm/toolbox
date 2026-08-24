@@ -871,3 +871,108 @@ class TestE2E7ClaudeWorktreeLaunch:
         assert session["acquisition"] == "pushed"
         assert session["confidence"] == "certain"
         assert session["session_id"] == pushed_session_id
+
+
+def _make_fake_codex_appserver(bin_dir: Path, *, thread_id: str, cwd_file: Path) -> None:
+    """Write a fake `codex` speaking the minimum JSON-RPC subset
+    `_run_managed_oneshot_codex_appserver` and `_CodexAppServer.mint_thread`
+    drive: initialize -> initialized (notification, no response) ->
+    thread/start -> turn/start, then one agentMessage delta and a completed
+    turn. Frame shapes match the real app-server response shapes read by
+    `_CodexAppServer.mint_thread` (``result.thread.id``) and the one-shot
+    runner's frame loop (``item/agentMessage/delta``, ``turn/completed``).
+    cwd is recorded before the handshake so the test can prove app-server
+    was started with the worktree as its cwd, the same fact
+    `_opencode_prefork_mint`'s Popen(cwd=...) establishes for opencode.
+    """
+    fake = bin_dir / "codex"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, os, json\n"
+        "def send(obj):\n"
+        "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "def recv():\n"
+        "    line = sys.stdin.readline()\n"
+        "    if not line:\n"
+        "        sys.exit(0)\n"
+        "    return json.loads(line)\n"
+        f"with open({str(cwd_file)!r}, 'w') as f:\n"
+        "    f.write(os.getcwd())\n"
+        "if len(sys.argv) < 2 or sys.argv[1] != 'app-server':\n"
+        "    sys.exit(1)\n"
+        f"THREAD_ID = {thread_id!r}\n"
+        "msg = recv()  # initialize\n"
+        "send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'userAgent': 'codex_exec/e2e7'}})\n"
+        "recv()  # initialized notification -- no response\n"
+        "msg = recv()  # thread/start\n"
+        "send({'jsonrpc': '2.0', 'id': msg['id'],\n"
+        "      'result': {'thread': {'id': THREAD_ID, 'path': '~/.codex/sessions/e2e7.jsonl'}}})\n"
+        "msg = recv()  # turn/start\n"
+        "send({'jsonrpc': '2.0', 'id': msg['id'],\n"
+        "      'result': {'turn': {'id': 'turn-1', 'status': 'inProgress'}}})\n"
+        "send({'jsonrpc': '2.0', 'method': 'item/agentMessage/delta',\n"
+        "      'params': {'delta': 'worktree answer'}})\n"
+        "send({'jsonrpc': '2.0', 'method': 'turn/completed',\n"
+        "      'params': {'turn': {'id': 'turn-1', 'status': 'completed'}}})\n"
+        "sys.exit(0)\n"
+    )
+    fake.chmod(0o755)
+
+
+@live_only
+class TestE2E7CodexWorktreeLaunch:
+    """A real `agent-run --harness codex --worktree ...` launch. Codex never
+    execs an argv -- both modes drive `codex app-server` over JSON-RPC
+    (agent_run.py:9415), so the fake substitutes the app-server process
+    itself rather than a harness argv, and speaks just enough of the
+    protocol for `_CodexAppServer.mint_thread` and the one-shot turn loop
+    to complete.
+    """
+
+    def test_worktree_created_and_thread_id_lands_in_session_json(
+        self, isolated_runs_root, isolated_log_root, tmp_path, monkeypatch
+    ):
+        repo = _make_repo(tmp_path, "repo-codex-wt")
+        base_oid = _git(repo, "rev-parse", "main").strip()
+        wt = tmp_path / "wt-codex"
+        name = "e2e7-codex-happy"
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        cwd_file = tmp_path / "codex-cwd.txt"
+        thread_id = "e2e7-thread-happy"
+        _make_fake_codex_appserver(bin_dir, thread_id=thread_id, cwd_file=cwd_file)
+        monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+        argv = [
+            "--harness", "codex", "--prompt", "hi",
+            "--worktree", str(wt), "--worktree-base", base_oid,
+            "--worktree-repo", str(repo),
+            name,
+        ]
+        rc = agent_run.main(argv)
+        assert rc == 0
+
+        state_dir = isolated_runs_root / name
+        status = _wait_terminal(state_dir)
+        assert status == "done"
+
+        # The same worktree/branch/cwd contract E2E1 checks for a raw launch.
+        porcelain = _git(repo, "worktree", "list", "--porcelain")
+        assert str(wt.resolve()) in porcelain
+        assert _git(wt, "rev-parse", "HEAD").strip() == base_oid
+        assert name in _git(repo, "branch", "--list", name)
+        assert (state_dir / "cwd").read_text().strip() == str(wt.resolve())
+
+        # The app-server process itself ran with the worktree as its cwd --
+        # mint_thread happens post-fork inside the runner, so this is the
+        # process-tree analogue of opencode's Popen(cwd=...) prefork mint.
+        assert cwd_file.read_text().strip() == str(wt.resolve())
+
+        session = agent_run._read_session_json(isolated_log_root / name)
+        assert session is not None
+        assert session["harness"] == "codex"
+        assert session["acquisition"] == "minted"
+        assert session["confidence"] == "certain"
+        assert session["session_id"] == thread_id
