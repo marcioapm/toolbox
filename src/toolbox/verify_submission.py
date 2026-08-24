@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import functools
 import json
 import os
 import re
@@ -81,6 +82,13 @@ class _State:
             self.skips += 1
 
 
+@dataclass
+class _Config:
+    keep: bool = False
+    json_mode: bool = False
+    work_dir: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Global teardown registry
 # ---------------------------------------------------------------------------
@@ -88,9 +96,6 @@ class _State:
 _launched_runs: list[str] = []
 _temp_repos: list[str] = []
 _claude_trusted_dirs: list[str] = []
-_work_dir: str = ""
-_keep: bool = False
-_json_mode: bool = False
 
 
 def _log(msg: str) -> None:
@@ -573,10 +578,10 @@ def _revoke_claude_trust(directory: str) -> None:
         pass
 
 
-def _cleanup() -> None:
-    if _keep:
+def _cleanup(cfg: _Config) -> None:
+    if cfg.keep:
         print(
-            f"verify-submission: --keep set, leaving {_work_dir} and "
+            f"verify-submission: --keep set, leaving {cfg.work_dir} and "
             f"{len(_launched_runs)} run(s) in place",
             file=sys.stderr,
         )
@@ -591,8 +596,8 @@ def _cleanup() -> None:
     for repo in _temp_repos:
         if repo:
             shutil.rmtree(repo, ignore_errors=True)
-    if _work_dir:
-        shutil.rmtree(_work_dir, ignore_errors=True)
+    if cfg.work_dir:
+        shutil.rmtree(cfg.work_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1247,8 +1252,8 @@ def run_opencode_http_contract(
 # ---------------------------------------------------------------------------
 
 
-def _print_table(rows: list[_HarnessRow]) -> None:
-    out = sys.stderr if _json_mode else sys.stdout
+def _print_table(rows: list[_HarnessRow], cfg: _Config) -> None:
+    out = sys.stderr if cfg.json_mode else sys.stdout
     print(
         f"{'harness':<10} {'version':<14} {'C1':<6} {'C2':<6} {'C3':<6} {'C4':<6}",
         file=out,
@@ -1261,9 +1266,9 @@ def _print_table(rows: list[_HarnessRow]) -> None:
     print(file=out)
 
 
-def _human_print(msg: str) -> None:
+def _human_print(msg: str, cfg: _Config) -> None:
     """Print a human-readable line; redirect to stderr when --json is active."""
-    print(msg, file=sys.stderr if _json_mode else sys.stdout)
+    print(msg, file=sys.stderr if cfg.json_mode else sys.stdout)
 
 
 def _summary_line(state: _State) -> str:
@@ -1281,7 +1286,10 @@ def _summary_line(state: _State) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    global _keep, _work_dir, _json_mode
+    # Reset registries so repeated main() calls don't accumulate entries.
+    _launched_runs.clear()
+    _temp_repos.clear()
+    _claude_trusted_dirs.clear()
 
     parser = argparse.ArgumentParser(
         prog="verify-submission",
@@ -1309,21 +1317,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    _keep = args.keep
-    _json_mode = args.json
+    cfg = _Config(keep=args.keep, json_mode=args.json)
 
-    atexit.register(_cleanup)
+    atexit.register(functools.partial(_cleanup, cfg))
 
     def _sig_handler(signum, frame):
-        _cleanup()
+        _cleanup(cfg)
         sys.exit(1)
 
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
 
-    _work_dir = tempfile.mkdtemp()
-    state_dir = os.path.join(_work_dir, "state")
-    log_dir = os.path.join(_work_dir, "log")
+    cfg.work_dir = tempfile.mkdtemp()
+    state_dir = os.path.join(cfg.work_dir, "state")
+    log_dir = os.path.join(cfg.work_dir, "log")
     os.makedirs(state_dir)
     os.makedirs(log_dir)
     os.environ["AGENT_RUN_STATE_DIR"] = state_dir
@@ -1336,40 +1343,41 @@ def main(argv: list[str] | None = None) -> int:
 
     harnesses = [args.harness] if args.harness else ["opencode", "claude", "codex"]
 
-    _human_print("verify-submission")
+    _human_print("verify-submission", cfg)
     if args.harness:
-        _human_print(f"harness: {args.harness}")
+        _human_print(f"harness: {args.harness}", cfg)
     else:
-        _human_print("harnesses: opencode claude codex (installed only)")
-    _human_print(f"workdir: {_work_dir}")
-    _human_print("")
+        _human_print("harnesses: opencode claude codex (installed only)", cfg)
+    _human_print(f"workdir: {cfg.work_dir}", cfg)
+    _human_print("", cfg)
 
     state = _State()
 
     rows: list[_HarnessRow] = []
     for h in harnesses:
-        row = run_harness_cells(h, state_dir, log_dir, _work_dir, model_args, state)
+        row = run_harness_cells(h, state_dir, log_dir, cfg.work_dir, model_args, state)
         rows.append(row)
-        _human_print("")
+        _human_print("", cfg)
 
     h_results: list[str] = []
     if not args.harness:
         h_results = run_opencode_http_contract(
-            state_dir, log_dir, _work_dir, model_args, state
+            state_dir, log_dir, cfg.work_dir, model_args, state
         )
-        _human_print("")
+        _human_print("", cfg)
 
-    _print_table(rows)
+    _print_table(rows, cfg)
 
     if not args.harness and h_results:
         _human_print(
             f"opencode HTTP contract: H1 {h_results[0]}  H2 {h_results[1]}  "
-            f"H3 {h_results[2]}  H4 {h_results[3]}  H5 {h_results[4]}"
+            f"H3 {h_results[2]}  H4 {h_results[3]}  H5 {h_results[4]}",
+            cfg,
         )
-        _human_print("")
+        _human_print("", cfg)
 
     summary = _summary_line(state)
-    _human_print(summary)
+    _human_print(summary, cfg)
 
     if args.json:
 
