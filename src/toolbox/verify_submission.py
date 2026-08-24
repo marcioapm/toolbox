@@ -93,6 +93,7 @@ class _Config:
 _launched_runs: list[str] = []
 _temp_repos: list[str] = []
 _claude_trusted_dirs: list[str] = []
+_cleanup_done: bool = False
 
 
 def _log(msg: str) -> None:
@@ -593,6 +594,10 @@ def _revoke_claude_trust(directory: str) -> None:
 
 
 def _cleanup(cfg: _Config) -> None:
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
     if cfg.keep:
         print(
             f"verify-submission: --keep set, leaving {cfg.work_dir} and "
@@ -1283,6 +1288,8 @@ def _summary_line(state: _State) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     # Reset registries so repeated main() calls don't accumulate entries.
+    global _cleanup_done
+    _cleanup_done = False
     _launched_runs.clear()
     _temp_repos.clear()
     _claude_trusted_dirs.clear()
