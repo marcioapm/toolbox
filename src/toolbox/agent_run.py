@@ -346,6 +346,7 @@ import codecs
 from contextlib import contextmanager
 import errno
 import fcntl
+import http.client
 import json
 import math
 import os
@@ -4400,14 +4401,19 @@ def _opencode_http_endpoint(state_dir: Path, log_dir: Path) -> Optional[tuple[in
 def _opencode_http_message_count(port: int, session_id: str) -> Optional[int]:
     """GET /session/<id>/message and count user-role entries. None on any
     failure (unreachable server, non-200, malformed body): an unreadable
-    witness is unknown, never zero."""
+    witness is unknown, never zero.
+
+    http.client.HTTPException covers the failures urllib does not wrap:
+    resp.read() raises IncompleteRead for a body shorter than Content-Length
+    and BadStatusLine for non-HTTP bytes, neither of which is an OSError.
+    """
     url = f"http://127.0.0.1:{port}/session/{urllib.parse.quote(session_id, safe='')}/message"
     try:
         with urllib.request.urlopen(url, timeout=2.0) as resp:
             if resp.status != 200:
                 return None
             body = resp.read().decode("utf-8", errors="replace")
-    except OSError:
+    except (OSError, http.client.HTTPException, ValueError):
         return None
     try:
         data = json.loads(body)
@@ -4433,13 +4439,48 @@ class _WitnessSource:
         self._count = count
 
     def user_count(self) -> Optional[int]:
-        """User-record count, or None when this source cannot be read."""
-        return self._count()
+        """User-record count, or None when this source cannot be read.
+
+        Any exception from the underlying counter is an unreadable witness:
+        _submit_and_verify promises never to raise for a submission failure,
+        and a verification bug must not kill an otherwise working run.
+        """
+        try:
+            return self._count()
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def _run_is_managed(log_dir: Optional[Path]) -> bool:
+    """True when the run was launched under --harness and therefore has a
+    harness session, and so a transcript store, to witness against.
+
+    Keyed on session.json existing rather than parsing: ``_record_session``
+    writes it for every managed launch, including one whose session id could
+    not be acquired (``session_id: null``, ``acquisition: "missing"``) and
+    one whose contents are truncated. A raw run (`agent-run NAME -- <cmd>`)
+    never produces the file at all.
+    """
+    if log_dir is None:
+        return False
+    try:
+        os.stat(log_dir / "session.json")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # Unstatable: assume managed, so an unverifiable submission is
+        # reported rather than falsely stamped as delivered.
+        return True
+    return True
 
 
 def _resolve_witness_source(state_dir: Path, log_dir: Optional[Path]) -> Optional[_WitnessSource]:
-    """Pick the witness source for a run, or None when the run is unmanaged
-    (no session.json) and therefore has no transcript to witness against.
+    """Pick the witness source for a run, or None when no usable session id
+    is available to count records for.
+
+    None covers both an unmanaged run (no session.json) and a managed run
+    whose session id could not be acquired; ``_run_is_managed`` separates
+    them, and only the former may treat a write as delivery.
 
     opencode's own HTTP endpoint wins when a port is known: it reports what
     the TUI ingested, without the store's write lag.
@@ -4490,6 +4531,10 @@ class SubmissionOutcome:
     ``unwitnessed``     the run is unmanaged, so no harness session exists to
                         witness against. delivered still reports whether the
                         bytes were written.
+    ``no_session_id``   the run *is* managed but its session id could not be
+                        acquired, so there is a session and no handle on it.
+                        Never a success: unlike ``unwitnessed`` this is a
+                        failed mint, not a mode without verification.
     ``witness_unreadable`` / ``timeout`` / ``transport_error: ...``
     """
     verified: bool
@@ -4542,13 +4587,29 @@ def _submit_via_http(port: int, session_id: str, text: str) -> None:
         sock.close()
 
 
+class _PartialFifoWrite(OSError):
+    """A FIFO write that failed after some bytes of the payload had landed.
+
+    The TUI has ingested a prefix of the payload without its submit
+    terminator, so the composer holds a truncated prompt. Sending the
+    terminator alone next would submit that truncation as a complete
+    message; the composer must be cleared and the text re-sent in full.
+    """
+
+    def __init__(self, written: int, cause: OSError) -> None:
+        super().__init__(f"wrote {written} byte(s) of the payload before failing: {cause}")
+        self.written = written
+
+
 def _write_all_to_fifo(fd: int, payload: bytes) -> None:
     """Write every byte of *payload* to *fd*, retrying short writes.
 
     A pipe guarantees atomicity only up to PIPE_BUF; past that a single
     os.write can truncate the text or drop the submit terminator, leaving
-    the composer holding a partial prompt. EINTR retries; any other OSError
-    propagates to the caller as a failed attempt.
+    the composer holding a partial prompt. EINTR retries. A failure once
+    bytes have already landed raises _PartialFifoWrite carrying the count,
+    so the caller knows the composer is dirty; a failure at offset 0
+    propagates unchanged, meaning nothing reached the TUI at all.
     """
     written = 0
     while written < len(payload):
@@ -4556,17 +4617,29 @@ def _write_all_to_fifo(fd: int, payload: bytes) -> None:
             written += os.write(fd, payload[written:])
         except InterruptedError:
             continue
+        except OSError as exc:
+            if written:
+                raise _PartialFifoWrite(written, exc) from exc
+            raise
 
 
 def _submit_via_keystroke(state_dir: Path, payload: bytes) -> None:
     """Write *payload* to the run's stdin FIFO. Raises OSError if the FIFO
     cannot be opened or the write fails; the caller treats that as a failed
-    attempt, not a crash."""
+    attempt, not a crash. _PartialFifoWrite, a subclass, additionally means
+    a prefix of the payload did reach the TUI.
+
+    A close() failure is swallowed: every byte is already in the pipe by
+    then, so it says nothing about delivery and must not be mistaken for a
+    write that never landed."""
     fd = os.open(str(state_dir / "stdin"), os.O_WRONLY)
     try:
         _write_all_to_fifo(fd, payload)
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 # Sent alone to clear a TUI composer that may still hold a previous
@@ -4574,21 +4647,30 @@ def _submit_via_keystroke(state_dir: Path, payload: bytes) -> None:
 # ctrl-u kills the line readline-style.
 _COMPOSER_RESET_BYTES = b"\x1b\x15"
 
+# The ladder rung that assumes the composer holds something unusable: clear
+# it and re-send the text in full. The last rung, repeated while attempts
+# remain.
+_KEYSTROKE_LADDER_RESET_STEP = 3
 
-def _keystroke_payload(attempt: int, text: bytes, submit_mode: str) -> bytes:
-    """FIFO bytes for one keystroke attempt.
 
-    Attempt 1 sends the text and the Enter sequence. The failure a retry
+def _keystroke_payload(step: int, text: bytes, submit_mode: str) -> bytes:
+    """FIFO bytes for one rung of the keystroke ladder.
+
+    Step 1 sends the text and the Enter sequence. The failure a retry
     exists for is "the TUI took the text but swallowed the Enter", which
-    leaves attempt 1's text sitting in the composer -- so attempt 2 sends
-    the terminator alone, submitting what is already buffered rather than
-    doubling the prompt. Only attempt 3 and later assume the composer is
+    leaves step 1's text sitting in the composer -- so step 2 sends the
+    terminator alone, submitting what is already buffered rather than
+    doubling the prompt. Only step 3 and later assume the composer is
     holding something unusable and clear it before re-sending in full.
+
+    The step is not the attempt number: it advances only when an attempt
+    delivered its whole payload (see _submit_and_verify), because step 2
+    only makes sense once step 1's text is known to be buffered.
     """
     terminator = _submit_bytes(submit_mode)
-    if attempt == 1:
+    if step == 1:
         return text + terminator
-    if attempt == 2:
+    if step == 2:
         return terminator
     return _COMPOSER_RESET_BYTES + text + terminator
 
@@ -4608,9 +4690,12 @@ def _submit_and_verify(
     """Submit text and verify that the pinned witness gained a user record.
 
     Only a fresh session can prove delivery from a nonzero count after an
-    unreadable baseline. An unreadable witness permits no retry except the
-    keystroke ladder's terminator-only second attempt. A custom *submit* may
-    reject immediately or raise OSError; out-of-band TimeoutError propagates.
+    unreadable baseline. On an unreadable witness the only permitted resends
+    are ones that cannot duplicate a prompt that may already have landed:
+    the keystroke ladder's terminator-only rung over a composer known to
+    hold this text, and a repeat of a write that provably delivered no
+    bytes. A custom *submit* may reject immediately or raise OSError;
+    out-of-band TimeoutError propagates.
     """
     if submit is not None:
         transport = transport or "rpc"
@@ -4618,6 +4703,11 @@ def _submit_and_verify(
         endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
         transport = "http" if endpoint is not None else "keystroke"
     witness = _resolve_witness_source(state_dir, log_dir)
+    # No witness has two causes that must not be conflated: a raw run, for
+    # which "written" has always been the only available evidence, and a
+    # managed run whose session id could not be acquired, which is a failed
+    # mint and must never read as a success.
+    unwitnessed_detail = "no_session_id" if _run_is_managed(log_dir) else "unwitnessed"
     baseline = witness.user_count() if witness is not None else None
     # Without a baseline, a count is evidence only for a session this launch
     # just minted, which held no user records before this submission. An
@@ -4638,6 +4728,10 @@ def _submit_and_verify(
     detail: Optional[str] = None
     attempts = 0
     delivered = False
+    # Which rung of the keystroke ladder to send next. Advances only on a
+    # fully delivered write, so a rung that never reached the TUI is re-sent
+    # rather than skipped (see _keystroke_payload).
+    step = 1
 
     for attempt in range(1, max_attempts + 1):
         attempts = attempt
@@ -4654,6 +4748,11 @@ def _submit_and_verify(
             # not answered with a duplicate submission.
             if _witness_rose():
                 return SubmissionOutcome(True, attempts, transport, None, delivered=True)
+        delivered_this_attempt = False
+        # Set when a failure provably put no submittable input in front of the
+        # harness, which makes re-sending duplication-free.
+        resend_cannot_duplicate = False
+        step_sent = step
         try:
             if submit is not None:
                 submit(text)
@@ -4661,8 +4760,8 @@ def _submit_and_verify(
                 port, session_id = endpoint
                 _submit_via_http(port, session_id, text.decode("utf-8", errors="replace"))
             else:
-                _submit_via_keystroke(state_dir, _keystroke_payload(attempt, text, submit_mode))
-            delivered = True
+                _submit_via_keystroke(state_dir, _keystroke_payload(step_sent, text, submit_mode))
+            delivered = delivered_this_attempt = True
         except _SubmissionRejected as exc:
             return SubmissionOutcome(False, attempts, transport, f"rejected: {exc}")
         except TimeoutError:
@@ -4672,46 +4771,64 @@ def _submit_and_verify(
             # non-TimeoutError OSErrors by the transports themselves, so
             # anything reaching here is an out-of-band deadline.
             raise
-        except OSError as exc:
-            # The peer may well have queued the request before the connection
-            # broke (an HTTP reset after the write, an equivalent RPC write),
-            # and no transport here is idempotent. Poll the witness for the
-            # normal window before deciding a resend is warranted.
+        except _PartialFifoWrite as exc:
+            # The composer now holds a prefix of the payload. Terminating that
+            # prefix would submit a truncated prompt as a complete message, so
+            # the next rung must clear the composer and re-send in full.
             detail = f"transport_error: {exc}"
-            if _poll_witness(_witness_rose, deadline_s):
-                return SubmissionOutcome(True, attempts, transport, None, delivered=True)
-            continue
+            step = _KEYSTROKE_LADDER_RESET_STEP
+            # That resend duplicates nothing only if no byte of the trailing
+            # terminator landed: with none of it in the TUI's hands the prefix
+            # was never submitted. A partial terminator (CRLF short-written
+            # after its CR) may already have submitted the truncation.
+            payload_length = len(_keystroke_payload(step_sent, text, submit_mode))
+            resend_cannot_duplicate = (
+                exc.written <= payload_length - len(_submit_bytes(submit_mode))
+            )
+        except OSError as exc:
+            detail = f"transport_error: {exc}"
+            # A keystroke write that failed before its first byte left the
+            # composer exactly as the previous rung left it, so re-sending
+            # the same rung is both correct and duplication-free. HTTP and
+            # RPC offer no such guarantee: the peer may have queued the
+            # request before the connection broke.
+            resend_cannot_duplicate = submit is None and transport == "keystroke"
 
-        if witness is None:
-            # An unmanaged run has no harness session to witness against.
-            # This is not a verification failure -- there is nothing to
-            # verify -- so it reports delivered without a retry, and callers
-            # distinguish it from a managed run whose witness failed.
+        if witness is None and delivered_this_attempt:
+            # Nothing to verify against, so one write is the whole story.
+            # Retrying could only duplicate. Callers decide whether the
+            # detail is a legitimate outcome (raw run) or a failure.
             return SubmissionOutcome(
-                False, attempts, transport, "unwitnessed", delivered=True
+                False, attempts, transport, unwitnessed_detail, delivered=True
             )
 
+        # The peer may well have queued the request before a connection broke
+        # (an HTTP reset after the write, an equivalent RPC write), and no
+        # transport here is idempotent, so a failed attempt gets the same
+        # verification window as a successful one before a resend is
+        # considered.
         if _poll_witness(_witness_rose, deadline_s):
             return SubmissionOutcome(True, attempts, transport, None, delivered=True)
 
-        detail = "timeout" if readable_this_attempt else "witness_unreadable"
+        if delivered_this_attempt:
+            detail = "timeout" if readable_this_attempt else "witness_unreadable"
+            step = min(step + 1, _KEYSTROKE_LADDER_RESET_STEP)
 
-        # The rule against resending on an unreadable witness exists to avoid
-        # duplicating a prompt that may already have landed. A terminator-only
-        # keystroke payload carries no prompt text, so it cannot duplicate
-        # anything: it either submits a composer the TUI left buffered or is
-        # a no-op. That is worth doing precisely when the witness is
-        # unreadable, because a swallowed launch prompt is itself why the
-        # harness has not created a transcript yet.
-        next_send_is_terminator_only = (
+        # A readable-but-flat witness is proof the submission did not land,
+        # which licenses any resend. Without that proof the next send must be
+        # incapable of duplicating: either it carries no prompt text (the
+        # terminator-only rung, over a composer this call is known to have
+        # filled), or the failed attempt delivered no bytes at all.
+        next_step_is_terminator_only = (
             submit is None
             and transport == "keystroke"
-            and attempt + 1 <= max_attempts
-            and _keystroke_payload(attempt + 1, text, submit_mode) == _submit_bytes(submit_mode)
+            and _keystroke_payload(step, text, submit_mode) == _submit_bytes(submit_mode)
         )
-        if not readable_this_attempt and not next_send_is_terminator_only:
-            # No evidence to justify a resend, and the resend would carry the
-            # prompt text: it could only duplicate, never confirm or refute.
+        if not (
+            readable_this_attempt
+            or resend_cannot_duplicate
+            or (next_step_is_terminator_only and delivered_this_attempt)
+        ):
             break
 
     return SubmissionOutcome(False, attempts, transport, detail, delivered=delivered)
@@ -11019,8 +11136,9 @@ def _run_interactive(
                 elif outcome.detail == "unwitnessed" and outcome.delivered:
                     # A raw interactive run has no harness session, so the
                     # marker keeps the weaker meaning it always had for this
-                    # mode: the prompt bytes were written. Distinct from a
-                    # managed run whose witness failed, which stays unverified.
+                    # mode: the prompt bytes were written. A managed run whose
+                    # witness failed or whose session id was never acquired
+                    # (no_session_id) stays unverified instead.
                     _write(state_dir / "prompt_submitted", _now_iso() + "\n")
                 else:
                     _write(state_dir / "prompt_unverified", f"{outcome.detail}\n")

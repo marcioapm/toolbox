@@ -1025,6 +1025,143 @@ def test_resolve_witness_source_is_none_for_an_unmanaged_run(tmp_path):
     assert agent_run._resolve_witness_source(tmp_path, None) is None
 
 
+@pytest.mark.parametrize(
+    "session_json",
+    [
+        pytest.param('{"harness":"opencode","session_id":null,"acquisition":"missing"}',
+                     id="failed_mint"),
+        pytest.param("{broken", id="truncated"),
+        pytest.param('{"harness":"codex","session_id":""}', id="empty_session_id"),
+    ],
+)
+def test_run_is_managed_separates_a_failed_mint_from_a_raw_run(tmp_path, session_json):
+    """Both shapes leave _resolve_witness_source with nothing to count, but a
+    managed run's session.json exists and a raw run's never does."""
+    (tmp_path / "session.json").write_text(session_json)
+
+    assert agent_run._resolve_witness_source(tmp_path, tmp_path) is None
+    assert agent_run._run_is_managed(tmp_path) is True
+    assert agent_run._run_is_managed(tmp_path / "nonexistent") is False
+    assert agent_run._run_is_managed(None) is False
+
+
+@pytest.mark.parametrize(
+    "session_json",
+    [
+        pytest.param('{"harness":"opencode","session_id":null,"acquisition":"missing"}',
+                     id="failed_mint"),
+        pytest.param("{broken", id="truncated"),
+    ],
+)
+def test_managed_run_without_a_session_id_is_never_stamped_as_delivered(
+    tmp_path, monkeypatch, session_json
+):
+    """A failed session mint has nothing to witness against, but unlike a raw
+    run that is a broken launch, not a mode without verification. Reporting
+    it as unwitnessed would stamp prompt_submitted on a run whose prompt was
+    never confirmed and let steer exit 0."""
+    state, log = tmp_path / "state", tmp_path / "log"
+    state.mkdir()
+    log.mkdir()
+    (log / "session.json").write_text(session_json)
+    submissions: list = []
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+    monkeypatch.setattr(
+        agent_run, "_submit_via_keystroke",
+        lambda _state_dir, payload: submissions.append(payload),
+    )
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.0, max_attempts=2, fresh_session=True,
+    )
+
+    assert outcome.detail == "no_session_id"
+    assert outcome.detail != "unwitnessed", "the raw-run exemption must not apply"
+    assert outcome.verified is False
+    assert len(submissions) == 1, "nothing to verify against licenses no resend"
+
+
+def test_steer_on_a_managed_run_without_a_session_id_exits_one(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    """The raw-run exemption returns 0; a failed mint must not borrow it."""
+    _fifo, reader = _seed_live_interactive_run(
+        isolated_runs_root, "run", agent_run.SUBMIT_MODE_CR
+    )
+    log_dir = isolated_log_root / "run"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "session.json").write_text(
+        '{"harness":"opencode","session_id":null,"acquisition":"missing"}'
+    )
+    monkeypatch.setattr(agent_run, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(agent_run.signal, "alarm", lambda _seconds: None)
+    try:
+        assert agent_run.cmd_steer(_steer_args("run")) == 1
+        assert os.read(reader, 4096) == b"hello\r"
+    finally:
+        os.close(reader)
+
+
+@pytest.mark.parametrize(
+    "session_json",
+    [
+        pytest.param('{"harness":"claude","session_id":null,"acquisition":"missing",'
+                     '"confidence":"missing"}', id="failed_mint"),
+        pytest.param("{broken", id="truncated"),
+    ],
+)
+def test_launch_with_an_unusable_session_id_writes_prompt_unverified(
+    isolated_runs_root, isolated_log_root, tmp_path, monkeypatch, session_json
+):
+    """The interactive launch path must not stamp prompt_submitted for a
+    managed run whose session id could not be acquired. _record_session
+    writes exactly this shape when a pre-fork mint fails."""
+    fake_dir = tmp_path / "bin"
+    fake_dir.mkdir()
+    fake = fake_dir / "claude"
+    fake.write_text("#!/bin/sh\nsleep 10\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+    monkeypatch.setattr(agent_run, "PROMPT_SUBMISSION_DELAY_SECONDS", 0.1)
+    monkeypatch.setenv("AGENT_RUN_SUBMIT_VERIFY_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_RUN_SUBMIT_ATTEMPTS", "1")
+    # Substitutes the launch's own session.json for the failed-mint shape,
+    # before the runner forks, so the prompt helper reads only that.
+    monkeypatch.setattr(
+        agent_run, "_record_session",
+        lambda log_dir, *_a, **_k: (log_dir / "session.json").write_text(session_json),
+    )
+
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("do the thing\n")
+    name = "unusable-session-id"
+    ns = argparse.Namespace(
+        name=name, command=[], interactive=True, prompt_file=str(prompt),
+        submit_mode=None, idle_timeout=None,
+        harness="claude", prompt=None, model=None, agent_mode=None,
+        harness_args=[], permissions="bypass",
+    )
+    assert agent_run.cmd_launch(ns) == 0
+
+    state = isolated_runs_root / name
+    try:
+        assert (isolated_log_root / name / "session.json").read_text() == session_json
+        assert _wait_until(lambda: (state / "prompt_unverified").exists(), timeout=20.0), (
+            "a managed run with no usable session id must record why it is unverified"
+        )
+        assert not (state / "prompt_submitted").exists()
+        assert (state / "prompt_unverified").read_text().strip() == "no_session_id"
+    finally:
+        pid_path = state / "pid"
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+
+
 def test_unmanaged_run_reports_unwitnessed_after_one_delivered_write(tmp_path, monkeypatch):
     """A raw run has no harness session, so there is nothing to verify. That
     is not a verification failure: report the write and do not retry."""
@@ -1216,6 +1353,160 @@ def test_fifo_write_retries_eintr(monkeypatch):
     agent_run._write_all_to_fifo(7, payload)
 
     assert bytes(delivered) == payload
+
+
+def test_fifo_write_reports_how_many_bytes_landed_before_failing(monkeypatch):
+    """A payload larger than the pipe buffer can short-write and then fail,
+    leaving the composer holding a truncated prompt. The caller must be able
+    to tell that from a write that never started."""
+    payload = b"X" * 70000 + agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)
+    calls = {"n": 0}
+
+    def short_then_epipe(_fd, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return 65536
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+    monkeypatch.setattr(agent_run.os, "write", short_then_epipe)
+
+    with pytest.raises(agent_run._PartialFifoWrite) as caught:
+        agent_run._write_all_to_fifo(7, payload)
+
+    assert caught.value.written == 65536
+    assert isinstance(caught.value, OSError), "callers catch OSError for a failed attempt"
+
+
+def test_fifo_write_failing_at_offset_zero_is_not_a_partial_write(monkeypatch):
+    """Nothing reached the TUI, so the composer is untouched and the caller
+    must not treat it as dirty."""
+    def refuse(_fd, _data):
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+    monkeypatch.setattr(agent_run.os, "write", refuse)
+
+    with pytest.raises(OSError) as caught:
+        agent_run._write_all_to_fifo(7, b"prompt\r")
+
+    assert not isinstance(caught.value, agent_run._PartialFifoWrite)
+
+
+def test_truncated_keystroke_write_is_never_answered_with_a_bare_terminator(
+    tmp_path, monkeypatch
+):
+    """A write that short-wrote then failed left a truncated prompt with no
+    terminator in the composer. Terminating that submits the truncation as a
+    complete message, so the next payload must reset the composer and carry
+    the full text instead."""
+    submissions: list = []
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+    _witness_unreadable(monkeypatch)
+    text = b"X" * 70000
+
+    def truncate_then_fail(_state_dir, payload):
+        submissions.append(payload)
+        if len(submissions) == 1:
+            raise agent_run._PartialFifoWrite(65536, BrokenPipeError("EPIPE"))
+
+    monkeypatch.setattr(agent_run, "_submit_via_keystroke", truncate_then_fail)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, text, submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.0, max_attempts=2,
+    )
+
+    cr = agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)
+    assert len(submissions) == 2
+    assert submissions[1] != cr, "a bare terminator would submit the truncated prompt"
+    assert submissions[1] == agent_run._COMPOSER_RESET_BYTES + text + cr
+    assert outcome.verified is False
+
+
+def test_failed_keystroke_write_still_gets_its_prompt_text_onto_the_fifo(
+    tmp_path, monkeypatch
+):
+    """Attempt 1 raises before any byte lands (keeper momentarily gone), so
+    nothing is buffered for a terminator to rescue. With the shipped
+    two-attempt budget, answering that with a bare terminator would end the
+    run having sent only a lone CR -- the prompt lost entirely."""
+    submissions: list = []
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+    _witness_unreadable(monkeypatch)
+    landed: list = []
+
+    def enxio_then_ok(_state_dir, payload):
+        submissions.append(payload)
+        if len(submissions) == 1:
+            raise OSError(errno.ENXIO, "Device not configured")
+        landed.append(payload)
+
+    monkeypatch.setattr(agent_run, "_submit_via_keystroke", enxio_then_ok)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"PROMPT", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.0, max_attempts=agent_run.SUBMISSION_MAX_ATTEMPTS,
+    )
+
+    cr = agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)
+    assert agent_run.SUBMISSION_MAX_ATTEMPTS == 2, "the defect needs the shipped budget"
+    assert landed == [b"PROMPT" + cr], "the prompt text must reach the FIFO"
+    assert cr not in landed, "a lone terminator is not a delivered prompt"
+    assert outcome.verified is False
+
+
+def test_transport_error_on_a_texted_transport_never_resends_an_unwitnessed_prompt(
+    tmp_path, monkeypatch
+):
+    """An RPC/HTTP write that raised may still have been queued by the peer.
+    With the witness unreadable afterwards there is no evidence either way,
+    so the text must not be sent a second time."""
+    sent: list = []
+    counts = iter([0])
+
+    def reset_once(payload):
+        sent.append(payload)
+        if len(sent) == 1:
+            raise ConnectionResetError("reset")
+
+    def witness():
+        return next(counts, None)  # baseline 0, then unreadable forever
+
+    _witness_counter(monkeypatch, witness)
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"PROMPT", deadline_s=0.0, max_attempts=3, submit=reset_once,
+    )
+
+    assert sent == [b"PROMPT"], "an unreadable witness licenses no texted resend"
+    assert outcome.verified is False
+    assert outcome.attempts == 1
+
+
+def test_fifo_close_failure_after_a_full_write_is_not_a_failed_attempt(
+    tmp_path, monkeypatch
+):
+    """Every byte is in the pipe before close() runs, so a close error says
+    nothing about delivery. Reporting it as a failed write would make the
+    retry logic treat the payload as never sent and resend the prompt."""
+    os.mkfifo(tmp_path / "stdin")
+    reader = os.open(tmp_path / "stdin", os.O_RDONLY | os.O_NONBLOCK)
+    real_close = os.close
+
+    def close_that_fails(fd):
+        real_close(fd)
+        if fd != reader:
+            raise OSError(errno.EIO, "close failed")
+
+    monkeypatch.setattr(agent_run.os, "close", close_that_fails)
+    try:
+        agent_run._submit_via_keystroke(tmp_path, b"hello\r")
+        assert os.read(reader, 4096) == b"hello\r"
+    finally:
+        monkeypatch.undo()
+        os.close(reader)
 
 
 def test_submit_and_verify_rechecks_the_witness_immediately_before_a_resend(
@@ -1475,6 +1766,153 @@ def test_submit_via_http_is_fire_and_forget(monkeypatch):
     assert sent.get("closed") is True
     assert b"POST /session/ses_1/message" in sent["data"]
     assert b"hello there" in sent["data"]
+
+
+@pytest.fixture
+def http_witness_server():
+    """Serve one canned response on a loopback port, then close.
+
+    Yields a factory taking the raw bytes to write on the socket, so a
+    response the http.client parser rejects can be produced -- which a
+    mocked urlopen cannot reproduce faithfully.
+    """
+    import socket as socket_module
+    import threading
+
+    servers = []
+
+    def serve(raw_response: bytes) -> int:
+        listener = socket_module.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        servers.append(listener)
+
+        def handle():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            with conn:
+                conn.recv(65536)
+                try:
+                    conn.sendall(raw_response)
+                except OSError:
+                    pass
+
+        thread = threading.Thread(target=handle, daemon=True)
+        thread.start()
+        return listener.getsockname()[1]
+
+    yield serve
+    for listener in servers:
+        listener.close()
+
+
+@pytest.mark.parametrize(
+    ("raw_response", "label"),
+    [
+        pytest.param(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: 500\r\n\r\n[{\"info\"",
+            "body shorter than Content-Length (IncompleteRead)",
+            id="truncated_body",
+        ),
+        pytest.param(
+            b"not http at all\r\n\r\ngarbage",
+            "non-HTTP bytes on the port (BadStatusLine)",
+            id="port_collision",
+        ),
+    ],
+)
+def test_opencode_http_count_reports_a_malformed_response_as_unreadable(
+    http_witness_server, raw_response, label
+):
+    """http.client.HTTPException does not subclass OSError, and urllib does
+    not wrap the exceptions resp.read() raises. Letting one escape breaks
+    _submit_and_verify's promise never to raise for a submission failure."""
+    port = http_witness_server(raw_response)
+
+    assert agent_run._opencode_http_message_count(port, "ses_1") is None, label
+
+
+def test_witness_source_treats_a_raising_counter_as_unreadable():
+    """_submit_and_verify never raises for a submission failure, so the
+    pinned source absorbs anything its counter throws."""
+    def explode():
+        raise RuntimeError("counter blew up")
+
+    assert agent_run._WitnessSource("boom", explode).user_count() is None
+
+
+def test_submit_and_verify_survives_a_witness_that_raises(tmp_path, monkeypatch):
+    """The end-to-end counterpart: a counter raising mid-verification
+    degrades to an unreadable witness rather than killing the run."""
+    _no_transport_side_effects(monkeypatch)
+
+    def explode():
+        raise ValueError("malformed body")
+
+    _witness_counter(monkeypatch, explode)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, tmp_path, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.0, max_attempts=2,
+    )
+
+    assert outcome.verified is False
+    assert outcome.detail == "witness_unreadable"
+
+
+@pytest.mark.parametrize(
+    ("harness", "partial_line"),
+    [
+        pytest.param("claude", '{"type":"user","message":{"role":"user","conte', id="claude"),
+        pytest.param("codex", '{"type":"response_item","payload":{"type":"mess', id="codex"),
+    ],
+)
+def test_a_transcript_caught_mid_append_never_causes_a_resend(
+    tmp_path, monkeypatch, harness, partial_line
+):
+    """A transcript is mid-append for the seconds right after a launch prompt
+    lands, and the unterminated trailing line may be that very prompt's
+    record. Counting it as 0 would read as proof the prompt did not land and
+    license a resend of a prompt already delivered.
+
+    Wired through the real transcript reader, not a mocked count, so the
+    store's own unreadable/flat distinction is what is under test.
+    """
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    session_id = "sess-mid-append"
+    if harness == "claude":
+        monkeypatch.setattr(agent_run_transcript, "CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+        store = tmp_path / "projects" / "-tmp-proj" / f"{session_id}.jsonl"
+    else:
+        monkeypatch.setattr(agent_run_transcript, "CODEX_SESSIONS_DIR", tmp_path / "sessions")
+        store = (tmp_path / "sessions" / "2026" / "08" / "19"
+                 / f"rollout-2026-08-19T00-00-00-{session_id}.jsonl")
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(partial_line)
+    (log_dir / "session.json").write_text(
+        json.dumps({"harness": harness, "session_id": session_id})
+    )
+    (log_dir / "run.json").write_text(json.dumps({"cwd": "/tmp/proj"}))
+
+    submissions = _no_transport_side_effects(monkeypatch)
+
+    outcome = agent_run._submit_and_verify(
+        tmp_path, log_dir, b"PROMPT", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=0.0, max_attempts=3, fresh_session=True,
+    )
+
+    cr = agent_run._submit_bytes(agent_run.SUBMIT_MODE_CR)
+    assert outcome.detail == "witness_unreadable", (
+        "a partial record is an unknown count, not an observed zero"
+    )
+    assert sum(1 for payload in submissions if b"PROMPT" in payload) == 1
+    # The terminator-only rung is the one permitted follow-up; the composer
+    # reset that carries the text again must never be reached.
+    assert submissions == [b"PROMPT" + cr, cr]
 
 
 # ---------------------------------------------------------------------------
