@@ -123,7 +123,8 @@ Ephemeral files under $AGENT_RUN_STATE_DIR/<name>/ (default /tmp/agent-runs)::
     prompt_submitted  interactive prompt submission was verified (or, for an
                  unmanaged run with no session to witness, was written)
     prompt_unverified  verification failed; contains the reason. Surfaced on
-                 the watch contract as the `prompt_unverified` key.
+                 the watch contract as the `prompt_unverified` key. Mirrored
+                 into the log dir, which survives this directory.
     opencode_port  managed interactive opencode HTTP API port used by the witness
     idle_timeout      idle-timeout seconds this run was launched with
     idle_timeout_fired  idle seconds measured when the watchdog fired
@@ -160,6 +161,9 @@ Persistent files under $AGENT_RUN_LOG_DIR/<name>/ (default /var/tmp/agent-runs):
 
     log          captured stdout+stderr (PTY-captured when interactive)
     prompt       copy of the -f/--prompt-file input, if one was given
+    prompt_unverified  durable copy of the state-dir file of the same name, so
+                 a postmortem on a preserved log can still tell an
+                 unconfirmed submission from one never attempted
     session.json session attribution (managed mode only): session_id, harness,
                  acquisition, confidence, observed_at; absent for raw runs
     run.json     immutable launch facts + exit facts (all modes): name, argv,
@@ -4898,18 +4902,47 @@ def _poll_witness(witness_rose: Callable[[], bool], deadline_s: float) -> bool:
     return witness_rose()
 
 
-def _read_prompt_unverified(state_dir: Optional[Path]) -> Optional[str]:
+def _record_prompt_unverified(
+    state_dir: Path, log_dir: Optional[Path], reason: Optional[str]
+) -> None:
+    """Record why a prompt's delivery could not be verified, in both the
+    ephemeral state dir and the durable log dir.
+
+    The state dir is what a live `watch`/`_finalize` reads, but it is gone
+    after a reboot or a state GC. Without the log-dir copy a postmortem on a
+    preserved log cannot tell an unconfirmed submission from one that was
+    never attempted -- the two look identical once `prompt_submitted` is
+    simply absent.
+    """
+    text = f"{reason}\n"
+    _write(state_dir / "prompt_unverified", text)
+    if log_dir is None:
+        return
+    try:
+        _write(log_dir / "prompt_unverified", text)
+    except OSError:
+        # The state-dir copy is what gates this run's own behaviour; losing
+        # the durable copy costs postmortem detail, not correctness.
+        pass
+
+
+def _read_prompt_unverified(state_dir: Optional[Path], log_dir: Optional[Path] = None) -> Optional[str]:
     """The reason an interactive prompt's delivery could not be verified, or
     None when it was verified or no submission has resolved yet.
 
     A run that received its prompt and failed later projects differently
     from one that never got it: without this, both look identical to a
-    consumer that only sees the absence of prompt_submitted.
+    consumer that only sees the absence of prompt_submitted. The state dir
+    is preferred when present; the log-dir copy keeps that distinction
+    readable after the state dir has been reclaimed.
     """
-    if state_dir is None:
-        return None
-    reason = _read(state_dir / "prompt_unverified")
-    return reason or None
+    for directory in (state_dir, log_dir):
+        if directory is None:
+            continue
+        reason = _read(directory / "prompt_unverified")
+        if reason:
+            return reason
+    return None
 
 
 def _watch_payload(name: str, observed_at: str, status: str, **fields) -> dict:
@@ -5035,6 +5068,9 @@ def _cmd_watch_observe(
             name, observed_at, WATCH_STATUS_LOG_PRESERVED,
             **observed(repo_arg, None, repo_arg, session_data, None),
             session=session_data,
+            # The state dir is gone; the log dir's durable copy is what keeps
+            # an unconfirmed submission distinguishable from an unattempted one.
+            prompt_unverified=_read_prompt_unverified(None, log_dir),
             hooks=_read_hooks_jsonl(log_dir),
         )
         _watch_emit(
@@ -5075,7 +5111,7 @@ def _cmd_watch_observe(
         ended_at=ended_raw,
         elapsed_s=elapsed_s,
         session=session_data,
-        prompt_unverified=_read_prompt_unverified(state_dir),
+        prompt_unverified=_read_prompt_unverified(state_dir, log_dir),
         hooks=_read_hooks_jsonl(log_dir),
         # repo_str is for git-fact attribution; recorded_cwd is for scratch so
         # that --repo (correcting which repo to inspect) does not silently move
@@ -11613,7 +11649,7 @@ def _run_interactive(
                     # (no_session_id) stays unverified instead.
                     _write(state_dir / "prompt_submitted", _now_iso() + "\n")
                 else:
-                    _write(state_dir / "prompt_unverified", f"{outcome.detail}\n")
+                    _record_prompt_unverified(state_dir, log_dir, outcome.detail)
                     _log_write(
                         log_fd,
                         f"\r\nagent-run: WARNING: initial prompt could not be verified "
@@ -12766,7 +12802,7 @@ def _run_managed_interactive_codex_appserver(
             # content uniformly -- but _finalize must not misclassify a
             # later failure as launch_failed on a turn that plausibly did
             # not land.
-            _write(state_dir / "prompt_unverified", f"{outcome.detail}\n")
+            _record_prompt_unverified(state_dir, log_dir, outcome.detail)
             server.log(
                 f"turn/start could not be verified as delivered "
                 f"({outcome.detail}, {outcome.attempts} attempt(s))"

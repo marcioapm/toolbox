@@ -912,7 +912,9 @@ that nulls out `entries`.
 field: the reason an interactive prompt's delivery could not be verified
 (`witness_unreadable`, `timeout`, `transport_error: ...`, `rejected: ...`,
 `unwitnessed`), or `null` when it was verified or nothing has been submitted
-yet. Every pre-existing key is unchanged in name and meaning.
+yet. Every pre-existing key is unchanged in name and meaning. It is served
+from the state dir while the run's state survives, and from the log dir's
+durable copy afterwards, so a preserved-log postmortem still reports it.
 
 Without it, "the prompt was submitted and delivery could not be confirmed"
 and "no prompt has been submitted yet" project identically — both are just
@@ -1112,10 +1114,13 @@ established session whose existing history would otherwise verify a
 swallowed message, so it reports `witness_unreadable` instead.
 
 Either way an unverified submission has `steer` exit 1 with the reason on
-stderr and a launch prompt write `state_dir/prompt_unverified` instead of
-stamping `prompt_submitted`. That distinction is visible on the watch
-contract's `prompt_unverified` key, and keeps a run that received its prompt
-and later failed from being recorded as `launch_failed`.
+stderr and a launch prompt write `prompt_unverified` instead of stamping
+`prompt_submitted`. The reason is recorded in both the state dir and the log
+dir: the state dir is what a live run reads, and the log dir's copy keeps
+the distinction readable in a postmortem after a reboot or state GC has
+reclaimed it. It is visible on the watch contract's `prompt_unverified` key,
+and keeps a run that received its prompt and later failed from being
+recorded as `launch_failed`.
 
 A **raw** run (`agent-run -i -f prompt.txt name -- <cmd>`) has no harness
 session and so nothing to witness against. Verification does not apply:
