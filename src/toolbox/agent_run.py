@@ -4395,13 +4395,14 @@ def _opencode_argv_port(state_dir: Path) -> Optional[int]:
 
 
 def _effective_argv_model(argv: Sequence[str]) -> Optional[str]:
-    """Return the ``--model`` an argv actually takes effect with.
+    """Return the ``--model`` value the last occurrence in argv resolves to.
 
-    The last occurrence wins, matching how the harness CLIs parse repeated
-    flags: agent-run's managed ``-m`` is appended before harness_args, so
-    ``--harness-arg=--model --harness-arg=other`` overrides it and the run
-    uses that model. All four spellings are recognised: ``-m V``, ``-m=V``,
-    ``--model V``, and ``--model=V``. Non-str tokens are skipped.
+    opencode's CLI itself does not last-win on repeated ``-m``/``--model``
+    flags; it crashes at model resolution instead. cmd_launch rejects
+    duplicates before exec, so this scan's last-occurrence result is only
+    ever consumed for a single-occurrence argv. All four spellings are
+    recognised: ``-m V``, ``-m=V``, ``--model V``, and ``--model=V``.
+    Non-str tokens are skipped.
     """
     model: Optional[str] = None
     for i, token in enumerate(argv):
@@ -4414,6 +4415,27 @@ def _effective_argv_model(argv: Sequence[str]) -> Optional[str]:
         elif token.startswith("--model="):
             model = token[len("--model="):]
     return model
+
+
+def _argv_model_occurrences(argv: Sequence[str]) -> List[str]:
+    """Return every ``--model``/``-m`` value in argv, in order, duplicates
+    included.
+
+    Same four spellings as _effective_argv_model, but keeps every occurrence
+    instead of only the last, so a launch-time duplicate check can report the
+    count and each value.
+    """
+    values: List[str] = []
+    for i, token in enumerate(argv):
+        if not isinstance(token, str):
+            continue
+        if token in ("-m", "--model") and i + 1 < len(argv) and isinstance(argv[i + 1], str):
+            values.append(argv[i + 1])
+        elif token.startswith("-m="):
+            values.append(token[len("-m="):])
+        elif token.startswith("--model="):
+            values.append(token[len("--model="):])
+    return values
 
 
 def _opencode_argv_model(state_dir: Path) -> Optional[str]:
@@ -10316,6 +10338,28 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             _fail_launch_after_starting(
                 f"agent-run: failed to record opencode port: {exc}"
             )
+
+    if harness == "opencode":
+        # opencode itself crashes at model resolution on repeated -m/--model
+        # flags (`j.split is not a function`) and returns a server error for
+        # a value with no `/`; refusing the launch here is a real diagnosis
+        # instead of that cryptic failure or a silent fall-back to no model.
+        model_occurrences = _argv_model_occurrences(argv)
+        if len(model_occurrences) > 1:
+            _fail_launch_after_starting(
+                f"agent-run: opencode rejects repeated model flags "
+                f"({len(model_occurrences)} occurrences: {model_occurrences!r})"
+            )
+        elif len(model_occurrences) == 1:
+            value = model_occurrences[0]
+            slash = value.find("/")
+            provider_id = value[:slash] if slash >= 0 else ""
+            model_id = value[slash + 1:] if slash >= 0 else ""
+            if not provider_id or not model_id:
+                _fail_launch_after_starting(
+                    f"agent-run: invalid opencode model {value!r}; "
+                    f"expected provider/model"
+                )
 
     # Copy the launch facts into the persistent log dir so postmortem survives a
     # reboot that wipes the ephemeral /tmp state. Never a liveness signal.

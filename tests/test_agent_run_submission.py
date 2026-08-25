@@ -2778,20 +2778,24 @@ def test_launch_resolves_to_failed_when_the_port_file_cannot_be_written(
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        # All four spellings of the flag.
-        (["opencode", "-m", "prov/mod"], "prov/mod"),
-        (["opencode", "-m=prov/mod"], "prov/mod"),
-        (["opencode", "--model", "prov/mod"], "prov/mod"),
-        (["opencode", "--model=prov/mod"], "prov/mod"),
-        # No flag at all.
-        (["opencode"], None),
-        # Last-wins across repeated occurrences.
-        (["opencode", "-m", "first/m", "--model", "last/m"], "last/m"),
-        (["opencode", "--model=first/m", "-m", "last/m"], "last/m"),
-        # A trailing --harness-arg-style override beats the managed -m.
-        (["opencode", "-m", "managed/m", "--model", "harness/override"], "harness/override"),
-        # Non-str tokens are skipped without crashing.
-        (["opencode", 42, "-m", "prov/mod"], "prov/mod"),
+        pytest.param(["opencode", "-m", "prov/mod"], "prov/mod", id="short-flag-space"),
+        pytest.param(["opencode", "-m=prov/mod"], "prov/mod", id="short-flag-equals"),
+        pytest.param(["opencode", "--model", "prov/mod"], "prov/mod", id="long-flag-space"),
+        pytest.param(["opencode", "--model=prov/mod"], "prov/mod", id="long-flag-equals"),
+        pytest.param(["opencode"], None, id="absent"),
+        pytest.param(
+            ["opencode", "-m", "first/m", "--model", "last/m"], "last/m",
+            id="last-of-two-occurrences",
+        ),
+        pytest.param(
+            ["opencode", "--model=first/m", "-m", "last/m"], "last/m",
+            id="last-of-two-occurrences-mixed-spelling",
+        ),
+        pytest.param(
+            ["opencode", "-m", "managed/m", "--model", "harness/override"], "harness/override",
+            id="harness-arg-override-beats-managed-flag",
+        ),
+        pytest.param(["opencode", 42, "-m", "prov/mod"], "prov/mod", id="non-str-token-skipped"),
     ],
 )
 def test_effective_argv_model_spellings_and_last_wins(argv, expected):
@@ -2805,15 +2809,17 @@ def test_effective_argv_model_spellings_and_last_wins(argv, expected):
 @pytest.mark.parametrize(
     ("model_value", "expected"),
     [
-        ("llmproxy-openai/gpt-5.6-sol", ("llmproxy-openai", "gpt-5.6-sol")),
-        # First slash only: the remainder is the modelID.
-        ("openrouter/anthropic/claude-3", ("openrouter", "anthropic/claude-3")),
-        # No slash -> None (unsplittable, API requires both fields).
-        ("no-slash-at-all", None),
-        # Empty provider side.
-        ("/just-model", None),
-        # Empty model side.
-        ("just-provider/", None),
+        pytest.param(
+            "llmproxy-openai/gpt-5.6-sol", ("llmproxy-openai", "gpt-5.6-sol"),
+            id="single-slash",
+        ),
+        pytest.param(
+            "openrouter/anthropic/claude-3", ("openrouter", "anthropic/claude-3"),
+            id="split-on-first-slash-only",
+        ),
+        pytest.param("no-slash-at-all", None, id="unsplittable"),
+        pytest.param("/just-model", None, id="empty-provider-side"),
+        pytest.param("just-provider/", None, id="empty-model-side"),
     ],
 )
 def test_opencode_submission_model_splits_on_first_slash(tmp_path, model_value, expected):
@@ -2859,7 +2865,8 @@ def _extract_json_body(raw_request: bytes) -> dict:
 
 
 def _seed_http_run(state_dir: Path, model: str) -> None:
-    """Write the argv and session files that make _submit_and_verify use HTTP."""
+    """Write the argv and opencode_port files that make _submit_and_verify
+    resolve an HTTP transport. Callers write log/session.json themselves."""
     (state_dir / "argv").write_text(json.dumps(["opencode", "--model", model]))
     (state_dir / "opencode_port").write_text("41234\n")
 
@@ -2889,71 +2896,37 @@ def test_http_submission_includes_model_when_model_is_in_argv(tmp_path, monkeypa
     assert body["model"] == {"providerID": "llmproxy-openai", "modelID": "gpt-5.6-sol"}
 
 
-def test_http_submission_omits_model_when_no_model_in_argv(tmp_path, monkeypatch):
-    """A run launched without --model must not send a model field at all --
-    the server must be free to apply its own default."""
+def test_submit_via_http_omits_model_field_when_model_is_none(monkeypatch):
+    """Calling _submit_via_http with model=None (its default) must produce a
+    body byte-identical to the pre-fix payload shape, with no model key at
+    all -- not an empty or null one."""
     import socket as socket_module
-
-    state = tmp_path / "state"
-    log = tmp_path / "log"
-    state.mkdir()
-    log.mkdir()
-    # No --model in argv.
-    (state / "argv").write_text(json.dumps(["opencode", "--port", "41234"]))
-    (state / "opencode_port").write_text("41234\n")
-    (log / "session.json").write_text(json.dumps({"session_id": "ses_2", "harness": "opencode"}))
 
     cap = _CapturingSocket()
     monkeypatch.setattr(socket_module, "create_connection", lambda *_a, **_k: cap)
-    _witness_sequence(monkeypatch, [0, 1])
 
-    outcome = agent_run._submit_and_verify(
-        state, log, b"hello", deadline_s=5.0, max_attempts=1,
-    )
+    agent_run._submit_via_http(41234, "ses_1", "hello", model=None)
 
-    assert outcome.transport == "http"
     body = _extract_json_body(bytes(cap.sent))
-    assert "model" not in body
+    assert body == {"parts": [{"type": "text", "text": "hello"}]}
 
 
-def test_http_submission_omits_model_when_value_has_no_slash(tmp_path, monkeypatch):
-    """A model value that cannot be split into providerID/modelID must produce
-    no model field rather than a malformed pair."""
-    import socket as socket_module
-
+def test_keystroke_transport_does_not_resolve_a_model(tmp_path, monkeypatch):
+    """The keystroke path must never call into model resolution: raising from
+    _opencode_submission_model proves it is not on the keystroke call graph,
+    and the exact FIFO payload proves no JSON body leaked in."""
     state = tmp_path / "state"
     log = tmp_path / "log"
     state.mkdir()
     log.mkdir()
-    (state / "argv").write_text(json.dumps(["opencode", "--model", "no-slash-at-all"]))
-    (state / "opencode_port").write_text("41234\n")
-    (log / "session.json").write_text(json.dumps({"session_id": "ses_3", "harness": "opencode"}))
-
-    cap = _CapturingSocket()
-    monkeypatch.setattr(socket_module, "create_connection", lambda *_a, **_k: cap)
-    _witness_sequence(monkeypatch, [0, 1])
-
-    outcome = agent_run._submit_and_verify(
-        state, log, b"hello", deadline_s=5.0, max_attempts=1,
-    )
-
-    assert outcome.transport == "http"
-    body = _extract_json_body(bytes(cap.sent))
-    assert "model" not in body
-
-
-def test_keystroke_transport_unaffected_by_model_in_argv(tmp_path, monkeypatch):
-    """A run with --model in argv but no resolvable HTTP endpoint falls back to
-    keystroke transport; the model flag has no effect on that path."""
-    state = tmp_path / "state"
-    log = tmp_path / "log"
-    state.mkdir()
-    log.mkdir()
-    # argv has a model but no port file -> no HTTP endpoint -> keystroke.
     (state / "argv").write_text(json.dumps(["opencode", "--model", "prov/mod"]))
 
-    keystroke_payloads: list = []
+    def _boom(_state_dir):
+        raise AssertionError("_opencode_submission_model must not be called on the keystroke arm")
+
+    monkeypatch.setattr(agent_run, "_opencode_submission_model", _boom)
     monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+    keystroke_payloads: list = []
     monkeypatch.setattr(
         agent_run, "_submit_via_keystroke",
         lambda _state_dir, payload: keystroke_payloads.append(payload),
@@ -2967,6 +2940,75 @@ def test_keystroke_transport_unaffected_by_model_in_argv(tmp_path, monkeypatch):
     )
 
     assert outcome.transport == "keystroke"
-    assert len(keystroke_payloads) == 1
-    # The keystroke payload is the raw FIFO bytes, not a JSON body.
-    assert b"hello" in keystroke_payloads[0]
+    assert keystroke_payloads == [b"hello\r"]
+
+
+# ---------------------------------------------------------------------------
+# cmd_launch: opencode model validation
+# ---------------------------------------------------------------------------
+
+def _launch_opencode_with_model_args(
+    isolated_runs_root, monkeypatch, *, name, model, harness_args,
+):
+    monkeypatch.setattr(agent_run, "_find_free_port", lambda: 47001)
+    monkeypatch.setattr(
+        agent_run, "_opencode_prefork_mint",
+        lambda *a, **k: "ses_model_validation",
+    )
+    fake_dir = isolated_runs_root.parent / "bin"
+    fake_dir.mkdir(exist_ok=True)
+    fake = fake_dir / "opencode"
+    fake.write_text("#!/bin/sh\nsleep 30\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_dir) + ":" + os.environ.get("PATH", ""))
+
+    ns = argparse.Namespace(
+        name=name, command=[], interactive=True, prompt_file=None,
+        submit_mode=None, idle_timeout=None,
+        harness="opencode", prompt=None, model=model, agent_mode=None,
+        harness_args=harness_args, permissions="bypass",
+    )
+    return ns
+
+
+def test_launch_resolves_to_failed_when_the_model_flag_is_duplicated(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    """opencode itself crashes at model resolution on a repeated -m/--model
+    flag rather than taking the last one; agent-run must refuse the launch
+    instead of handing opencode an argv it cannot parse."""
+    name = "oc-model-dup"
+    ns = _launch_opencode_with_model_args(
+        isolated_runs_root, monkeypatch, name=name, model="prov/one",
+        harness_args=["--model", "prov/two"],
+    )
+    with pytest.raises(SystemExit, match="rejects repeated model flags"):
+        agent_run.cmd_launch(ns)
+
+    state = isolated_runs_root / name
+    assert (state / "status").read_text().strip() == "failed"
+    assert (state / "exit_code").read_text().strip() == "1"
+    assert (state / "ended_at").is_file()
+    assert not (state / "pid").exists()
+
+
+def test_launch_resolves_to_failed_when_the_model_value_is_unsplittable(
+    isolated_runs_root, isolated_log_root, monkeypatch
+):
+    """A --model value with no `/` is invalid for opencode itself (server
+    error at submission); agent-run must refuse the launch rather than start
+    a run doomed to fail server-side."""
+    name = "oc-model-no-slash"
+    ns = _launch_opencode_with_model_args(
+        isolated_runs_root, monkeypatch, name=name, model="no-slash-at-all",
+        harness_args=[],
+    )
+    with pytest.raises(SystemExit, match="invalid opencode model"):
+        agent_run.cmd_launch(ns)
+
+    state = isolated_runs_root / name
+    assert (state / "status").read_text().strip() == "failed"
+    assert (state / "exit_code").read_text().strip() == "1"
+    assert (state / "ended_at").is_file()
+    assert not (state / "pid").exists()
+
