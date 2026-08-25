@@ -4394,6 +4394,63 @@ def _opencode_argv_port(state_dir: Path) -> Optional[int]:
     return _effective_argv_port(argv)
 
 
+def _effective_argv_model(argv: Sequence[str]) -> Optional[str]:
+    """Return the ``--model`` an argv actually takes effect with.
+
+    The last occurrence wins, matching how the harness CLIs parse repeated
+    flags: agent-run's managed ``-m`` is appended before harness_args, so
+    ``--harness-arg=--model --harness-arg=other`` overrides it and the run
+    uses that model. All four spellings are recognised: ``-m V``, ``-m=V``,
+    ``--model V``, and ``--model=V``. Non-str tokens are skipped.
+    """
+    model: Optional[str] = None
+    for i, token in enumerate(argv):
+        if not isinstance(token, str):
+            continue
+        if token in ("-m", "--model") and i + 1 < len(argv) and isinstance(argv[i + 1], str):
+            model = argv[i + 1]
+        elif token.startswith("-m="):
+            model = token[len("-m="):]
+        elif token.startswith("--model="):
+            model = token[len("--model="):]
+    return model
+
+
+def _opencode_argv_model(state_dir: Path) -> Optional[str]:
+    """Recover the effective --model from the persisted argv."""
+    try:
+        argv = json.loads((state_dir / "argv").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(argv, list):
+        return None
+    return _effective_argv_model(argv)
+
+
+def _opencode_submission_model(state_dir: Path) -> Optional[tuple[str, str]]:
+    """(providerID, modelID) for the model the run was launched with, or None.
+
+    Splits the argv model on the first ``/``: ``llmproxy-openai/gpt-5.6-sol``
+    yields ``("llmproxy-openai", "gpt-5.6-sol")``, and
+    ``openrouter/anthropic/claude-3`` yields ``("openrouter", "anthropic/claude-3")``,
+    matching opencode's own provider/model convention. Returns None when no
+    ``--model`` was given, when the value contains no ``/``, or when either
+    side of the split is empty — the API requires both fields, so an
+    unsplittable value must omit the model field rather than send a malformed pair.
+    """
+    value = _opencode_argv_model(state_dir)
+    if value is None:
+        return None
+    slash = value.find("/")
+    if slash < 0:
+        return None
+    provider_id = value[:slash]
+    model_id = value[slash + 1:]
+    if not provider_id or not model_id:
+        return None
+    return provider_id, model_id
+
+
 def _opencode_http_endpoint(state_dir: Path, log_dir: Path) -> Optional[tuple[int, str]]:
     """(port, session_id) for a managed interactive opencode run whose HTTP
     API is expected to be reachable, else None.
@@ -4614,11 +4671,21 @@ class _SubmissionRejected(Exception):
     explicit rejection is not evidence a resend might succeed."""
 
 
-def _submit_via_http(port: int, session_id: str, text: str) -> None:
+def _submit_via_http(
+    port: int,
+    session_id: str,
+    text: str,
+    *,
+    model: Optional[tuple[str, str]] = None,
+) -> None:
     """POST *text* to opencode's message endpoint without waiting for a
     response. A normal POST blocks until the whole turn completes; dropping
     the connection right after the request is written is safe -- the turn
     still runs to completion server-side.
+
+    When *model* is given as ``(providerID, modelID)``, the JSON body includes
+    a ``model`` field so the server routes inference to the requested provider
+    instead of its own default.
 
     Raises OSError on a connection failure, which the caller treats as a
     failed attempt, not a crash. A socket timeout is re-raised as a
@@ -4627,7 +4694,11 @@ def _submit_via_http(port: int, session_id: str, text: str) -> None:
     transport failure.
     """
     path = f"/session/{urllib.parse.quote(session_id, safe='')}/message"
-    body = json.dumps({"parts": [{"type": "text", "text": text}]}).encode("utf-8")
+    payload: dict = {"parts": [{"type": "text", "text": text}]}
+    if model is not None:
+        provider_id, model_id = model
+        payload["model"] = {"providerID": provider_id, "modelID": model_id}
+    body = json.dumps(payload).encode("utf-8")
     request = (
         f"POST {path} HTTP/1.1\r\n"
         f"Host: 127.0.0.1:{port}\r\n"
@@ -4765,6 +4836,8 @@ def _submit_and_verify(
     else:
         endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
         transport = "http" if endpoint is not None else "keystroke"
+    # Resolve once before the retry loop; model is stable across attempts.
+    submission_model = _opencode_submission_model(state_dir) if transport == "http" else None
     witness = _resolve_witness_source(state_dir, log_dir, text.decode("utf-8", errors="replace"))
     # No witness has two causes that must not be conflated: a raw run, for
     # which "written" has always been the only available evidence, and a
@@ -4826,7 +4899,10 @@ def _submit_and_verify(
                 submit(text)
             elif transport == "http":
                 port, session_id = endpoint
-                _submit_via_http(port, session_id, text.decode("utf-8", errors="replace"))
+                _submit_via_http(
+                    port, session_id, text.decode("utf-8", errors="replace"),
+                    model=submission_model,
+                )
             else:
                 _submit_via_keystroke(state_dir, _keystroke_payload(step_sent, text, submit_mode))
             delivered = delivered_this_attempt = True

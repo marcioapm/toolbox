@@ -2769,3 +2769,204 @@ def test_launch_resolves_to_failed_when_the_port_file_cannot_be_written(
     assert (state / "exit_code").read_text().strip() == "1"
     assert (state / "ended_at").is_file()
     assert not (state / "pid").exists()
+
+
+# ---------------------------------------------------------------------------
+# _effective_argv_model: flag parsing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        # All four spellings of the flag.
+        (["opencode", "-m", "prov/mod"], "prov/mod"),
+        (["opencode", "-m=prov/mod"], "prov/mod"),
+        (["opencode", "--model", "prov/mod"], "prov/mod"),
+        (["opencode", "--model=prov/mod"], "prov/mod"),
+        # No flag at all.
+        (["opencode"], None),
+        # Last-wins across repeated occurrences.
+        (["opencode", "-m", "first/m", "--model", "last/m"], "last/m"),
+        (["opencode", "--model=first/m", "-m", "last/m"], "last/m"),
+        # A trailing --harness-arg-style override beats the managed -m.
+        (["opencode", "-m", "managed/m", "--model", "harness/override"], "harness/override"),
+        # Non-str tokens are skipped without crashing.
+        (["opencode", 42, "-m", "prov/mod"], "prov/mod"),
+    ],
+)
+def test_effective_argv_model_spellings_and_last_wins(argv, expected):
+    assert agent_run._effective_argv_model(argv) == expected
+
+
+# ---------------------------------------------------------------------------
+# _opencode_submission_model: splitting and failure cases
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("model_value", "expected"),
+    [
+        ("llmproxy-openai/gpt-5.6-sol", ("llmproxy-openai", "gpt-5.6-sol")),
+        # First slash only: the remainder is the modelID.
+        ("openrouter/anthropic/claude-3", ("openrouter", "anthropic/claude-3")),
+        # No slash -> None (unsplittable, API requires both fields).
+        ("no-slash-at-all", None),
+        # Empty provider side.
+        ("/just-model", None),
+        # Empty model side.
+        ("just-provider/", None),
+    ],
+)
+def test_opencode_submission_model_splits_on_first_slash(tmp_path, model_value, expected):
+    (tmp_path / "argv").write_text(json.dumps(["opencode", "--model", model_value]))
+    assert agent_run._opencode_submission_model(tmp_path) == expected
+
+
+def test_opencode_submission_model_returns_none_when_argv_missing(tmp_path):
+    assert agent_run._opencode_submission_model(tmp_path) is None
+
+
+def test_opencode_submission_model_returns_none_when_argv_unparsable(tmp_path):
+    (tmp_path / "argv").write_text("{not a list}")
+    assert agent_run._opencode_submission_model(tmp_path) is None
+
+
+def test_opencode_submission_model_returns_none_when_no_model_flag(tmp_path):
+    (tmp_path / "argv").write_text(json.dumps(["opencode", "--port", "41234"]))
+    assert agent_run._opencode_submission_model(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# _submit_and_verify HTTP body: model field presence and absence
+# ---------------------------------------------------------------------------
+
+class _CapturingSocket:
+    """Records every sendall call; close() is a no-op."""
+
+    def __init__(self):
+        self.sent = bytearray()
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.extend(data)
+
+    def close(self) -> None:
+        pass
+
+
+def _extract_json_body(raw_request: bytes) -> dict:
+    """Parse the JSON body out of a raw HTTP/1.1 request."""
+    header_end = raw_request.index(b"\r\n\r\n")
+    return json.loads(raw_request[header_end + 4:].decode("utf-8"))
+
+
+def _seed_http_run(state_dir: Path, model: str) -> None:
+    """Write the argv and session files that make _submit_and_verify use HTTP."""
+    (state_dir / "argv").write_text(json.dumps(["opencode", "--model", model]))
+    (state_dir / "opencode_port").write_text("41234\n")
+
+
+def test_http_submission_includes_model_when_model_is_in_argv(tmp_path, monkeypatch):
+    """An interactive opencode run launched with --model sends model.providerID
+    and model.modelID in the POST body so the server routes inference correctly."""
+    import socket as socket_module
+
+    state = tmp_path / "state"
+    log = tmp_path / "log"
+    state.mkdir()
+    log.mkdir()
+    _seed_http_run(state, "llmproxy-openai/gpt-5.6-sol")
+    (log / "session.json").write_text(json.dumps({"session_id": "ses_1", "harness": "opencode"}))
+
+    cap = _CapturingSocket()
+    monkeypatch.setattr(socket_module, "create_connection", lambda *_a, **_k: cap)
+    _witness_sequence(monkeypatch, [0, 1])
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"hello", deadline_s=5.0, max_attempts=1,
+    )
+
+    assert outcome.transport == "http"
+    body = _extract_json_body(bytes(cap.sent))
+    assert body["model"] == {"providerID": "llmproxy-openai", "modelID": "gpt-5.6-sol"}
+
+
+def test_http_submission_omits_model_when_no_model_in_argv(tmp_path, monkeypatch):
+    """A run launched without --model must not send a model field at all --
+    the server must be free to apply its own default."""
+    import socket as socket_module
+
+    state = tmp_path / "state"
+    log = tmp_path / "log"
+    state.mkdir()
+    log.mkdir()
+    # No --model in argv.
+    (state / "argv").write_text(json.dumps(["opencode", "--port", "41234"]))
+    (state / "opencode_port").write_text("41234\n")
+    (log / "session.json").write_text(json.dumps({"session_id": "ses_2", "harness": "opencode"}))
+
+    cap = _CapturingSocket()
+    monkeypatch.setattr(socket_module, "create_connection", lambda *_a, **_k: cap)
+    _witness_sequence(monkeypatch, [0, 1])
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"hello", deadline_s=5.0, max_attempts=1,
+    )
+
+    assert outcome.transport == "http"
+    body = _extract_json_body(bytes(cap.sent))
+    assert "model" not in body
+
+
+def test_http_submission_omits_model_when_value_has_no_slash(tmp_path, monkeypatch):
+    """A model value that cannot be split into providerID/modelID must produce
+    no model field rather than a malformed pair."""
+    import socket as socket_module
+
+    state = tmp_path / "state"
+    log = tmp_path / "log"
+    state.mkdir()
+    log.mkdir()
+    (state / "argv").write_text(json.dumps(["opencode", "--model", "no-slash-at-all"]))
+    (state / "opencode_port").write_text("41234\n")
+    (log / "session.json").write_text(json.dumps({"session_id": "ses_3", "harness": "opencode"}))
+
+    cap = _CapturingSocket()
+    monkeypatch.setattr(socket_module, "create_connection", lambda *_a, **_k: cap)
+    _witness_sequence(monkeypatch, [0, 1])
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"hello", deadline_s=5.0, max_attempts=1,
+    )
+
+    assert outcome.transport == "http"
+    body = _extract_json_body(bytes(cap.sent))
+    assert "model" not in body
+
+
+def test_keystroke_transport_unaffected_by_model_in_argv(tmp_path, monkeypatch):
+    """A run with --model in argv but no resolvable HTTP endpoint falls back to
+    keystroke transport; the model flag has no effect on that path."""
+    state = tmp_path / "state"
+    log = tmp_path / "log"
+    state.mkdir()
+    log.mkdir()
+    # argv has a model but no port file -> no HTTP endpoint -> keystroke.
+    (state / "argv").write_text(json.dumps(["opencode", "--model", "prov/mod"]))
+
+    keystroke_payloads: list = []
+    monkeypatch.setattr(agent_run, "_opencode_http_endpoint", lambda *_a: None)
+    monkeypatch.setattr(
+        agent_run, "_submit_via_keystroke",
+        lambda _state_dir, payload: keystroke_payloads.append(payload),
+    )
+    monkeypatch.setattr(agent_run, "SUBMISSION_RETRY_BACKOFF_SECONDS", 0.0)
+    _witness_sequence(monkeypatch, [0, 1])
+
+    outcome = agent_run._submit_and_verify(
+        state, log, b"hello", submit_mode=agent_run.SUBMIT_MODE_CR,
+        deadline_s=5.0, max_attempts=1,
+    )
+
+    assert outcome.transport == "keystroke"
+    assert len(keystroke_payloads) == 1
+    # The keystroke payload is the raw FIFO bytes, not a JSON body.
+    assert b"hello" in keystroke_payloads[0]
