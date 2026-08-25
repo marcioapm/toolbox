@@ -4394,6 +4394,85 @@ def _opencode_argv_port(state_dir: Path) -> Optional[int]:
     return _effective_argv_port(argv)
 
 
+def _effective_argv_model(argv: Sequence[str]) -> Optional[str]:
+    """Return the ``--model`` value the last occurrence in argv resolves to.
+
+    opencode's CLI itself does not last-win on repeated ``-m``/``--model``
+    flags; it crashes at model resolution instead. cmd_launch rejects
+    duplicates before exec, so this scan's last-occurrence result is only
+    ever consumed for a single-occurrence argv. All four spellings are
+    recognised: ``-m V``, ``-m=V``, ``--model V``, and ``--model=V``.
+    Non-str tokens are skipped.
+    """
+    model: Optional[str] = None
+    for i, token in enumerate(argv):
+        if not isinstance(token, str):
+            continue
+        if token in ("-m", "--model") and i + 1 < len(argv) and isinstance(argv[i + 1], str):
+            model = argv[i + 1]
+        elif token.startswith("-m="):
+            model = token[len("-m="):]
+        elif token.startswith("--model="):
+            model = token[len("--model="):]
+    return model
+
+
+def _argv_model_occurrences(argv: Sequence[str]) -> List[str]:
+    """Return every ``--model``/``-m`` value in argv, in order, duplicates
+    included.
+
+    Same four spellings as _effective_argv_model, but keeps every occurrence
+    instead of only the last, so a launch-time duplicate check can report the
+    count and each value.
+    """
+    values: List[str] = []
+    for i, token in enumerate(argv):
+        if not isinstance(token, str):
+            continue
+        if token in ("-m", "--model") and i + 1 < len(argv) and isinstance(argv[i + 1], str):
+            values.append(argv[i + 1])
+        elif token.startswith("-m="):
+            values.append(token[len("-m="):])
+        elif token.startswith("--model="):
+            values.append(token[len("--model="):])
+    return values
+
+
+def _opencode_argv_model(state_dir: Path) -> Optional[str]:
+    """Recover the effective --model from the persisted argv."""
+    try:
+        argv = json.loads((state_dir / "argv").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(argv, list):
+        return None
+    return _effective_argv_model(argv)
+
+
+def _opencode_submission_model(state_dir: Path) -> Optional[tuple[str, str]]:
+    """(providerID, modelID) for the model the run was launched with, or None.
+
+    Splits the argv model on the first ``/``: ``llmproxy-openai/gpt-5.6-sol``
+    yields ``("llmproxy-openai", "gpt-5.6-sol")``, and
+    ``openrouter/anthropic/claude-3`` yields ``("openrouter", "anthropic/claude-3")``,
+    matching opencode's own provider/model convention. Returns None when no
+    ``--model`` was given, when the value contains no ``/``, or when either
+    side of the split is empty — the API requires both fields, so an
+    unsplittable value must omit the model field rather than send a malformed pair.
+    """
+    value = _opencode_argv_model(state_dir)
+    if value is None:
+        return None
+    slash = value.find("/")
+    if slash < 0:
+        return None
+    provider_id = value[:slash]
+    model_id = value[slash + 1:]
+    if not provider_id or not model_id:
+        return None
+    return provider_id, model_id
+
+
 def _opencode_http_endpoint(state_dir: Path, log_dir: Path) -> Optional[tuple[int, str]]:
     """(port, session_id) for a managed interactive opencode run whose HTTP
     API is expected to be reachable, else None.
@@ -4614,11 +4693,21 @@ class _SubmissionRejected(Exception):
     explicit rejection is not evidence a resend might succeed."""
 
 
-def _submit_via_http(port: int, session_id: str, text: str) -> None:
+def _submit_via_http(
+    port: int,
+    session_id: str,
+    text: str,
+    *,
+    model: Optional[tuple[str, str]] = None,
+) -> None:
     """POST *text* to opencode's message endpoint without waiting for a
     response. A normal POST blocks until the whole turn completes; dropping
     the connection right after the request is written is safe -- the turn
     still runs to completion server-side.
+
+    When *model* is given as ``(providerID, modelID)``, the JSON body includes
+    a ``model`` field so the server routes inference to the requested provider
+    instead of its own default.
 
     Raises OSError on a connection failure, which the caller treats as a
     failed attempt, not a crash. A socket timeout is re-raised as a
@@ -4627,7 +4716,11 @@ def _submit_via_http(port: int, session_id: str, text: str) -> None:
     transport failure.
     """
     path = f"/session/{urllib.parse.quote(session_id, safe='')}/message"
-    body = json.dumps({"parts": [{"type": "text", "text": text}]}).encode("utf-8")
+    payload: dict = {"parts": [{"type": "text", "text": text}]}
+    if model is not None:
+        provider_id, model_id = model
+        payload["model"] = {"providerID": provider_id, "modelID": model_id}
+    body = json.dumps(payload).encode("utf-8")
     request = (
         f"POST {path} HTTP/1.1\r\n"
         f"Host: 127.0.0.1:{port}\r\n"
@@ -4765,6 +4858,8 @@ def _submit_and_verify(
     else:
         endpoint = _opencode_http_endpoint(state_dir, log_dir) if log_dir is not None else None
         transport = "http" if endpoint is not None else "keystroke"
+    # Resolve once before the retry loop; model is stable across attempts.
+    submission_model = _opencode_submission_model(state_dir) if transport == "http" else None
     witness = _resolve_witness_source(state_dir, log_dir, text.decode("utf-8", errors="replace"))
     # No witness has two causes that must not be conflated: a raw run, for
     # which "written" has always been the only available evidence, and a
@@ -4826,7 +4921,10 @@ def _submit_and_verify(
                 submit(text)
             elif transport == "http":
                 port, session_id = endpoint
-                _submit_via_http(port, session_id, text.decode("utf-8", errors="replace"))
+                _submit_via_http(
+                    port, session_id, text.decode("utf-8", errors="replace"),
+                    model=submission_model,
+                )
             else:
                 _submit_via_keystroke(state_dir, _keystroke_payload(step_sent, text, submit_mode))
             delivered = delivered_this_attempt = True
@@ -10240,6 +10338,28 @@ def _cmd_launch_locked(args: argparse.Namespace, name: str, lock_fd: int) -> int
             _fail_launch_after_starting(
                 f"agent-run: failed to record opencode port: {exc}"
             )
+
+    if harness == "opencode":
+        # opencode itself crashes at model resolution on repeated -m/--model
+        # flags (`j.split is not a function`) and returns a server error for
+        # a value with no `/`; refusing the launch here is a real diagnosis
+        # instead of that cryptic failure or a silent fall-back to no model.
+        model_occurrences = _argv_model_occurrences(argv)
+        if len(model_occurrences) > 1:
+            _fail_launch_after_starting(
+                f"agent-run: opencode rejects repeated model flags "
+                f"({len(model_occurrences)} occurrences: {model_occurrences!r})"
+            )
+        elif len(model_occurrences) == 1:
+            value = model_occurrences[0]
+            slash = value.find("/")
+            provider_id = value[:slash] if slash >= 0 else ""
+            model_id = value[slash + 1:] if slash >= 0 else ""
+            if not provider_id or not model_id:
+                _fail_launch_after_starting(
+                    f"agent-run: invalid opencode model {value!r}; "
+                    f"expected provider/model"
+                )
 
     # Copy the launch facts into the persistent log dir so postmortem survives a
     # reboot that wipes the ephemeral /tmp state. Never a liveness signal.
