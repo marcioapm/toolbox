@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 authors = [
     { name = "Márcio Martins", email = "marcioapm@gmail.com" }
 ]
-dependencies = ["click>=8.0", "pyte>=0.8"]
+dependencies = ["click>=8.0"]
 keywords = ["cli", "gemini", "ai", "tts", "image-generation", "video-generation", "slack"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -21,9 +21,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Utilities",
 ]
-
-[project.optional-dependencies]
-dev = ["pytest-timeout>=2"]
 
 [project.urls]
 Homepage = "https://github.com/marcioapm/toolbox"
@@ -37,20 +34,7 @@ gemini-video = "toolbox.gemini_video:main"
 gemini-vision = "toolbox.gemini_vision:main"
 slackcli = "toolbox.slackcli:main"
 llm-usage = "toolbox.llm_usage:main"
-agent-run = "toolbox.agent_run:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-# No single test in this suite legitimately runs for a minute. A per-test
-# cap turns a hang -- a regression that stops a loop terminating, or a
-# detach flush that waits forever on a backpressured agent -- into a named
-# failing test instead of a stalled CI job with nothing to point at.
-timeout = 120
-
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-]
