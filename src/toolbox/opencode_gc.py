@@ -75,9 +75,8 @@ import shutil
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
 
 DEFAULT_DB = Path.home() / ".local/share/opencode/opencode.db"
 
@@ -152,7 +151,7 @@ class DeleteOutcome:
     deadline_reached: bool = False
     # The failure that stopped the run, if any. Whatever committed before it
     # is already durable, so `rows` is still authoritative for those batches.
-    failure: Optional[str] = None
+    failure: str | None = None
 
     @property
     def incomplete(self) -> bool:
@@ -249,7 +248,7 @@ def on_disk_bytes(db: Path) -> int:
 
 
 def _order_descendant_first(
-    deletable: set[str], parent_of: dict[str, Optional[str]]
+    deletable: set[str], parent_of: dict[str, str | None]
 ) -> tuple[list[str], list[str]]:
     """Order so every session precedes its ancestors; return (ordered, cyclic).
 
@@ -280,7 +279,7 @@ def _order_descendant_first(
 
 
 def select_expired(
-    rows: list[tuple], cutoff_ms: int, *, restrict_to: Optional[set[str]] = None
+    rows: list[tuple], cutoff_ms: int, *, restrict_to: set[str] | None = None
 ) -> Selection:
     """Sessions whose entire subtree is older than the cutoff, deepest first.
 
@@ -307,7 +306,7 @@ def select_expired(
     deletion, so it counts as a live descendant even when it is old.
     """
     updated = {r[0]: r[2] for r in rows}
-    parent_of: dict[str, Optional[str]] = {r[0]: r[1] for r in rows}
+    parent_of: dict[str, str | None] = {r[0]: r[1] for r in rows}
 
     # int and float both carry a readable age; str, bytes and None do not.
     unknown = {sid for sid, t in updated.items() if not isinstance(t, (int, float))}
@@ -337,7 +336,7 @@ def select_expired(
 
 
 def expired_session_ids(
-    conn: sqlite3.Connection, cutoff_ms: int, *, restrict_to: Optional[set[str]] = None
+    conn: sqlite3.Connection, cutoff_ms: int, *, restrict_to: set[str] | None = None
 ) -> Selection:
     rows = conn.execute("SELECT id, parent_id, time_updated FROM session").fetchall()
     return select_expired(rows, cutoff_ms, restrict_to=restrict_to)
@@ -349,7 +348,7 @@ def delete_sessions(
     *,
     cutoff_ms: int,
     batch: int,
-    deadline: Optional[float],
+    deadline: float | None,
     clock=time.monotonic,
 ) -> DeleteOutcome:
     """Delete sessions and all their rows, children first, in batches.
@@ -471,7 +470,7 @@ def delete_sessions(
     return outcome
 
 
-def _commit_batch(conn: sqlite3.Connection) -> Optional[BaseException]:
+def _commit_batch(conn: sqlite3.Connection) -> BaseException | None:
     """COMMIT, handing back an interrupt that arrived once it had returned.
 
     A batch spends nearly all of its time inside SQLite's C code, so that is
@@ -547,7 +546,7 @@ class VacuumOutcome:
 
 
 def run_incremental_vacuum(
-    conn: sqlite3.Connection, *, pages: Optional[int], deadline: Optional[float],
+    conn: sqlite3.Connection, *, pages: int | None, deadline: float | None,
     clock=time.monotonic,
 ) -> VacuumOutcome:
     """Release freed pages back to the filesystem.
@@ -572,28 +571,22 @@ def run_incremental_vacuum(
     if before == 0:
         return VacuumOutcome()
     step = 2000
-    released = 0
-    # What is reclaimable, and how much of it this run may do.
-    target = before
     budget = before if pages is None else min(pages, before)
-    outcome = VacuumOutcome(target=target)
-    while released < budget:
+    outcome = VacuumOutcome(target=before)
+    while outcome.released < budget:
         if deadline is not None and clock() > deadline:
             outcome.deadline_reached = True
             break
-        conn.execute(f"PRAGMA incremental_vacuum({min(step, budget - released)})")
+        conn.execute(
+            f"PRAGMA incremental_vacuum({min(step, budget - outcome.released)})"
+        )
         now = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
-        progressed = before - now - released
+        released = max(0, before - now)
+        progressed = released - outcome.released
         # A concurrent writer can grow the freelist under us; that is not
         # negative progress to report, it is no progress.
-        released = max(0, before - now)
         outcome.released = released
         if progressed <= 0:
-            # No page moved. `target` deliberately stays at the real freelist
-            # size: lowering it to `released` -- as this once did -- makes a
-            # stalled pass report remaining=0 and claim it reclaimed
-            # everything available, which is the same lie the page budget
-            # used to tell.
             outcome.stalled = True
             break
     return outcome

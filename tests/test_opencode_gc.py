@@ -13,6 +13,7 @@ which is the whole reason a naive session delete leaks event rows.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -117,18 +118,8 @@ def _counts(conn):
     return {t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in TABLES}
 
 
-def _snapshot(path):
-    """Every row of every table, so a test can assert nothing at all changed."""
-    conn = sqlite3.connect(path)
-    try:
-        return {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall()) for t in TABLES}
-    finally:
-        conn.close()
-
-
-def _snapshot_of(path, tables):
-    """Every row of the named tables, for databases whose shape is not the
-    standard fixture's."""
+def _snapshot(path, tables=TABLES):
+    """Every row of the requested tables."""
     conn = sqlite3.connect(path)
     try:
         return {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall()) for t in tables}
@@ -141,6 +132,18 @@ def _delete(conn, ids, *, cutoff=None, batch=200, deadline=None):
         conn, ids, cutoff_ms=_cutoff() if cutoff is None else cutoff,
         batch=batch, deadline=deadline,
     )
+
+
+def _dangling_sessions(conn):
+    return conn.execute(
+        "SELECT id FROM session WHERE parent_id IS NOT NULL "
+        "AND parent_id NOT IN (SELECT id FROM session)"
+    ).fetchall()
+
+
+def _run_json_cli(monkeypatch, capsys, *args):
+    monkeypatch.setattr(opencode_gc.sys, "argv", ["opencode-gc", *args, "--json"])
+    return opencode_gc.main(), json.loads(capsys.readouterr().out)
 
 
 def _counting_clock():
@@ -303,10 +306,7 @@ class TestDeletionOrder:
         first = sel.deletable[:1]
         _delete(conn, first, batch=1)
 
-        dangling = conn.execute(
-            "SELECT s.id FROM session s WHERE s.parent_id IS NOT NULL "
-            "AND s.parent_id NOT IN (SELECT id FROM session)"
-        ).fetchall()
+        dangling = _dangling_sessions(conn)
         assert dangling == [], f"surviving session points at a deleted parent: {dangling}"
         assert conn.execute("SELECT count(*) FROM session").fetchone()[0] == 2
 
@@ -330,10 +330,7 @@ class TestDeletionOrder:
         )
 
         assert outcome.rows["session"] == 2, "the run must stop part-way through"
-        dangling = conn.execute(
-            "SELECT id FROM session WHERE parent_id IS NOT NULL "
-            "AND parent_id NOT IN (SELECT id FROM session)"
-        ).fetchall()
+        dangling = _dangling_sessions(conn)
         assert dangling == []
 
     def test_a_parent_with_several_old_children_waits_for_all_of_them(self, db):
@@ -363,10 +360,7 @@ class TestDeletionOrder:
         # And the ordering must survive a real interrupted run, not just an
         # index check: one batch commits, then the run stops.
         _delete(conn, sel.deletable[:1], batch=1)
-        dangling = conn.execute(
-            "SELECT id FROM session WHERE parent_id IS NOT NULL "
-            "AND parent_id NOT IN (SELECT id FROM session)"
-        ).fetchall()
+        dangling = _dangling_sessions(conn)
         assert dangling == [], f"surviving session points at a deleted parent: {dangling}"
 
     def test_a_shared_grandparent_waits_for_every_branch(self, db):
@@ -395,10 +389,7 @@ class TestDeletionOrder:
                 _add_session(probe, "c-mid", age_days=44, parent="a-root")
                 _add_session(probe, "d-deep", age_days=40, parent="c-mid")
                 _delete(probe, sel.deletable[:stop], batch=1)
-                dangling = probe.execute(
-                    "SELECT id FROM session WHERE parent_id IS NOT NULL "
-                    "AND parent_id NOT IN (SELECT id FROM session)"
-                ).fetchall()
+                dangling = _dangling_sessions(probe)
                 assert dangling == [], f"stopping after {stop} batch(es) stranded {dangling}"
             finally:
                 probe.close()
@@ -528,12 +519,6 @@ class TestMidRunGraphChanges:
         gc_conn.close()
         app.close()
 
-    def _dangling(self, conn):
-        return conn.execute(
-            "SELECT id FROM session WHERE parent_id IS NOT NULL "
-            "AND parent_id NOT IN (SELECT id FROM session)"
-        ).fetchall()
-
     def test_old_child_inserted_after_selection_protects_its_parent(self, live):
         """A session that was never a candidate is retained whatever its age,
         so it still shields the ancestors it acquires.
@@ -561,7 +546,7 @@ class TestMidRunGraphChanges:
             gc_conn, selected, cutoff_ms=cutoff, batch=10, deadline=None
         )
 
-        assert self._dangling(app) == [], "'kid' must not outlive its parent"
+        assert _dangling_sessions(app) == [], "'kid' must not outlive its parent"
         assert sorted(r[0] for r in app.execute("SELECT id FROM session")) == ["kid", "par"]
         assert outcome.rows["session"] == 0
         assert outcome.skipped == ["par"]
@@ -590,7 +575,7 @@ class TestMidRunGraphChanges:
         )
 
         assert outcome.rows["session"] == 1, "the run must stop after one batch"
-        assert self._dangling(app) == []
+        assert _dangling_sessions(app) == []
         surviving = sorted(r[0] for r in app.execute("SELECT id FROM session"))
         assert surviving == ["aaa"], "the child must be deleted before its new parent"
 
@@ -1272,8 +1257,6 @@ class TestVacuumDeadline:
         `if vac.remaining:`. rc falls back to 0, so automation is told a run
         that left the file oversized finished cleanly.
         """
-        import json
-
         path = tmp_path / "vacdeadline.db"
         conn = _make_db(path)
         for i in range(60):
@@ -1287,12 +1270,7 @@ class TestVacuumDeadline:
                 c, **{**kw, "deadline": -1.0, "clock": _counting_clock()}
             ),
         )
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--json"],
-        )
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
+        rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(path), "--apply")
 
         assert rc == 3, "an unfinished reclamation must not share the clean-run status"
         assert payload["incomplete"] is True
@@ -1376,20 +1354,16 @@ class TestVacuumRemainderIsHonest:
         never fires, rc is 0 and incomplete is false -- while the freelist
         asserted below is still full.
         """
-        import json
-
         path = tmp_path / "capped.db"
         conn = _make_db(path)
         for i in range(120):
             _add_session(conn, f"s{i}", age_days=30, events=40, messages=10)
         conn.close()
 
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--vacuum-pages", "5", "--json"],
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys,
+            "--db", str(path), "--apply", "--vacuum-pages", "5",
         )
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
 
         probe = sqlite3.connect(str(path))
         try:
@@ -1419,8 +1393,6 @@ class TestVacuumRemainderIsHonest:
         rc=0, so the assertion that it was incomplete fails before the
         continuation is even exercised.
         """
-        import json
-
         path = tmp_path / "resume.db"
         conn = _make_db(path)
         for i in range(120):
@@ -1428,12 +1400,9 @@ class TestVacuumRemainderIsHonest:
         conn.close()
 
         def run(*extra):
-            monkeypatch.setattr(
-                opencode_gc.sys, "argv",
-                ["opencode-gc", "--db", str(path), "--apply", "--json", *extra],
+            return _run_json_cli(
+                monkeypatch, capsys, "--db", str(path), "--apply", *extra
             )
-            rc = opencode_gc.main()
-            return rc, json.loads(capsys.readouterr().out)
 
         rc1, first = run("--vacuum-pages", "5")
         assert rc1 == 3 and first["pages_reclaimable_remaining"] > 0
@@ -1559,8 +1528,6 @@ class TestVacuumStall:
         `if vac.remaining:` never fires and rc is 0 while the freelist
         asserted below is still full.
         """
-        import json
-
         path = tmp_path / "stallcli.db"
         conn = _make_db(path, auto_vacuum=0)
         for i in range(60):
@@ -1585,13 +1552,7 @@ class TestVacuumStall:
                 c, **{**kw, "deadline": 1e18, "clock": clock}
             ),
         )
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--json"],
-        )
-
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
+        rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(path), "--apply")
 
         probe = sqlite3.connect(str(path))
         try:
@@ -1898,8 +1859,6 @@ class TestInterruptedRunReporting:
         """Mutation: same as above. main() dies with a traceback and emits no
         JSON at all, so the json.loads below raises.
         """
-        import json
-
         path = tmp_path / "busycli.db"
         setup = _make_db(path, wal=True)
         for i in range(6):
@@ -1909,13 +1868,10 @@ class TestInterruptedRunReporting:
         blocker = sqlite3.connect(str(path), isolation_level=None, timeout=0)
         gc_conn = self._locking_conn(path, blocker, before_batch=2)
         monkeypatch.setattr(opencode_gc, "connect", lambda *a, **kw: gc_conn)
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--batch", "1", "--json"],
-        )
         try:
-            rc = opencode_gc.main()
-            payload = json.loads(capsys.readouterr().out)
+            rc, payload = _run_json_cli(
+                monkeypatch, capsys, "--db", str(path), "--apply", "--batch", "1"
+            )
 
             assert rc == 1
             assert payload["incomplete"] is True
@@ -1936,8 +1892,6 @@ class TestInterruptedRunReporting:
         `res.deadline_reached = outcome.deadline_reached`. rc returns to 0 and
         the flags go false, so a caller cannot tell the run was truncated.
         """
-        import json
-
         path = tmp_path / "deadline.db"
         conn = _make_db(path)
         for i in range(5):
@@ -1951,12 +1905,9 @@ class TestInterruptedRunReporting:
                 c, ids, **{**kw, "deadline": 1.5, "clock": _counting_clock()}
             ),
         )
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--batch", "1", "--json"],
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--batch", "1"
         )
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
 
         assert rc == 3, "a truncated run must not share the complete-run status"
         assert payload["incomplete"] is True
@@ -2160,8 +2111,6 @@ class TestInterruptDuringDeletion:
         delete_sessions and then main(), so no JSON is printed at all and the
         json.loads below raises.
         """
-        import json
-
         path = tmp_path / "ctrlc.db"
         conn = _make_db(path)
         for i in range(4):
@@ -2183,13 +2132,9 @@ class TestInterruptDuringDeletion:
                 c, ids, **{**kw, "deadline": 1.0, "clock": interrupting_clock}
             ),
         )
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--batch", "1", "--json"],
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--batch", "1"
         )
-
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
 
         assert rc == 1, "an interrupted run must map to a documented status"
         assert payload["incomplete"] is True
@@ -2210,8 +2155,6 @@ class TestInterruptDuringDeletion:
         handler back to `except sqlite3.Error`. The KeyboardInterrupt escapes
         the finally, no report is printed, and json.loads gets nothing.
         """
-        import json
-
         path = tmp_path / "closeint.db"
         setup = _make_db(path, wal=True)
         for i in range(3):
@@ -2227,13 +2170,7 @@ class TestInterruptDuringDeletion:
             str(path), isolation_level=None, timeout=5, factory=InterruptsOnClose
         )
         monkeypatch.setattr(opencode_gc, "connect", lambda *a, **kw: gc_conn)
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--json"],
-        )
-
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
+        rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(path), "--apply")
 
         assert rc == 1
         assert payload["incomplete"] is True
@@ -2259,8 +2196,6 @@ class TestInterruptDuringDeletion:
         `except sqlite3.Error`. The interrupt escapes main(), no JSON is
         printed, and json.loads below raises.
         """
-        import json
-
         path = tmp_path / "vacint.db"
         conn = _make_db(path)
         for i in range(20):
@@ -2273,13 +2208,7 @@ class TestInterruptDuringDeletion:
         monkeypatch.setattr(
             opencode_gc, "run_incremental_vacuum", interrupting_vacuum
         )
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--json"],
-        )
-
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
+        rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(path), "--apply")
 
         assert rc == 1
         assert payload["incomplete"] is True
@@ -2299,8 +2228,6 @@ class TestInterruptDuringDeletion:
         `res.bytes_after = on_disk_bytes(db_path)` back to `except OSError`.
         The interrupt escapes and no report is printed.
         """
-        import json
-
         path = tmp_path / "sizeint.db"
         conn = _make_db(path)
         for i in range(3):
@@ -2317,13 +2244,7 @@ class TestInterruptDuringDeletion:
             return real_on_disk(p)
 
         monkeypatch.setattr(opencode_gc, "on_disk_bytes", interrupting_on_disk)
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--json"],
-        )
-
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
+        rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(path), "--apply")
 
         assert rc == 1
         assert payload["incomplete"] is True
@@ -2966,10 +2887,7 @@ class TestCli:
         ]
 
     def test_json_reports_cutoff_and_keep_reasons(self, populated, monkeypatch, capsys):
-        import json
-
-        self._run(monkeypatch, ["--db", str(populated), "--json"])
-        payload = json.loads(capsys.readouterr().out)
+        _, payload = _run_json_cli(monkeypatch, capsys, "--db", str(populated))
         assert payload["dry_run"] is True
         assert payload["sessions_expired"] == 1
         assert payload["sessions_kept_live_descendant"] == 1
@@ -2986,8 +2904,6 @@ class TestStats:
         `res.bytes_before = stats.total_bytes`. bytes_before then excludes the
         WAL and no longer matches the measured file sizes.
         """
-        import json
-
         path = tmp_path / "sizes.db"
         conn = _make_db(path, wal=True)
         for i in range(80):
@@ -3001,11 +2917,8 @@ class TestStats:
         assert wal_bytes > 0
 
         try:
-            monkeypatch.setattr(
-                opencode_gc.sys, "argv", ["opencode-gc", "--db", str(path), "--json"]
-            )
-            assert opencode_gc.main() == 0
-            payload = json.loads(capsys.readouterr().out)
+            rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(path))
+            assert rc == 0
 
             assert payload["bytes_before"] == db_bytes + wal_bytes
             assert payload["auto_vacuum_before"] == "INCREMENTAL"
@@ -3028,8 +2941,6 @@ class TestStats:
         `res.bytes_after = res.bytes_before - res.pages_released * 4096`.
         bytes_reclaimed then reports pages that are still on disk.
         """
-        import json
-
         path = tmp_path / "reclaim.db"
         conn = _make_db(path, wal=True)
         for i in range(120):
@@ -3042,12 +2953,8 @@ class TestStats:
         reader.execute("SELECT count(*) FROM event").fetchone()
         try:
             before = opencode_gc.on_disk_bytes(path)
-            monkeypatch.setattr(
-                opencode_gc.sys, "argv",
-                ["opencode-gc", "--db", str(path), "--apply", "--json"],
-            )
-            assert opencode_gc.main() == 0
-            payload = json.loads(capsys.readouterr().out)
+            rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(path), "--apply")
+            assert rc == 0
 
             after = opencode_gc.on_disk_bytes(path)
             assert payload["pages_released"] > 0, "pages must actually be released"
@@ -3089,8 +2996,6 @@ class TestStats:
         `on_disk_bytes(args.db)` (the unresolved path). bytes_before then
         omits the whole WAL and no longer matches the files on disk.
         """
-        import json
-
         target = tmp_path / "target.db"
         conn = _make_db(target, wal=True)
         for i in range(80):
@@ -3104,11 +3009,8 @@ class TestStats:
         expected = target.stat().st_size + wal_path.stat().st_size
 
         try:
-            monkeypatch.setattr(
-                opencode_gc.sys, "argv", ["opencode-gc", "--db", str(alias), "--json"]
-            )
-            assert opencode_gc.main() == 0
-            payload = json.loads(capsys.readouterr().out)
+            rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(alias))
+            assert rc == 0
 
             assert payload["bytes_before"] == expected
             # The report still names what the operator typed.
@@ -3436,13 +3338,13 @@ class TestUnusableDatabase:
         conn.execute("CREATE TABLE unrelated (x integer)")
         conn.execute("INSERT INTO unrelated VALUES (1)")
         conn.close()
-        before = _snapshot_of(path, ["unrelated"])
+        before = _snapshot(path, ["unrelated"])
 
         rc = self._run(monkeypatch, path, "--apply")
 
         assert rc == 2
         assert "not an opencode database" in capsys.readouterr().err
-        assert _snapshot_of(path, ["unrelated"]) == before
+        assert _snapshot(path, ["unrelated"]) == before
 
     def test_a_database_missing_one_child_table_is_refused(
         self, tmp_path, monkeypatch, capsys
@@ -3465,7 +3367,7 @@ class TestUnusableDatabase:
         _add_session(conn, "old", age_days=30)
         conn.execute("DROP TABLE event")
         conn.close()
-        surviving = _snapshot_of(path, ["session", "event_sequence"])
+        surviving = _snapshot(path, ["session", "event_sequence"])
 
         rc = self._run(monkeypatch, path, "--apply")
 
@@ -3475,7 +3377,7 @@ class TestUnusableDatabase:
             "a missing table must be reported as a missing table, before any "
             f"column probe: {err.strip()}"
         )
-        assert _snapshot_of(path, ["session", "event_sequence"]) == surviving, \
+        assert _snapshot(path, ["session", "event_sequence"]) == surviving, \
             "nothing may be deleted from a database we cannot fully prune"
 
     def test_a_table_present_but_empty_of_its_keyed_column_is_refused(
@@ -3493,13 +3395,13 @@ class TestUnusableDatabase:
         # 'event' still exists, but no longer keys on aggregate_id.
         conn.execute("ALTER TABLE event RENAME COLUMN aggregate_id TO agg")
         conn.close()
-        before = _snapshot_of(path, ["session", "event"])
+        before = _snapshot(path, ["session", "event"])
 
         rc = self._run(monkeypatch, path, "--apply")
 
         assert rc == 2
         assert "event.aggregate_id" in capsys.readouterr().err
-        assert _snapshot_of(path, ["session", "event"]) == before
+        assert _snapshot(path, ["session", "event"]) == before
 
     def test_a_session_table_missing_parent_id_is_refused(
         self, tmp_path, monkeypatch, capsys
@@ -3515,13 +3417,13 @@ class TestUnusableDatabase:
         _add_session(conn, "old", age_days=30)
         conn.execute("ALTER TABLE session DROP COLUMN parent_id")
         conn.close()
-        before = _snapshot_of(path, ["session"])
+        before = _snapshot(path, ["session"])
 
         rc = self._run(monkeypatch, path, "--apply")
 
         assert rc == 2
         assert "parent_id" in capsys.readouterr().err
-        assert _snapshot_of(path, ["session"]) == before
+        assert _snapshot(path, ["session"]) == before
 
     def test_a_healthy_database_is_not_refused(self, tmp_path, monkeypatch):
         """The guard must not reject the databases it exists to protect.
@@ -3557,8 +3459,6 @@ class TestPostDeletionErrorsAreReported:
         guarded). main() then dies with a traceback, so json.loads below gets
         no output at all and the counts are lost.
         """
-        import json
-
         path = tmp_path / "poststats.db"
         conn = _make_db(path)
         for i in range(3):
@@ -3577,13 +3477,7 @@ class TestPostDeletionErrorsAreReported:
             return real_read_stats(c)
 
         monkeypatch.setattr(opencode_gc, "read_stats", failing_read_stats)
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--json"],
-        )
-
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
+        rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(path), "--apply")
 
         assert rc == 1
         assert payload["incomplete"] is True
@@ -3601,8 +3495,6 @@ class TestPostDeletionErrorsAreReported:
         Mutation: in main's `finally`, replace the guarded close with a bare
         `conn.close()`. The error escapes and the report is never printed.
         """
-        import json
-
         path = tmp_path / "postclose.db"
         setup = _make_db(path)
         for i in range(3):
@@ -3618,13 +3510,7 @@ class TestPostDeletionErrorsAreReported:
             str(path), isolation_level=None, timeout=5, factory=FailsToClose
         )
         monkeypatch.setattr(opencode_gc, "connect", lambda *a, **kw: gc_conn)
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--json"],
-        )
-
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
+        rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(path), "--apply")
 
         assert rc == 1
         assert payload["incomplete"] is True
@@ -3642,8 +3528,6 @@ class TestPostDeletionErrorsAreReported:
         `res.bytes_after = on_disk_bytes(db_path)`. The OSError propagates and
         no report is printed.
         """
-        import json
-
         path = tmp_path / "postsize.db"
         conn = _make_db(path)
         for i in range(3):
@@ -3660,13 +3544,7 @@ class TestPostDeletionErrorsAreReported:
             return real_on_disk(p)
 
         monkeypatch.setattr(opencode_gc, "on_disk_bytes", failing_on_disk)
-        monkeypatch.setattr(
-            opencode_gc.sys, "argv",
-            ["opencode-gc", "--db", str(path), "--apply", "--json"],
-        )
-
-        rc = opencode_gc.main()
-        payload = json.loads(capsys.readouterr().out)
+        rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(path), "--apply")
 
         assert rc == 1
         assert payload["incomplete"] is True
