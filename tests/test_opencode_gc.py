@@ -126,6 +126,16 @@ def _snapshot(path):
         conn.close()
 
 
+def _snapshot_of(path, tables):
+    """Every row of the named tables, for databases whose shape is not the
+    standard fixture's."""
+    conn = sqlite3.connect(path)
+    try:
+        return {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall()) for t in tables}
+    finally:
+        conn.close()
+
+
 def _delete(conn, ids, *, cutoff=None, batch=200, deadline=None):
     return opencode_gc.delete_sessions(
         conn, ids, cutoff_ms=_cutoff() if cutoff is None else cutoff,
@@ -730,6 +740,44 @@ class TestRolledBackWorkIsNotReported:
         assert outcome.rows["part"] == 2
 
 
+    def test_a_failing_commit_reports_nothing_as_deleted(self, tmp_path):
+        """The DELETEs all succeed and only COMMIT fails -- a deferred foreign
+        key is checked at commit time, not at the statement. Merging the
+        counts anywhere before COMMIT returns is therefore not equivalent to
+        merging after it.
+
+        Mutation: in delete_sessions, move the
+        `for table, n in committed.items(): outcome.rows[table] += n` merge to
+        just above `conn.execute("COMMIT")`. Every DELETE has run by then, so
+        the counts are merged and the failed COMMIT leaves them standing.
+        """
+        path = tmp_path / "commitfail.db"
+        conn = _make_db(path)
+        try:
+            _add_session(conn, "old", age_days=30, events=3, messages=2)
+            # An audit row that must always point at a live session, checked
+            # at COMMIT rather than at the DELETE.
+            conn.execute(
+                "CREATE TABLE audit (id integer PRIMARY KEY, session_id text NOT NULL "
+                "REFERENCES session(id) DEFERRABLE INITIALLY DEFERRED)"
+            )
+            conn.execute("INSERT INTO audit VALUES (1,'old')")
+            conn.execute("PRAGMA foreign_keys=ON")
+            before = _counts(conn)
+
+            outcome = _delete(conn, ["old"], batch=1)
+
+            assert outcome.failure is not None, "the COMMIT must have failed"
+            assert "FOREIGN KEY" in outcome.failure
+            assert _counts(conn) == before, "the rollback must restore every row"
+            assert sum(outcome.rows.values()) == 0, (
+                "the transaction never committed, so no row may be reported "
+                f"as deleted: {outcome.rows}"
+            )
+        finally:
+            conn.close()
+
+
 class TestRevalidationHoldsTheWriteLock:
     """Re-reading the graph before BEGIN IMMEDIATE is not revalidation: the
     window between the read and the lock is exactly the window the read exists
@@ -891,13 +939,28 @@ class TestIncrementalVacuum:
         assert conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
 
     def test_respects_page_cap(self, db):
+        """`pages=1` must release one page, not merely fewer than all of them.
+
+        Mutation: in run_incremental_vacuum, `target = before if pages is None
+        else min(pages, before)` -> `target = before`. The old assertion
+        (`0 < released < free_before`) passed under any over-release; this one
+        pins the cap and checks the freelist moved by exactly that much.
+        """
         path, conn = db
         for i in range(60):
             _add_session(conn, f"s{i}", age_days=30, events=40, messages=10)
         _delete(conn, [f"s{i}" for i in range(60)])
         free_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        assert free_before > 1, "the fixture must leave more pages than the cap"
+
         vac = opencode_gc.run_incremental_vacuum(conn, pages=1, deadline=None)
-        assert 0 < vac.released < free_before
+
+        assert vac.released == 1, "the cap is one page, not 'fewer than all'"
+        free_after = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        assert free_before - free_after == vac.released, (
+            "the reported count must match the pages that actually left the "
+            f"freelist: {free_before} -> {free_after}, reported {vac.released}"
+        )
 
     def test_noop_when_nothing_freed(self, db):
         path, conn = db
@@ -1738,6 +1801,233 @@ class TestStats:
             assert payload["db"] == str(alias)
         finally:
             conn.close()
+
+
+class TestSqliteTempDirSearchOrder:
+    """The guard measures free space wherever SQLite will actually write its
+    VACUUM copy. https://sqlite.org/tempfiles.html gives the unix order:
+    SQLITE_TMPDIR, TMPDIR, /var/tmp, /usr/tmp, /tmp, then the current
+    directory -- first one that exists and is writable and searchable.
+
+    Python's tempfile.gettempdir() applies a different policy and caches its
+    answer, so on a host where /var/tmp and /tmp are separate filesystems it
+    can name the wrong one and approve a VACUUM that fills the real one.
+    """
+
+    def test_sqlite_tmpdir_wins(self, tmp_path, monkeypatch):
+        chosen = tmp_path / "chosen"
+        chosen.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        monkeypatch.setenv("SQLITE_TMPDIR", str(chosen))
+        monkeypatch.setenv("TMPDIR", str(other))
+        assert opencode_gc._sqlite_temp_dir() == chosen
+
+    def test_tmpdir_is_used_when_sqlite_tmpdir_is_unset(self, tmp_path, monkeypatch):
+        """Mutation: drop `os.environ.get("TMPDIR")` from the candidate list.
+        The function then skips straight to /var/tmp and returns the wrong
+        filesystem.
+        """
+        chosen = tmp_path / "chosen"
+        chosen.mkdir()
+        monkeypatch.delenv("SQLITE_TMPDIR", raising=False)
+        monkeypatch.setenv("TMPDIR", str(chosen))
+        assert opencode_gc._sqlite_temp_dir() == chosen
+
+    def test_a_nonexistent_sqlite_tmpdir_falls_through(self, tmp_path, monkeypatch):
+        """SQLite skips a candidate that does not exist rather than failing on
+        it, and so must the guard.
+
+        Mutation: `if path.is_dir() and os.access(...)` -> `return path` on the
+        first candidate (the old `SQLITE_TMPDIR or gettempdir()` behaviour).
+        The nonexistent directory is then returned and stat() raises
+        FileNotFoundError out of enable_incremental_vacuum.
+        """
+        fallback = tmp_path / "fallback"
+        fallback.mkdir()
+        monkeypatch.setenv("SQLITE_TMPDIR", str(tmp_path / "does-not-exist"))
+        monkeypatch.setenv("TMPDIR", str(fallback))
+        assert opencode_gc._sqlite_temp_dir() == fallback
+
+    def test_an_unwritable_candidate_is_skipped(self, tmp_path, monkeypatch):
+        """Mutation: drop `and os.access(path, os.W_OK | os.X_OK)` from the
+        test. The unwritable directory is then chosen, and the space check
+        runs against a filesystem SQLite cannot use.
+        """
+        unwritable = tmp_path / "unwritable"
+        unwritable.mkdir(mode=0o500)
+        fallback = tmp_path / "fallback"
+        fallback.mkdir()
+        monkeypatch.setenv("SQLITE_TMPDIR", str(unwritable))
+        monkeypatch.setenv("TMPDIR", str(fallback))
+        try:
+            assert opencode_gc._sqlite_temp_dir() == fallback
+        finally:
+            unwritable.chmod(0o700)
+
+    def test_documented_order_is_followed_when_the_env_is_empty(self, monkeypatch):
+        """With no environment override the first existing, writable entry of
+        SQLite's own list wins -- not whatever tempfile caches.
+
+        Mutation: `SQLITE_TEMP_DIR_CANDIDATES = ("/var/tmp", "/usr/tmp", "/tmp")`
+        -> `("/tmp", "/usr/tmp", "/var/tmp")`. On this host both exist, so the
+        wrong one is returned.
+        """
+        monkeypatch.delenv("SQLITE_TMPDIR", raising=False)
+        monkeypatch.delenv("TMPDIR", raising=False)
+        expected = next(
+            (Path(c) for c in opencode_gc.SQLITE_TEMP_DIR_CANDIDATES
+             if Path(c).is_dir() and os.access(c, os.W_OK | os.X_OK)),
+            None,
+        )
+        assert expected is not None, "this host must have one of SQLite's temp dirs"
+        assert opencode_gc._sqlite_temp_dir() == expected
+
+    def test_an_unusable_temp_dir_refuses_instead_of_raising_oserror(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A nonexistent SQLITE_TMPDIR used to reach os.stat() and escape as
+        FileNotFoundError. It must be the documented conversion refusal, and
+        nothing may be deleted.
+
+        Mutation: in enable_incremental_vacuum, remove the `except OSError`
+        around the temp-dir stat and restore the bare
+        `os.stat(tmp_dir).st_dev` call. main()'s handler catches RuntimeError
+        and sqlite3.Error, not OSError, so the run dies with a traceback.
+        """
+        path = tmp_path / "badtmp.db"
+        conn = _make_db(path, auto_vacuum=0)
+        _add_session(conn, "old", age_days=30)
+        _add_session(conn, "live", age_days=1)
+        conn.close()
+        before = _snapshot(path)
+
+        # Every candidate unusable, so the failure is unambiguous.
+        monkeypatch.setattr(
+            opencode_gc, "SQLITE_TEMP_DIR_CANDIDATES", (str(tmp_path / "nope-3"),)
+        )
+        monkeypatch.setenv("SQLITE_TMPDIR", str(tmp_path / "nope-1"))
+        monkeypatch.setenv("TMPDIR", str(tmp_path / "nope-2"))
+        # The final "." fallback must not rescue the lookup either.
+        monkeypatch.setattr(opencode_gc.os, "access", lambda p, mode: False)
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply", "--enable-incremental-vacuum"],
+        )
+
+        rc = opencode_gc.main()
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "refusing to delete anything" in err
+        assert _snapshot(path) == before, "a refused conversion must delete nothing"
+
+
+class TestUnusableDatabase:
+    """A corrupt file, or a valid SQLite file that is not opencode's, must be
+    classified before any destructive work rather than surfacing as a
+    traceback from the middle of the run.
+    """
+
+    def _run(self, monkeypatch, path, *extra):
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv", ["opencode-gc", "--db", str(path), *extra]
+        )
+        return opencode_gc.main()
+
+    def test_a_file_that_is_not_sqlite_is_refused(self, tmp_path, monkeypatch, capsys):
+        """Mutation: delete the `verify_usable(conn)` call in main. The
+        DatabaseError escapes from the first query as a traceback instead.
+        """
+        path = tmp_path / "junk.db"
+        path.write_bytes(b"this is not a database at all")
+
+        rc = self._run(monkeypatch, path, "--apply")
+
+        assert rc == 2
+        assert "cannot use" in capsys.readouterr().err
+        assert path.read_bytes() == b"this is not a database at all", \
+            "the file must be left exactly as it was"
+
+    def test_a_foreign_sqlite_database_is_refused(self, tmp_path, monkeypatch, capsys):
+        """Valid SQLite, but not opencode's schema: deleting from it would be
+        deleting from the wrong database entirely.
+
+        Mutation: same as above.
+        """
+        path = tmp_path / "foreign.db"
+        conn = sqlite3.connect(str(path), isolation_level=None)
+        conn.execute("CREATE TABLE unrelated (x integer)")
+        conn.execute("INSERT INTO unrelated VALUES (1)")
+        conn.close()
+        before = _snapshot_of(path, ["unrelated"])
+
+        rc = self._run(monkeypatch, path, "--apply")
+
+        assert rc == 2
+        assert "not an opencode database" in capsys.readouterr().err
+        assert _snapshot_of(path, ["unrelated"]) == before
+
+    def test_a_database_missing_one_child_table_is_refused(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Discovering a missing table mid-run would leave a half-pruned
+        database: the session rows gone, their events stranded.
+
+        Mutation: in verify_usable, `required = ["session"] + [t for t, _ in
+        CHILD_TABLES]` -> `required = ["session"]`. The run then starts and
+        dies partway through the first batch.
+        """
+        path = tmp_path / "partial.db"
+        conn = _make_db(path)
+        _add_session(conn, "old", age_days=30)
+        conn.execute("DROP TABLE event")
+        conn.close()
+        surviving = _snapshot_of(path, ["session", "event_sequence"])
+
+        rc = self._run(monkeypatch, path, "--apply")
+
+        assert rc == 2
+        assert "event" in capsys.readouterr().err
+        assert _snapshot_of(path, ["session", "event_sequence"]) == surviving, \
+            "nothing may be deleted from a database we cannot fully prune"
+
+    def test_a_session_table_missing_parent_id_is_refused(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The whole live-descendant protection keys on parent_id. A session
+        table without it cannot be pruned safely at all.
+
+        Mutation: in verify_usable, drop the per-column PRAGMA table_info
+        loop. The run then reaches the selection query and raises.
+        """
+        path = tmp_path / "nocol.db"
+        conn = _make_db(path)
+        _add_session(conn, "old", age_days=30)
+        conn.execute("ALTER TABLE session DROP COLUMN parent_id")
+        conn.close()
+        before = _snapshot_of(path, ["session"])
+
+        rc = self._run(monkeypatch, path, "--apply")
+
+        assert rc == 2
+        assert "parent_id" in capsys.readouterr().err
+        assert _snapshot_of(path, ["session"]) == before
+
+    def test_a_healthy_database_is_not_refused(self, tmp_path, monkeypatch):
+        """The guard must not reject the databases it exists to protect.
+
+        Mutation: in verify_usable, `if missing:` -> `if True:`. A perfectly
+        good database is then refused and nothing is ever collected.
+        """
+        path = tmp_path / "healthy.db"
+        conn = _make_db(path)
+        _add_session(conn, "old", age_days=30)
+        _add_session(conn, "live", age_days=1)
+        conn.close()
+
+        assert self._run(monkeypatch, path, "--apply") == 0
+        assert [r[0] for r in _snapshot(path)["session"]] == ["live"]
 
 
 class TestPostDeletionErrorsAreReported:

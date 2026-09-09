@@ -70,7 +70,6 @@ import os
 import shutil
 import sqlite3
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -514,8 +513,42 @@ def vacuum_space_plan(db: Path, stats: DbStats) -> tuple[int, int, int]:
     return payload, VACUUM_COPY_FACTOR * payload + reserve, payload + reserve
 
 
+# https://sqlite.org/tempfiles.html: on unix SQLite tries each of these in
+# turn and uses the first that exists and is writable and searchable. Asking
+# Python's tempfile instead answers a different question -- it applies its own
+# policy and caches the result -- and on a host where /var/tmp and /tmp are
+# separate filesystems that means measuring free space on the wrong one.
+SQLITE_TEMP_DIR_CANDIDATES = ("/var/tmp", "/usr/tmp", "/tmp")
+
+
 def _sqlite_temp_dir() -> Path:
-    return Path(os.environ.get("SQLITE_TMPDIR") or tempfile.gettempdir())
+    """Where SQLite will put the VACUUM copy, in SQLite's own search order.
+
+    Raises RuntimeError when no candidate qualifies: the free-space guard
+    cannot be evaluated at all then, and a destructive rewrite must not start
+    on an unchecked filesystem.
+    """
+    candidates = []
+    for value in (os.environ.get("SQLITE_TMPDIR"), os.environ.get("TMPDIR")):
+        if value:
+            candidates.append(value)
+    candidates.extend(SQLITE_TEMP_DIR_CANDIDATES)
+    # SQLite falls back to the current directory when nothing else qualifies.
+    candidates.append(".")
+
+    for candidate in candidates:
+        path = Path(candidate)
+        try:
+            if path.is_dir() and os.access(path, os.W_OK | os.X_OK):
+                return path
+        except OSError:
+            continue
+    raise RuntimeError(
+        "none of SQLite's temporary directories "
+        f"({', '.join(str(c) for c in candidates)}) exists and is writable, "
+        "so the space a VACUUM needs cannot be checked. Set SQLITE_TMPDIR to a "
+        "writable directory on a filesystem with room for one copy."
+    )
 
 
 def enable_incremental_vacuum(conn: sqlite3.Connection, db: Path, stats: DbStats) -> list[str]:
@@ -545,18 +578,64 @@ def enable_incremental_vacuum(conn: sqlite3.Connection, db: Path, stats: DbStats
             "Delete rows first, or move the database to a larger filesystem."
         )
     tmp_dir = _sqlite_temp_dir()
-    if os.stat(tmp_dir).st_dev != os.stat(db.parent).st_dev:
-        tmp_free = shutil.disk_usage(tmp_dir).free
-        if tmp_free < need_tmp_fs:
-            raise RuntimeError(
-                f"VACUUM needs ~{need_tmp_fs:,} bytes free on SQLite's temp "
-                f"filesystem {tmp_dir}; only {tmp_free:,} available. "
-                "Set SQLITE_TMPDIR to a larger filesystem."
-            )
+    try:
+        different_fs = os.stat(tmp_dir).st_dev != os.stat(db.parent).st_dev
+        tmp_free = shutil.disk_usage(tmp_dir).free if different_fs else None
+    except OSError as exc:
+        # The temp filesystem could not be measured, so the space a VACUUM
+        # needs there is unknown. Refuse rather than rewrite on an unchecked
+        # filesystem: an interrupted VACUUM is worse than a skipped one.
+        raise RuntimeError(
+            f"cannot inspect SQLite's temp directory {tmp_dir}: {exc}. "
+            "Set SQLITE_TMPDIR to a readable directory with room for one copy."
+        ) from exc
+    if different_fs and tmp_free < need_tmp_fs:
+        raise RuntimeError(
+            f"VACUUM needs ~{need_tmp_fs:,} bytes free on SQLite's temp "
+            f"filesystem {tmp_dir}; only {tmp_free:,} available. "
+            "Set SQLITE_TMPDIR to a larger filesystem."
+        )
 
     conn.execute("PRAGMA auto_vacuum=2")
     conn.execute("VACUUM")
     return [f"auto_vacuum {stats.auto_vacuum_name} -> INCREMENTAL (full VACUUM run)"]
+
+
+def verify_usable(conn: sqlite3.Connection) -> None:
+    """Confirm this is readable SQLite carrying the schema we delete from.
+
+    Raises RuntimeError otherwise. Reaching the deletion loop and discovering
+    there mid-run that a table is missing would leave a half-pruned database
+    and a traceback; every table this tool touches is therefore probed first,
+    while nothing has been written.
+    """
+    required = ["session"] + [t for t, _ in CHILD_TABLES]
+    try:
+        present = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError(f"not a readable SQLite database: {exc}") from exc
+
+    missing = [t for t in required if t not in present]
+    if missing:
+        raise RuntimeError(
+            f"not an opencode database: table(s) {', '.join(missing)} are missing"
+        )
+
+    # A table can exist without the columns this tool keys on.
+    for table, column in [("session", "id"), ("session", "parent_id"),
+                          ("session", "time_updated")] + list(CHILD_TABLES):
+        try:
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError(f"cannot read the schema of {table}: {exc}") from exc
+        if column not in cols:
+            raise RuntimeError(
+                f"not an opencode database: {table}.{column} is missing"
+            )
 
 
 def main() -> int:
@@ -616,6 +695,15 @@ def main() -> int:
         conn = connect(args.db, read_only=not args.apply)
     except (sqlite3.Error, RuntimeError, ValueError) as exc:
         print(f"opencode-gc: cannot open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    # sqlite3.connect() does not touch the file, so a corrupt or foreign
+    # database is only discovered on first use. Find out now, before anything
+    # is deleted, and report it as an unusable input rather than a traceback.
+    try:
+        verify_usable(conn)
+    except RuntimeError as exc:
+        conn.close()
+        print(f"opencode-gc: cannot use {args.db}: {exc}", file=sys.stderr)
         return 2
     try:
         # Clamp before anything is deleted: a batch wider than SQLite's
