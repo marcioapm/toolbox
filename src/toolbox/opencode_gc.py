@@ -692,7 +692,7 @@ def main() -> int:
                  retention_days=args.retention_days)
 
     try:
-        conn = connect(args.db, read_only=not args.apply)
+        conn = connect(db_path, read_only=not args.apply)
     except (sqlite3.Error, RuntimeError, ValueError) as exc:
         print(f"opencode-gc: cannot open {args.db}: {exc}", file=sys.stderr)
         return 2

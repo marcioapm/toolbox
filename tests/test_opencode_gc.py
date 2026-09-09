@@ -1865,23 +1865,63 @@ class TestSqliteTempDirSearchOrder:
         finally:
             unwritable.chmod(0o700)
 
-    def test_documented_order_is_followed_when_the_env_is_empty(self, monkeypatch):
-        """With no environment override the first existing, writable entry of
-        SQLite's own list wins -- not whatever tempfile caches.
+    def test_documented_order_is_followed_when_the_env_is_empty(self, tmp_path, monkeypatch):
+        """With no environment override, /var/tmp is preferred over /tmp --
+        SQLite's own precedence, and the two are separate filesystems on the
+        hosts this tool targets.
 
-        Mutation: `SQLITE_TEMP_DIR_CANDIDATES = ("/var/tmp", "/usr/tmp", "/tmp")`
-        -> `("/tmp", "/usr/tmp", "/var/tmp")`. On this host both exist, so the
-        wrong one is returned.
+        The expectation is written out literally rather than derived from
+        SQLITE_TEMP_DIR_CANDIDATES: computing it from the constant under test
+        would reverse with the constant and assert nothing.
+
+        Mutation: `SQLITE_TEMP_DIR_CANDIDATES = ("/var/tmp", "/usr/tmp",
+        "/tmp")` -> `("/tmp", "/usr/tmp", "/var/tmp")`. '/tmp' is then
+        returned where SQLite would have used '/var/tmp'.
         """
         monkeypatch.delenv("SQLITE_TMPDIR", raising=False)
         monkeypatch.delenv("TMPDIR", raising=False)
-        expected = next(
-            (Path(c) for c in opencode_gc.SQLITE_TEMP_DIR_CANDIDATES
-             if Path(c).is_dir() and os.access(c, os.W_OK | os.X_OK)),
-            None,
+
+        # Stand-ins for the real system directories, so the assertion does not
+        # depend on which of them happens to exist on the host.
+        var_tmp = tmp_path / "var-tmp"
+        usr_tmp = tmp_path / "usr-tmp"
+        plain_tmp = tmp_path / "plain-tmp"
+        for d in (var_tmp, usr_tmp, plain_tmp):
+            d.mkdir()
+        monkeypatch.setattr(
+            opencode_gc, "SQLITE_TEMP_DIR_CANDIDATES",
+            (str(var_tmp), str(usr_tmp), str(plain_tmp)),
         )
-        assert expected is not None, "this host must have one of SQLite's temp dirs"
-        assert opencode_gc._sqlite_temp_dir() == expected
+
+        assert opencode_gc._sqlite_temp_dir() == var_tmp, \
+            "the first candidate in SQLite's order must win"
+
+    def test_the_real_candidate_list_is_sqlites_documented_one(self):
+        """The order the production constant actually carries.
+
+        Mutation: same reversal. https://sqlite.org/tempfiles.html gives
+        /var/tmp before /usr/tmp before /tmp, and on a host where /var/tmp and
+        /tmp are separate filesystems the difference decides which filesystem
+        the free-space guard measures.
+        """
+        assert opencode_gc.SQLITE_TEMP_DIR_CANDIDATES == \
+            ("/var/tmp", "/usr/tmp", "/tmp")
+
+    def test_a_later_candidate_is_used_when_an_earlier_one_is_missing(
+        self, tmp_path, monkeypatch
+    ):
+        """Mutation: same reversal, and also `if path.is_dir() and
+        os.access(...)` -> `return path` unconditionally.
+        """
+        monkeypatch.delenv("SQLITE_TMPDIR", raising=False)
+        monkeypatch.delenv("TMPDIR", raising=False)
+        present = tmp_path / "present"
+        present.mkdir()
+        monkeypatch.setattr(
+            opencode_gc, "SQLITE_TEMP_DIR_CANDIDATES",
+            (str(tmp_path / "absent"), str(present)),
+        )
+        assert opencode_gc._sqlite_temp_dir() == present
 
     def test_an_unusable_temp_dir_refuses_instead_of_raising_oserror(
         self, tmp_path, monkeypatch, capsys
@@ -1890,10 +1930,16 @@ class TestSqliteTempDirSearchOrder:
         FileNotFoundError. It must be the documented conversion refusal, and
         nothing may be deleted.
 
-        Mutation: in enable_incremental_vacuum, remove the `except OSError`
-        around the temp-dir stat and restore the bare
-        `os.stat(tmp_dir).st_dev` call. main()'s handler catches RuntimeError
-        and sqlite3.Error, not OSError, so the run dies with a traceback.
+        The refusal must come from _sqlite_temp_dir() finding no usable
+        candidate at all, so every candidate -- including the "." fallback --
+        is pointed at a directory that does not exist.
+
+        Mutation: in _sqlite_temp_dir, replace the closing `raise
+        RuntimeError(...)` with `return Path(candidates[0])`. The nonexistent
+        directory is then handed to enable_incremental_vacuum, whose os.stat
+        raises FileNotFoundError -- and main()'s handler catches RuntimeError
+        and sqlite3.Error, not OSError, so the run dies with a traceback and
+        prints no refusal at all.
         """
         path = tmp_path / "badtmp.db"
         conn = _make_db(path, auto_vacuum=0)
@@ -1902,14 +1948,20 @@ class TestSqliteTempDirSearchOrder:
         conn.close()
         before = _snapshot(path)
 
-        # Every candidate unusable, so the failure is unambiguous.
+        missing = tmp_path / "nope"
+        assert not missing.exists()
         monkeypatch.setattr(
-            opencode_gc, "SQLITE_TEMP_DIR_CANDIDATES", (str(tmp_path / "nope-3"),)
+            opencode_gc, "SQLITE_TEMP_DIR_CANDIDATES", (str(missing / "3"),)
         )
-        monkeypatch.setenv("SQLITE_TMPDIR", str(tmp_path / "nope-1"))
-        monkeypatch.setenv("TMPDIR", str(tmp_path / "nope-2"))
-        # The final "." fallback must not rescue the lookup either.
-        monkeypatch.setattr(opencode_gc.os, "access", lambda p, mode: False)
+        monkeypatch.setenv("SQLITE_TMPDIR", str(missing / "1"))
+        monkeypatch.setenv("TMPDIR", str(missing / "2"))
+        # The final "." candidate: run from a directory that has been removed
+        # is not portable, so make Path(".") fail the is_dir() test instead.
+        real_is_dir = opencode_gc.Path.is_dir
+        monkeypatch.setattr(
+            opencode_gc.Path, "is_dir",
+            lambda self: False if str(self) == "." else real_is_dir(self),
+        )
         monkeypatch.setattr(
             opencode_gc.sys, "argv",
             ["opencode-gc", "--db", str(path), "--apply", "--enable-incremental-vacuum"],
@@ -1920,6 +1972,61 @@ class TestSqliteTempDirSearchOrder:
         assert rc == 1
         err = capsys.readouterr().err
         assert "refusing to delete anything" in err
+        assert "temporary directories" in err
+        assert _snapshot(path) == before, "a refused conversion must delete nothing"
+
+    def test_an_unreadable_temp_dir_is_a_refusal_not_a_traceback(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Measuring the temp filesystem is a separate syscall at a later
+        instant than choosing it, and it can fail on its own -- an unmounted
+        or stale network filesystem answers `is_dir()` and then refuses to be
+        measured.
+
+        Mutation: in enable_incremental_vacuum, remove the `try/except OSError`
+        around the temp-dir stat and disk_usage. main()'s handler catches
+        RuntimeError and sqlite3.Error, not OSError, so the run dies with a
+        traceback instead of the documented refusal.
+        """
+        path = tmp_path / "statfail.db"
+        conn = _make_db(path, auto_vacuum=0)
+        _add_session(conn, "old", age_days=30)
+        conn.close()
+        before = _snapshot(path)
+
+        usable = tmp_path / "usable"
+        usable.mkdir()
+        monkeypatch.setenv("SQLITE_TMPDIR", str(usable))
+
+        # A different device, so the temp filesystem is measured at all.
+        real_stat = opencode_gc.os.stat
+        usable_real = real_stat(usable)
+
+        def fake_stat(p, *a, **kw):
+            st = real_stat(p, *a, **kw)
+            dev = 77 if os.path.samestat(st, usable_real) else 88
+            return type(st)((st.st_mode, st.st_ino, dev, st.st_nlink, st.st_uid,
+                             st.st_gid, st.st_size, int(st.st_atime),
+                             int(st.st_mtime), int(st.st_ctime)))
+
+        def failing_usage(p):
+            if Path(p) == usable:
+                raise OSError("stale NFS file handle")
+            return type("U", (), {"free": 1 << 60})()
+
+        monkeypatch.setattr(opencode_gc.os, "stat", fake_stat)
+        monkeypatch.setattr(opencode_gc.shutil, "disk_usage", failing_usage)
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply", "--enable-incremental-vacuum"],
+        )
+
+        rc = opencode_gc.main()
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "refusing to delete anything" in err
+        assert "stale NFS file handle" in err
         assert _snapshot(path) == before, "a refused conversion must delete nothing"
 
 
@@ -1974,9 +2081,15 @@ class TestUnusableDatabase:
         """Discovering a missing table mid-run would leave a half-pruned
         database: the session rows gone, their events stranded.
 
+        The missing table is named as a *table*, not as a missing column on a
+        table that is not there -- the column probe would otherwise subsume
+        this check and the table list could be reduced to ["session"] with no
+        test noticing.
+
         Mutation: in verify_usable, `required = ["session"] + [t for t, _ in
-        CHILD_TABLES]` -> `required = ["session"]`. The run then starts and
-        dies partway through the first batch.
+        CHILD_TABLES]` -> `required = ["session"]`. The refusal then comes
+        from the column probe with a different message, so the assertion on
+        "table(s)" fails.
         """
         path = tmp_path / "partial.db"
         conn = _make_db(path)
@@ -1988,9 +2101,36 @@ class TestUnusableDatabase:
         rc = self._run(monkeypatch, path, "--apply")
 
         assert rc == 2
-        assert "event" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "table(s) event are missing" in err, (
+            "a missing table must be reported as a missing table, before any "
+            f"column probe: {err.strip()}"
+        )
         assert _snapshot_of(path, ["session", "event_sequence"]) == surviving, \
             "nothing may be deleted from a database we cannot fully prune"
+
+    def test_a_table_present_but_empty_of_its_keyed_column_is_refused(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The complement: the table exists, so only the column probe can
+        catch it.
+
+        Mutation: in verify_usable, drop the per-column PRAGMA table_info
+        loop. The run then reaches the DELETE and fails mid-batch.
+        """
+        path = tmp_path / "nocolumn.db"
+        conn = _make_db(path)
+        _add_session(conn, "old", age_days=30)
+        # 'event' still exists, but no longer keys on aggregate_id.
+        conn.execute("ALTER TABLE event RENAME COLUMN aggregate_id TO agg")
+        conn.close()
+        before = _snapshot_of(path, ["session", "event"])
+
+        rc = self._run(monkeypatch, path, "--apply")
+
+        assert rc == 2
+        assert "event.aggregate_id" in capsys.readouterr().err
+        assert _snapshot_of(path, ["session", "event"]) == before
 
     def test_a_session_table_missing_parent_id_is_refused(
         self, tmp_path, monkeypatch, capsys
