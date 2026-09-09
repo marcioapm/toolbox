@@ -32,9 +32,11 @@ opencode may be writing to the same file. Selecting expired sessions and then
 deleting them are two different points in time, and `BEGIN IMMEDIATE` only
 serialises writers from the moment it takes the lock -- it does not make an
 earlier `SELECT` current. A session that became active in between would still
-be destroyed. Every transaction therefore re-reads the whole `session` graph
-under its own write lock and deletes only the ids that are still expired
-there; the selection pass exists to bound the work, not to authorise it.
+be destroyed, and an order computed earlier describes a topology that may have
+changed shape since. Every transaction therefore re-reads the whole `session`
+graph under its own write lock and recomputes eligibility, the
+descendant-first order and the batch boundary from it; the selection pass
+bounds which sessions may be considered, not which are deleted or when.
 
 WHY INCREMENTAL VACUUM AND NOT VACUUM
 -------------------------------------
@@ -135,8 +137,8 @@ class Selection:
 @dataclass
 class DeleteOutcome:
     rows: dict = field(default_factory=dict)
-    # Candidates that stopped being expired between selection and their
-    # transaction, and were therefore left alone.
+    # Candidates found ineligible under a write lock -- revived, sheltering a
+    # live descendant, or cyclic in the graph at that moment.
     skipped: list = field(default_factory=list)
     # Candidates never attempted, because the run stopped first.
     remaining: int = 0
@@ -165,6 +167,8 @@ class Result:
     sessions_kept_parent_cycle: int = 0
     rows_deleted: dict = field(default_factory=dict)
     pages_released: int = 0
+    pages_reclaimable_remaining: int = 0
+    vacuum_deadline_reached: bool = False
     # Real on-disk footprint (main database + WAL), not page arithmetic: a
     # released page is not a reclaimed byte until the file actually shrinks.
     bytes_before: int = 0
@@ -265,7 +269,9 @@ def _order_descendant_first(
     return ordered, sorted(deletable - set(ordered))
 
 
-def select_expired(rows: list[tuple], cutoff_ms: int) -> Selection:
+def select_expired(
+    rows: list[tuple], cutoff_ms: int, *, restrict_to: Optional[set[str]] = None
+) -> Selection:
     """Sessions whose entire subtree is older than the cutoff, deepest first.
 
     `rows` is (id, parent_id, time_updated) for the whole `session` table.
@@ -276,12 +282,20 @@ def select_expired(rows: list[tuple], cutoff_ms: int) -> Selection:
 
     A NULL `time_updated` is an unknown age, not an infinite one: such a
     session is kept and counted rather than treated as older than the cutoff.
+
+    `restrict_to` narrows the candidates to that set. Every other session in
+    `rows` is then retained whatever its age, and still protects its ancestors
+    -- which is what makes a mid-run recomputation safe: a session that
+    appeared after the candidates were chosen was never authorised for
+    deletion, so it counts as a live descendant even when it is old.
     """
     updated = {r[0]: r[2] for r in rows}
     parent_of: dict[str, Optional[str]] = {r[0]: r[1] for r in rows}
 
     unknown = {sid for sid, t in updated.items() if t is None}
     old = {sid for sid, t in updated.items() if t is not None and t < cutoff_ms}
+    if restrict_to is not None:
+        old &= restrict_to
 
     # Walk up from every live session, protecting its whole ancestor chain.
     protected: set[str] = set()
@@ -304,9 +318,11 @@ def select_expired(rows: list[tuple], cutoff_ms: int) -> Selection:
     )
 
 
-def expired_session_ids(conn: sqlite3.Connection, cutoff_ms: int) -> Selection:
+def expired_session_ids(
+    conn: sqlite3.Connection, cutoff_ms: int, *, restrict_to: Optional[set[str]] = None
+) -> Selection:
     rows = conn.execute("SELECT id, parent_id, time_updated FROM session").fetchall()
-    return select_expired(rows, cutoff_ms)
+    return select_expired(rows, cutoff_ms, restrict_to=restrict_to)
 
 
 def delete_sessions(
@@ -323,46 +339,59 @@ def delete_sessions(
     Batched so a single statement never holds the write lock across millions of
     rows while opencode itself is running.
 
-    `session_ids` only bounds the work. Eligibility is decided again inside
-    every transaction, under the write lock, against `cutoff_ms` and the
-    `session` graph as it exists at that moment -- a session that opencode
-    touched, or gave a live child, after the selection pass is skipped.
+    `session_ids` only bounds the work: it is the set of sessions this run is
+    *allowed* to consider, and nothing more. Every batch is chosen from
+    scratch inside its own transaction, under the write lock, from the
+    `session` graph as it exists at that moment -- eligibility, the
+    descendant-first order, and the batch boundary alike. An order computed
+    before the lock describes a topology that may no longer exist: a session
+    reparented, or a new old child inserted under a candidate, changes which
+    deletions strand a row. Only ids in `session_ids` are ever deleted; every
+    other session in the graph is treated as retained whatever its age and
+    protects its whole ancestor chain, so a session that appeared after
+    selection can never be deleted and always shields its parents.
 
     `clock` is the monotonic source the deadline is compared against.
 
     A batch that fails is rolled back, but every batch committed before it is
     already durable and irreversible. The failure is therefore recorded on the
     outcome rather than raised, so the caller can report exactly what was
-    destroyed instead of losing the counts to a traceback.
+    destroyed instead of losing the counts to a traceback. Row counts are
+    accumulated per transaction and merged into `rows` only once its COMMIT
+    has returned: a rolled-back DELETE undid its rows, and reporting them as
+    destroyed would misdirect the very recovery the counts exist to inform.
     """
     outcome = DeleteOutcome(rows={t: 0 for t, _ in CHILD_TABLES} | {"session": 0})
-    attempted = 0
+    order_index = {sid: i for i, sid in enumerate(session_ids)}
+    pending = set(session_ids)
 
-    for start in range(0, len(session_ids), batch):
+    while pending:
         if deadline is not None and clock() > deadline:
             outcome.deadline_reached = True
             break
-        chunk = session_ids[start:start + batch]
 
         # BEGIN IMMEDIATE is inside the guarded region: it is the statement
         # most likely to fail, with SQLITE_BUSY, when opencode holds the write
         # lock -- and by then earlier batches have already committed.
         began = False
+        committed = {t: 0 for t, _ in CHILD_TABLES} | {"session": 0}
         try:
             conn.execute("BEGIN IMMEDIATE")
             began = True
-            still = set(expired_session_ids(conn, cutoff_ms).deletable)
-            doomed = [sid for sid in chunk if sid in still]
-            skipped = [sid for sid in chunk if sid not in still]
+            eligible = expired_session_ids(conn, cutoff_ms, restrict_to=pending).deletable
+            doomed = eligible[:batch]
+            # Anything left over is ineligible in the graph under this lock:
+            # revived, newly sheltering a live descendant, or cyclic.
+            ineligible = pending - set(eligible)
             if doomed:
                 marks = ",".join("?" * len(doomed))
                 for table, column in CHILD_TABLES:
                     cur = conn.execute(
                         f"DELETE FROM {table} WHERE {column} IN ({marks})", doomed
                     )
-                    outcome.rows[table] += max(0, cur.rowcount)
+                    committed[table] += max(0, cur.rowcount)
                 cur = conn.execute(f"DELETE FROM session WHERE id IN ({marks})", doomed)
-                outcome.rows["session"] += max(0, cur.rowcount)
+                committed["session"] += max(0, cur.rowcount)
             conn.execute("COMMIT")
         except (sqlite3.Error, KeyboardInterrupt, MemoryError, OSError) as exc:
             if began:
@@ -373,11 +402,14 @@ def delete_sessions(
             if began:
                 _rollback_quietly(conn)
             raise
-        # Only counted once the transaction is durable.
-        outcome.skipped.extend(skipped)
-        attempted = start + len(chunk)
+        # Past COMMIT: the deletes are durable, so their counts are now facts.
+        for table, n in committed.items():
+            outcome.rows[table] += n
+        outcome.skipped.extend(sorted(ineligible, key=order_index.__getitem__))
+        pending -= set(doomed)
+        pending -= ineligible
 
-    outcome.remaining = len(session_ids) - attempted
+    outcome.remaining = len(pending)
     return outcome
 
 
@@ -408,32 +440,60 @@ def count_rows_for(conn: sqlite3.Connection, session_ids: list[str], batch: int)
     return counts
 
 
+@dataclass
+class VacuumOutcome:
+    """What one reclamation pass actually managed to hand back.
+
+    `released < target` with `deadline_reached` set is an incomplete run:
+    pages that were eligible are still in the file, and re-running continues.
+    """
+
+    released: int = 0
+    target: int = 0
+    deadline_reached: bool = False
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.target - self.released)
+
+
 def run_incremental_vacuum(
-    conn: sqlite3.Connection, *, pages: Optional[int], deadline: Optional[float]
-) -> int:
-    """Release freed pages back to the filesystem. Returns pages released.
+    conn: sqlite3.Connection, *, pages: Optional[int], deadline: Optional[float],
+    clock=time.monotonic,
+) -> VacuumOutcome:
+    """Release freed pages back to the filesystem.
 
     Bounded per call so a huge freelist cannot block the database for minutes.
     In WAL mode the released pages only leave the file once a checkpoint runs,
-    which a long-lived reader can defer, so the return value is a count of
-    logical pages -- not a promise of bytes off the disk.
+    which a long-lived reader can defer, so the count is of logical pages --
+    not a promise of bytes off the disk.
+
+    Stopping on the deadline is reported rather than swallowed: exiting 0 with
+    a still-oversized file tells an operator the reclamation finished when it
+    did not.
     """
     before = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
     if before == 0:
-        return 0
+        return VacuumOutcome()
     step = 2000
     released = 0
     target = before if pages is None else min(pages, before)
+    outcome = VacuumOutcome(target=target)
     while released < target:
-        if deadline is not None and time.monotonic() > deadline:
+        if deadline is not None and clock() > deadline:
+            outcome.deadline_reached = True
             break
         conn.execute(f"PRAGMA incremental_vacuum({min(step, target - released)})")
         now = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
         progressed = before - now - released
         released = before - now
+        outcome.released = released
         if progressed <= 0:
+            # No page moved: the freelist is as small as this pass can make
+            # it, so the target is unreachable rather than merely unfinished.
+            outcome.target = released
             break
-    return released
+    return outcome
 
 
 def vacuum_space_plan(db: Path, stats: DbStats) -> tuple[int, int, int]:
@@ -542,6 +602,11 @@ def main() -> int:
     if not args.db.is_file():
         print(f"opencode-gc: no database at {args.db}", file=sys.stderr)
         return 2
+    # connect() opens the resolved file, so every sidecar probe (-wal, the
+    # containing filesystem) must resolve too: for `alias.db -> target.db`,
+    # `alias.db-wal` is a path that simply does not exist. Only the report
+    # keeps the name the operator typed.
+    db_path = args.db.resolve()
 
     deadline = time.monotonic() + args.max_seconds if args.max_seconds > 0 else None
     res = Result(db=str(args.db), dry_run=not args.apply,
@@ -562,7 +627,7 @@ def main() -> int:
                              "(SQLITE_LIMIT_VARIABLE_NUMBER)")
 
         stats = read_stats(conn)
-        res.bytes_before = on_disk_bytes(args.db)
+        res.bytes_before = on_disk_bytes(db_path)
         res.auto_vacuum_before = res.auto_vacuum_after = stats.auto_vacuum_name
 
         if args.enable_incremental_vacuum:
@@ -574,13 +639,13 @@ def main() -> int:
                 )
             else:
                 try:
-                    res.notes.extend(enable_incremental_vacuum(conn, args.db, stats))
+                    res.notes.extend(enable_incremental_vacuum(conn, db_path, stats))
                     res.auto_vacuum_after = read_stats(conn).auto_vacuum_name
                 except (RuntimeError, sqlite3.Error) as exc:
                     # Deleting anyway would destroy history and still leave the
                     # freed pages unreclaimable: the worst of both outcomes.
                     res.errors.append(f"{exc}; refusing to delete anything")
-                    res.bytes_after = on_disk_bytes(args.db)
+                    res.bytes_after = on_disk_bytes(db_path)
                     return _report(args, res)
 
         res.cutoff_ms = cutoff_ms = int((time.time() - args.retention_days * 86400) * 1000)
@@ -615,31 +680,56 @@ def main() -> int:
             else:
                 res.rows_deleted = count_rows_for(conn, selection.deletable, batch)
 
-        # Reclaiming is still worth doing after a partial delete: the pages
-        # freed by the batches that did commit are already on the freelist.
-        if args.apply and not args.no_vacuum:
-            current = read_stats(conn)
-            if current.auto_vacuum == 2:
-                try:
-                    res.pages_released = run_incremental_vacuum(
+        # Past this point rows may already be gone. Nothing that follows is
+        # allowed to escape as a traceback: an operator deciding what to
+        # restore needs the committed counts far more than a stack trace.
+        try:
+            # Reclaiming is still worth doing after a partial delete: the pages
+            # freed by the batches that did commit are already on the freelist.
+            if args.apply and not args.no_vacuum:
+                current = read_stats(conn)
+                if current.auto_vacuum == 2:
+                    vac = run_incremental_vacuum(
                         conn, pages=args.vacuum_pages, deadline=deadline
                     )
-                except (sqlite3.Error, KeyboardInterrupt, OSError) as exc:
-                    # The deletes are already committed and must still be
-                    # reported; failing to reclaim is not failing to delete.
-                    res.incomplete = True
-                    res.errors.append(f"page reclamation stopped: "
-                                      f"{type(exc).__name__}: {exc}")
-            elif current.freelist_count:
-                res.notes.append(
-                    f"{current.freelist_count:,} pages are free but auto_vacuum is "
-                    f"{current.auto_vacuum_name}; they stay in the file. Re-run with "
-                    "--enable-incremental-vacuum to reclaim future deletes."
-                )
+                    res.pages_released = vac.released
+                    res.pages_reclaimable_remaining = vac.remaining
+                    res.vacuum_deadline_reached = vac.deadline_reached
+                    if vac.deadline_reached:
+                        # Pages that were eligible are still in the file, so
+                        # the file is larger than the run implies.
+                        res.incomplete = True
+                        res.notes.append(
+                            f"--max-seconds reached during page reclamation; "
+                            f"{vac.remaining:,} of {vac.target:,} page(s) were not "
+                            "released. Re-run to continue."
+                        )
+                elif current.freelist_count:
+                    res.notes.append(
+                        f"{current.freelist_count:,} pages are free but auto_vacuum is "
+                        f"{current.auto_vacuum_name}; they stay in the file. Re-run with "
+                        "--enable-incremental-vacuum to reclaim future deletes."
+                    )
+        except (sqlite3.Error, KeyboardInterrupt, OSError) as exc:
+            # The deletes are already committed and must still be reported;
+            # failing to reclaim is not failing to delete.
+            res.incomplete = True
+            res.errors.append(f"page reclamation stopped: "
+                              f"{type(exc).__name__}: {exc}")
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except sqlite3.Error as exc:
+            res.incomplete = True
+            res.errors.append(f"closing the database failed: "
+                              f"{type(exc).__name__}: {exc}")
 
-    res.bytes_after = on_disk_bytes(args.db)
+    try:
+        res.bytes_after = on_disk_bytes(db_path)
+    except OSError as exc:
+        res.incomplete = True
+        res.errors.append(f"measuring the database failed: "
+                          f"{type(exc).__name__}: {exc}")
     if res.pages_released and res.bytes_reclaimed == 0:
         res.notes.append(
             f"{res.pages_released:,} pages were released but the file has not "
@@ -674,12 +764,12 @@ def _report(args, res: Result) -> int:
         print(f"    {verb}: {rows}")
         if not args.apply:
             print(f"    cutoff: sessions not updated since epoch ms {res.cutoff_ms}")
-    if res.incomplete and args.apply:
+    if res.incomplete and args.apply and res.sessions_remaining:
         print(f"    INCOMPLETE: {res.sessions_remaining} eligible session(s) not "
               "attempted; the deletions above are already committed")
     if res.sessions_skipped_revalidation:
-        print(f"    skipped {res.sessions_skipped_revalidation} session(s) that became "
-              "active after selection")
+        print(f"    skipped {res.sessions_skipped_revalidation} session(s) no longer "
+              "eligible under the write lock")
     if res.sessions_kept_live_descendant:
         print(f"    kept {res.sessions_kept_live_descendant} old session(s) with a "
               "recently-updated descendant")
