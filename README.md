@@ -107,6 +107,7 @@ Text-to-speech using Gemini's native audio generation.
 |-------|-------|---------|
 | `gemini-2.5-flash-preview-tts` | Fast | Good (default) |
 | `gemini-2.5-pro-preview-tts` | Slower | More expressive |
+| `opencode-gc` | Prune old opencode sessions and release freed SQLite pages back to the filesystem | — |
 
 **Voices:**
 | Voice | Character |
@@ -1668,3 +1669,68 @@ it tested against.
 ## License
 
 MIT
+
+---
+
+## opencode-gc
+
+opencode's SQLite store never prunes finished sessions. Measured on one host:
+**76.6 GB across 3,164 sessions** (2.30M `event` rows), growing ~6 GB/day.
+
+```bash
+opencode-gc                              # dry run, 5-day retention
+opencode-gc --apply                      # delete + release pages
+opencode-gc --retention-days 14 --apply
+opencode-gc --apply --enable-incremental-vacuum   # first run on a new host
+opencode-gc --json                       # machine-readable
+```
+
+### Why a session delete is not enough
+
+The foreign keys are:
+
+```
+message.session_id -> session.id                    ON DELETE CASCADE
+part.message_id    -> message.id                    ON DELETE CASCADE
+event.aggregate_id -> event_sequence.aggregate_id   ON DELETE CASCADE
+event_sequence     -> (nothing)
+```
+
+`event_sequence` has **no** foreign key to `session` — its `aggregate_id` merely
+happens to equal a session id. So `opencode session delete` (or a plain
+`DELETE FROM session`) strands every event row, which is the bulk of the file.
+`PRAGMA foreign_keys` is also off by default, so the cascades above do not fire
+unless enabled. This tool deletes each table explicitly, children first.
+
+### Why incremental vacuum
+
+A plain `VACUUM` rewrites the whole database and needs free space roughly equal
+to the file — impossible at 76 GB on a full disk. `PRAGMA auto_vacuum=2`
+(INCREMENTAL) lets `PRAGMA incremental_vacuum(N)` hand pages back in bounded
+chunks with no rewrite and no large temp file.
+
+`--enable-incremental-vacuum` switches a database to that mode. It costs one
+full `VACUUM`, so it refuses unless free space is at least 1.1x the database
+size; run it once per host, ideally before the file gets large.
+
+### Safety
+
+- Dry run by default; `--apply` is required to delete anything.
+- A session is only expired when it **and every descendant** are older than the
+  retention window — `session.parent_id` has no foreign key, so deleting a
+  parent out from under a live child would leave a dangling reference.
+- `--retention-days` below 1 is refused; this deletes irreplaceable history.
+- Deletes run in batches inside transactions, so opencode can keep running and
+  an interrupted run never leaves orphaned rows.
+- `--max-seconds` bounds the run; `--vacuum-pages` bounds page reclamation.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--db` | `~/.local/share/opencode/opencode.db` | database path |
+| `--retention-days` | `5` | keep sessions updated within this window |
+| `--apply` | off | actually delete |
+| `--batch` | `200` | sessions per transaction |
+| `--max-seconds` | `600` | stop starting new work after this long |
+| `--vacuum-pages` | all | cap pages released per run |
+| `--no-vacuum` | off | delete rows but do not release pages |
+| `--enable-incremental-vacuum` | off | switch `auto_vacuum` to INCREMENTAL |
