@@ -4,7 +4,8 @@ Run: pytest tests/test_opencode_gc.py -q
 
 This deletes irreplaceable history, so the tests that matter are negative:
 a live session is never touched, an old parent of a live session is never
-touched, a too-small retention is refused, and a dry run never writes.
+touched, a session that came back to life mid-run is never touched, a
+too-small retention is refused, and a dry run never writes.
 
 Every test builds a real SQLite database with the same schema shape as the
 live one -- in particular `event_sequence` with NO foreign key to `session`,
@@ -22,17 +23,12 @@ from toolbox import opencode_gc
 
 DAY_MS = 86_400_000
 
-
-def _make_db(path, *, auto_vacuum=2):
-    conn = sqlite3.connect(path, isolation_level=None)
-    conn.execute(f"PRAGMA auto_vacuum={auto_vacuum}")
-    conn.executescript(
-        """
+SCHEMA = """
         CREATE TABLE session (
             id text PRIMARY KEY,
             parent_id text,
             time_created integer NOT NULL,
-            time_updated integer NOT NULL
+            time_updated integer {updated_null}
         );
         CREATE TABLE message (
             id text PRIMARY KEY,
@@ -57,7 +53,16 @@ def _make_db(path, *, auto_vacuum=2):
                 REFERENCES event_sequence(aggregate_id) ON DELETE CASCADE,
             data text NOT NULL
         );
-        """
+"""
+
+
+def _make_db(path, *, auto_vacuum=2, wal=False, nullable_time_updated=False):
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute(f"PRAGMA auto_vacuum={auto_vacuum}")
+    if wal:
+        conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(
+        SCHEMA.format(updated_null="" if nullable_time_updated else "NOT NULL")
     )
     conn.execute("VACUUM")
     return conn
@@ -70,6 +75,10 @@ def _add_session(conn, sid, *, age_days, parent=None, events=3, messages=2):
         "INSERT INTO session (id, parent_id, time_created, time_updated) VALUES (?,?,?,?)",
         (sid, parent, t, t),
     )
+    _add_rows(conn, sid, events=events, messages=messages)
+
+
+def _add_rows(conn, sid, *, events=3, messages=2):
     conn.execute("INSERT INTO event_sequence (aggregate_id, seq) VALUES (?,?)", (sid, events))
     for i in range(events):
         conn.execute(
@@ -87,6 +96,10 @@ def _add_session(conn, sid, *, age_days, parent=None, events=3, messages=2):
         )
 
 
+def _cutoff(days=5):
+    return int((time.time() - days * 86400) * 1000)
+
+
 @pytest.fixture()
 def db(tmp_path):
     path = tmp_path / "opencode.db"
@@ -95,11 +108,34 @@ def db(tmp_path):
     conn.close()
 
 
+TABLES = ("session", "message", "part", "event", "event_sequence")
+
+
 def _counts(conn):
-    return {
-        t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
-        for t in ("session", "message", "part", "event", "event_sequence")
-    }
+    return {t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in TABLES}
+
+
+def _snapshot(path):
+    """Every row of every table, so a test can assert nothing at all changed."""
+    conn = sqlite3.connect(path)
+    try:
+        return {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall()) for t in TABLES}
+    finally:
+        conn.close()
+
+
+def _delete(conn, ids, *, cutoff=None, batch=200, deadline=None):
+    return opencode_gc.delete_sessions(
+        conn, ids, cutoff_ms=_cutoff() if cutoff is None else cutoff,
+        batch=batch, deadline=deadline,
+    )
+
+
+def _counting_clock():
+    """Advances one second per read, so a deadline trips at an exact batch
+    instead of at whatever the wall clock happens to do on a loaded machine."""
+    ticks = iter(range(10_000))
+    return lambda: float(next(ticks))
 
 
 class TestExpirySelection:
@@ -107,18 +143,32 @@ class TestExpirySelection:
         path, conn = db
         _add_session(conn, "old", age_days=30)
         _add_session(conn, "fresh", age_days=1)
-        cutoff = int((time.time() - 5 * 86400) * 1000)
-        expired, kept = opencode_gc.expired_session_ids(conn, cutoff)
-        assert expired == ["old"]
-        assert kept == 0
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+        assert sel.deletable == ["old"]
+        assert sel.kept_live_descendant == 0
 
-    def test_boundary_is_strict(self, db):
+    def test_boundary_is_exactly_strict(self, db):
+        """One millisecond either side of the cutoff, and the cutoff itself.
+
+        4.9-vs-5.1-day fixtures pass under both `<` and `<=`, so they do not
+        test the boundary at all; a separate time.time() per session also
+        drifts the effective cutoff between fixture and assertion.
+
+        Mutation: in select_expired, `t < cutoff_ms` -> `t <= cutoff_ms`.
+        'at' is then expired and the assertion fails.
+        """
         path, conn = db
-        _add_session(conn, "just_inside", age_days=4.9)
-        _add_session(conn, "just_outside", age_days=5.1)
         cutoff = int((time.time() - 5 * 86400) * 1000)
-        expired, _ = opencode_gc.expired_session_ids(conn, cutoff)
-        assert expired == ["just_outside"]
+        for sid, t in (("before", cutoff - 1), ("at", cutoff), ("after", cutoff + 1)):
+            conn.execute(
+                "INSERT INTO session (id, parent_id, time_created, time_updated) "
+                "VALUES (?,NULL,?,?)", (sid, t, t),
+            )
+            _add_rows(conn, sid)
+
+        sel = opencode_gc.expired_session_ids(conn, cutoff)
+
+        assert sel.deletable == ["before"], "only strictly-older-than-cutoff may expire"
 
     def test_old_parent_of_live_child_is_kept(self, db):
         """session.parent_id has no FK, so deleting the parent would leave the
@@ -126,30 +176,27 @@ class TestExpirySelection:
         path, conn = db
         _add_session(conn, "parent", age_days=30)
         _add_session(conn, "child", age_days=1, parent="parent")
-        cutoff = int((time.time() - 5 * 86400) * 1000)
-        expired, kept = opencode_gc.expired_session_ids(conn, cutoff)
-        assert expired == []
-        assert kept == 1
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+        assert sel.deletable == []
+        assert sel.kept_live_descendant == 1
 
     def test_whole_old_chain_is_collected(self, db):
         path, conn = db
         _add_session(conn, "gp", age_days=40)
         _add_session(conn, "p", age_days=35, parent="gp")
         _add_session(conn, "c", age_days=30, parent="p")
-        cutoff = int((time.time() - 5 * 86400) * 1000)
-        expired, kept = opencode_gc.expired_session_ids(conn, cutoff)
-        assert expired == ["c", "gp", "p"]
-        assert kept == 0
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+        assert sorted(sel.deletable) == ["c", "gp", "p"]
+        assert sel.kept_live_descendant == 0
 
     def test_grandparent_of_live_grandchild_is_kept(self, db):
         path, conn = db
         _add_session(conn, "gp", age_days=40)
         _add_session(conn, "p", age_days=35, parent="gp")
         _add_session(conn, "live", age_days=1, parent="p")
-        cutoff = int((time.time() - 5 * 86400) * 1000)
-        expired, kept = opencode_gc.expired_session_ids(conn, cutoff)
-        assert expired == []
-        assert kept == 2
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+        assert sel.deletable == []
+        assert sel.kept_live_descendant == 2
 
     def test_parent_cycle_does_not_hang(self, db):
         """Corrupt data must not spin the ancestor walk forever."""
@@ -157,9 +204,217 @@ class TestExpirySelection:
         _add_session(conn, "a", age_days=30)
         _add_session(conn, "b", age_days=1, parent="a")
         conn.execute("UPDATE session SET parent_id='b' WHERE id='a'")
-        cutoff = int((time.time() - 5 * 86400) * 1000)
-        expired, _ = opencode_gc.expired_session_ids(conn, cutoff)
-        assert "a" not in expired
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+        assert "a" not in sel.deletable
+
+
+class TestNullTimeUpdated:
+    """A NULL time_updated is an unknown age. Guessing that unknown means
+    expired makes a destructive tool delete on no evidence at all.
+
+    Mutation: in select_expired, `old = {sid for sid, t in updated.items()
+    if t is not None and t < cutoff_ms}` -> `... if (t or 0) < cutoff_ms}`
+    (the original code). Both tests below fail.
+    """
+
+    @pytest.fixture()
+    def nulldb(self, tmp_path):
+        path = tmp_path / "null.db"
+        conn = _make_db(path, nullable_time_updated=True)
+        yield path, conn
+        conn.close()
+
+    def test_unknown_age_session_is_not_selected(self, nulldb):
+        path, conn = nulldb
+        _add_session(conn, "unknown", age_days=30)
+        conn.execute("UPDATE session SET time_updated=NULL WHERE id='unknown'")
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+        assert sel.deletable == []
+        assert sel.kept_unknown_age == 1
+
+    def test_unknown_age_session_and_its_rows_survive_a_delete(self, nulldb):
+        path, conn = nulldb
+        _add_session(conn, "unknown", age_days=30, events=4, messages=2)
+        _add_session(conn, "old", age_days=30)
+        conn.execute("UPDATE session SET time_updated=NULL WHERE id='unknown'")
+
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+        _delete(conn, sel.deletable)
+
+        assert conn.execute("SELECT id FROM session").fetchall() == [("unknown",)]
+        assert conn.execute(
+            "SELECT count(*) FROM event WHERE aggregate_id='unknown'"
+        ).fetchone()[0] == 4
+        assert conn.execute(
+            "SELECT count(*) FROM message WHERE session_id='unknown'"
+        ).fetchone()[0] == 2
+
+    def test_unknown_age_child_protects_its_old_parent(self, nulldb):
+        """Mutation: same as above -- with NULL read as 0 the child is itself
+        expired, so nothing protects the parent and both are selected."""
+        path, conn = nulldb
+        _add_session(conn, "parent", age_days=30)
+        _add_session(conn, "child", age_days=30, parent="parent")
+        conn.execute("UPDATE session SET time_updated=NULL WHERE id='child'")
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+        assert sel.deletable == []
+
+
+class TestDeletionOrder:
+    """Batches commit separately, so a parent deleted in an earlier
+    transaction than its child leaves a dangling parent_id if the run then
+    stops. Order must be deepest-descendant-first.
+    """
+
+    def test_children_are_ordered_before_their_parents(self, db):
+        path, conn = db
+        _add_session(conn, "a-gp", age_days=40)
+        _add_session(conn, "z-p", age_days=35, parent="a-gp")
+        _add_session(conn, "m-c", age_days=30, parent="z-p")
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+        pos = {sid: i for i, sid in enumerate(sel.deletable)}
+        assert pos["m-c"] < pos["z-p"] < pos["a-gp"]
+
+    def test_batch_boundary_never_strands_a_child(self, db):
+        """Mutation: `ordered, cyclic = _order_descendant_first(...)` ->
+        `ordered, cyclic = sorted(old - protected), []` (lexicographic, the
+        original behaviour). 'a-gp' then sorts first, commits in batch 1,
+        and 'm-c'/'z-p' survive pointing at a deleted parent.
+        """
+        path, conn = db
+        _add_session(conn, "a-gp", age_days=40)
+        _add_session(conn, "z-p", age_days=35, parent="a-gp")
+        _add_session(conn, "m-c", age_days=30, parent="z-p")
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+
+        # One batch commits, then stop: exactly the crash/deadline window.
+        first = sel.deletable[:1]
+        _delete(conn, first, batch=1)
+
+        dangling = conn.execute(
+            "SELECT s.id FROM session s WHERE s.parent_id IS NOT NULL "
+            "AND s.parent_id NOT IN (SELECT id FROM session)"
+        ).fetchall()
+        assert dangling == [], f"surviving session points at a deleted parent: {dangling}"
+        assert conn.execute("SELECT count(*) FROM session").fetchone()[0] == 2
+
+    def test_deadline_between_batches_leaves_no_dangling_parent(self, db):
+        """A real stop: some batches commit, then the deadline trips. This is
+        the crash/deadline window the docstring promises is safe.
+
+        Mutation: same `_order_descendant_first` -> `sorted(...)` swap.
+        Lexicographic order deletes 's0' (the root) first and leaves its
+        children behind.
+        """
+        path, conn = db
+        _add_session(conn, "s0", age_days=40)
+        for i in range(1, 5):
+            _add_session(conn, f"s{i}", age_days=40 - i, parent=f"s{i - 1}")
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+
+        outcome = opencode_gc.delete_sessions(
+            conn, sel.deletable, cutoff_ms=_cutoff(), batch=1,
+            deadline=1.5, clock=_counting_clock(),
+        )
+
+        assert outcome.rows["session"] == 2, "the run must stop part-way through"
+        dangling = conn.execute(
+            "SELECT id FROM session WHERE parent_id IS NOT NULL "
+            "AND parent_id NOT IN (SELECT id FROM session)"
+        ).fetchall()
+        assert dangling == []
+
+    def test_cyclic_component_is_retained_not_reordered(self, db):
+        """Two old sessions pointing at each other have no safe order.
+
+        Mutation: in _order_descendant_first, return `sorted(deletable), []`
+        instead of `(ordered, sorted(deletable - set(ordered)))`. The cycle is
+        then deleted one id per batch, stranding the other half.
+        """
+        path, conn = db
+        _add_session(conn, "x", age_days=30)
+        _add_session(conn, "y", age_days=30, parent="x")
+        conn.execute("UPDATE session SET parent_id='y' WHERE id='x'")
+        _add_session(conn, "plain", age_days=30)
+
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+        assert sel.deletable == ["plain"]
+        assert sel.kept_parent_cycle == 2
+
+        _delete(conn, sel.deletable, batch=1)
+        assert sorted(r[0] for r in conn.execute("SELECT id FROM session")) == ["x", "y"]
+
+
+class TestConcurrentRevival:
+    """The database is live. Selection and deletion are different instants,
+    and BEGIN IMMEDIATE only serialises writers from the lock onward -- it
+    does not make an earlier SELECT current.
+
+    Mutation for both tests: in delete_sessions, replace
+    `doomed = [sid for sid in chunk if sid in still]` with `doomed = chunk`
+    (the original behaviour). Both fail: the revived session is destroyed.
+    """
+
+    @pytest.fixture()
+    def live(self, tmp_path):
+        path = tmp_path / "live.db"
+        setup = _make_db(path, wal=True)
+        setup.close()
+        gc_conn = opencode_gc.connect(path, read_only=False, timeout_s=5)
+        app = sqlite3.connect(path, isolation_level=None, timeout=5)
+        app.execute("PRAGMA busy_timeout=5000")
+        yield path, gc_conn, app
+        gc_conn.close()
+        app.close()
+
+    def test_session_touched_after_selection_survives(self, live):
+        path, gc_conn, app = live
+        _add_session(app, "s", age_days=30, events=4)
+        cutoff = _cutoff()
+
+        selected = opencode_gc.expired_session_ids(gc_conn, cutoff).deletable
+        assert selected == ["s"], "the test must start from a genuinely expired session"
+
+        # opencode writes to the session between selection and deletion.
+        app.execute(
+            "UPDATE session SET time_updated=? WHERE id='s'", (int(time.time() * 1000),)
+        )
+
+        outcome = opencode_gc.delete_sessions(
+            gc_conn, selected, cutoff_ms=cutoff, batch=200, deadline=None
+        )
+
+        assert outcome.rows["session"] == 0
+        assert outcome.skipped == ["s"]
+        assert app.execute("SELECT id FROM session").fetchall() == [("s",)]
+        assert app.execute(
+            "SELECT count(*) FROM event WHERE aggregate_id='s'"
+        ).fetchone()[0] == 4
+
+    def test_live_child_created_after_selection_protects_its_parent(self, live):
+        path, gc_conn, app = live
+        _add_session(app, "p", age_days=30, events=4)
+        cutoff = _cutoff()
+
+        selected = opencode_gc.expired_session_ids(gc_conn, cutoff).deletable
+        assert selected == ["p"]
+
+        # opencode forks a subagent session under the expired parent.
+        now = int(time.time() * 1000)
+        app.execute(
+            "INSERT INTO session (id, parent_id, time_created, time_updated) "
+            "VALUES ('kid','p',?,?)", (now, now),
+        )
+
+        outcome = opencode_gc.delete_sessions(
+            gc_conn, selected, cutoff_ms=cutoff, batch=200, deadline=None
+        )
+
+        assert outcome.rows["session"] == 0
+        assert sorted(r[0] for r in app.execute("SELECT id FROM session")) == ["kid", "p"]
+        assert app.execute(
+            "SELECT count(*) FROM event WHERE aggregate_id='p'"
+        ).fetchone()[0] == 4
 
 
 class TestDeletion:
@@ -172,7 +427,7 @@ class TestDeletion:
         before = _counts(conn)
         assert before["event"] == 9
 
-        opencode_gc.delete_sessions(conn, ["old"], batch=200, deadline=None)
+        _delete(conn, ["old"])
 
         after = _counts(conn)
         assert after["session"] == 1
@@ -182,21 +437,46 @@ class TestDeletion:
         assert after["part"] == 1
 
     def test_no_orphans_left_behind(self, db):
+        """Mutation: remove ("event_sequence", "aggregate_id") from
+        CHILD_TABLES. The stranded event_sequence row is then found here,
+        because the table list below is the schema's, not production's.
+        """
         path, conn = db
         _add_session(conn, "a", age_days=30)
         _add_session(conn, "b", age_days=30)
-        opencode_gc.delete_sessions(conn, ["a", "b"], batch=1, deadline=None)
-        for table, column in opencode_gc.CHILD_TABLES:
-            assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+        _delete(conn, ["a", "b"], batch=1)
+        # Enumerated independently of CHILD_TABLES: deriving them from the
+        # production constant would let dropping a table from that constant
+        # also drop the assertion that its rows were cleaned.
+        leftovers = {
+            "session": conn.execute("SELECT count(*) FROM session").fetchone()[0],
+            "message": conn.execute("SELECT count(*) FROM message").fetchone()[0],
+            "part": conn.execute("SELECT count(*) FROM part").fetchone()[0],
+            "event": conn.execute("SELECT count(*) FROM event").fetchone()[0],
+            "event_sequence":
+                conn.execute("SELECT count(*) FROM event_sequence").fetchone()[0],
+        }
+        assert leftovers == {
+            "session": 0, "message": 0, "part": 0, "event": 0, "event_sequence": 0,
+        }
 
     def test_live_session_rows_survive(self, db):
         path, conn = db
         _add_session(conn, "old", age_days=30)
         _add_session(conn, "live", age_days=1)
-        opencode_gc.delete_sessions(conn, ["old"], batch=200, deadline=None)
+        _delete(conn, ["old"])
         assert conn.execute(
             "SELECT count(*) FROM event WHERE aggregate_id='live'"
         ).fetchone()[0] == 3
+        assert conn.execute("SELECT id FROM session").fetchall() == [("live",)]
+
+    def test_a_live_id_passed_in_is_refused(self, db):
+        """delete_sessions authorises against cutoff_ms, not its argument."""
+        path, conn = db
+        _add_session(conn, "live", age_days=1)
+        outcome = _delete(conn, ["live"])
+        assert outcome.rows["session"] == 0
+        assert outcome.skipped == ["live"]
         assert conn.execute("SELECT id FROM session").fetchall() == [("live",)]
 
     def test_batching_deletes_everything(self, db):
@@ -204,21 +484,9 @@ class TestDeletion:
         ids = [f"s{i}" for i in range(7)]
         for sid in ids:
             _add_session(conn, sid, age_days=30)
-        counts = opencode_gc.delete_sessions(conn, ids, batch=2, deadline=None)
-        assert counts["session"] == 7
+        outcome = _delete(conn, ids, batch=2)
+        assert outcome.rows["session"] == 7
         assert _counts(conn)["event"] == 0
-
-    def test_deadline_stops_early_without_corruption(self, db):
-        path, conn = db
-        ids = [f"s{i}" for i in range(6)]
-        for sid in ids:
-            _add_session(conn, sid, age_days=30)
-        # Already expired: the first batch check trips immediately.
-        opencode_gc.delete_sessions(conn, ids, batch=2, deadline=time.monotonic() - 1)
-        c = _counts(conn)
-        # Nothing half-deleted: every surviving session keeps all its rows.
-        assert c["session"] * 3 == c["event"]
-        assert c["session"] * 2 == c["message"]
 
 
 class TestCounting:
@@ -226,7 +494,7 @@ class TestCounting:
         path, conn = db
         _add_session(conn, "old", age_days=30, events=5, messages=3)
         predicted = opencode_gc.count_rows_for(conn, ["old"], 200)
-        actual = opencode_gc.delete_sessions(conn, ["old"], batch=200, deadline=None)
+        actual = _delete(conn, ["old"]).rows
         assert predicted == actual
 
 
@@ -235,9 +503,7 @@ class TestIncrementalVacuum:
         path, conn = db
         for i in range(60):
             _add_session(conn, f"s{i}", age_days=30, events=40, messages=10)
-        opencode_gc.delete_sessions(
-            conn, [f"s{i}" for i in range(60)], batch=200, deadline=None
-        )
+        _delete(conn, [f"s{i}" for i in range(60)])
         assert conn.execute("PRAGMA freelist_count").fetchone()[0] > 0
         released = opencode_gc.run_incremental_vacuum(conn, pages=None, deadline=None)
         assert released > 0
@@ -247,9 +513,7 @@ class TestIncrementalVacuum:
         path, conn = db
         for i in range(60):
             _add_session(conn, f"s{i}", age_days=30, events=40, messages=10)
-        opencode_gc.delete_sessions(
-            conn, [f"s{i}" for i in range(60)], batch=200, deadline=None
-        )
+        _delete(conn, [f"s{i}" for i in range(60)])
         free_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
         released = opencode_gc.run_incremental_vacuum(conn, pages=1, deadline=None)
         assert 0 < released < free_before
@@ -274,6 +538,31 @@ class TestIncrementalVacuum:
             stats = opencode_gc.read_stats(conn)
             assert stats.auto_vacuum == 0
             opencode_gc.enable_incremental_vacuum(conn, path, stats)
+            assert opencode_gc.read_stats(conn).auto_vacuum == 2
+        finally:
+            conn.close()
+
+    def test_enable_from_full_needs_no_vacuum(self, tmp_path):
+        """FULL -> INCREMENTAL is a header change. Demanding VACUUM space for
+        it would refuse a conversion that costs nothing.
+
+        Mutation: delete the `if stats.auto_vacuum == 1:` branch in
+        enable_incremental_vacuum. The free-space guard then rejects the
+        oversized DbStats and the RuntimeError propagates.
+        """
+        path = tmp_path / "full.db"
+        conn = _make_db(path, auto_vacuum=1)
+        try:
+            _add_session(conn, "s", age_days=30)
+            stats = opencode_gc.read_stats(conn)
+            assert stats.auto_vacuum == 1
+            # Larger than any filesystem: a VACUUM-requiring path must refuse.
+            huge = opencode_gc.DbStats(
+                page_size=stats.page_size, page_count=10 ** 9,
+                freelist_count=stats.freelist_count, auto_vacuum=1,
+            )
+            notes = opencode_gc.enable_incremental_vacuum(conn, path, huge)
+            assert "no VACUUM needed" in notes[0]
             assert opencode_gc.read_stats(conn).auto_vacuum == 2
         finally:
             conn.close()
@@ -304,10 +593,519 @@ class TestIncrementalVacuum:
         finally:
             conn.close()
 
+    def test_guard_demands_the_documented_two_copies(self, tmp_path, monkeypatch):
+        """SQLite documents VACUUM as needing up to twice the file size. A
+        database with 1.5x its size free must be refused; 2.5x proceeds.
+
+        Mutation: `VACUUM_COPY_FACTOR = 2` -> `1` (or the pre-review 1.1
+        multiplier). The 1.5x case then passes the guard and nothing raises.
+        """
+        path = tmp_path / "guard.db"
+        conn = _make_db(path, auto_vacuum=0)
+        try:
+            _add_session(conn, "s", age_days=30)
+            real = opencode_gc.read_stats(conn)
+            # 40 GB claimed, so the proportional reserve dominates the floor
+            # and the assertion is about the copy factor, not the reserve.
+            stats = opencode_gc.DbStats(
+                page_size=4096, page_count=10 ** 7, freelist_count=0, auto_vacuum=0
+            )
+            payload, _, _ = opencode_gc.vacuum_space_plan(path.resolve(), stats)
+            assert payload * opencode_gc.VACUUM_RESERVE_FRACTION > \
+                opencode_gc.MIN_VACUUM_RESERVE_BYTES
+
+            def fake_usage(free):
+                return lambda _p: type("U", (), {"free": free})()
+
+            monkeypatch.setattr(opencode_gc.shutil, "disk_usage", fake_usage(int(payload * 1.5)))
+            with pytest.raises(RuntimeError, match="needs"):
+                opencode_gc.enable_incremental_vacuum(conn, path, stats)
+            assert opencode_gc.read_stats(conn).auto_vacuum == 0
+
+            monkeypatch.setattr(opencode_gc.shutil, "disk_usage", fake_usage(int(payload * 2.5)))
+            opencode_gc.enable_incremental_vacuum(conn, path, stats)
+            assert opencode_gc.read_stats(conn).auto_vacuum == 2
+            assert real.auto_vacuum == 0
+        finally:
+            conn.close()
+
+    def test_guard_counts_the_wal(self, tmp_path):
+        """An uncheckpointed WAL is data VACUUM has to copy too.
+
+        Mutation: drop the `+ wal` term from vacuum_space_plan's payload.
+        """
+        path = tmp_path / "wal.db"
+        conn = _make_db(path, auto_vacuum=0, wal=True)
+        try:
+            for i in range(200):
+                _add_session(conn, f"s{i}", age_days=30, events=20, messages=5)
+            wal_bytes = path.with_name(path.name + "-wal").stat().st_size
+            assert wal_bytes > 0, "fixture must leave an uncheckpointed WAL"
+            stats = opencode_gc.read_stats(conn)
+            payload, _, _ = opencode_gc.vacuum_space_plan(path.resolve(), stats)
+            assert payload >= stats.total_bytes + wal_bytes
+        finally:
+            conn.close()
+
+
+class TestUriEscaping:
+    """`file:{db}?mode=rw` reparses a legitimate filename as URI syntax, so
+    `--db 'victim?.db'` passes is_file() and then deletes from `victim`. Each
+    candidate below carries a distinct marker session, so the test proves
+    *which* database was opened rather than merely that one opened.
+
+    Mutation for all of these: in connect(), replace the body with
+    `conn = sqlite3.connect(f"file:{Path(db).resolve()}?mode=" + ("ro" if
+    read_only else "rw"), uri=True, timeout=timeout_s, isolation_level=None)`.
+    The '?' and '#' cases then read the decoy's marker, and '%41' reads the
+    percent-decoded neighbour's.
+    """
+
+    @pytest.fixture()
+    def decoys(self, tmp_path):
+        """A directory where a naive URI parse lands on a different file."""
+        made = {}
+        for name, marker in (
+            ("victim", "DECOY_TRUNCATED"),      # what 'victim?.db' truncates to
+            ("victimA.db", "DECOY_PERCENT"),    # what 'victim%41.db' decodes to
+            ("victim?.db", "TARGET_Q"),
+            ("victim#1.db", "TARGET_HASH"),
+            ("victim%41.db", "TARGET_PERCENT"),
+            ("vic tim.db", "TARGET_SPACE"),
+        ):
+            path = tmp_path / name
+            conn = _make_db(path)
+            _add_session(conn, marker, age_days=30)
+            conn.close()
+            made[name] = (path, marker)
+        return made
+
+    @pytest.mark.parametrize(
+        "name", ["victim?.db", "victim#1.db", "victim%41.db", "vic tim.db"]
+    )
+    @pytest.mark.parametrize("read_only", [True, False])
+    def test_connect_opens_the_named_file(self, decoys, name, read_only):
+        path, marker = decoys[name]
+        conn = opencode_gc.connect(path, read_only=read_only)
+        try:
+            assert conn.execute("SELECT id FROM session").fetchall() == [(marker,)]
+        finally:
+            conn.close()
+
+    def test_apply_deletes_from_the_named_file_only(self, decoys, monkeypatch):
+        """The full blast radius: --apply on 'victim?.db' must not touch
+        'victim'."""
+        path, marker = decoys["victim?.db"]
+        decoy_path, decoy_marker = decoys["victim"]
+
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv", ["opencode-gc", "--db", str(path), "--apply"]
+        )
+        assert opencode_gc.main() == 0
+
+        assert _snapshot(path)["session"] == [], "the named database must be pruned"
+        assert [r[0] for r in _snapshot(decoy_path)["session"]] == [decoy_marker], \
+            "the decoy database must be untouched"
+
+
+class TestInterruptedRunReporting:
+    """Committed batches are irreversible. A failure or deadline afterwards
+    must still yield counts and an incomplete marker, never a traceback.
+
+    The failure here is a genuine SQLITE_BUSY: a second connection takes the
+    write lock before one of the batches, which is exactly what opencode does
+    to this tool in production. No exception is fabricated.
+    """
+
+    def _locking_conn(self, path, blocker, *, before_batch):
+        """A connection whose `before_batch`-th BEGIN IMMEDIATE loses the race
+        for the write lock."""
+
+        class LosesTheLock(sqlite3.Connection):
+            begins = 0
+
+            def execute(self, sql, *a):
+                if sql == "BEGIN IMMEDIATE":
+                    LosesTheLock.begins += 1
+                    if LosesTheLock.begins == before_batch:
+                        blocker.execute("BEGIN IMMEDIATE")
+                        blocker.execute(
+                            "INSERT INTO session (id, parent_id, time_created, "
+                            "time_updated) VALUES ('blocker',NULL,1,1)"
+                        )
+                return super().execute(sql, *a)
+
+        conn = sqlite3.connect(
+            str(path), isolation_level=None, timeout=0, factory=LosesTheLock
+        )
+        conn.execute("PRAGMA busy_timeout=0")
+        return conn
+
+    def test_lock_failure_after_a_committed_batch_reports_what_was_destroyed(self, tmp_path):
+        """Mutation: in delete_sessions, move `conn.execute("BEGIN IMMEDIATE")`
+        back outside the `try`, or re-`raise` from the
+        `except (sqlite3.Error, ...)` handler. The SQLITE_BUSY then escapes as
+        a traceback and the committed counts are lost.
+        """
+        path = tmp_path / "busy.db"
+        setup = _make_db(path, wal=True)
+        for i in range(6):
+            _add_session(setup, f"s{i}", age_days=30)
+        setup.close()
+
+        blocker = sqlite3.connect(str(path), isolation_level=None, timeout=0)
+        gc_conn = self._locking_conn(path, blocker, before_batch=3)
+        try:
+            cutoff = _cutoff()
+            sel = opencode_gc.expired_session_ids(gc_conn, cutoff)
+            assert len(sel.deletable) == 6
+
+            outcome = opencode_gc.delete_sessions(
+                gc_conn, sel.deletable, cutoff_ms=cutoff, batch=1, deadline=None
+            )
+
+            assert outcome.failure is not None
+            assert "locked" in outcome.failure.lower()
+            assert outcome.incomplete is True
+            # Two batches committed before the lock was lost; the reported
+            # count must match what is genuinely gone.
+            assert outcome.rows["session"] == 2
+            assert outcome.remaining == 4
+            blocker.execute("ROLLBACK")
+            surviving = {r[0] for r in gc_conn.execute("SELECT id FROM session")}
+            assert len(surviving) == 4
+            assert len(sel.deletable) - outcome.rows["session"] == len(surviving)
+        finally:
+            gc_conn.close()
+            blocker.close()
+
+    def test_cli_reports_committed_counts_and_exits_nonzero(self, tmp_path, monkeypatch, capsys):
+        """Mutation: same as above. main() dies with a traceback and emits no
+        JSON at all, so the json.loads below raises.
+        """
+        import json
+
+        path = tmp_path / "busycli.db"
+        setup = _make_db(path, wal=True)
+        for i in range(6):
+            _add_session(setup, f"s{i}", age_days=30)
+        setup.close()
+
+        blocker = sqlite3.connect(str(path), isolation_level=None, timeout=0)
+        gc_conn = self._locking_conn(path, blocker, before_batch=2)
+        monkeypatch.setattr(opencode_gc, "connect", lambda *a, **kw: gc_conn)
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply", "--batch", "1", "--json"],
+        )
+        try:
+            rc = opencode_gc.main()
+            payload = json.loads(capsys.readouterr().out)
+
+            assert rc == 1
+            assert payload["incomplete"] is True
+            assert payload["sessions_deleted"] == 1
+            assert any("locked" in e.lower() for e in payload["errors"])
+            assert payload["sessions_remaining"] == 5
+        finally:
+            blocker.execute("ROLLBACK")
+            blocker.close()
+        # The reported count must match the database, not the intent.
+        assert len(_snapshot(path)["session"]) == 5
+
+    def test_deadline_is_not_reported_as_clean_success(self, tmp_path, monkeypatch, capsys):
+        """A run that stops on --max-seconds leaves eligible sessions behind.
+
+        Mutation: in main, delete the two lines assigning
+        `res.incomplete = outcome.incomplete` and
+        `res.deadline_reached = outcome.deadline_reached`. rc returns to 0 and
+        the flags go false, so a caller cannot tell the run was truncated.
+        """
+        import json
+
+        path = tmp_path / "deadline.db"
+        conn = _make_db(path)
+        for i in range(5):
+            _add_session(conn, f"s{i}", age_days=30)
+        conn.close()
+
+        real_delete = opencode_gc.delete_sessions
+        monkeypatch.setattr(
+            opencode_gc, "delete_sessions",
+            lambda c, ids, **kw: real_delete(
+                c, ids, **{**kw, "deadline": 1.5, "clock": _counting_clock()}
+            ),
+        )
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply", "--batch", "1", "--json"],
+        )
+        rc = opencode_gc.main()
+        payload = json.loads(capsys.readouterr().out)
+
+        assert rc == 3, "a truncated run must not share the complete-run status"
+        assert payload["incomplete"] is True
+        assert payload["deadline_reached"] is True
+        assert payload["sessions_deleted"] == 2
+        assert payload["sessions_remaining"] == 3
+        assert len(_snapshot(path)["session"]) == 3
+
+
+class TestArgumentBounds:
+    """Invalid numerics must be refused, not silently turned into "no limit"."""
+
+    @pytest.fixture()
+    def anydb(self, tmp_path):
+        path = tmp_path / "args.db"
+        conn = _make_db(path)
+        _add_session(conn, "old", age_days=30)
+        conn.close()
+        return path
+
+    @pytest.mark.parametrize("flag,value", [
+        ("--max-seconds", "nan"),
+        ("--max-seconds", "-1"),
+        ("--vacuum-pages", "0"),
+        ("--vacuum-pages", "-1"),
+        ("--retention-days", "nan"),
+    ])
+    def test_invalid_bounds_are_refused_without_touching_the_db(
+        self, anydb, monkeypatch, flag, value
+    ):
+        """Mutation: drop the `not math.isfinite(args.max_seconds) or
+        args.max_seconds < 0` check (and likewise the --vacuum-pages check).
+        The NaN/negative cases then run to completion instead of exiting 2,
+        having silently disabled the deadline or the page cap.
+        """
+        before = _snapshot(anydb)
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(anydb), "--apply", flag, value],
+        )
+        with pytest.raises(SystemExit) as exc:
+            opencode_gc.main()
+        assert exc.value.code == 2
+        assert _snapshot(anydb) == before
+
+    def test_max_seconds_zero_means_no_limit_and_completes(self, anydb, monkeypatch):
+        """The documented escape hatch must actually run to completion."""
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(anydb), "--apply", "--max-seconds", "0"],
+        )
+        assert opencode_gc.main() == 0
+        assert _snapshot(anydb)["session"] == []
+
+
+class TestCli:
+    """Nothing above goes through argument parsing, so an argument-wiring or
+    mode-inversion bug would pass every other test in this file.
+    """
+
+    def _run(self, monkeypatch, argv):
+        monkeypatch.setattr(opencode_gc.sys, "argv", ["opencode-gc", *argv])
+        return opencode_gc.main()
+
+    @pytest.fixture()
+    def populated(self, tmp_path):
+        path = tmp_path / "cli.db"
+        conn = _make_db(path)
+        _add_session(conn, "old", age_days=30, events=4, messages=2)
+        _add_session(conn, "live", age_days=1, events=3, messages=2)
+        _add_session(conn, "oldparent", age_days=40)
+        _add_session(conn, "livekid", age_days=1, parent="oldparent")
+        conn.close()
+        return path
+
+    def test_dry_run_changes_nothing(self, populated, monkeypatch, capsys):
+        """Mutation: in main, `conn = connect(args.db, read_only=not args.apply)`
+        stays, but change `if args.apply:` before delete_sessions to
+        `if True:`. The dry run then writes and the snapshot differs.
+        """
+        before = _snapshot(populated)
+        rc = self._run(monkeypatch, ["--db", str(populated)])
+        assert rc == 0
+        assert _snapshot(populated) == before
+        assert "DRY RUN" in capsys.readouterr().out
+
+    def test_apply_deletes_only_eligible_sessions(self, populated, monkeypatch):
+        """Mutation: `if args.apply:` -> `if not args.apply:` around the
+        delete/count branch. 'old' then survives.
+        """
+        rc = self._run(monkeypatch, ["--db", str(populated), "--apply"])
+        assert rc == 0
+        after = _snapshot(populated)
+        assert sorted(r[0] for r in after["session"]) == ["live", "livekid", "oldparent"]
+        assert {r[1] for r in after["event"]} == {"live", "livekid", "oldparent"}
+        assert {r[1] for r in after["message"]} == {"live", "livekid", "oldparent"}
+
+    def test_retention_floor_is_refused_and_nothing_is_touched(self, populated, monkeypatch):
+        """Mutation: `args.retention_days < MIN_RETENTION_DAYS` ->
+        `args.retention_days < 0`. The run then proceeds and deletes.
+        """
+        before = _snapshot(populated)
+        with pytest.raises(SystemExit) as exc:
+            self._run(monkeypatch, ["--db", str(populated), "--retention-days", "0.5", "--apply"])
+        assert exc.value.code == 2
+        assert _snapshot(populated) == before
+
+    def test_missing_database_is_reported_not_created(self, tmp_path, monkeypatch):
+        missing = tmp_path / "nope.db"
+        assert self._run(monkeypatch, ["--db", str(missing)]) == 2
+        assert not missing.exists()
+
+    def test_failed_mode_conversion_aborts_before_deleting(self, tmp_path, monkeypatch, capsys):
+        """--apply --enable-incremental-vacuum must not destroy history when it
+        cannot enable reclamation: that is the worst of both outcomes.
+
+        Mutation: in main's `except (RuntimeError, sqlite3.Error)` handler,
+        replace `return _report(args, res)` with `pass`. The run then deletes
+        'old' while still exiting nonzero.
+        """
+        path = tmp_path / "nofree.db"
+        conn = _make_db(path, auto_vacuum=0)
+        _add_session(conn, "old", age_days=30)
+        _add_session(conn, "live", age_days=1)
+        conn.close()
+        before = _snapshot(path)
+
+        monkeypatch.setattr(
+            opencode_gc.shutil, "disk_usage", lambda _p: type("U", (), {"free": 0})()
+        )
+        rc = self._run(
+            monkeypatch, ["--db", str(path), "--apply", "--enable-incremental-vacuum"]
+        )
+        assert rc == 1
+        assert "refusing to delete anything" in capsys.readouterr().err
+        assert _snapshot(path) == before
+
+    def test_batch_is_clamped_before_any_deletion(self, populated, monkeypatch, capsys):
+        """A --batch above SQLite's parameter limit must not fail after
+        earlier batches have already committed.
+
+        Mutation: `batch = min(args.batch, var_limit)` -> `batch = args.batch`.
+        The first DELETE raises sqlite3.OperationalError instead of succeeding.
+        """
+        rc = self._run(
+            monkeypatch, ["--db", str(populated), "--apply", "--batch", "10000000"]
+        )
+        assert rc == 0
+        assert "clamped" in capsys.readouterr().out
+        assert sorted(r[0] for r in _snapshot(populated)["session"]) == [
+            "live", "livekid", "oldparent",
+        ]
+
+    def test_json_reports_cutoff_and_keep_reasons(self, populated, monkeypatch, capsys):
+        import json
+
+        self._run(monkeypatch, ["--db", str(populated), "--json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dry_run"] is True
+        assert payload["sessions_expired"] == 1
+        assert payload["sessions_kept_live_descendant"] == 1
+        assert payload["cutoff_ms"] > 0
+
 
 class TestStats:
-    def test_reports_sizes_and_mode(self, db):
-        path, conn = db
-        stats = opencode_gc.read_stats(conn)
-        assert stats.total_bytes == stats.page_size * stats.page_count
-        assert stats.auto_vacuum_name == "INCREMENTAL"
+    def test_reported_sizes_are_the_real_file_sizes(self, tmp_path, monkeypatch, capsys):
+        """The old assertion restated the total_bytes property and never
+        touched reporting. Check the JSON the CLI actually emits against the
+        database and -wal files on disk.
+
+        Mutation: in main, `res.bytes_before = on_disk_bytes(args.db)` ->
+        `res.bytes_before = stats.total_bytes`. bytes_before then excludes the
+        WAL and no longer matches the measured file sizes.
+        """
+        import json
+
+        path = tmp_path / "sizes.db"
+        conn = _make_db(path, wal=True)
+        for i in range(80):
+            _add_session(conn, f"s{i}", age_days=30, events=20, messages=5)
+        # Left open: closing checkpoints and removes the WAL, and the point
+        # here is that an uncheckpointed WAL is counted.
+        wal_path = path.with_name(path.name + "-wal")
+        assert wal_path.is_file(), "fixture must leave an uncheckpointed WAL to measure"
+        db_bytes = path.stat().st_size
+        wal_bytes = wal_path.stat().st_size
+        assert wal_bytes > 0
+
+        try:
+            monkeypatch.setattr(
+                opencode_gc.sys, "argv", ["opencode-gc", "--db", str(path), "--json"]
+            )
+            assert opencode_gc.main() == 0
+            payload = json.loads(capsys.readouterr().out)
+
+            assert payload["bytes_before"] == db_bytes + wal_bytes
+            assert payload["auto_vacuum_before"] == "INCREMENTAL"
+            assert payload["bytes_reclaimed"] == 0, "a dry run reclaims nothing"
+        finally:
+            conn.close()
+
+    def test_reclaimed_bytes_are_measured_not_asserted(self, tmp_path, monkeypatch, capsys):
+        """Released pages and reclaimed bytes are different quantities.
+
+        In WAL mode a long-lived reader defers the checkpoint that truncates
+        the file, so pages leave the freelist while the bytes are still on
+        disk -- here the footprint even grows, by the WAL the deletes wrote.
+        Reporting page arithmetic as "freed" would claim space the filesystem
+        has not got back. A reader is held open for exactly that reason;
+        without one, page arithmetic and the real file size happen to agree
+        and the assertion would prove nothing.
+
+        Mutation: `res.bytes_after = on_disk_bytes(args.db)` ->
+        `res.bytes_after = res.bytes_before - res.pages_released * 4096`.
+        bytes_reclaimed then reports pages that are still on disk.
+        """
+        import json
+
+        path = tmp_path / "reclaim.db"
+        conn = _make_db(path, wal=True)
+        for i in range(120):
+            _add_session(conn, f"s{i}", age_days=30, events=30, messages=8)
+        conn.close()
+
+        # A concurrent reader, i.e. opencode itself, blocking the checkpoint.
+        reader = sqlite3.connect(str(path), isolation_level=None)
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM event").fetchone()
+        try:
+            before = opencode_gc.on_disk_bytes(path)
+            monkeypatch.setattr(
+                opencode_gc.sys, "argv",
+                ["opencode-gc", "--db", str(path), "--apply", "--json"],
+            )
+            assert opencode_gc.main() == 0
+            payload = json.loads(capsys.readouterr().out)
+
+            after = opencode_gc.on_disk_bytes(path)
+            assert payload["pages_released"] > 0, "pages must actually be released"
+            assert payload["bytes_after"] == after
+            assert payload["bytes_reclaimed"] == max(0, before - after)
+
+            # The blocked checkpoint means the footprint has not shrunk at all
+            # -- here it has grown by the WAL the deletes themselves wrote.
+            assert after >= before
+            assert payload["bytes_reclaimed"] == 0, (
+                "no byte left the disk, so none may be reported as reclaimed"
+            )
+            assert any("has not shrunk yet" in n for n in payload["notes"])
+        finally:
+            reader.close()
+
+    def test_on_disk_bytes_includes_the_wal(self, tmp_path):
+        """Reclaimed bytes must come from real file sizes, not page arithmetic.
+
+        Mutation: drop the WAL from on_disk_bytes' loop.
+        """
+        path = tmp_path / "sizes.db"
+        conn = _make_db(path, wal=True)
+        try:
+            for i in range(100):
+                _add_session(conn, f"s{i}", age_days=30, events=20, messages=5)
+            wal = path.with_name(path.name + "-wal").stat().st_size
+            assert wal > 0
+            assert opencode_gc.on_disk_bytes(path) == path.stat().st_size + wal
+        finally:
+            conn.close()
