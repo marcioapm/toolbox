@@ -941,8 +941,8 @@ class TestIncrementalVacuum:
     def test_respects_page_cap(self, db):
         """`pages=1` must release one page, not merely fewer than all of them.
 
-        Mutation: in run_incremental_vacuum, `target = before if pages is None
-        else min(pages, before)` -> `target = before`. The old assertion
+        Mutation: in run_incremental_vacuum, `budget = before if pages is None
+        else min(pages, before)` -> `budget = before`. The old assertion
         (`0 < released < free_before`) passed under any over-release; this one
         pins the cap and checks the freelist moved by exactly that much.
         """
@@ -1269,8 +1269,8 @@ class TestVacuumDeadline:
 
     def test_cli_exits_three_when_reclamation_is_cut_short(self, tmp_path, monkeypatch, capsys):
         """Mutation: in main, drop the `res.incomplete = True` inside
-        `if vac.deadline_reached:`. rc falls back to 0, so automation is told
-        a run that left the file oversized finished cleanly.
+        `if vac.remaining:`. rc falls back to 0, so automation is told a run
+        that left the file oversized finished cleanly.
         """
         import json
 
@@ -1302,6 +1302,465 @@ class TestVacuumDeadline:
         # The deletions themselves did finish; only the reclamation did not.
         assert payload["sessions_deleted"] == 60
         assert len(_snapshot(path)["session"]) == 0
+
+
+class TestVacuumRemainderIsHonest:
+    """`remaining` is what an operator and their automation read to decide
+    whether the disk is reclaimed. It must count pages still in the file,
+    whatever stopped the pass -- a budget, a deadline or a stall.
+
+    Conflating "what this run was allowed to do" with "what is reclaimable"
+    made a capped run report a full freelist as fully reclaimed. Every
+    assertion here is checked against `PRAGMA freelist_count` on the real
+    database rather than against the message text.
+    """
+
+    def _freed(self, conn, sessions=120):
+        for i in range(sessions):
+            _add_session(conn, f"s{i}", age_days=30, events=40, messages=10)
+        _delete(conn, [f"s{i}" for i in range(sessions)])
+        free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        assert free > 5, f"the fixture must free more pages than the cap: {free}"
+        return free
+
+    def test_a_capped_run_reports_the_pages_it_did_not_release(self, db):
+        """The reproduced blocker: `--vacuum-pages` bounds the work, not the
+        freelist. `remaining` must equal what is genuinely still on disk.
+
+        Mutation (V-budget-is-target): in run_incremental_vacuum, collapse the
+        split back to `target = before if pages is None else min(pages, before)`
+        with the loop bounded by `target`. remaining becomes 0 while the
+        freelist below is still full, and both assertions fail.
+        """
+        path, conn = db
+        free_before = self._freed(conn)
+
+        vac = opencode_gc.run_incremental_vacuum(conn, pages=5, deadline=None)
+
+        free_after = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        assert vac.released == 5
+        assert free_before - free_after == 5, "exactly the budget must have moved"
+        assert free_after > 0, "the fixture must leave pages behind, or nothing is proven"
+        assert vac.target == free_before, \
+            "target is what was reclaimable, not what this run was allowed to do"
+        assert vac.remaining == free_after, (
+            f"remaining must be the pages genuinely still in the file: "
+            f"reported {vac.remaining}, freelist holds {free_after}"
+        )
+        assert vac.deadline_reached is False
+        assert vac.stalled is False
+
+    def test_an_uncapped_run_that_finishes_reports_nothing_remaining(self, db):
+        """The complement: a genuinely complete pass must not now claim to be
+        incomplete, or --vacuum-pages' honesty would cost every clean run its
+        exit status.
+
+        Mutation (V-remaining-always): make `remaining` return `self.target`
+        unconditionally. This test fails while the capped one still passes.
+        """
+        path, conn = db
+        self._freed(conn)
+
+        vac = opencode_gc.run_incremental_vacuum(conn, pages=None, deadline=None)
+
+        assert conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
+        assert vac.remaining == 0
+        assert vac.released == vac.target
+        assert vac.stalled is False
+
+    def test_the_cli_exits_three_after_a_capped_run(self, tmp_path, monkeypatch, capsys):
+        """End to end through argument parsing, which no --vacuum-pages test
+        previously reached at all.
+
+        Mutation (V-budget-is-target): remaining is 0, so `if vac.remaining:`
+        never fires, rc is 0 and incomplete is false -- while the freelist
+        asserted below is still full.
+        """
+        import json
+
+        path = tmp_path / "capped.db"
+        conn = _make_db(path)
+        for i in range(120):
+            _add_session(conn, f"s{i}", age_days=30, events=40, messages=10)
+        conn.close()
+
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply", "--vacuum-pages", "5", "--json"],
+        )
+        rc = opencode_gc.main()
+        payload = json.loads(capsys.readouterr().out)
+
+        probe = sqlite3.connect(str(path))
+        try:
+            left = probe.execute("PRAGMA freelist_count").fetchone()[0]
+        finally:
+            probe.close()
+
+        assert left > 0, "the fixture must leave pages on the freelist"
+        assert rc == 3, \
+            "a capped run left pages in the file and must not share the clean status"
+        assert payload["incomplete"] is True
+        assert payload["pages_released"] == 5
+        assert payload["pages_reclaimable_remaining"] == left
+        assert payload["vacuum_deadline_reached"] is False
+        assert payload["vacuum_stalled"] is False
+        assert payload["errors"] == [], "a page budget is not an error"
+        # The deletions themselves completed.
+        assert payload["sessions_deleted"] == 120
+        assert len(_snapshot(path)["session"]) == 0
+
+    def test_re_running_after_a_cap_reclaims_the_rest(self, tmp_path, monkeypatch, capsys):
+        """"Re-run to continue" is the instruction the note gives, so it has
+        to be true: a second capped run must release more pages and lower the
+        remainder, and an uncapped one must finish and exit 0.
+
+        Mutation (V-budget-is-target): the first run reports remaining=0 and
+        rc=0, so the assertion that it was incomplete fails before the
+        continuation is even exercised.
+        """
+        import json
+
+        path = tmp_path / "resume.db"
+        conn = _make_db(path)
+        for i in range(120):
+            _add_session(conn, f"s{i}", age_days=30, events=40, messages=10)
+        conn.close()
+
+        def run(*extra):
+            monkeypatch.setattr(
+                opencode_gc.sys, "argv",
+                ["opencode-gc", "--db", str(path), "--apply", "--json", *extra],
+            )
+            rc = opencode_gc.main()
+            return rc, json.loads(capsys.readouterr().out)
+
+        rc1, first = run("--vacuum-pages", "5")
+        assert rc1 == 3 and first["pages_reclaimable_remaining"] > 0
+
+        rc2, second = run("--vacuum-pages", "5")
+        assert rc2 == 3
+        assert second["pages_released"] == 5
+        assert second["pages_reclaimable_remaining"] == \
+            first["pages_reclaimable_remaining"] - 5, \
+            "each capped run must genuinely advance the remainder"
+
+        rc3, third = run()
+        assert rc3 == 0, "an uncapped run must finish and report a clean status"
+        assert third["pages_reclaimable_remaining"] == 0
+        probe = sqlite3.connect(str(path))
+        try:
+            assert probe.execute("PRAGMA freelist_count").fetchone()[0] == 0
+        finally:
+            probe.close()
+
+
+class TestVacuumStall:
+    """`incremental_vacuum` returning without moving a page is what stops the
+    loop from spinning forever. Nothing exercised it, and reaching it used to
+    rewrite `target` down to `released` -- so a stalled pass reported
+    remaining=0 and claimed it had reclaimed everything available.
+
+    A database with auto_vacuum=NONE reproduces it honestly: the pragma is a
+    documented no-op there, so the freelist genuinely cannot shrink.
+    """
+
+    def _stalled_db(self, path, sessions=60):
+        conn = _make_db(path, auto_vacuum=0)
+        for i in range(sessions):
+            _add_session(conn, f"s{i}", age_days=30, events=40, messages=10)
+        _delete(conn, [f"s{i}" for i in range(sessions)])
+        free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        assert free > 0, "the fixture must leave a freelist that cannot shrink"
+        return conn, free
+
+    @staticmethod
+    def _bounded_clock(limit=10):
+        """A clock that aborts the pass after `limit` iterations.
+
+        Every test in this class drives a freelist that cannot shrink, which
+        is precisely the input the stall guard exists to stop looping on. If
+        the guard is gone they would spin forever and the suite would hang
+        rather than fail, so each one carries its own bound: the deadline is
+        set far in the future, making this purely an iteration counter.
+        """
+        reads = []
+
+        def clock():
+            reads.append(1)
+            if len(reads) > limit:
+                raise AssertionError(
+                    f"run_incremental_vacuum did not terminate within {limit} passes"
+                )
+            return 0.0
+
+        return clock, reads
+
+    def test_a_stalled_pass_terminates(self, tmp_path):
+        """The branch's actual job. Without it the loop never exits, because
+        `released < budget` stays true forever with released stuck at 0.
+
+        Termination is proven from inside the pass with a bounded clock rather
+        than by wall-clock timeout: a test that hangs cannot report anything.
+
+        Mutation (V-no-stall-guard): delete the `if progressed <= 0:` block.
+        The loop then spins on a freelist that never shrinks; the bounded
+        clock raises, so this fails instead of the suite hanging.
+        """
+        conn, free = self._stalled_db(tmp_path / "stall.db")
+        try:
+            clock, reads = self._bounded_clock()
+
+            vac = opencode_gc.run_incremental_vacuum(
+                conn, pages=None, deadline=1e18, clock=clock
+            )
+
+            assert len(reads) <= 2, f"a stall must be detected at once, took {len(reads)}"
+            assert vac.stalled is True
+            assert vac.released == 0
+            assert conn.execute("PRAGMA freelist_count").fetchone()[0] == free
+        finally:
+            conn.close()
+
+    def test_a_stalled_pass_does_not_claim_the_pages_were_reclaimed(self, tmp_path):
+        """The misreport: `target` must stay at the real freelist size, so
+        `remaining` still counts the pages sitting in the file.
+
+        Mutation (V-stall-lowers-target): restore `outcome.target = released`
+        in the stall branch. target and remaining both collapse to 0 while the
+        freelist below is untouched.
+        """
+        conn, free = self._stalled_db(tmp_path / "stallreport.db")
+        try:
+            clock, _ = self._bounded_clock()
+            vac = opencode_gc.run_incremental_vacuum(
+                conn, pages=None, deadline=1e18, clock=clock
+            )
+
+            still_free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            assert still_free == free, "the fixture's freelist must be unchanged"
+            assert vac.target == free
+            assert vac.remaining == still_free, (
+                "a stalled pass left every page in the file and must say so: "
+                f"reported {vac.remaining}, freelist holds {still_free}"
+            )
+        finally:
+            conn.close()
+
+    def test_the_cli_reports_a_stall_as_incomplete(self, tmp_path, monkeypatch, capsys):
+        """A stalled run leaves the file oversized, so it must not exit 0.
+
+        The database is auto_vacuum=NONE, which main() normally routes away
+        from reclamation entirely; read_stats is stubbed to report INCREMENTAL
+        so the pass actually runs and stalls, which is the only way to reach
+        this branch through the CLI.
+
+        Mutation (V-stall-lowers-target): remaining collapses to 0, so
+        `if vac.remaining:` never fires and rc is 0 while the freelist
+        asserted below is still full.
+        """
+        import json
+
+        path = tmp_path / "stallcli.db"
+        conn = _make_db(path, auto_vacuum=0)
+        for i in range(60):
+            _add_session(conn, f"s{i}", age_days=30, events=40, messages=10)
+        conn.close()
+
+        real_read_stats = opencode_gc.read_stats
+
+        def as_incremental(c):
+            stats = real_read_stats(c)
+            return opencode_gc.DbStats(
+                page_size=stats.page_size, page_count=stats.page_count,
+                freelist_count=stats.freelist_count, auto_vacuum=2,
+            )
+
+        clock, _ = self._bounded_clock()
+        real_vacuum = opencode_gc.run_incremental_vacuum
+        monkeypatch.setattr(opencode_gc, "read_stats", as_incremental)
+        monkeypatch.setattr(
+            opencode_gc, "run_incremental_vacuum",
+            lambda c, **kw: real_vacuum(
+                c, **{**kw, "deadline": 1e18, "clock": clock}
+            ),
+        )
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply", "--json"],
+        )
+
+        rc = opencode_gc.main()
+        payload = json.loads(capsys.readouterr().out)
+
+        probe = sqlite3.connect(str(path))
+        try:
+            left = probe.execute("PRAGMA freelist_count").fetchone()[0]
+        finally:
+            probe.close()
+
+        assert left > 0, "the fixture must stall with pages still on the freelist"
+        assert rc == 3, "a stalled run left the file oversized and must say so"
+        assert payload["incomplete"] is True
+        assert payload["vacuum_stalled"] is True
+        assert payload["vacuum_deadline_reached"] is False
+        assert payload["pages_released"] == 0
+        assert payload["pages_reclaimable_remaining"] == left
+        assert payload["errors"] == []
+        # The deletions are unaffected: failing to reclaim is not failing to
+        # delete.
+        assert payload["sessions_deleted"] == 60
+        assert len(_snapshot(path)["session"]) == 0
+
+    def test_a_freelist_that_grows_mid_pass_is_not_negative_progress(self, tmp_path):
+        """opencode deleting rows during the pass grows the freelist, so
+        `before - now` goes negative. That is a stall, not a negative release
+        count, and `released` must never go below zero.
+
+        Mutation (V-released-unclamped): `released = max(0, before - now)` ->
+        `released = before - now`. released is then negative and remaining
+        exceeds the freelist, overstating what is left to reclaim.
+        """
+        path = tmp_path / "grow.db"
+        setup = _make_db(path, wal=True)
+        for i in range(200):
+            _add_session(setup, f"s{i}", age_days=30, events=40, messages=10)
+        _delete(setup, [f"s{i}" for i in range(60)])
+        setup.close()
+
+        app = sqlite3.connect(str(path), isolation_level=None, timeout=5)
+
+        class GrowsTheFreelistMidPass(sqlite3.Connection):
+            passes = 0
+
+            def execute(self, sql, *a):
+                if sql.startswith("PRAGMA incremental_vacuum"):
+                    GrowsTheFreelistMidPass.passes += 1
+                    if GrowsTheFreelistMidPass.passes == 1:
+                        # A concurrent prune frees far more than this pass
+                        # can release.
+                        app.execute(
+                            "DELETE FROM event WHERE aggregate_id IN "
+                            "(SELECT id FROM session LIMIT 100)"
+                        )
+                return super().execute(sql, *a)
+
+        gc_conn = sqlite3.connect(
+            str(path), isolation_level=None, timeout=5,
+            factory=GrowsTheFreelistMidPass,
+        )
+        try:
+            before = gc_conn.execute("PRAGMA freelist_count").fetchone()[0]
+            clock, _ = self._bounded_clock()
+            vac = opencode_gc.run_incremental_vacuum(
+                gc_conn, pages=None, deadline=1e18, clock=clock
+            )
+            after = gc_conn.execute("PRAGMA freelist_count").fetchone()[0]
+
+            assert after > before, "the fixture must grow the freelist mid-pass"
+            assert vac.released >= 0, \
+                f"a growing freelist is not a negative release: {vac.released}"
+            assert vac.remaining <= after, (
+                "remaining may not exceed the pages actually on the freelist: "
+                f"reported {vac.remaining}, freelist holds {after}"
+            )
+            assert vac.stalled is True
+        finally:
+            gc_conn.close()
+            app.close()
+
+
+class TestChildTableOrder:
+    """CHILD_TABLES deletes children before parents so every intermediate
+    state of the transaction is referentially valid.
+
+    The live schema's `ON DELETE CASCADE` actions mask this: under them either
+    order commits, which is why the property was previously asserted nowhere.
+    A plain `REFERENCES` with no action -- one migration away, and what
+    event_sequence would become if the cascade were ever dropped -- makes the
+    wrong order fail immediately under `PRAGMA foreign_keys=ON`.
+    """
+
+    NO_CASCADE_SCHEMA = """
+        CREATE TABLE session (
+            id text PRIMARY KEY,
+            parent_id text,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL
+        );
+        CREATE TABLE message (
+            id text PRIMARY KEY,
+            session_id text NOT NULL REFERENCES session(id),
+            data text NOT NULL
+        );
+        CREATE TABLE part (
+            id text PRIMARY KEY,
+            message_id text NOT NULL REFERENCES message(id),
+            session_id text NOT NULL,
+            data text NOT NULL
+        );
+        CREATE TABLE event_sequence (
+            aggregate_id text PRIMARY KEY,
+            seq integer NOT NULL
+        );
+        CREATE TABLE event (
+            id text PRIMARY KEY,
+            aggregate_id text NOT NULL REFERENCES event_sequence(aggregate_id),
+            data text NOT NULL
+        );
+    """
+
+    def _db(self, path):
+        conn = sqlite3.connect(str(path), isolation_level=None)
+        conn.executescript(self.NO_CASCADE_SCHEMA)
+        _add_session(conn, "old", age_days=30, events=3, messages=2)
+        conn.execute("PRAGMA foreign_keys=ON")
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        return conn
+
+    def test_the_documented_order_deletes_cleanly_without_cascades(self, tmp_path):
+        """Mutation (O-child-tables-reversed): `CHILD_TABLES` ->
+        `list(reversed(CHILD_TABLES))`. event_sequence is then deleted before
+        the event rows referencing it, and the batch fails with a FOREIGN KEY
+        error instead of committing.
+        """
+        conn = self._db(tmp_path / "nocascade.db")
+        try:
+            outcome = _delete(conn, ["old"], batch=1)
+
+            assert outcome.failure is None, (
+                "children must be deleted before their parents: "
+                f"{outcome.failure}"
+            )
+            assert outcome.rows["session"] == 1
+            for table in ("session", "message", "part", "event", "event_sequence"):
+                assert conn.execute(
+                    f"SELECT count(*) FROM {table}"
+                ).fetchone()[0] == 0, f"{table} must be empty"
+        finally:
+            conn.close()
+
+    def test_the_reverse_order_really_would_fail(self, tmp_path):
+        """The fixture's own proof: without this, the test above would pass on
+        a schema where order is irrelevant and assert nothing.
+
+        No mutation -- this test exists to make the previous one meaningful,
+        and asserts on the schema fixture rather than on production code.
+        """
+        conn = self._db(tmp_path / "reverse.db")
+        try:
+            with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+                conn.execute("BEGIN IMMEDIATE")
+                for table, column in reversed(opencode_gc.CHILD_TABLES):
+                    conn.execute(f"DELETE FROM {table} WHERE {column}='old'")
+                conn.execute("DELETE FROM session WHERE id='old'")
+                conn.execute("COMMIT")
+        finally:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            conn.close()
 
 
 class TestUriEscaping:
@@ -2441,6 +2900,29 @@ class TestCli:
         missing = tmp_path / "nope.db"
         assert self._run(monkeypatch, ["--db", str(missing)]) == 2
         assert not missing.exists()
+
+    def test_apply_on_a_missing_database_creates_nothing(self, tmp_path, monkeypatch, capsys):
+        """The destructive path of the same guard. sqlite3.connect() creates
+        the file it cannot find, so without the check --apply on a typo'd
+        --db would silently make an empty database at that path -- and report
+        a clean run against it.
+
+        Mutation (G-no-is-file-guard): in main, delete the
+        `if not args.db.is_file():` block. rc becomes 0, and the file below
+        exists.
+
+        The dry-run half is covered above; this is the half that writes.
+        """
+        missing = tmp_path / "typo.db"
+
+        rc = self._run(monkeypatch, ["--db", str(missing), "--apply"])
+
+        assert rc == 2
+        assert "no database at" in capsys.readouterr().err
+        assert not missing.exists(), \
+            "a mistyped --db must not leave a new database behind"
+        assert list(tmp_path.iterdir()) == [], \
+            "no sidecar (-wal, -shm) may be created either"
 
     def test_failed_mode_conversion_aborts_before_deleting(self, tmp_path, monkeypatch, capsys):
         """--apply --enable-incremental-vacuum must not destroy history when it

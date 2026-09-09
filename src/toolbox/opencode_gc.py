@@ -81,8 +81,12 @@ from typing import Optional
 
 DEFAULT_DB = Path.home() / ".local/share/opencode/opencode.db"
 
-# Deletion order matters: children before parents, so an interrupted run can
-# never strand rows whose parent is already gone.
+# Children before parents, so every intermediate state of the transaction is
+# referentially valid and the sequence works under immediate FK enforcement
+# whatever the referential action -- the live schema's cascades happen to make
+# either order work, and depending on that is depending on the schema not
+# changing. Atomicity across an interrupt comes from the transaction, not from
+# this order; the cross-batch guarantee comes from _order_descendant_first.
 #   (table, column holding the session id)
 CHILD_TABLES = [
     ("part", "session_id"),
@@ -172,6 +176,9 @@ class Result:
     pages_released: int = 0
     pages_reclaimable_remaining: int = 0
     vacuum_deadline_reached: bool = False
+    # incremental_vacuum could not move a page. The remainder stays in the
+    # file and re-running will not change that, unlike a deadline or a budget.
+    vacuum_stalled: bool = False
     # Real on-disk footprint (main database + WAL), not page arithmetic: a
     # released page is not a reclaimed byte until the file actually shrinks.
     bytes_before: int = 0
@@ -518,13 +525,21 @@ def count_rows_for(conn: sqlite3.Connection, session_ids: list[str], batch: int)
 class VacuumOutcome:
     """What one reclamation pass actually managed to hand back.
 
-    `released < target` with `deadline_reached` set is an incomplete run:
-    pages that were eligible are still in the file, and re-running continues.
+    `target` is what the freelist held when the pass started -- everything
+    genuinely reclaimable -- and never the ceiling a `--vacuum-pages` budget
+    put on this run. So a non-zero `remaining` always means what the flag
+    documentation says it means: pages that were eligible are still in the
+    file. Conflating the two let a capped run report a full freelist as
+    reclaimed.
     """
 
     released: int = 0
     target: int = 0
     deadline_reached: bool = False
+    # incremental_vacuum returned without moving a page. The rest of the
+    # freelist is still in the file and this mechanism cannot shift it, so
+    # re-running continues nothing -- unlike a deadline or a page budget.
+    stalled: bool = False
 
     @property
     def remaining(self) -> int:
@@ -542,32 +557,44 @@ def run_incremental_vacuum(
     which a long-lived reader can defer, so the count is of logical pages --
     not a promise of bytes off the disk.
 
-    Stopping on the deadline is reported rather than swallowed: exiting 0 with
-    a still-oversized file tells an operator the reclamation finished when it
-    did not. Other failures propagate: no row is at stake here, and the caller
-    already routes them into the report alongside the deletion counts that
-    are.
+    `pages` budgets this run; it does not redefine what is reclaimable. The
+    two are tracked separately because `--vacuum-pages` exists to bound a
+    cautious first pass on a nearly-full disk, and an operator reaching for it
+    is the one who most needs to be told the file is still oversized.
+
+    Stopping early is reported rather than swallowed, whether the cause is the
+    deadline, the page budget or a stall: exiting 0 with a still-oversized
+    file tells an operator the reclamation finished when it did not. Other
+    failures propagate: no row is at stake here, and the caller already routes
+    them into the report alongside the deletion counts that are.
     """
     before = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
     if before == 0:
         return VacuumOutcome()
     step = 2000
     released = 0
-    target = before if pages is None else min(pages, before)
+    # What is reclaimable, and how much of it this run may do.
+    target = before
+    budget = before if pages is None else min(pages, before)
     outcome = VacuumOutcome(target=target)
-    while released < target:
+    while released < budget:
         if deadline is not None and clock() > deadline:
             outcome.deadline_reached = True
             break
-        conn.execute(f"PRAGMA incremental_vacuum({min(step, target - released)})")
+        conn.execute(f"PRAGMA incremental_vacuum({min(step, budget - released)})")
         now = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
         progressed = before - now - released
-        released = before - now
+        # A concurrent writer can grow the freelist under us; that is not
+        # negative progress to report, it is no progress.
+        released = max(0, before - now)
         outcome.released = released
         if progressed <= 0:
-            # No page moved: the freelist is as small as this pass can make
-            # it, so the target is unreachable rather than merely unfinished.
-            outcome.target = released
+            # No page moved. `target` deliberately stays at the real freelist
+            # size: lowering it to `released` -- as this once did -- makes a
+            # stalled pass report remaining=0 and claim it reclaimed
+            # everything available, which is the same lie the page budget
+            # used to tell.
+            outcome.stalled = True
             break
     return outcome
 
@@ -860,15 +887,31 @@ def main() -> int:
                     res.pages_released = vac.released
                     res.pages_reclaimable_remaining = vac.remaining
                     res.vacuum_deadline_reached = vac.deadline_reached
-                    if vac.deadline_reached:
-                        # Pages that were eligible are still in the file, so
-                        # the file is larger than the run implies.
+                    res.vacuum_stalled = vac.stalled
+                    if vac.remaining:
+                        # Whatever stopped the pass, pages that were eligible
+                        # are still in the file, so it is larger than a run
+                        # reporting itself finished would imply.
                         res.incomplete = True
-                        res.notes.append(
-                            f"--max-seconds reached during page reclamation; "
-                            f"{vac.remaining:,} of {vac.target:,} page(s) were not "
-                            "released. Re-run to continue."
-                        )
+                        if vac.deadline_reached:
+                            res.notes.append(
+                                f"--max-seconds reached during page reclamation; "
+                                f"{vac.remaining:,} of {vac.target:,} page(s) were not "
+                                "released. Re-run to continue."
+                            )
+                        elif vac.stalled:
+                            res.notes.append(
+                                f"page reclamation stopped making progress with "
+                                f"{vac.remaining:,} of {vac.target:,} page(s) still "
+                                "on the freelist; they stay in the file. Re-running "
+                                "will not release them."
+                            )
+                        else:
+                            res.notes.append(
+                                f"--vacuum-pages capped this run; {vac.remaining:,} of "
+                                f"{vac.target:,} page(s) are still reclaimable. "
+                                "Re-run to continue."
+                            )
                 elif current.freelist_count:
                     res.notes.append(
                         f"{current.freelist_count:,} pages are free but auto_vacuum is "
