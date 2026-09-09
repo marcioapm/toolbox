@@ -1507,6 +1507,838 @@ class TestInterruptedRunReporting:
         assert len(_snapshot(path)["session"]) == 3
 
 
+class TestInterruptDuringDeletion:
+    """Ctrl-C is how an operator stops a multi-hour prune, and by then batches
+    have committed irreversibly. Every point in the loop must route the
+    interrupt into the outcome rather than let it escape: a traceback exits
+    130, a status _status() never produces, and carries none of the counts.
+    """
+
+    def _interrupt_clock(self, after):
+        """A clock that raises KeyboardInterrupt on its `after`-th read.
+
+        The deadline check is the loop's one clock() call per batch, so this
+        lands the interrupt exactly there.
+        """
+        reads = []
+
+        def clock():
+            reads.append(1)
+            if len(reads) == after:
+                raise KeyboardInterrupt()
+            return 0.0
+
+        return clock
+
+    def test_an_interrupt_at_the_deadline_check_keeps_the_committed_counts(self, db):
+        """The reproduced blocker: batch 1 commits, then Ctrl-C lands on the
+        deadline check before batch 2.
+
+        Mutation (D-ctrlc-deadline-outside): in delete_sessions, move the
+        `if deadline is not None and clock() > deadline:` check back above
+        `try:`. The KeyboardInterrupt then escapes delete_sessions entirely --
+        no DeleteOutcome is returned, so the sessions destroyed by batch 1 are
+        reported nowhere.
+        """
+        path, conn = db
+        for sid in ("aaa", "bbb", "ccc", "ddd"):
+            _add_session(conn, sid, age_days=30, events=3, messages=2)
+
+        outcome = opencode_gc.delete_sessions(
+            conn, ["aaa", "bbb", "ccc", "ddd"], cutoff_ms=_cutoff(), batch=1,
+            deadline=1.0, clock=self._interrupt_clock(2),
+        )
+
+        assert outcome.failure is not None
+        assert "KeyboardInterrupt" in outcome.failure
+        assert outcome.incomplete is True
+        # Exactly one batch committed, and the count says so.
+        assert outcome.rows["session"] == 1
+        assert outcome.rows["event"] == 3
+        assert outcome.rows["message"] == 2
+        surviving = sorted(r[0] for r in conn.execute("SELECT id FROM session"))
+        assert surviving == ["bbb", "ccc", "ddd"], \
+            "the interrupt must not have destroyed a second batch"
+        assert outcome.remaining == 3
+        assert conn.in_transaction is False
+
+    def test_an_interrupt_before_the_first_batch_reports_zero_not_a_traceback(self, db):
+        """Nothing has committed yet, so the counts are zero -- but the
+        outcome must still exist, and the database must be untouched.
+
+        Mutation (D-ctrlc-deadline-outside): same move. The interrupt escapes
+        and there is no outcome to assert on at all.
+        """
+        path, conn = db
+        _add_session(conn, "old", age_days=30)
+        before = _counts(conn)
+
+        outcome = opencode_gc.delete_sessions(
+            conn, ["old"], cutoff_ms=_cutoff(), batch=1,
+            deadline=1.0, clock=self._interrupt_clock(1),
+        )
+
+        assert "KeyboardInterrupt" in outcome.failure
+        assert sum(outcome.rows.values()) == 0
+        assert outcome.remaining == 1
+        assert _counts(conn) == before
+
+    def test_an_interrupt_just_after_commit_still_reports_that_batch(self, tmp_path):
+        """The narrowest window: COMMIT has returned and the rows are gone,
+        but the counts have not been merged yet. An interrupt there must not
+        lose the batch it describes.
+
+        The interrupt is raised from the connection itself, on the statement
+        immediately after the COMMIT of the first batch -- the BEGIN IMMEDIATE
+        of the second -- because that is the first thing the loop executes
+        once the merge has happened.
+
+        Mutation (D-ctrlc-merge-outside): in delete_sessions, move the
+        `outcome.rows.update(...)` merge and the two `pending` updates below
+        the `except` clauses, back outside the `try`. The interrupt then skips
+        the merge and reports 0 sessions deleted while one is genuinely gone.
+        """
+        path = tmp_path / "postcommit.db"
+        setup = _make_db(path, wal=True)
+        for sid in ("aaa", "bbb"):
+            _add_session(setup, sid, age_days=30, events=3, messages=2)
+        setup.close()
+
+        class InterruptsAfterFirstCommit(sqlite3.Connection):
+            commits = 0
+
+            def execute(self, sql, *a):
+                result = super().execute(sql, *a)
+                if sql == "COMMIT":
+                    InterruptsAfterFirstCommit.commits += 1
+                    if InterruptsAfterFirstCommit.commits == 1:
+                        raise KeyboardInterrupt()
+                return result
+
+        conn = sqlite3.connect(
+            str(path), isolation_level=None, timeout=5,
+            factory=InterruptsAfterFirstCommit,
+        )
+        try:
+            outcome = opencode_gc.delete_sessions(
+                conn, ["aaa", "bbb"], cutoff_ms=_cutoff(), batch=1, deadline=None
+            )
+
+            assert "KeyboardInterrupt" in outcome.failure
+            assert outcome.incomplete is True
+            gone = 2 - conn.execute("SELECT count(*) FROM session").fetchone()[0]
+            assert gone == 1, "exactly one batch must have committed"
+            assert outcome.rows["session"] == gone, (
+                "the COMMIT returned, so its rows are durable and must be "
+                f"reported: {outcome.rows}"
+            )
+            assert outcome.rows["event"] == 3
+        finally:
+            conn.close()
+
+    def test_an_interrupt_on_the_merge_itself_does_not_escape(self, tmp_path, monkeypatch):
+        """The last unguarded window the reviewer named: COMMIT has returned
+        and the bookkeeping that records it has not finished. An interrupt
+        delivered between those bytecodes must still come back as an outcome.
+
+        The interrupt is raised from `outcome.rows.update` itself -- the exact
+        statement -- because that is the only way to land in a window a few
+        bytecodes wide deterministically. The batch it describes is lost
+        either way (the counts never got written), but the earlier batches'
+        are not, and neither is the report.
+
+        Mutation (D-ctrlc-merge-outside): in delete_sessions, move the merge,
+        the `skipped` extend, the `pending` update and the two `break`s below
+        the `except` clauses, back outside the `try`. The KeyboardInterrupt
+        then escapes delete_sessions and this raises instead of asserting.
+        """
+        path = tmp_path / "mergeint.db"
+        setup = _make_db(path, wal=True)
+        for sid in ("aaa", "bbb", "ccc"):
+            _add_session(setup, sid, age_days=30, events=3, messages=2)
+        setup.close()
+
+        class InterruptsOnSecondMerge(dict):
+            merges = 0
+
+            def update(self, *a, **kw):
+                InterruptsOnSecondMerge.merges += 1
+                if InterruptsOnSecondMerge.merges == 2:
+                    raise KeyboardInterrupt()
+                return super().update(*a, **kw)
+
+        real_outcome = opencode_gc.DeleteOutcome
+
+        def wrapping_outcome(*, rows):
+            return real_outcome(rows=InterruptsOnSecondMerge(rows))
+
+        monkeypatch.setattr(opencode_gc, "DeleteOutcome", wrapping_outcome)
+
+        conn = sqlite3.connect(str(path), isolation_level=None, timeout=5)
+        try:
+            outcome = opencode_gc.delete_sessions(
+                conn, ["aaa", "bbb", "ccc"], cutoff_ms=_cutoff(), batch=1, deadline=None
+            )
+
+            assert "KeyboardInterrupt" in outcome.failure, \
+                "an interrupt on the merge must be reported, not raised"
+            assert outcome.incomplete is True
+            # Batch 1's merge ran; batch 2 committed but was interrupted
+            # before its counts landed.
+            assert outcome.rows["session"] == 1
+            assert conn.execute("SELECT count(*) FROM session").fetchone()[0] == 1
+            assert conn.in_transaction is False
+        finally:
+            conn.close()
+
+    def test_the_cli_reports_an_interrupt_instead_of_exiting_130(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """End to end: Ctrl-C during --apply must produce the JSON report and
+        a classified status, not a traceback.
+
+        Mutation (D-ctrlc-deadline-outside): the interrupt escapes
+        delete_sessions and then main(), so no JSON is printed at all and the
+        json.loads below raises.
+        """
+        import json
+
+        path = tmp_path / "ctrlc.db"
+        conn = _make_db(path)
+        for i in range(4):
+            _add_session(conn, f"s{i}", age_days=30)
+        conn.close()
+
+        reads = []
+
+        def interrupting_clock():
+            reads.append(1)
+            if len(reads) == 3:
+                raise KeyboardInterrupt()
+            return 0.0
+
+        real_delete = opencode_gc.delete_sessions
+        monkeypatch.setattr(
+            opencode_gc, "delete_sessions",
+            lambda c, ids, **kw: real_delete(
+                c, ids, **{**kw, "deadline": 1.0, "clock": interrupting_clock}
+            ),
+        )
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply", "--batch", "1", "--json"],
+        )
+
+        rc = opencode_gc.main()
+        payload = json.loads(capsys.readouterr().out)
+
+        assert rc == 1, "an interrupted run must map to a documented status"
+        assert payload["incomplete"] is True
+        assert any("KeyboardInterrupt" in e for e in payload["errors"])
+        assert payload["sessions_deleted"] == 2
+        assert payload["sessions_remaining"] == 2
+        # The report must match the database, not the intent.
+        assert len(_snapshot(path)["session"]) == 2
+
+    def test_an_interrupt_closing_the_database_still_reports(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """In WAL mode close() checkpoints, which on a 76 GB file is minutes
+        of IO an operator can interrupt -- with the deletions already
+        committed.
+
+        Mutation (M-close-sqlite-only): in main's `finally`, narrow the
+        handler back to `except sqlite3.Error`. The KeyboardInterrupt escapes
+        the finally, no report is printed, and json.loads gets nothing.
+        """
+        import json
+
+        path = tmp_path / "closeint.db"
+        setup = _make_db(path, wal=True)
+        for i in range(3):
+            _add_session(setup, f"s{i}", age_days=30)
+        setup.close()
+
+        class InterruptsOnClose(sqlite3.Connection):
+            def close(self):
+                super().close()
+                raise KeyboardInterrupt()
+
+        gc_conn = sqlite3.connect(
+            str(path), isolation_level=None, timeout=5, factory=InterruptsOnClose
+        )
+        monkeypatch.setattr(opencode_gc, "connect", lambda *a, **kw: gc_conn)
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply", "--json"],
+        )
+
+        rc = opencode_gc.main()
+        payload = json.loads(capsys.readouterr().out)
+
+        assert rc == 1
+        assert payload["incomplete"] is True
+        assert any("KeyboardInterrupt" in e and "closing" in e
+                   for e in payload["errors"])
+        assert payload["sessions_deleted"] == 3
+        assert len(_snapshot(path)["session"]) == 0
+
+    def test_an_interrupt_during_reclamation_still_reports_the_deletions(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """incremental_vacuum runs for as long as the freelist is large, so an
+        interrupt lands there too -- with every deletion already committed.
+        Failing to reclaim is not failing to delete, and the counts must
+        survive it.
+
+        This pins the reclamation handler main() already has, alongside the
+        close() one widened above: both sit after the rows are gone, and
+        catching the interrupt in one but not the other leaves the same hole.
+
+        Mutation (M-reclaim-sqlite-only): in main, narrow the reclamation
+        handler from `except (sqlite3.Error, KeyboardInterrupt, OSError)` to
+        `except sqlite3.Error`. The interrupt escapes main(), no JSON is
+        printed, and json.loads below raises.
+        """
+        import json
+
+        path = tmp_path / "vacint.db"
+        conn = _make_db(path)
+        for i in range(20):
+            _add_session(conn, f"s{i}", age_days=30, events=10, messages=4)
+        conn.close()
+
+        def interrupting_vacuum(c, **kw):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(
+            opencode_gc, "run_incremental_vacuum", interrupting_vacuum
+        )
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply", "--json"],
+        )
+
+        rc = opencode_gc.main()
+        payload = json.loads(capsys.readouterr().out)
+
+        assert rc == 1
+        assert payload["incomplete"] is True
+        assert any("KeyboardInterrupt" in e and "reclamation" in e
+                   for e in payload["errors"])
+        # The deletions themselves finished and are still fully reported.
+        assert payload["sessions_deleted"] == 20
+        assert payload["rows_deleted"]["event"] == 200
+        assert len(_snapshot(path)["session"]) == 0
+
+    def test_an_interrupt_measuring_the_file_still_reports_the_deletions(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """on_disk_bytes() stats files after close, once the rows are gone.
+
+        Mutation (M-measure-oserror-only): in main, narrow the handler around
+        `res.bytes_after = on_disk_bytes(db_path)` back to `except OSError`.
+        The interrupt escapes and no report is printed.
+        """
+        import json
+
+        path = tmp_path / "sizeint.db"
+        conn = _make_db(path)
+        for i in range(3):
+            _add_session(conn, f"s{i}", age_days=30)
+        conn.close()
+
+        real_on_disk = opencode_gc.on_disk_bytes
+        calls = []
+
+        def interrupting_on_disk(p):
+            calls.append(1)
+            if len(calls) >= 2:
+                raise KeyboardInterrupt()
+            return real_on_disk(p)
+
+        monkeypatch.setattr(opencode_gc, "on_disk_bytes", interrupting_on_disk)
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply", "--json"],
+        )
+
+        rc = opencode_gc.main()
+        payload = json.loads(capsys.readouterr().out)
+
+        assert rc == 1
+        assert payload["incomplete"] is True
+        assert any("KeyboardInterrupt" in e and "measuring" in e
+                   for e in payload["errors"])
+        assert payload["sessions_deleted"] == 3
+        assert len(_snapshot(path)["session"]) == 0
+
+
+class TestNonNumericTimeUpdated:
+    """`time_updated integer` is an affinity, not a constraint: SQLite stores
+    a value it cannot convert verbatim, and Python reads it back as `str` or
+    `bytes`. Comparing that against the cutoff raises TypeError from under the
+    write lock, after earlier batches have committed irreversibly.
+
+    Conservative, like the NULL policy: an age that cannot be read is an
+    unknown age, and unknown ages are never deleted.
+
+    Mutation for every test here (S-nonnumeric-compared): in select_expired,
+    revert to `unknown = {sid for sid, t in updated.items() if t is None}` /
+    `old = {... if t is not None and t < cutoff_ms}`.
+    """
+
+    @pytest.fixture()
+    def textdb(self, tmp_path):
+        path = tmp_path / "text.db"
+        conn = _make_db(path)
+        yield path, conn
+        conn.close()
+
+    def _add_text_age(self, conn, sid, value, *, parent=None):
+        conn.execute(
+            "INSERT INTO session (id, parent_id, time_created, time_updated) "
+            "VALUES (?,?,?,?)", (sid, parent, 0, value),
+        )
+        _add_rows(conn, sid)
+        stored = conn.execute(
+            "SELECT typeof(time_updated) FROM session WHERE id=?", (sid,)
+        ).fetchone()[0]
+        assert stored == "text", (
+            f"the fixture must actually store non-numeric text, got {stored!r}"
+        )
+
+    def test_a_text_age_is_kept_as_unknown_rather_than_raising(self, textdb):
+        path, conn = textdb
+        self._add_text_age(conn, "garbled", "not-a-timestamp")
+        _add_session(conn, "old", age_days=30)
+
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+
+        assert sel.deletable == ["old"], "the unreadable age must not be deletable"
+        assert sel.kept_unknown_age == 1
+
+    def test_a_text_age_survives_a_real_delete(self, textdb):
+        """The selection is one thing; the revalidation under the write lock
+        runs the same comparison on every session in the graph, including ones
+        this run never selected.
+        """
+        path, conn = textdb
+        _add_session(conn, "old", age_days=30, events=3, messages=2)
+        self._add_text_age(conn, "garbled", "not-a-timestamp")
+
+        outcome = _delete(conn, ["old"], batch=1)
+
+        assert outcome.failure is None, (
+            f"an unreadable age must not fail the run: {outcome.failure}"
+        )
+        assert outcome.rows["session"] == 1
+        assert [r[0] for r in conn.execute("SELECT id FROM session")] == ["garbled"]
+        assert conn.execute(
+            "SELECT count(*) FROM event WHERE aggregate_id='garbled'"
+        ).fetchone()[0] == 3
+
+    def test_a_text_age_appearing_mid_run_does_not_lose_the_counts(self, tmp_path):
+        """The row need not exist when verify_usable() probes, so the write
+        lock is where it is met. One batch has committed by then, and the
+        TypeError is not in delete_sessions' enumerated except list: it would
+        take the `except BaseException` arm, roll back, and re-raise, losing
+        every count.
+        """
+        path = tmp_path / "midrun-text.db"
+        setup = _make_db(path, wal=True)
+        for sid in ("aaa", "bbb"):
+            _add_session(setup, sid, age_days=30, events=3, messages=2)
+        setup.close()
+
+        gc_conn = opencode_gc.connect(path, read_only=False, timeout_s=5)
+        app = sqlite3.connect(str(path), isolation_level=None, timeout=5)
+        try:
+            cutoff = _cutoff()
+            selected = opencode_gc.expired_session_ids(gc_conn, cutoff).deletable
+            assert sorted(selected) == ["aaa", "bbb"]
+
+            # opencode -- or a corruption, or a schema migration -- writes a
+            # non-numeric time_updated after selection.
+            app.execute(
+                "INSERT INTO session (id, parent_id, time_created, time_updated) "
+                "VALUES ('garbled',NULL,0,'not-a-timestamp')"
+            )
+
+            outcome = opencode_gc.delete_sessions(
+                gc_conn, selected, cutoff_ms=cutoff, batch=1, deadline=None
+            )
+
+            assert outcome.failure is None, (
+                f"the unreadable age must not abort the run: {outcome.failure}"
+            )
+            assert outcome.rows["session"] == 2
+            assert [r[0] for r in app.execute("SELECT id FROM session")] == ["garbled"]
+        finally:
+            gc_conn.close()
+            app.close()
+
+    def test_a_text_aged_child_protects_its_old_parent(self, textdb):
+        """Unknown age joins the same policy as NULL, so it shields ancestors
+        exactly as a live session does.
+        """
+        path, conn = textdb
+        _add_session(conn, "parent", age_days=30)
+        self._add_text_age(conn, "child", "not-a-timestamp", parent="parent")
+
+        sel = opencode_gc.expired_session_ids(conn, _cutoff())
+
+        assert sel.deletable == []
+        assert sel.kept_live_descendant == 1
+
+    def test_a_float_age_is_still_a_readable_age(self, textdb):
+        """REAL is numeric and comparable, so it is an age like any other --
+        the unknown-age policy must not swallow it. INTEGER affinity only
+        rewrites a float it can convert losslessly, so a fractional
+        millisecond survives as `real`.
+
+        Mutation (S-float-unknown): in select_expired, narrow the isinstance
+        test to `isinstance(t, int)`. The old float-aged session is then
+        counted as unknown age and never collected.
+        """
+        path, conn = textdb
+        cutoff = _cutoff()
+        conn.execute(
+            "INSERT INTO session (id, parent_id, time_created, time_updated) "
+            "VALUES ('floaty',NULL,0,?)", (cutoff - 1000.5,),
+        )
+        _add_rows(conn, "floaty")
+        assert conn.execute(
+            "SELECT typeof(time_updated) FROM session WHERE id='floaty'"
+        ).fetchone()[0] == "real", "the fixture must actually store a REAL"
+
+        sel = opencode_gc.expired_session_ids(conn, cutoff)
+
+        assert sel.deletable == ["floaty"], "a REAL age is readable and expired"
+        assert sel.kept_unknown_age == 0
+
+
+class TestDryRunIsReadOnlyAtTheHandle:
+    """The dry-run snapshot being unchanged proves the dry-run branch happens
+    not to write; it does not prove the handle could not. `mode=ro` is the
+    last backstop against a dry run mutating an irreplaceable store, so it is
+    asserted directly.
+    """
+
+    @pytest.fixture()
+    def populated(self, tmp_path):
+        path = tmp_path / "ro.db"
+        conn = _make_db(path)
+        _add_session(conn, "old", age_days=30)
+        _add_session(conn, "live", age_days=1)
+        conn.close()
+        return path
+
+    def test_a_dry_run_opens_the_database_read_only(self, populated, monkeypatch):
+        """Mutation (C-dry-run-read-write): in main,
+        `connect(db_path, read_only=not args.apply)` -> `read_only=False`.
+        The recorded flag is then False and this fails, where
+        test_dry_run_changes_nothing passes on a read-write handle.
+        """
+        seen = []
+        real_connect = opencode_gc.connect
+
+        def spy(db, *, read_only, **kw):
+            seen.append(read_only)
+            return real_connect(db, read_only=read_only, **kw)
+
+        monkeypatch.setattr(opencode_gc, "connect", spy)
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv", ["opencode-gc", "--db", str(populated)]
+        )
+
+        assert opencode_gc.main() == 0
+        assert seen == [True], \
+            f"a dry run must open a read-only handle, got read_only={seen}"
+
+    def test_apply_opens_the_database_read_write(self, populated, monkeypatch):
+        """The complement: hard-coding read_only=True would make --apply a
+        no-op that still exits 0.
+
+        Mutation (C-apply-read-only): same line -> `read_only=True`. The
+        deletes then raise 'attempt to write a readonly database' and the
+        session survives.
+        """
+        seen = []
+        real_connect = opencode_gc.connect
+
+        def spy(db, *, read_only, **kw):
+            seen.append(read_only)
+            return real_connect(db, read_only=read_only, **kw)
+
+        monkeypatch.setattr(opencode_gc, "connect", spy)
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv", ["opencode-gc", "--db", str(populated), "--apply"]
+        )
+
+        assert opencode_gc.main() == 0
+        assert seen == [False]
+        assert [r[0] for r in _snapshot(populated)["session"]] == ["live"]
+
+    def test_a_read_only_handle_refuses_every_write_this_tool_makes(self, populated):
+        """What read_only=True actually buys: the statements the apply path
+        would run are refused by SQLite itself, whatever the calling code does.
+
+        Mutation (C-connect-ro-dropped): in connect(), drop the `?mode=ro`
+        from the read-only URI. Every statement below then succeeds and the
+        rows are gone.
+        """
+        before = _snapshot(populated)
+        conn = opencode_gc.connect(populated, read_only=True)
+        try:
+            # A read must still work -- a dry run has to count rows.
+            assert conn.execute("SELECT count(*) FROM session").fetchone()[0] == 2
+
+            for sql in (
+                "DELETE FROM session WHERE id='old'",
+                "DELETE FROM event WHERE aggregate_id='old'",
+                "UPDATE session SET time_updated=0 WHERE id='live'",
+                "PRAGMA incremental_vacuum(1)",
+            ):
+                with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                    conn.execute(sql)
+        finally:
+            conn.close()
+        assert _snapshot(populated) == before
+
+
+class TestDeadlineBoundary:
+    """`--max-seconds` is a bound on when new batches may start. Which side of
+    it the boundary instant falls on is a one-line decision that no other test
+    exercises.
+    """
+
+    def _clock_reading(self, *values):
+        """A clock returning exactly these values, one per read."""
+        it = iter(values)
+        return lambda: next(it)
+
+    def test_a_batch_starting_exactly_at_the_deadline_still_runs(self, db):
+        """`clock() > deadline`, not `>=`: the deadline is the last instant a
+        batch may start, and a run that stops at it reports itself incomplete
+        and leaves rows behind for no reason.
+
+        Mutation (D5b-deadline-ge): `clock() > deadline` -> `>=`. The batch
+        below is then never attempted: deadline_reached is True, nothing is
+        deleted, and the CLI would exit 3 on a run that had work it could
+        have done.
+        """
+        path, conn = db
+        _add_session(conn, "old", age_days=30)
+
+        outcome = opencode_gc.delete_sessions(
+            conn, ["old"], cutoff_ms=_cutoff(), batch=1,
+            deadline=10.0, clock=self._clock_reading(10.0),
+        )
+
+        assert outcome.deadline_reached is False, \
+            "a batch starting exactly at the deadline is within the bound"
+        assert outcome.rows["session"] == 1
+        assert outcome.remaining == 0
+        assert conn.execute("SELECT count(*) FROM session").fetchone()[0] == 0
+
+    def test_a_batch_one_tick_past_the_deadline_does_not_run(self, db):
+        """The other side of the same boundary: past the bound, no new batch.
+
+        Mutation (D5b-deadline-never): `clock() > deadline` -> `False`. The
+        run then ignores --max-seconds entirely and deletes.
+        """
+        path, conn = db
+        _add_session(conn, "old", age_days=30)
+        before = _counts(conn)
+
+        outcome = opencode_gc.delete_sessions(
+            conn, ["old"], cutoff_ms=_cutoff(), batch=1,
+            deadline=10.0, clock=self._clock_reading(10.001),
+        )
+
+        assert outcome.deadline_reached is True
+        assert outcome.rows["session"] == 0
+        assert outcome.remaining == 1
+        assert _counts(conn) == before
+
+
+class TestTheLoopAlwaysTerminates:
+    """`delete_sessions` loops until `pending` is empty, and every iteration
+    must shrink it. A batch that deletes nothing and drops nothing spins
+    forever, taking and releasing the write lock at full speed against a live
+    database -- a hang, and a hang is the one outcome a test suite cannot
+    report: it never gets to fail.
+
+    So the loop refuses to iterate without progress, and these tests assert
+    both halves: the normal path drops ineligible candidates and finishes, and
+    a batch that somehow makes no progress stops with a failure instead of
+    looping. Termination is proven from inside the run, with a bounded clock,
+    rather than left to a wall-clock timeout.
+    """
+
+    def _bounded(self, conn, session_ids, *, cutoff, batch, limit):
+        """Run delete_sessions, failing if the loop exceeds `limit` batches.
+
+        The counter is driven by the injected `clock`, which the loop reads
+        exactly once per iteration. Raising from it goes through the guarded
+        region like any other interrupt, so the outcome still comes back and
+        the bound is enforced rather than merely observed.
+        """
+        iterations = []
+
+        def counting_clock():
+            iterations.append(1)
+            if len(iterations) > limit:
+                raise MemoryError(f"loop exceeded {limit} batches")
+            return 0.0
+
+        outcome = opencode_gc.delete_sessions(
+            conn, session_ids, cutoff_ms=cutoff, batch=batch,
+            # A deadline far in the future: the check never trips, so the
+            # clock is read purely as an iteration counter.
+            deadline=1e18, clock=counting_clock,
+        )
+        return outcome, len(iterations)
+
+    def test_ineligible_candidates_are_dropped_so_the_run_ends(self, db):
+        """Every candidate is ineligible under the lock, so no batch can
+        delete anything. The loop must still end, by dropping them from
+        `pending`.
+
+        Mutation (D2-ineligible-empty): `ineligible = pending - set(eligible)`
+        -> `ineligible = set()`. Nothing is deleted and nothing is dropped, so
+        the batch makes no progress; the loop stops on that rather than
+        spinning, and `failure` below is set instead of None. Before the
+        no-progress guard existed this mutant hung the whole suite -- it never
+        reached a failing assertion at all.
+        """
+        path, conn = db
+        # Live sessions: delete_sessions authorises against cutoff_ms, so
+        # none of these is eligible however they were passed in.
+        for sid in ("aaa", "bbb", "ccc"):
+            _add_session(conn, sid, age_days=1)
+        before = _counts(conn)
+
+        outcome, batches = self._bounded(
+            conn, ["aaa", "bbb", "ccc"], cutoff=_cutoff(), batch=1, limit=20
+        )
+
+        assert outcome.failure is None, (
+            f"the loop did not terminate on its own: {outcome.failure}"
+        )
+        assert batches <= 2, (
+            f"one batch suffices to drop every ineligible candidate, took {batches}"
+        )
+        assert sorted(outcome.skipped) == ["aaa", "bbb", "ccc"]
+        assert outcome.remaining == 0
+        assert _counts(conn) == before, "nothing was eligible, so nothing may go"
+
+    def test_a_cycle_among_the_candidates_does_not_spin(self, db):
+        """A parent_id cycle is ineligible for a different reason -- no safe
+        order rather than the wrong age -- and reaches the same drop.
+
+        Mutation (D2-ineligible-empty): same. 'plain' is deleted, then the two
+        cyclic ids stay in `pending` with nothing to delete: the no-progress
+        guard stops the run and `failure` is set.
+        """
+        path, conn = db
+        _add_session(conn, "x", age_days=30)
+        _add_session(conn, "y", age_days=30, parent="x")
+        conn.execute("UPDATE session SET parent_id='y' WHERE id='x'")
+        _add_session(conn, "plain", age_days=30)
+
+        outcome, batches = self._bounded(
+            conn, ["plain", "x", "y"], cutoff=_cutoff(), batch=1, limit=20
+        )
+
+        assert outcome.failure is None, (
+            f"the loop did not terminate on its own: {outcome.failure}"
+        )
+        assert batches <= 3
+        assert outcome.rows["session"] == 1
+        assert sorted(outcome.skipped) == ["x", "y"]
+        assert outcome.remaining == 0
+        assert sorted(r[0] for r in conn.execute("SELECT id FROM session")) == ["x", "y"]
+
+    def test_every_batch_makes_progress_on_a_mixed_workload(self, db):
+        """Deletable and ineligible candidates together, one session per
+        batch: the loop must take at most one iteration per candidate plus a
+        final empty one, never more.
+
+        Mutation (D2-ineligible-empty): the three live ids are never dropped,
+        so the batch after the last deletion makes no progress and the run
+        stops with a failure instead of finishing clean.
+        """
+        path, conn = db
+        old = [f"old{i}" for i in range(4)]
+        for sid in old:
+            _add_session(conn, sid, age_days=30)
+        for sid in ("live0", "live1", "live2"):
+            _add_session(conn, sid, age_days=1)
+
+        outcome, batches = self._bounded(
+            conn, old + ["live0", "live1", "live2"],
+            cutoff=_cutoff(), batch=1, limit=20,
+        )
+
+        assert outcome.failure is None, (
+            f"the loop did not terminate on its own: {outcome.failure}"
+        )
+        assert batches <= len(old) + 1, (
+            f"{len(old)} deletable candidates at batch=1 need at most "
+            f"{len(old) + 1} iterations, took {batches}"
+        )
+        assert outcome.rows["session"] == 4
+        assert sorted(outcome.skipped) == ["live0", "live1", "live2"]
+        assert outcome.remaining == 0
+        assert sorted(r[0] for r in conn.execute("SELECT id FROM session")) == \
+            ["live0", "live1", "live2"]
+
+    def test_a_batch_that_makes_no_progress_stops_instead_of_looping(self, db):
+        """The guard itself, driven directly: a graph where the candidates are
+        neither deleted nor dropped is what a progress bug looks like from
+        inside the loop, and the run must end saying so.
+
+        Constructed by stubbing `expired_session_ids` to report every pending
+        candidate as eligible -- so nothing is dropped -- while putting a
+        session that is not pending first, so the `batch`-sized slice deletes
+        none of them. The real function cannot produce that, because
+        `restrict_to=pending` bounds what it returns; the guard exists for the
+        case that invariant is broken, and asserting it needs the case built.
+
+        Mutation (D2-no-progress-guard-dropped): delete the
+        `if len(pending) == remaining_before:` block. The loop then iterates
+        on a `pending` that never shrinks; the bounded clock stops it, so
+        `failure` reads "MemoryError: loop exceeded 20 batches" and the
+        assertions below fail rather than the suite hanging.
+        """
+        path, conn = db
+        for sid in ("aaa", "bbb"):
+            _add_session(conn, sid, age_days=30)
+        before = _counts(conn)
+
+        import unittest.mock
+
+        # 'zzz' is no session at all, so the batch deletes nothing, while
+        # 'aaa'/'bbb' being eligible means neither is dropped as ineligible.
+        stuck = opencode_gc.Selection(deletable=["zzz", "aaa", "bbb"])
+        with unittest.mock.patch.object(
+            opencode_gc, "expired_session_ids", return_value=stuck
+        ):
+            outcome, batches = self._bounded(
+                conn, ["aaa", "bbb"], cutoff=_cutoff(), batch=1, limit=20
+            )
+
+        assert outcome.failure is not None, "a stuck loop must be reported"
+        assert "no progress" in outcome.failure
+        assert batches <= 2, f"the guard must stop on the first stuck batch, took {batches}"
+        assert outcome.remaining == 2, "the candidates it could not resolve are still owed"
+        assert outcome.incomplete is True
+        assert _counts(conn) == before, "a stuck batch must not have deleted anything"
+        assert conn.in_transaction is False
+
+
 class TestArgumentBounds:
     """Invalid numerics must be refused, not silently turned into "no limit"."""
 
@@ -1864,6 +2696,61 @@ class TestSqliteTempDirSearchOrder:
             assert opencode_gc._sqlite_temp_dir() == fallback
         finally:
             unwritable.chmod(0o700)
+
+    def test_an_unsearchable_candidate_is_skipped(self, tmp_path, monkeypatch):
+        """SQLite requires the directory be searchable as well as writable, and
+        0o600 is writable but not. Without this, the X_OK half of the check is
+        unpinned: the 0o500 case above fails W_OK too, so dropping X_OK alone
+        changes nothing there.
+
+        Mutation (T4-no-exec-bit-check): `os.access(path, os.W_OK | os.X_OK)`
+        -> `os.access(path, os.W_OK)`. The unsearchable directory is then
+        chosen, and the guard measures a filesystem SQLite cannot write its
+        VACUUM copy to.
+        """
+        unsearchable = tmp_path / "unsearchable"
+        unsearchable.mkdir(mode=0o600)
+        fallback = tmp_path / "fallback"
+        fallback.mkdir()
+        assert os.access(unsearchable, os.W_OK), \
+            "the fixture must be writable, or W_OK alone would reject it"
+        assert not os.access(unsearchable, os.X_OK), \
+            "the fixture must not be searchable, or there is nothing to pin"
+        monkeypatch.setenv("SQLITE_TMPDIR", str(unsearchable))
+        monkeypatch.setenv("TMPDIR", str(fallback))
+        try:
+            assert opencode_gc._sqlite_temp_dir() == fallback
+        finally:
+            unsearchable.chmod(0o700)
+
+    def test_the_current_directory_is_the_last_resort(self, tmp_path, monkeypatch):
+        """SQLite falls back to the current directory when no named candidate
+        qualifies, and so must the guard: refusing outright would block a
+        conversion SQLite would have completed.
+
+        Asserted by using the fallback, not by neutralising it -- the cwd is
+        moved to a known directory and the returned path must resolve there.
+
+        Mutation (T5-no-cwd-fallback): drop `candidates.append(".")`. Every
+        named candidate is missing here, so _sqlite_temp_dir raises
+        RuntimeError instead of returning the cwd.
+        """
+        monkeypatch.delenv("SQLITE_TMPDIR", raising=False)
+        monkeypatch.delenv("TMPDIR", raising=False)
+        missing = tmp_path / "absent"
+        monkeypatch.setattr(
+            opencode_gc, "SQLITE_TEMP_DIR_CANDIDATES", (str(missing),)
+        )
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+
+        chosen = opencode_gc._sqlite_temp_dir()
+
+        assert chosen.resolve() == cwd.resolve(), (
+            "with no named candidate usable, SQLite would write its VACUUM "
+            f"copy in the current directory; the guard chose {chosen}"
+        )
 
     def test_documented_order_is_followed_when_the_env_is_empty(self, tmp_path, monkeypatch):
         """With no environment override, /var/tmp is preferred over /tmp --

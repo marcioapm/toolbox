@@ -54,11 +54,15 @@ NONE -> INCREMENTAL requires the full rewrite, which is what
 
 REPORTING AN INTERRUPTED RUN
 ----------------------------
-Committed batches cannot be undone. A deadline, a lock error or an I/O failure
-part-way through therefore still produces a full result -- committed counts,
-`incomplete: true`, and the number of eligible sessions left -- instead of a
-traceback that tells automation nothing about what was destroyed. Exit status
-is 0 for a complete run, 3 for one stopped early, 1 for one that errored.
+Committed batches cannot be undone. A deadline, a Ctrl-C, a lock error or an
+I/O failure part-way through therefore still produces a full result --
+committed counts, `incomplete: true`, and the number of eligible sessions left
+-- instead of a traceback that tells automation nothing about what was
+destroyed. Ctrl-C is the expected way to stop a multi-hour prune, so the
+guarded region covers every statement of a batch and everything after the last
+one: an interrupt landing between two guarded blocks would exit 130, a status
+no report ever produces. Exit status is 0 for a complete run, 3 for one
+stopped early, 1 for one that errored.
 """
 from __future__ import annotations
 
@@ -281,6 +285,13 @@ def select_expired(
 
     A NULL `time_updated` is an unknown age, not an infinite one: such a
     session is kept and counted rather than treated as older than the cutoff.
+    So is a non-numeric one. `time_updated` has INTEGER affinity, which SQLite
+    applies as a preference and not a constraint: a value it cannot convert is
+    stored verbatim as `text` or `blob` and read back as `str` or `bytes`.
+    Comparing that against the cutoff raises TypeError, and it would raise
+    under the write lock, after earlier batches had already committed
+    irreversibly. An age that cannot be read is an unknown age, which this
+    tool never deletes.
 
     `restrict_to` narrows the candidates to that set. Every other session in
     `rows` is then retained whatever its age, and still protects its ancestors
@@ -291,8 +302,9 @@ def select_expired(
     updated = {r[0]: r[2] for r in rows}
     parent_of: dict[str, Optional[str]] = {r[0]: r[1] for r in rows}
 
-    unknown = {sid for sid, t in updated.items() if t is None}
-    old = {sid for sid, t in updated.items() if t is not None and t < cutoff_ms}
+    # int and float both carry a readable age; str, bytes and None do not.
+    unknown = {sid for sid, t in updated.items() if not isinstance(t, (int, float))}
+    old = {sid for sid, t in updated.items() if sid not in unknown and t < cutoff_ms}
     if restrict_to is not None:
         old &= restrict_to
 
@@ -355,26 +367,45 @@ def delete_sessions(
     A batch that fails is rolled back, but every batch committed before it is
     already durable and irreversible. The failure is therefore recorded on the
     outcome rather than raised, so the caller can report exactly what was
-    destroyed instead of losing the counts to a traceback. Row counts are
-    accumulated per transaction and merged into `rows` only once its COMMIT
-    has returned: a rolled-back DELETE undid its rows, and reporting them as
-    destroyed would misdirect the very recovery the counts exist to inform.
+    destroyed instead of losing the counts to a traceback. That covers the
+    whole of each iteration, the deadline check and the bookkeeping included:
+    Ctrl-C is how an operator stops this tool, and an interrupt landing between
+    the guarded blocks would destroy rows and report nothing about them. Row
+    counts are accumulated per transaction and merged into `rows` only once its
+    COMMIT has returned: a rolled-back DELETE undid its rows, and reporting
+    them as destroyed would misdirect the very recovery the counts exist to
+    inform.
+
+    An interrupt raised by the COMMIT call itself, from a transaction that is
+    already durable, is recorded and then stops the run -- see `_commit_batch`.
+    The few bytecodes between that merge and the next guarded statement are the
+    one window left: an interrupt there is still caught, but lands after
+    `rows` is correct and before `pending` shrinks, so the run overstates what
+    is left rather than understating what was destroyed.
+
+    Every iteration must shrink `pending`, by deleting candidates or by
+    dropping the ones the lock found ineligible. A batch that does neither is
+    reported as a failure rather than retried: against a live database the
+    retry is an endless loop taking and releasing the write lock, which
+    starves opencode and never terminates to report anything at all.
     """
     outcome = DeleteOutcome(rows={t: 0 for t, _ in CHILD_TABLES} | {"session": 0})
     order_index = {sid: i for i, sid in enumerate(session_ids)}
     pending = set(session_ids)
 
     while pending:
-        if deadline is not None and clock() > deadline:
-            outcome.deadline_reached = True
-            break
-
-        # BEGIN IMMEDIATE is inside the guarded region: it is the statement
-        # most likely to fail, with SQLITE_BUSY, when opencode holds the write
-        # lock -- and by then earlier batches have already committed.
+        # Everything a batch does is inside the guarded region, the deadline
+        # check and the bookkeeping included. Ctrl-C is how an operator stops
+        # this tool, and by the second batch there are already committed
+        # deletions that only this outcome can account for.
         began = False
         committed = {t: 0 for t, _ in CHILD_TABLES} | {"session": 0}
         try:
+            if deadline is not None and clock() > deadline:
+                outcome.deadline_reached = True
+                break
+            # BEGIN IMMEDIATE is guarded too: it is the statement most likely
+            # to fail, with SQLITE_BUSY, when opencode holds the write lock.
             conn.execute("BEGIN IMMEDIATE")
             began = True
             eligible = expired_session_ids(conn, cutoff_ms, restrict_to=pending).deletable
@@ -391,7 +422,34 @@ def delete_sessions(
                     committed[table] += max(0, cur.rowcount)
                 cur = conn.execute(f"DELETE FROM session WHERE id IN ({marks})", doomed)
                 committed["session"] += max(0, cur.rowcount)
-            conn.execute("COMMIT")
+            interrupted = _commit_batch(conn)
+            # Past COMMIT: the deletes are durable, so their counts are now
+            # facts. One dict.update rather than a `+=` per table, so an
+            # interrupt cannot leave `rows` describing half a batch, and the
+            # counts land before `pending` shrinks: an interrupt in between
+            # overstates what is left rather than understating what was
+            # destroyed.
+            began = False
+            outcome.rows.update({t: outcome.rows[t] + n for t, n in committed.items()})
+            outcome.skipped.extend(sorted(ineligible, key=order_index.__getitem__))
+            remaining_before = len(pending)
+            pending = pending - set(doomed) - ineligible
+            if len(pending) == remaining_before:
+                # Every batch either deletes candidates or drops the ones the
+                # lock found ineligible, so this cannot happen -- and if it
+                # ever does, the alternative is an endless loop taking and
+                # releasing the write lock on a live database. Stop and say so.
+                outcome.failure = (
+                    f"RuntimeError: batch made no progress on {remaining_before} "
+                    "remaining candidate(s); stopping rather than looping"
+                )
+                break
+            if interrupted is not None:
+                # The COMMIT itself returned and was then interrupted. Its
+                # rows are gone and are now recorded, so the interrupt stops
+                # the run rather than discarding the batch that caused it.
+                outcome.failure = f"{type(interrupted).__name__}: {interrupted}"
+                break
         except (sqlite3.Error, KeyboardInterrupt, MemoryError, OSError) as exc:
             if began:
                 _rollback_quietly(conn)
@@ -401,15 +459,32 @@ def delete_sessions(
             if began:
                 _rollback_quietly(conn)
             raise
-        # Past COMMIT: the deletes are durable, so their counts are now facts.
-        for table, n in committed.items():
-            outcome.rows[table] += n
-        outcome.skipped.extend(sorted(ineligible, key=order_index.__getitem__))
-        pending -= set(doomed)
-        pending -= ineligible
 
     outcome.remaining = len(pending)
     return outcome
+
+
+def _commit_batch(conn: sqlite3.Connection) -> Optional[BaseException]:
+    """COMMIT, handing back an interrupt that arrived once it had returned.
+
+    A batch spends nearly all of its time inside SQLite's C code, so that is
+    where an interrupt lands: CPython runs the signal handler when the call
+    returns, and `conn.execute("COMMIT")` raises KeyboardInterrupt from a
+    transaction that is already durable. Letting that propagate would discard
+    the counts for rows this process has just destroyed. Only the caller holds
+    those counts, so the exception is returned for it to record and then stop
+    on, rather than raised here.
+
+    `in_transaction` separates the two cases: still in a transaction means the
+    COMMIT did not happen and the interrupt is a plain failure.
+    """
+    try:
+        conn.execute("COMMIT")
+    except (KeyboardInterrupt, MemoryError) as exc:
+        if conn.in_transaction:
+            raise
+        return exc
+    return None
 
 
 def _rollback_quietly(conn: sqlite3.Connection) -> None:
@@ -469,7 +544,9 @@ def run_incremental_vacuum(
 
     Stopping on the deadline is reported rather than swallowed: exiting 0 with
     a still-oversized file tells an operator the reclamation finished when it
-    did not.
+    did not. Other failures propagate: no row is at stake here, and the caller
+    already routes them into the report alongside the deletion counts that
+    are.
     """
     before = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
     if before == 0:
@@ -807,14 +884,16 @@ def main() -> int:
     finally:
         try:
             conn.close()
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, KeyboardInterrupt, OSError) as exc:
+            # In WAL mode close() checkpoints, which on a large database is
+            # real IO an operator can interrupt or a filesystem can fail.
             res.incomplete = True
             res.errors.append(f"closing the database failed: "
                               f"{type(exc).__name__}: {exc}")
 
     try:
         res.bytes_after = on_disk_bytes(db_path)
-    except OSError as exc:
+    except (KeyboardInterrupt, OSError) as exc:
         res.incomplete = True
         res.errors.append(f"measuring the database failed: "
                           f"{type(exc).__name__}: {exc}")
@@ -862,8 +941,8 @@ def _report(args, res: Result) -> int:
         print(f"    kept {res.sessions_kept_live_descendant} old session(s) with a "
               "recently-updated descendant")
     if res.sessions_kept_unknown_age:
-        print(f"    kept {res.sessions_kept_unknown_age} session(s) with a NULL "
-              "time_updated (unknown age, not expired)")
+        print(f"    kept {res.sessions_kept_unknown_age} session(s) whose "
+              "time_updated is NULL or not numeric (unknown age, not expired)")
     if res.sessions_kept_parent_cycle:
         print(f"    kept {res.sessions_kept_parent_cycle} session(s) in a parent_id "
               "cycle (no safe deletion order)")
