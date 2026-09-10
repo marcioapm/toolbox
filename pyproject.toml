@@ -39,6 +39,7 @@ slackcli = "toolbox.slackcli:main"
 llm-usage = "toolbox.llm_usage:main"
 agent-run = "toolbox.agent_run:main"
 verify-submission = "toolbox.verify_submission:main"
+opencode-gc = "toolbox.opencode_gc:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
