@@ -200,9 +200,10 @@ REBUILD_DISK_POLL_SECONDS = 2.0
 # slow the rebuild.
 REBUILD_PROGRESS_INSTRUCTIONS = 20_000
 REBUILD_SUFFIX = ".rebuild-tmp"
-# The old database is hard-linked here across the swap, so the live pathname is
-# never without a complete database for an instant and the original stays
-# recoverable until the replacement is durably in place. See `_swap_in`.
+# The old database is hard-linked here across the swap, so the original stays
+# recoverable until the replacement is durably in place. Atomicity at the live
+# pathname comes from `os.replace`, not from this link; the link's job is
+# crash-recovery. See `_swap_in`.
 REBUILD_BACKUP_SUFFIX = ".rebuild-old"
 # Two rebuilds share one REBUILD_SUFFIX path and would destroy each other's
 # copy mid-write. flock is advisory and process-scoped, which is exactly the
@@ -213,7 +214,13 @@ REBUILD_LOCK_SUFFIX = ".rebuild-lock"
 # setting; this only stops OUR transactions from leaving a huge WAL behind.
 JOURNAL_SIZE_LIMIT_BYTES = 256 * 1024 ** 2
 
-SIDECAR_SUFFIXES = ("-wal", "-shm")
+# A SQLite database is a pathname-bound SET of files, and which sidecars exist
+# depends on the journal mode: `-wal`/`-shm` in WAL, `-journal` in the rollback
+# modes. All three are listed because both places that use this tuple are about
+# the pathname rather than the mode -- `db_holders` must see a process holding
+# any of them, and `_swap_in` must leave none of them behind to be replayed
+# over the replacement. A suffix with no file costs nothing: both skip it.
+SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 # lsof is the only portable way to ask who has the file open, and it is not on
 # the bare PATH launchd and systemd hand a job (macOS keeps it in /usr/sbin).
@@ -1066,24 +1073,31 @@ def _prepare_replacement(target: Path, source_stat: os.stat_result, journal_mode
     user and silently changes opencode's concurrency model -- in rollback-journal
     mode a long reader blocks writers instead of coexisting with them.
 
-    Both are established here and then read back from a fresh connection,
-    because the value that matters is the one that persisted in the file rather
-    than the one the setting statement returned. Failure to establish either is
-    a refusal, not a warning: the swap is destructive and there is no way to
-    put the old file back once opencode has written to the new one.
+    All three are established here and then read back -- the journal mode from
+    a fresh connection, the mode and ownership from the file itself -- because
+    the value that matters is the one that persisted rather than the one the
+    setting call returned. Failure to establish any of them is a refusal, not a
+    warning: the swap is destructive and there is no way to put the old file
+    back once opencode has written to the new one.
     """
     try:
         os.chmod(target, stat.S_IMODE(source_stat.st_mode))
     except OSError as exc:
         return f"the rebuilt copy could not be given the source's permissions: {exc}"
-    if (source_stat.st_uid, source_stat.st_gid) != (os.geteuid(), os.getegid()):
-        try:
-            os.chown(target, source_stat.st_uid, source_stat.st_gid)
-        except OSError as exc:
-            return (
-                f"the rebuilt copy could not be given the source's ownership "
-                f"(uid {source_stat.st_uid}, gid {source_stat.st_gid}): {exc}"
-            )
+    # Unconditionally, and NOT only when the source differs from (euid, egid):
+    # `VACUUM INTO` writes the copy inside the database's own directory, and
+    # BSD/darwin gives a new file the DIRECTORY's gid rather than the process's
+    # egid. Measured on macmini: a 0640 source at gid 20 under a directory at
+    # gid 12 came out gid 12, group-readable by a group it was never in -- a
+    # case a `(euid, egid)` short-circuit cannot see, because the source and
+    # the process agree and it is the directory that differs.
+    try:
+        os.chown(target, source_stat.st_uid, source_stat.st_gid)
+    except OSError as exc:
+        return (
+            f"the rebuilt copy could not be given the source's ownership "
+            f"(uid {source_stat.st_uid}, gid {source_stat.st_gid}): {exc}"
+        )
 
     if journal_mode.casefold() == "wal":
         # Set WAL and close: the mode is persistent in the file header, and a
@@ -1097,11 +1111,21 @@ def _prepare_replacement(target: Path, source_stat: os.stat_result, journal_mode
     problem = _verify_rebuilt(target, journal_mode)
     if problem:
         return problem
-    mode = stat.S_IMODE(target.stat().st_mode)
+    try:
+        final = target.stat()
+    except OSError as exc:
+        return f"the rebuilt copy could not be inspected before the swap: {exc}"
+    mode = stat.S_IMODE(final.st_mode)
     if mode != stat.S_IMODE(source_stat.st_mode):
         return (
             f"the rebuilt copy is mode {mode:04o}, not the source's "
             f"{stat.S_IMODE(source_stat.st_mode):04o}"
+        )
+    if (final.st_uid, final.st_gid) != (source_stat.st_uid, source_stat.st_gid):
+        return (
+            f"the rebuilt copy is owned by uid {final.st_uid} gid "
+            f"{final.st_gid}, not the source's uid {source_stat.st_uid} gid "
+            f"{source_stat.st_gid}"
         )
     return None
 
@@ -1146,24 +1170,32 @@ def _swap_in(db: Path, target: Path) -> SwapOutcome:
     they were mistaken.
 
     The ordering is what is left of that, and it is chosen so that the rename
-    is the LAST mutating step:
+    is the last step that can LOSE anything -- not the last step outright: the
+    directory fsync and the removal of the backup both come after it, and
+    neither can leave the live pathname short of a complete database.
 
     1. The sidecars are removed first, while the WAL is known to be empty --
        the caller folded it with a TRUNCATE checkpoint and refused if any frame
        could not be moved, and then closed the connection, which folds again.
        A `-wal` that carries no committed frame is not data, and removing it
        before the rename is what stops a crash mid-swap from leaving the NEW
-       main file paired with the OLD file's `-wal`. SQLite would replay that
-       WAL over the replacement.
+       main file paired with the OLD file's sidecar. SQLite replays that over
+       the replacement; measured on a rollback-mode fixture, a surviving
+       `-journal` turned the compacted copy into `database disk image is
+       malformed` on the next read.
     2. The original is hard-linked aside, so it survives the rename and stays
        recoverable until the replacement is durable.
     3. `os.replace` is atomic: the live pathname holds either the whole old
        database or the whole new one, never neither.
+    4. The directory entry is fsynced and the backup removed. The replacement
+       is already installed by then, so a failure here is reported as such.
 
     Every failure up to and including step 3 therefore leaves a complete,
-    openable database at `db` with every committed row. A failure AFTER it
+    openable database at `db` with every committed row. A failure in step 4
     leaves the new database installed and the old one at the backup name, and
-    says so with both paths in the message.
+    says so with both paths in the message -- including when it arrives as a
+    KeyboardInterrupt, which past the rename is not an operator stopping the
+    run in time.
     """
     backup = db.with_name(db.name + REBUILD_BACKUP_SUFFIX)
     if backup.exists():
@@ -1199,24 +1231,30 @@ def _swap_in(db: Path, target: Path) -> SwapOutcome:
 
     # Past here the replacement IS the database. Nothing below can be reported
     # as a skip: the swap has happened and only its durability is in question.
+    # KeyboardInterrupt is caught alongside OSError and NOT re-raised, because
+    # past the rename an interrupt is not "the operator stopped it in time" --
+    # the replacement is installed and a `.rebuild-old` is on disk. Letting it
+    # propagate reported `the rebuild stopped: KeyboardInterrupt:` and named
+    # neither file, which is the one thing an operator must be told here.
     try:
         _fsync_path(db.parent)
-    except OSError as exc:
+    except (OSError, KeyboardInterrupt) as exc:
         return SwapOutcome(installed=True, failure=(
             f"the rebuilt database is installed at {db} but the directory "
-            f"entry could not be made durable: {exc}. The previous database is "
-            f"preserved at {backup}; if the host loses power before the "
-            f"filesystem flushes, the rename may not survive. Verify {db} and "
-            f"remove {backup} by hand"
+            f"entry could not be made durable ({type(exc).__name__}: {exc}). "
+            f"The previous database is preserved at {backup}; if the host "
+            f"loses power before the filesystem flushes, the rename may not "
+            f"survive. Verify {db} and remove {backup} by hand"
         ))
 
     try:
         backup.unlink()
-    except OSError as exc:
+    except (OSError, KeyboardInterrupt) as exc:
         return SwapOutcome(installed=True, failure=(
             f"the rebuilt database is installed at {db}, but the preserved "
-            f"original at {backup} could not be removed: {exc}. Remove it by "
-            "hand; until it is gone every later rebuild refuses"
+            f"original at {backup} could not be removed ({type(exc).__name__}: "
+            f"{exc}). Remove it by hand; until it is gone every later rebuild "
+            "refuses"
         ))
     return SwapOutcome(installed=True)
 
@@ -1302,8 +1340,9 @@ def rebuild_database(
        unrelated to concurrency: it is the 23-minute, 39.6 GB runaway of
        2026-09-12, which no Python-level deadline could reach.
     7. The copy is verified before it is trusted: `quick_check` ok, auto_vacuum
-       still INCREMENTAL, and the source's journal mode, permissions and
-       ownership established on it and read back from a fresh connection.
+       still INCREMENTAL, the source's journal mode established on it and read
+       back from a fresh connection, and its permissions and ownership
+       established and read back off the file itself.
     8. The source WAL is folded and this connection is CLOSED before the swap,
        so the file being replaced is self-contained and we are not ourselves a
        holder of it.
@@ -1334,14 +1373,21 @@ def rebuild_database(
 
 
 def rebuild_preflight(
-    db: Path, stats: DbStats, *, min_free_bytes: int
+    db: Path, stats: DbStats, *, min_free_bytes: int, holders: list[str] | None
 ) -> str | None:
     """Reasons not to start a rebuild, or None. Touches nothing.
 
     Shared by the real run and by `--dry-run`, so a preview reports the same
     refusals the run would hit rather than a second implementation of them.
+
+    `holders` is passed IN rather than looked up here, and that is the point:
+    the caller reports the same snapshot this refuses on. Two `db_holders`
+    calls are two different observations under one name -- reproduced, a run
+    reported `holders_before: []` while refusing with "1 process(es) still hold
+    the database", and the reverse, a `completed: true` beside a named holder,
+    which tells an operator reading the log that the file was replaced under a
+    live process when it was not.
     """
-    holders = db_holders(db)
     if holders is None:
         return (
             "cannot determine who holds the database (lsof is missing from "
@@ -1397,8 +1443,12 @@ def _rebuild_locked(
     clock,
     outcome: RebuildOutcome,
 ) -> RebuildOutcome:
+    # One lookup, one snapshot, one name: `holders_before` is the list the
+    # refusal below was actually decided on, not a second observation of it.
     outcome.holders_before = db_holders(db)
-    refusal = rebuild_preflight(db, stats, min_free_bytes=min_free_bytes)
+    refusal = rebuild_preflight(
+        db, stats, min_free_bytes=min_free_bytes, holders=outcome.holders_before
+    )
     if refusal:
         outcome.skipped = refusal
         return outcome
@@ -2243,7 +2293,9 @@ def _rebuild_command(ap: argparse.ArgumentParser, args) -> int:
         # The same preflight the real run uses, so a preview reports the
         # refusals the run would hit rather than a second implementation.
         report.holders = db_holders(db_path)
-        refusal = rebuild_preflight(db_path, stats, min_free_bytes=min_free_bytes)
+        refusal = rebuild_preflight(
+            db_path, stats, min_free_bytes=min_free_bytes, holders=report.holders
+        )
         if refusal:
             report.skipped = refusal
         else:

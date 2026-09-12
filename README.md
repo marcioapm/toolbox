@@ -646,7 +646,10 @@ stay; the honest claim is the precondition, not the check.
   environment and macOS keeps it in `/usr/sbin` — and unknown is also a refusal.
   Any diagnostic on stderr, unexpected exit status or unparseable output is
   likewise unknown. This is a snapshot: a process can attach immediately after
-  it, and nothing here prevents that.
+  it, and nothing here prevents that. It is taken **once per run** and both the
+  refusal and the reported `holders` come from that one sample — two samples
+  under one name let a run report `holders_before: []` while refusing by pid,
+  and the reverse, a named holder beside `completed: true`.
 - **`st_nlink != 1`.** A second hard link is a second public pathname to the same
   inode. `lsof` was given one path and cannot enumerate who might arrive through
   the other, and `os.replace` only moves the name it was given — the other name
@@ -667,20 +670,28 @@ stay; the honest claim is the precondition, not the check.
 And the parts that are about crash-safety rather than concurrency, which hold
 regardless:
 
-- **The rename is the last mutating step.** Sidecars cleared (WAL already
-  folded), original hard-linked aside, then `os.replace` — which is atomic, so
-  the live pathname holds either the whole old database or the whole new one.
-  Every failure up to and including it leaves a complete, openable database with
-  every committed row. A failure *after* it is reported as an **error with a
-  non-zero exit** naming both files, because the replacement is installed and
-  only you can finish the job.
+- **The rename is the last step that can lose anything.** Sidecars cleared (WAL
+  already folded), original hard-linked aside, then `os.replace` — which is
+  atomic, so the live pathname holds either the whole old database or the whole
+  new one. The directory fsync and the removal of the preserved original follow
+  it, and neither can leave the pathname short of a database. Every failure up to
+  and including the rename leaves a complete, openable database with every
+  committed row. A failure *after* it — including a Ctrl-C, which by then is not
+  stopping the run in time — is reported as an **error with a non-zero exit**
+  naming both files, because the replacement is installed and only you can finish
+  the job.
 - **The copy is verified before it is trusted**: `quick_check` ok, `auto_vacuum`
-  still INCREMENTAL, and the source's **journal mode**, **permissions** and
-  **ownership** established on it and read back from a fresh connection.
+  still INCREMENTAL, the source's **journal mode** established on it and read
+  back from a fresh connection, and its **permissions** and **ownership**
+  established and read back off the file itself.
   `VACUUM INTO` writes its output in the default `DELETE` mode and at the process
   umask whatever the source used — measured, a `0600` WAL source produced a
   `0644` `DELETE` copy. One changes opencode's concurrency model, the other
-  publishes session history to every local user. Both fail closed.
+  publishes session history to every local user. Both fail closed. Ownership is
+  set unconditionally: the copy is written inside the database's directory, and
+  on BSD/darwin a new file takes the *directory's* gid — measured, a `0640`
+  source at gid 20 under a gid-12 directory came out gid 12, still
+  group-readable but by a group it was never in.
 - **One rebuild at a time**, via `flock` on a lock file beside the database. Two
   invocations share one `.rebuild-tmp` and would destroy each other's copy
   mid-write. The lock is advisory and per-open-file-description, so the kernel
