@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
@@ -3551,3 +3553,1694 @@ class TestPostDeletionErrorsAreReported:
         assert any("stat failed" in e for e in payload["errors"])
         assert payload["sessions_deleted"] == 3
         assert len(_snapshot(path)["session"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Operational hygiene: WAL checkpointing, the opportunistic rebuild, a deletion
+# loop that yields the write lock, and the child-table list that makes deleting
+# with foreign keys off equivalent to deleting with the cascades on.
+# ---------------------------------------------------------------------------
+
+# The live schema's shape as of 2026-09-12, enumerated from
+# `SELECT sql FROM sqlite_master` on a real store rather than assumed: every
+# table whose foreign key names session(id), plus the two event tables that key
+# on a session id with no foreign key at all. Columns are trimmed to the ones
+# this tool reads; the FK graph is not.
+LIVE_SCHEMA = """
+    CREATE TABLE session (
+        id text PRIMARY KEY,
+        parent_id text,
+        time_created integer NOT NULL,
+        time_updated integer NOT NULL
+    );
+    CREATE TABLE message (
+        id text PRIMARY KEY,
+        session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+        data text NOT NULL
+    );
+    CREATE TABLE part (
+        id text PRIMARY KEY,
+        message_id text NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+        session_id text NOT NULL,
+        data text NOT NULL
+    );
+    CREATE TABLE todo (
+        session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+        content text NOT NULL,
+        position integer NOT NULL,
+        PRIMARY KEY (session_id, position)
+    );
+    CREATE TABLE session_message (
+        id text PRIMARY KEY,
+        session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+        data text NOT NULL
+    );
+    CREATE TABLE session_input (
+        id text PRIMARY KEY,
+        session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+        prompt text NOT NULL
+    );
+    CREATE TABLE session_share (
+        session_id text PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+        secret text NOT NULL
+    );
+    CREATE TABLE session_context_epoch (
+        session_id text PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+        baseline text NOT NULL
+    );
+    CREATE TABLE event_sequence (
+        aggregate_id text PRIMARY KEY,
+        seq integer NOT NULL
+    );
+    CREATE TABLE event (
+        id text PRIMARY KEY,
+        aggregate_id text NOT NULL
+            REFERENCES event_sequence(aggregate_id) ON DELETE CASCADE,
+        data text NOT NULL
+    );
+"""
+
+# Every table in LIVE_SCHEMA that a deleted session must take with it, listed
+# independently of CHILD_TABLES so that dropping one from production does not
+# also drop the assertion that its rows were cleaned.
+LIVE_CHILD_TABLES = (
+    "message", "part", "todo", "session_message", "session_input",
+    "session_share", "session_context_epoch", "event", "event_sequence",
+)
+
+
+def _make_live_db(path, *, wal=True):
+    """A database with the live FK graph. auto_vacuum is set BEFORE the first
+    table: set afterwards it is silently discarded and reads back 0, which
+    would leave every reclamation test exercising nothing."""
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.execute("PRAGMA auto_vacuum=2")
+    if wal:
+        conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(LIVE_SCHEMA)
+    assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2, \
+        "the fixture must really be INCREMENTAL, or it tests nothing"
+    return conn
+
+
+def _add_live_session(conn, sid, *, age_days, parent=None, events=3, messages=2,
+                      todos=2):
+    t = int(time.time() * 1000) - int(age_days * DAY_MS)
+    conn.execute(
+        "INSERT INTO session (id, parent_id, time_created, time_updated) "
+        "VALUES (?,?,?,?)", (sid, parent, t, t),
+    )
+    conn.execute("INSERT INTO event_sequence VALUES (?,?)", (sid, events))
+    for i in range(events):
+        conn.execute("INSERT INTO event VALUES (?,?,?)", (f"{sid}-e{i}", sid, "x" * 64))
+    for m in range(messages):
+        mid = f"{sid}-m{m}"
+        conn.execute("INSERT INTO message VALUES (?,?,?)", (mid, sid, "y" * 64))
+        conn.execute(
+            "INSERT INTO part VALUES (?,?,?,?)", (f"{mid}-p0", mid, sid, "z" * 64)
+        )
+        conn.execute(
+            "INSERT INTO session_message VALUES (?,?,?)", (f"{mid}-sm", sid, "w" * 64)
+        )
+    for n in range(todos):
+        conn.execute("INSERT INTO todo VALUES (?,?,?)", (sid, f"todo {n}", n))
+    conn.execute("INSERT INTO session_input VALUES (?,?,?)", (f"{sid}-in", sid, "ask"))
+    conn.execute("INSERT INTO session_share VALUES (?,?)", (sid, "secret"))
+    conn.execute("INSERT INTO session_context_epoch VALUES (?,?)", (sid, "base"))
+
+
+def _live_counts(conn):
+    return {
+        t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+        for t in ("session",) + LIVE_CHILD_TABLES
+    }
+
+
+class TestChildTablesCoverTheLiveSchema:
+    """CHILD_TABLES being complete is what makes deleting with
+    `PRAGMA foreign_keys` off -- SQLite's default, and what this tool runs
+    under -- equivalent to deleting with the cascades on.
+
+    It was not complete. `todo`, `session_message`, `session_input` and
+    `session_share` all carry `session_id ... ON DELETE CASCADE` in the live
+    schema and were absent from the list, so every session the tool deleted
+    orphaned their rows silently. `session_context_epoch` is a fifth.
+    """
+
+    def test_every_session_child_in_the_live_schema_is_covered(self, tmp_path):
+        """The regression that a future opencode migration would reintroduce.
+
+        Mutation: drop ("todo", "session_id") -- or any other entry -- from
+        CHILD_TABLES. `todo` is then a session child production does not know
+        about, and this fails naming it.
+        """
+        conn = _make_live_db(tmp_path / "cover.db")
+        try:
+            children = opencode_gc.session_child_tables(conn)
+            # The fixture must really contain the tables at issue, or the
+            # set-difference below is trivially empty and proves nothing.
+            assert {"todo", "session_message", "session_input", "session_share",
+                    "session_context_epoch", "message"} <= children
+
+            known = {t for t, _ in opencode_gc.CHILD_TABLES}
+            assert children - known == set(), (
+                "these tables reference session(id) but are not in "
+                f"CHILD_TABLES, so their rows are orphaned: {children - known}"
+            )
+        finally:
+            conn.close()
+
+    def test_a_new_session_child_is_refused_rather_than_orphaned(self, tmp_path):
+        """A schema gaining a session child this tool does not know about must
+        stop the run, not prune around it.
+
+        Mutation: delete the `uncovered` block from verify_usable. The run then
+        proceeds and deletes sessions whose `bookmark` rows survive them.
+        """
+        path = tmp_path / "future.db"
+        conn = _make_live_db(path)
+        conn.execute(
+            "CREATE TABLE bookmark (id text PRIMARY KEY, "
+            "session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE)"
+        )
+        _add_live_session(conn, "old", age_days=30)
+        conn.execute("INSERT INTO bookmark VALUES ('b1','old')")
+        conn.close()
+
+        with pytest.raises(RuntimeError, match="bookmark"):
+            probe = opencode_gc.connect(path, read_only=True)
+            try:
+                opencode_gc.verify_usable(probe)
+            finally:
+                probe.close()
+
+    def test_the_cli_refuses_an_unknown_child_before_deleting_anything(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        path = tmp_path / "future_cli.db"
+        conn = _make_live_db(path)
+        conn.execute(
+            "CREATE TABLE bookmark (id text PRIMARY KEY, "
+            "session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE)"
+        )
+        _add_live_session(conn, "old", age_days=30)
+        conn.execute("INSERT INTO bookmark VALUES ('b1','old')")
+        conn.close()
+
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(path), "--apply"],
+        )
+        assert opencode_gc.main() == 2
+        assert "bookmark" in capsys.readouterr().err
+        survivor = sqlite3.connect(str(path))
+        try:
+            assert survivor.execute("SELECT count(*) FROM session").fetchone()[0] == 1
+        finally:
+            survivor.close()
+
+    def test_deleting_a_session_leaves_no_row_in_any_child(self, tmp_path):
+        """The orphan itself, not the table list. Every child is counted from
+        the schema, so removing a table from CHILD_TABLES fails here.
+
+        Mutation: drop ("todo", "session_id") from CHILD_TABLES -> todo keeps
+        2 rows for a session that no longer exists.
+        """
+        path = tmp_path / "orphans.db"
+        conn = _make_live_db(path)
+        try:
+            _add_live_session(conn, "old", age_days=30)
+            _add_live_session(conn, "live", age_days=1)
+            assert _live_counts(conn)["todo"] == 4
+
+            outcome = opencode_gc.delete_sessions(
+                conn, ["old"], cutoff_ms=_cutoff(), batch=25, deadline=None,
+            )
+            assert outcome.failure is None
+
+            for table in LIVE_CHILD_TABLES:
+                column = "aggregate_id" if table.startswith("event") else "session_id"
+                orphans = conn.execute(
+                    f"SELECT count(*) FROM {table} WHERE {column} "
+                    "NOT IN (SELECT id FROM session)"
+                ).fetchone()[0]
+                assert orphans == 0, f"{table} kept {orphans} orphaned row(s)"
+            # And the live session is untouched.
+            assert conn.execute(
+                "SELECT count(*) FROM todo WHERE session_id='live'"
+            ).fetchone()[0] == 2
+        finally:
+            conn.close()
+
+    def test_the_counts_report_every_child_table(self, tmp_path):
+        """A dry run's estimate must cover the same tables the apply path
+        deletes, or it understates what is about to be destroyed."""
+        path = tmp_path / "counts.db"
+        conn = _make_live_db(path)
+        try:
+            _add_live_session(conn, "old", age_days=30)
+            predicted = opencode_gc.count_rows_for(conn, ["old"], 25)
+            actual = opencode_gc.delete_sessions(
+                conn, ["old"], cutoff_ms=_cutoff(), batch=25, deadline=None,
+            ).rows
+            assert predicted == actual
+            assert predicted["todo"] == 2
+            assert predicted["session_share"] == 1
+        finally:
+            conn.close()
+
+    def test_a_store_without_the_newer_tables_still_prunes(self, tmp_path):
+        """opencode added several of these tables recently and this tool has to
+        keep working against a store written by an older build: the optional
+        ones are deleted from when present and ignored when absent.
+
+        Mutation: make every CHILD_TABLES entry required in verify_usable. The
+        old-shaped database below is then refused outright.
+        """
+        path = tmp_path / "older.db"
+        conn = _make_db(path)
+        try:
+            _add_session(conn, "old", age_days=30)
+            opencode_gc.verify_usable(conn)
+            outcome = opencode_gc.delete_sessions(
+                conn, ["old"], cutoff_ms=_cutoff(), batch=25, deadline=None,
+            )
+            assert outcome.failure is None
+            assert outcome.rows["session"] == 1
+            assert "todo" not in outcome.rows
+            assert _counts(conn) == {
+                "session": 0, "message": 0, "part": 0, "event": 0,
+                "event_sequence": 0,
+            }
+        finally:
+            conn.close()
+
+
+class TestCheckpointModeSelection:
+    """TRUNCATE and RESTART wait for readers and block writers while they hold
+    the WAL; PASSIVE never blocks. opencode instances are writers, and a writer
+    that exhausts its own busy_timeout behind us dies with "Failed to execute
+    statement", so the mode is chosen from whether anything else holds the
+    database -- never by preference.
+    """
+
+    @pytest.mark.parametrize(
+        "holders, expected",
+        [
+            ([], "TRUNCATE"),           # determined, and nobody: safe to block
+            (["123"], "PASSIVE"),       # somebody is attached
+            (["123", "456"], "PASSIVE"),
+            (None, "PASSIVE"),          # undeterminable is not idle
+        ],
+    )
+    def test_only_a_database_known_to_be_idle_gets_a_blocking_mode(
+        self, holders, expected
+    ):
+        """Mutation: `return "TRUNCATE" if holders == [] else "PASSIVE"` ->
+        `... if not holders else ...`. The None case then selects TRUNCATE,
+        which is the fail-open this whole design exists to prevent.
+        """
+        assert opencode_gc.checkpoint_mode_for(holders) == expected
+
+    def test_the_cli_uses_passive_while_something_holds_the_database(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Mutation: in main, `checkpoint_wal(conn, checkpoint_mode_for(holders))`
+        -> `checkpoint_wal(conn, "TRUNCATE")`. The reported mode is then
+        TRUNCATE with a holder attached.
+        """
+        path = tmp_path / "busy.db"
+        conn = _make_live_db(path)
+        for i in range(4):
+            _add_live_session(conn, f"s{i}", age_days=30)
+        conn.close()
+
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: ["4242"])
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--batch-sleep-ms", "0"
+        )
+
+        assert rc == 0
+        assert payload["wal_checkpoint_mode"] == "PASSIVE"
+        assert payload["holders_before"] == ["4242"]
+
+    def test_the_cli_uses_truncate_only_when_nothing_holds_the_database(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        path = tmp_path / "idle.db"
+        conn = _make_live_db(path)
+        for i in range(4):
+            _add_live_session(conn, f"s{i}", age_days=30)
+        conn.close()
+
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--batch-sleep-ms", "0"
+        )
+
+        assert rc == 0
+        assert payload["wal_checkpoint_mode"] == "TRUNCATE"
+
+    def test_undeterminable_holders_downgrade_the_checkpoint_and_say_so(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """launchd and systemd hand a job a bare environment and macOS keeps
+        lsof in /usr/sbin, so this is the expected failure, not an exotic one.
+        """
+        path = tmp_path / "unknown.db"
+        conn = _make_live_db(path)
+        _add_live_session(conn, "old", age_days=30)
+        conn.close()
+
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: None)
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--batch-sleep-ms", "0"
+        )
+
+        assert rc == 0
+        assert payload["wal_checkpoint_mode"] == "PASSIVE"
+        assert payload["holders_before"] is None
+        assert any("could not be determined" in n for n in payload["notes"])
+
+
+class TestCheckpointActuallyFoldsTheWal:
+    """opencode-gc never checkpointed. In WAL mode a page released by
+    incremental_vacuum does not leave the file until a checkpoint runs, and an
+    uncheckpointed WAL is itself on the disk -- 15.28 GiB of it on vibes.
+
+    Every test here holds a second connection open for the duration, and must:
+    SQLite checkpoints and deletes the WAL when the LAST connection closes, so
+    against a database nothing else has open the file is folded whether this
+    tool checkpoints or not, and the assertions would pass on a build that
+    never checkpoints at all. An attached connection is also the only case that
+    matters in production, because opencode is the thing attached. Verified:
+    with one idle connection open, our close() leaves the 8,689,112-byte WAL
+    untouched, and the explicit checkpoint takes it to 0.
+    """
+
+    def _populated(self, path, sessions=40):
+        conn = _make_live_db(path)
+        for i in range(sessions):
+            _add_live_session(conn, f"s{i}", age_days=30, events=40, messages=6)
+        conn.close()
+
+    @pytest.fixture()
+    def attached(self):
+        """An idle connection, as opencode would be between requests. It holds
+        no read transaction, so it defers nothing -- it only stops SQLite from
+        folding the WAL for us on close."""
+        opened = []
+
+        def attach(path):
+            conn = sqlite3.connect(str(path), isolation_level=None)
+            conn.execute("SELECT count(*) FROM session").fetchone()
+            opened.append(conn)
+            return conn
+
+        yield attach
+        for conn in opened:
+            conn.close()
+
+    def test_an_idle_run_leaves_no_wal_behind(
+        self, tmp_path, monkeypatch, capsys, attached
+    ):
+        """Mutation: delete the `checkpoint_wal(conn, checkpoint_mode_for(...))`
+        call from main. The 8 MB the deletes wrote to the WAL is then still on
+        disk when the run reports itself finished.
+        """
+        path = tmp_path / "fold.db"
+        self._populated(path)
+        attached(path)
+        wal = path.with_name(path.name + "-wal")
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--batch-sleep-ms", "0"
+        )
+
+        assert rc == 0
+        assert payload["sessions_deleted"] == 40
+        assert payload["wal_pages_checkpointed"] > 0
+        assert wal.exists(), "the attached connection must keep the WAL in place"
+        assert wal.stat().st_size == 0, (
+            "a TRUNCATE checkpoint on an idle database must empty the WAL, "
+            f"but {wal.stat().st_size} bytes remain"
+        )
+        assert payload["wal_bytes_after"] == 0
+
+    def test_the_file_actually_shrinks_when_nothing_defers_the_checkpoint(
+        self, tmp_path, monkeypatch, capsys, attached
+    ):
+        """The point of the whole exercise: released pages become bytes the
+        filesystem has back, which is what bytes_before/bytes_after measures.
+
+        Mutation: delete the checkpoint call from main. pages_released stays
+        positive while bytes_reclaimed collapses to 0 and the run starts
+        emitting the "has not shrunk yet" note.
+        """
+        path = tmp_path / "shrink.db"
+        self._populated(path, sessions=60)
+        attached(path)
+        before = opencode_gc.on_disk_bytes(path)
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--batch-sleep-ms", "0"
+        )
+
+        assert rc == 0
+        assert payload["pages_released"] > 0
+        assert payload["bytes_reclaimed"] > 0, (
+            "with nothing deferring the checkpoint the released pages must "
+            "leave the disk"
+        )
+        assert opencode_gc.on_disk_bytes(path) < before
+        assert not any("has not shrunk yet" in n for n in payload["notes"])
+
+    def test_a_blocking_checkpoint_never_waits_out_the_busy_timeout(self, tmp_path):
+        """checkpoint_mode_for can only act on a snapshot of who holds the
+        database. A reader attaching between that snapshot and the call would
+        otherwise turn a checkpoint chosen as safe into a stall as long as the
+        connection's busy_timeout -- measured at 31.85s against a 30s timeout,
+        versus 0.0s with the timeout suspended.
+
+        Mutation: drop the `PRAGMA busy_timeout=0` / restore pair from
+        checkpoint_wal. This then takes the full timeout below and fails.
+        """
+        path = tmp_path / "raced.db"
+        conn = _make_live_db(path)
+        for i in range(30):
+            _add_live_session(conn, f"s{i}", age_days=30, events=40, messages=6)
+        conn.close()
+
+        # The reader takes its snapshot BEFORE the writer appends, so the
+        # checkpoint genuinely cannot complete and must give up rather than
+        # wait. A reader that attached afterwards would not block it at all,
+        # and the test would pass on a stalling implementation.
+        reader = sqlite3.connect(str(path), isolation_level=None)
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM event").fetchone()
+
+        writer = opencode_gc.connect(path, read_only=False, timeout_s=30.0)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("DELETE FROM event WHERE aggregate_id='s0'")
+            writer.execute("COMMIT")
+
+            started = time.monotonic()
+            outcome = opencode_gc.checkpoint_wal(writer, "TRUNCATE")
+            elapsed = time.monotonic() - started
+
+            assert outcome.busy is True, (
+                "the reader holds an older snapshot, so this checkpoint cannot "
+                "complete -- if it did, the fixture proves nothing"
+            )
+            assert elapsed < 5.0, (
+                f"a blocked checkpoint must give up at once, took {elapsed:.1f}s"
+            )
+            # The timeout the rest of the tool relies on is restored.
+            assert writer.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+        finally:
+            writer.close()
+            reader.close()
+
+    def test_a_busy_checkpoint_is_reported_not_hidden(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A checkpoint that could not fold the whole WAL is a fact the
+        operator needs: the file is larger than the page counts imply."""
+        path = tmp_path / "deferred.db"
+        self._populated(path, sessions=30)
+
+        reader = sqlite3.connect(str(path), isolation_level=None)
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM event").fetchone()
+        try:
+            # Claim the database is idle so a blocking mode is selected; the
+            # reader then makes it genuinely busy.
+            monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+            rc, payload = _run_json_cli(
+                monkeypatch, capsys, "--db", str(path), "--apply",
+                "--batch-sleep-ms", "0",
+            )
+
+            assert payload["wal_checkpoint_mode"] == "TRUNCATE"
+            assert payload["wal_checkpoint_busy"] is True
+            assert any("could not fold the whole WAL" in n for n in payload["notes"])
+            # Not an error: the frames fold on a later run.
+            assert rc in (0, 3)
+            assert payload["errors"] == []
+        finally:
+            reader.close()
+
+    def test_our_connection_bounds_the_wal_it_may_leave_behind(self, tmp_path):
+        """journal_size_limit is per-connection: it constrains our own
+        transactions and does not touch opencode's connections.
+
+        Mutation: drop the `PRAGMA journal_size_limit` from connect(). The
+        read-write handle then reports -1, i.e. unlimited.
+        """
+        path = tmp_path / "jsl.db"
+        conn = _make_live_db(path)
+        _add_live_session(conn, "old", age_days=30)
+        conn.close()
+
+        ours = opencode_gc.connect(path, read_only=False)
+        try:
+            assert ours.execute("PRAGMA journal_size_limit").fetchone()[0] == \
+                opencode_gc.JOURNAL_SIZE_LIMIT_BYTES
+        finally:
+            ours.close()
+
+        # A connection opencode would make is unaffected.
+        theirs = sqlite3.connect(str(path), isolation_level=None)
+        try:
+            assert theirs.execute("PRAGMA journal_size_limit").fetchone()[0] == -1
+        finally:
+            theirs.close()
+
+
+class TestHolderDetectionFailsClosed:
+    """`db_holders` returns None when it CANNOT determine who holds the file,
+    which is deliberately distinct from `[]`, "determined: nobody".
+
+    The rebuild destroys the file it swaps, so a missing lsof reading as idle
+    would swap it out from under live writers. launchd and systemd start jobs
+    with a bare environment and macOS keeps lsof in /usr/sbin, so this is the
+    expected failure mode -- the existing com.marcioapm.agent-run-reap.plist
+    already carries an explicit PATH for exactly this reason.
+    """
+
+    def _fake_lsof(self, monkeypatch, behaviour):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return behaviour(argv, **kwargs)
+
+        monkeypatch.setattr(opencode_gc.subprocess, "run", run)
+        return calls
+
+    def test_a_missing_lsof_is_unknown_not_empty(self, tmp_path, monkeypatch):
+        """Mutation: in db_holders, `return None` -> `continue` (or return the
+        pids gathered so far). A host without lsof then reports an idle
+        database and every guard downstream opens up.
+        """
+        def missing(argv, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "lsof")
+
+        self._fake_lsof(monkeypatch, missing)
+        assert opencode_gc.db_holders(tmp_path / "any.db") is None
+
+    def test_a_timed_out_lsof_is_unknown_not_empty(self, tmp_path, monkeypatch):
+        def slow(argv, **kwargs):
+            raise opencode_gc.subprocess.TimeoutExpired(argv, 30)
+
+        self._fake_lsof(monkeypatch, slow)
+        assert opencode_gc.db_holders(tmp_path / "any.db") is None
+
+    def test_no_output_is_determined_nobody(self, tmp_path, monkeypatch):
+        """The complement: an lsof that ran and found nothing must give the
+        empty list, or the rebuild could never run at all."""
+        def empty(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+        self._fake_lsof(monkeypatch, empty)
+        assert opencode_gc.db_holders(tmp_path / "any.db") == []
+
+    def test_our_own_pid_is_not_a_holder(self, tmp_path, monkeypatch):
+        """We hold the database ourselves whenever we have it open, and
+        counting that would make every rebuild skip forever."""
+        me = str(os.getpid())
+
+        def me_and_another(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=f"{me}\n5150\n", stderr=""
+            )
+
+        self._fake_lsof(monkeypatch, me_and_another)
+        assert opencode_gc.db_holders(tmp_path / "any.db") == ["5150"]
+
+    def test_the_sidecars_are_examined_too(self, tmp_path, monkeypatch):
+        """A process can hold the -wal or -shm without the main file, and it
+        is just as much a writer that a swap would strand."""
+        seen = []
+
+        def per_path(argv, **kwargs):
+            seen.append(argv[-1])
+            pid = "777" if argv[-1].endswith("-wal") else ""
+            return subprocess.CompletedProcess(argv, 0, stdout=pid, stderr="")
+
+        self._fake_lsof(monkeypatch, per_path)
+        db = tmp_path / "side.db"
+        assert opencode_gc.db_holders(db) == ["777"]
+        assert seen == [str(db), f"{db}-wal", f"{db}-shm"]
+
+    def test_a_real_lsof_sees_a_real_open_handle(self, tmp_path):
+        """No mocking: if lsof is genuinely available, an open connection must
+        show up and a closed one must not. Otherwise every test above is
+        asserting against a fake whose shape was never checked.
+        """
+        if shutil.which("lsof") is None:
+            pytest.skip("lsof is not on PATH")
+        path = tmp_path / "real.db"
+        conn = _make_live_db(path)
+        _add_live_session(conn, "old", age_days=30)
+
+        held = opencode_gc.db_holders(path)
+        conn.close()
+        released = opencode_gc.db_holders(path)
+
+        # Our own pid is excluded, and this process is the one holding it, so
+        # the observable claim is that neither reading invents a stranger.
+        assert held is not None and released is not None
+        assert str(os.getpid()) not in held
+        assert released == []
+
+
+GIB = 1024 ** 3
+
+
+class TestRebuildGuards:
+    """`VACUUM INTO` is the only pass that shrinks an already-oversized file,
+    and the only destructive one. The rebuild is safe; the SWAP is what loses
+    data, so the guards around it are the whole safety argument.
+    """
+
+    def _store(self, path, *, sessions=40, wal=True):
+        conn = _make_live_db(path, wal=wal)
+        for i in range(sessions):
+            _add_live_session(conn, f"s{i}", age_days=30, events=30, messages=5)
+        conn.close()
+        return path
+
+    def _stats(self, path):
+        conn = opencode_gc.connect(path, read_only=True)
+        try:
+            return opencode_gc.read_stats(conn)
+        finally:
+            conn.close()
+
+    def _rebuild(self, path, monkeypatch, *, holders, max_seconds=60.0,
+                 min_free=0, late=..., clock=time.monotonic):
+        """Run a rebuild with a scripted holder sequence: `holders` for the
+        pre-flight check, `late` for the pre-swap re-check."""
+        answers = [holders] if late is ... else [holders, late]
+        calls = []
+
+        def fake(db):
+            calls.append(db)
+            return answers[min(len(calls) - 1, len(answers) - 1)]
+
+        monkeypatch.setattr(opencode_gc, "db_holders", fake)
+        outcome = opencode_gc.rebuild_database(
+            path, self._stats(path), max_seconds=max_seconds,
+            min_free_bytes=min_free, clock=clock,
+        )
+        return outcome, calls
+
+    def test_an_idle_database_is_rebuilt_and_shrinks(self, tmp_path, monkeypatch):
+        """The positive case, so every refusal below is a refusal of something
+        that would otherwise have worked."""
+        path = self._store(tmp_path / "rebuild.db")
+        # Free the pages first, so there is genuinely something to compact.
+        conn = opencode_gc.connect(path, read_only=False)
+        opencode_gc.delete_sessions(
+            conn, [f"s{i}" for i in range(30)], cutoff_ms=_cutoff(), batch=25,
+            deadline=None,
+        )
+        conn.close()
+        before = path.stat().st_size
+
+        outcome, _ = self._rebuild(path, monkeypatch, holders=[], late=[])
+
+        assert outcome.failure is None, outcome.failure
+        assert outcome.skipped is None, outcome.skipped
+        assert outcome.completed is True
+        assert path.stat().st_size < before, "a rebuild must shrink the file"
+
+        check = sqlite3.connect(str(path))
+        try:
+            assert check.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert check.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+            assert check.execute("SELECT count(*) FROM session").fetchone()[0] == 10
+        finally:
+            check.close()
+
+    def test_a_held_database_is_not_rebuilt(self, tmp_path, monkeypatch):
+        """Mutation: drop the `if holders:` branch from rebuild_database. The
+        swap then runs while another process is writing to the old inode.
+        """
+        path = self._store(tmp_path / "held.db")
+        before = path.read_bytes()
+
+        outcome, _ = self._rebuild(path, monkeypatch, holders=["991", "992"])
+
+        assert outcome.completed is False
+        assert outcome.attempted is False
+        assert "2 process(es) hold the database" in outcome.skipped
+        assert outcome.failure is None
+        assert path.read_bytes() == before, "the database must be untouched"
+
+    def test_undeterminable_holders_refuse_the_rebuild(self, tmp_path, monkeypatch):
+        """Mutation: `if holders is None:` -> `if False:`. `None` then falls
+        through to `if holders:`, which is falsey, and a host whose lsof is
+        missing rebuilds and swaps blind.
+        """
+        path = self._store(tmp_path / "blind.db")
+        before = path.read_bytes()
+
+        outcome, _ = self._rebuild(path, monkeypatch, holders=None)
+
+        assert outcome.completed is False
+        assert outcome.attempted is False
+        assert "cannot determine who holds the database" in outcome.skipped
+        assert path.read_bytes() == before
+
+    def test_a_holder_appearing_during_the_rebuild_discards_the_copy(
+        self, tmp_path, monkeypatch
+    ):
+        """The window this re-check exists to close. A process that opens the
+        database while VACUUM INTO runs keeps writing to the OLD inode, and
+        os.replace strands those writes on an unlinked inode.
+
+        Mutation: delete the `late = db_holders(db)` block. The swap then
+        happens regardless and the original inode is replaced.
+        """
+        path = self._store(tmp_path / "late.db")
+        before = path.read_bytes()
+
+        outcome, calls = self._rebuild(
+            path, monkeypatch, holders=[], late=["8080"]
+        )
+
+        assert len(calls) == 2, "holders must be re-checked immediately before the swap"
+        assert outcome.completed is False
+        assert outcome.attempted is True, "the rebuild itself must have run"
+        assert "1 process(es) attached while it ran" in outcome.skipped
+        assert "strand their writes" in outcome.skipped
+        assert path.read_bytes() == before, "the original file must survive intact"
+        assert not path.with_name(path.name + opencode_gc.REBUILD_SUFFIX).exists(), \
+            "the discarded copy must not be left on disk"
+
+    def test_holders_becoming_undeterminable_mid_rebuild_discards_the_copy(
+        self, tmp_path, monkeypatch
+    ):
+        path = self._store(tmp_path / "lateblind.db")
+        before = path.read_bytes()
+
+        outcome, _ = self._rebuild(path, monkeypatch, holders=[], late=None)
+
+        assert outcome.completed is False
+        assert "became undeterminable" in outcome.skipped
+        assert path.read_bytes() == before
+        assert not path.with_name(path.name + opencode_gc.REBUILD_SUFFIX).exists()
+
+    def test_the_swap_replaces_the_inode_and_clears_the_sidecars(
+        self, tmp_path, monkeypatch
+    ):
+        """The -wal and -shm describe the file being replaced. Left in place,
+        the new database is opened against a WAL for the old one.
+
+        Mutation: delete the sidecar unlink loop before os.replace. The stale
+        -wal and -shm then survive the swap.
+
+        The connection stays open ACROSS the rebuild on purpose: SQLite folds
+        and deletes the WAL when the last connection closes, so a fixture that
+        closed it first would have no sidecars left to clear and would pass
+        against an implementation that clears nothing.
+        """
+        path = self._store(tmp_path / "sidecars.db")
+        attached = sqlite3.connect(str(path), isolation_level=None)
+        attached.execute("SELECT count(*) FROM session").fetchone()
+        try:
+            writer = sqlite3.connect(str(path), isolation_level=None)
+            writer.execute("BEGIN")
+            writer.execute("DELETE FROM event WHERE aggregate_id='s0'")
+            writer.execute("COMMIT")
+            writer.close()
+
+            wal = path.with_name(path.name + "-wal")
+            shm = path.with_name(path.name + "-shm")
+            assert wal.exists() and wal.stat().st_size > 0, \
+                "the fixture must really leave a WAL, or the assertion is vacuous"
+            assert shm.exists(), "the fixture must really leave a -shm"
+            old_inode = path.stat().st_ino
+
+            outcome, _ = self._rebuild(path, monkeypatch, holders=[], late=[])
+
+            assert outcome.completed is True
+            assert path.stat().st_ino != old_inode, "the file must be replaced"
+            assert not wal.exists(), \
+                "a WAL describing the old inode must not survive the swap"
+            assert not shm.exists()
+        finally:
+            attached.close()
+
+    def test_a_corrupt_copy_is_never_swapped_in(self, tmp_path, monkeypatch):
+        """Mutation: delete the `_verify_rebuilt` call. A copy that fails
+        quick_check is then swapped over a healthy database.
+        """
+        path = self._store(tmp_path / "corrupt.db")
+        before = path.read_bytes()
+        monkeypatch.setattr(
+            opencode_gc, "_verify_rebuilt",
+            lambda target: "the rebuilt copy failed quick_check: wrecked",
+        )
+
+        outcome, _ = self._rebuild(path, monkeypatch, holders=[], late=[])
+
+        assert outcome.completed is False
+        assert "failed quick_check" in outcome.failure
+        assert outcome.skipped is None, "a broken copy is a failure, not a skip"
+        assert path.read_bytes() == before
+        assert not path.with_name(path.name + opencode_gc.REBUILD_SUFFIX).exists()
+
+    def test_a_copy_that_lost_incremental_vacuum_is_rejected(self, tmp_path):
+        """auto_vacuum lives in the file header. A copy that came out NONE
+        could never reclaim in place again, and only another full rebuild
+        would restore it.
+
+        Mutation: drop the `auto_vacuum != 2` branch from _verify_rebuilt.
+        """
+        plain = tmp_path / "plain.db"
+        conn = sqlite3.connect(str(plain), isolation_level=None)
+        conn.execute("CREATE TABLE t(a)")
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.close()
+        assert sqlite3.connect(str(plain)).execute(
+            "PRAGMA auto_vacuum"
+        ).fetchone()[0] == 0, "the fixture must really be auto_vacuum=NONE"
+
+        problem = opencode_gc._verify_rebuilt(plain)
+        assert problem is not None
+        assert "not INCREMENTAL" in problem
+
+        # And a sound INCREMENTAL copy passes, or the check above would be
+        # satisfied by a function that rejects everything.
+        good = tmp_path / "good.db"
+        conn = _make_live_db(good, wal=False)
+        conn.close()
+        assert opencode_gc._verify_rebuilt(good) is None
+
+
+class TestRebuildIsBounded:
+    """The 2026-09-12 incident: a `VACUUM INTO` on a 99 GB store ran 23 minutes
+    in uninterruptible disk sleep, wrote a 39.6 GB temp copy and drove the disk
+    from 88% to 93% before it was killed by hand. `--max-seconds` never applied
+    to it, because VACUUM INTO is a single uninterruptible SQLite call.
+
+    The only thing that can bound it is `set_progress_handler`: SQLite calls
+    the handler every N virtual-machine instructions and a non-zero return
+    aborts the statement.
+    """
+
+    def _big_store(self, path, sessions=200):
+        """Large enough that the rebuild takes many progress callbacks, so an
+        abort has somewhere to land rather than finishing first."""
+        conn = _make_live_db(path, wal=False)
+        conn.execute("BEGIN")
+        for i in range(sessions):
+            _add_live_session(conn, f"s{i}", age_days=30, events=60, messages=10)
+        conn.execute("COMMIT")
+        conn.close()
+        return path
+
+    def _stats(self, path):
+        conn = opencode_gc.connect(path, read_only=True)
+        try:
+            return opencode_gc.read_stats(conn)
+        finally:
+            conn.close()
+
+    def test_an_exception_from_a_progress_handler_cannot_be_caught(self, tmp_path):
+        """The reason the abort reason is recorded in a cell and 1 returned,
+        rather than raised.
+
+        Verified on CPython 3.14: an exception raised inside a progress handler
+        is DISCARDED, and the statement resurfaces as a generic
+        `sqlite3.OperationalError: interrupted`. An `except MyAbortError`
+        clause is dead code that can never match, so a deliberate abort would
+        be misreported as a failure and spam a 5-minute timer with false
+        alarms. This test pins that platform behaviour: if a future CPython
+        propagates the original exception, the design can be simplified -- and
+        until then it must not be.
+        """
+        path = tmp_path / "handler.db"
+        conn = sqlite3.connect(str(path), isolation_level=None)
+        conn.execute("CREATE TABLE t(a)")
+        conn.execute("BEGIN")
+        conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(20000)])
+        conn.execute("COMMIT")
+
+        class Deliberate(Exception):
+            pass
+
+        state = {"raised": False}
+
+        def handler():
+            if not state["raised"]:
+                state["raised"] = True
+                raise Deliberate("abort")
+            return 0
+
+        conn.set_progress_handler(handler, 5)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+                conn.execute("SELECT sum(a * a) FROM t WHERE a % 3 = 0").fetchone()
+        finally:
+            conn.set_progress_handler(None, 0)
+            conn.close()
+        assert state["raised"] is True, "the handler must actually have raised"
+
+    def test_the_wall_clock_cap_aborts_the_rebuild(self, tmp_path, monkeypatch):
+        """Mutation: delete the `conn.set_progress_handler(guard, ...)` line.
+        The rebuild then runs to completion however long it takes, which is
+        precisely the 23-minute runaway.
+        """
+        path = self._big_store(tmp_path / "slow.db")
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+
+        # A clock that leaps past the cap on its third reading: the deadline is
+        # computed from the first, and the guard trips on a later one.
+        ticks = iter([0.0, 0.0, 0.0, 10_000.0] + [10_000.0] * 100_000)
+        outcome = opencode_gc.rebuild_database(
+            path, self._stats(path), max_seconds=5.0, min_free_bytes=0,
+            clock=lambda: next(ticks),
+        )
+
+        assert outcome.completed is False
+        assert outcome.failure is None, (
+            "a guard-triggered abort is a deliberate skip, not a failure: "
+            f"{outcome.failure}"
+        )
+        assert outcome.skipped is not None
+        assert "wall-clock cap" in outcome.skipped
+
+    def test_an_aborted_rebuild_leaves_no_orphan_copy(self, tmp_path, monkeypatch):
+        """SQLite leaves the partial copy behind on an aborted VACUUM INTO
+        (verified: the output file exists after `interrupted`), so without the
+        unlink a 39 GB orphan accumulates on every abort -- every 5 minutes, on
+        the disk the abort fired to protect.
+
+        Mutation: delete the `_unlink_quietly(target)` from the
+        `except (sqlite3.Error, OSError)` handler in rebuild_database.
+        """
+        path = self._big_store(tmp_path / "orphan.db")
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+        target = path.with_name(path.name + opencode_gc.REBUILD_SUFFIX)
+
+        ticks = iter([0.0, 0.0, 0.0, 10_000.0] + [10_000.0] * 100_000)
+        outcome = opencode_gc.rebuild_database(
+            path, self._stats(path), max_seconds=5.0, min_free_bytes=0,
+            clock=lambda: next(ticks),
+        )
+
+        assert outcome.skipped is not None and "wall-clock cap" in outcome.skipped
+        assert not target.exists(), (
+            "SQLite leaves the partial copy behind; it must be unlinked or it "
+            "accumulates once per abort"
+        )
+
+    def test_the_disk_floor_aborts_a_rebuild_that_is_eating_the_disk(
+        self, tmp_path, monkeypatch
+    ):
+        """The other half of the incident: the temp copy drove the disk from
+        88% to 93%. The floor is re-checked from inside the statement, not just
+        before it, because the space disappears while it runs.
+
+        Mutation: delete the `free < min_free_bytes` branch from _rebuild_guard.
+        The rebuild then runs on regardless of how little disk is left.
+        """
+        path = self._big_store(tmp_path / "floor.db")
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+
+        # Roomy for the pre-flight check, then the disk "fills" underneath it.
+        readings = iter([opencode_gc.shutil.disk_usage(tmp_path).free] + [1] * 100_000)
+        monkeypatch.setattr(
+            opencode_gc.shutil, "disk_usage", lambda p: _Usage(next(readings))
+        )
+
+        outcome = opencode_gc.rebuild_database(
+            path, self._stats(path), max_seconds=600.0, min_free_bytes=10 * GIB,
+        )
+
+        assert outcome.completed is False
+        assert outcome.failure is None
+        assert "free space fell to" in outcome.skipped
+        assert not path.with_name(path.name + opencode_gc.REBUILD_SUFFIX).exists()
+
+    def test_the_preflight_demands_room_for_the_copy_AND_the_floor(
+        self, tmp_path, monkeypatch
+    ):
+        """`free - needed >= floor`, not `free >= needed`: a rebuild that fits
+        exactly still drives the filesystem to the edge while it runs.
+
+        Mutation: `if free - needed < min_free_bytes:` -> `if free < needed:`.
+        The 'fits, but eats the floor' case below is then accepted.
+        """
+        path = self._big_store(tmp_path / "preflight.db", sessions=40)
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+        stats = self._stats(path)
+        needed = int(opencode_gc.live_bytes(stats) * opencode_gc.REBUILD_COPY_HEADROOM)
+        floor = 10 * GIB
+
+        # Enough for the copy, but not enough to leave the floor intact.
+        monkeypatch.setattr(
+            opencode_gc.shutil, "disk_usage", lambda p: _Usage(needed + floor - 1)
+        )
+        refused = opencode_gc.rebuild_database(
+            path, stats, max_seconds=600.0, min_free_bytes=floor
+        )
+        assert refused.completed is False
+        assert refused.attempted is False
+        assert "must leave" in refused.skipped
+
+        # One byte more and it proceeds, so the refusal above is the boundary
+        # and not a blanket rejection.
+        monkeypatch.setattr(
+            opencode_gc.shutil, "disk_usage", lambda p: _Usage(needed + floor)
+        )
+        allowed = opencode_gc.rebuild_database(
+            path, stats, max_seconds=600.0, min_free_bytes=floor
+        )
+        assert allowed.completed is True, allowed.skipped or allowed.failure
+
+    def test_a_guard_abort_is_a_skip_and_exits_zero(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A guard that fired did its job: the database is untouched and a
+        later run may succeed. Reporting it as an error would page someone
+        every five minutes for a working safety valve.
+
+        Mutation: in main, `res.errors.append(...)` for `rb.skipped` instead of
+        `res.notes.append(...)`. The exit status then becomes 1.
+        """
+        path = self._big_store(tmp_path / "skipzero.db", sessions=40)
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: ["31337"])
+
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--rebuild",
+            "--batch-sleep-ms", "0", "--retention-days", "9999",
+        )
+
+        assert rc == 0, "a skipped rebuild is not an error"
+        assert payload["errors"] == []
+        assert payload["rebuild_completed"] is False
+        assert "hold the database" in payload["rebuild_skipped"]
+        assert any("--rebuild did not run" in n for n in payload["notes"])
+
+
+class _Usage:
+    """shutil.disk_usage's shape, for tests that script free space."""
+
+    def __init__(self, free):
+        self.total = free * 4
+        self.used = self.total - free
+        self.free = free
+
+
+class TestDeletionYieldsTheWriteLock:
+    """WAL lets readers run concurrently, but opencode instances are WRITERS
+    and writers serialise: a concurrent writer that exhausts its own
+    busy_timeout waiting on our transaction fails with "Failed to execute
+    statement". Smaller batches with a pause between them give it a window.
+    """
+
+    def _store(self, path, sessions=10):
+        conn = _make_live_db(path)
+        for i in range(sessions):
+            _add_live_session(conn, f"s{i}", age_days=30)
+        conn.close()
+        return [f"s{i}" for i in range(sessions)]
+
+    def test_the_pause_happens_between_batches_and_not_inside_one(self, tmp_path):
+        """A sleep inside the transaction would hold the write lock for longer,
+        which is the opposite of the intent.
+
+        Mutation: move the `sleep(...)` call above `_commit_batch(conn)`. The
+        recorded in_transaction flags below then become True.
+        """
+        path = tmp_path / "yield.db"
+        ids = self._store(path, sessions=10)
+        conn = opencode_gc.connect(path, read_only=False)
+        naps = []
+        try:
+            outcome = opencode_gc.delete_sessions(
+                conn, ids, cutoff_ms=_cutoff(), batch=3, deadline=None,
+                sleep_ms=25, sleep=lambda s: naps.append((s, conn.in_transaction)),
+            )
+            assert outcome.rows["session"] == 10
+            assert len(naps) == 3, (
+                "four batches of three: a pause after each but the last, "
+                f"got {len(naps)}"
+            )
+            assert all(seconds == 0.025 for seconds, _ in naps)
+            assert not any(in_txn for _, in_txn in naps), (
+                "the pause must not happen while the write lock is held"
+            )
+        finally:
+            conn.close()
+
+    def test_no_pause_is_taken_after_the_final_batch(self, tmp_path):
+        """Sleeping once the work is done just delays the report."""
+        path = tmp_path / "last.db"
+        ids = self._store(path, sessions=4)
+        conn = opencode_gc.connect(path, read_only=False)
+        naps = []
+        try:
+            opencode_gc.delete_sessions(
+                conn, ids, cutoff_ms=_cutoff(), batch=4, deadline=None,
+                sleep_ms=50, sleep=naps.append,
+            )
+            assert naps == [], "a single batch clears everything; nothing to yield to"
+        finally:
+            conn.close()
+
+    def test_the_pause_can_be_disabled(self, tmp_path):
+        """Mutation: `if sleep_ms:` -> `if True:`. sleep(0.0) is then called
+        and this fails."""
+        path = tmp_path / "nosleep.db"
+        ids = self._store(path, sessions=6)
+        conn = opencode_gc.connect(path, read_only=False)
+        naps = []
+        try:
+            outcome = opencode_gc.delete_sessions(
+                conn, ids, cutoff_ms=_cutoff(), batch=2, deadline=None,
+                sleep_ms=0, sleep=naps.append,
+            )
+            assert outcome.rows["session"] == 6
+            assert naps == []
+        finally:
+            conn.close()
+
+    def test_a_checkpoint_runs_between_batches(self, tmp_path):
+        """Each batch's WAL frames are folded back as it goes, rather than
+        accumulating until the end.
+
+        Mutation: delete the `checkpoint_wal(conn, "PASSIVE")` call from the
+        loop. `checkpoints` is then 0.
+        """
+        path = tmp_path / "ckpt.db"
+        conn = _make_live_db(path)
+        for i in range(9):
+            _add_live_session(conn, f"s{i}", age_days=30, events=40, messages=6)
+        conn.close()
+        # Keeps SQLite from folding the WAL for us behind the test's back.
+        attached = sqlite3.connect(str(path), isolation_level=None)
+        attached.execute("SELECT count(*) FROM session").fetchone()
+
+        gc_conn = opencode_gc.connect(path, read_only=False)
+        try:
+            outcome = opencode_gc.delete_sessions(
+                gc_conn, [f"s{i}" for i in range(9)], cutoff_ms=_cutoff(),
+                batch=3, deadline=None, sleep_ms=0,
+            )
+            assert outcome.rows["session"] == 9
+            assert outcome.checkpoints == 2, (
+                "three batches means a checkpoint after the first two, "
+                f"got {outcome.checkpoints}"
+            )
+            assert outcome.pages_checkpointed > 0, (
+                "the checkpoints must have folded real WAL frames"
+            )
+        finally:
+            gc_conn.close()
+            attached.close()
+
+    def test_the_between_batch_checkpoint_is_never_a_blocking_mode(self, tmp_path):
+        """TRUNCATE between every chunk is what turned the standalone script
+        into the most contended thing on the box, and killed an opencode run
+        with "Failed to execute statement".
+
+        Mutation: `checkpoint_wal(conn, "PASSIVE")` -> `..., "TRUNCATE")` in
+        the deletion loop.
+        """
+        path = tmp_path / "mode.db"
+        ids = self._store(path, sessions=6)
+        conn = opencode_gc.connect(path, read_only=False)
+        modes = []
+        real = opencode_gc.checkpoint_wal
+        try:
+            opencode_gc.checkpoint_wal = lambda c, mode: (
+                modes.append(mode) or real(c, mode)
+            )
+            opencode_gc.delete_sessions(
+                conn, ids, cutoff_ms=_cutoff(), batch=2, deadline=None, sleep_ms=0,
+            )
+        finally:
+            opencode_gc.checkpoint_wal = real
+            conn.close()
+
+        assert modes, "the loop must checkpoint between batches"
+        assert set(modes) == {"PASSIVE"}, (
+            f"only PASSIVE may run between batches, saw {sorted(set(modes))}"
+        )
+
+    def test_a_concurrent_writer_wins_the_lock_during_the_pause(self, tmp_path):
+        """The behaviour the pause exists for, with a writer that is genuinely
+        contending: it has a short busy_timeout and would fail if our loop
+        never let go.
+
+        Both processes are live for the whole exchange -- a "concurrency" test
+        whose other party has already exited proves nothing.
+
+        Mutation: `sleep_ms=0` in the call below, i.e. no pause. The writer
+        below then has no window and its INSERT raises SQLITE_BUSY.
+        """
+        path = tmp_path / "contend.db"
+        ids = self._store(path, sessions=12)
+
+        rival = sqlite3.connect(str(path), isolation_level=None, timeout=0)
+        rival.execute("PRAGMA busy_timeout=0")
+        landed = []
+        failures = []
+
+        def rival_write(_seconds):
+            # Called from inside the pause, i.e. exactly when the lock is free.
+            try:
+                rival.execute("BEGIN IMMEDIATE")
+                rival.execute(
+                    "INSERT INTO session (id, parent_id, time_created, "
+                    f"time_updated) VALUES ('r{len(landed)}',NULL,1,1)"
+                )
+                rival.execute("COMMIT")
+                landed.append(1)
+            except sqlite3.OperationalError as exc:
+                failures.append(str(exc))
+
+        conn = opencode_gc.connect(path, read_only=False)
+        try:
+            outcome = opencode_gc.delete_sessions(
+                conn, ids, cutoff_ms=_cutoff(), batch=3, deadline=None,
+                sleep_ms=1, sleep=rival_write,
+            )
+        finally:
+            conn.close()
+
+        assert outcome.rows["session"] == 12, "our own work must still finish"
+        assert failures == [], f"the rival writer must not be starved: {failures}"
+        assert len(landed) == 3, "the rival must have taken the lock in each pause"
+        try:
+            assert rival.execute(
+                "SELECT count(*) FROM session WHERE id LIKE 'r%'"
+            ).fetchone()[0] == 3
+        finally:
+            rival.close()
+
+
+class TestNewFlagsAndDefaults:
+    """The existing surface is additive-only, and the new flags have to be
+    reachable and validated."""
+
+    @pytest.fixture()
+    def anydb(self, tmp_path):
+        path = tmp_path / "flags.db"
+        conn = _make_live_db(path)
+        _add_live_session(conn, "old", age_days=30)
+        conn.close()
+        return path
+
+    def test_help_lists_the_new_flags_and_keeps_the_old_ones(self, monkeypatch, capsys):
+        monkeypatch.setattr(opencode_gc.sys, "argv", ["opencode-gc", "--help"])
+        with pytest.raises(SystemExit) as exit_info:
+            opencode_gc.main()
+        assert exit_info.value.code == 0
+
+        out = capsys.readouterr().out
+        for flag in ("--rebuild", "--rebuild-max-seconds", "--rebuild-min-free-gib",
+                     "--batch-sleep-ms"):
+            assert flag in out, f"{flag} must be documented"
+        for flag in ("--retention-days", "--apply", "--batch", "--max-seconds",
+                     "--vacuum-pages", "--no-vacuum", "--enable-incremental-vacuum",
+                     "--json", "--db"):
+            assert flag in out, f"the existing flag {flag} must still be offered"
+
+    def test_retention_defaults_to_four_days(self, anydb, monkeypatch, capsys):
+        """Márcio's call; the cutoff is what actually decides, so it is what is
+        asserted rather than the parser's default string."""
+        rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(anydb))
+        assert rc == 0
+        assert payload["retention_days"] == 4.0
+        expected = (time.time() - 4 * 86400) * 1000
+        assert abs(payload["cutoff_ms"] - expected) < 5000
+
+    def test_the_retention_floor_still_applies(self, anydb, monkeypatch, capsys):
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(anydb), "--retention-days", "0.5"],
+        )
+        with pytest.raises(SystemExit) as exit_info:
+            opencode_gc.main()
+        assert exit_info.value.code == 2
+        assert "--retention-days" in capsys.readouterr().err
+
+    def test_the_batch_default_is_the_gentler_one(self, anydb, monkeypatch, capsys):
+        seen = {}
+        real = opencode_gc.delete_sessions
+
+        def spy(conn, ids, **kw):
+            seen.update(kw)
+            return real(conn, ids, **kw)
+
+        monkeypatch.setattr(opencode_gc, "delete_sessions", spy)
+        _run_json_cli(monkeypatch, capsys, "--db", str(anydb), "--apply")
+
+        assert seen["batch"] == opencode_gc.DEFAULT_BATCH == 25
+        assert seen["sleep_ms"] == opencode_gc.DEFAULT_BATCH_SLEEP_MS == 1000
+
+    @pytest.mark.parametrize(
+        "flag, value",
+        [
+            ("--batch-sleep-ms", "-1"),
+            ("--rebuild-max-seconds", "0"),      # unbounded is the incident
+            ("--rebuild-max-seconds", "-5"),
+            ("--rebuild-max-seconds", "nan"),
+            ("--rebuild-min-free-gib", "-1"),
+            ("--rebuild-min-free-gib", "nan"),
+        ],
+    )
+    def test_invalid_new_bounds_are_refused_without_touching_the_db(
+        self, anydb, monkeypatch, capsys, flag, value
+    ):
+        """Mutation: drop the `--rebuild-max-seconds must be finite and > 0`
+        check. `0` is then accepted and the guard's deadline is `now`, or
+        worse, never trips.
+        """
+        before = _snapshot(anydb, tables=("session",))
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(anydb), "--apply", flag, value],
+        )
+        with pytest.raises(SystemExit) as exit_info:
+            opencode_gc.main()
+        assert exit_info.value.code == 2
+        assert flag in capsys.readouterr().err
+        assert _snapshot(anydb, tables=("session",)) == before
+
+    def test_rebuild_needs_apply(self, anydb, monkeypatch, capsys):
+        """A dry run must never rewrite the file, whatever else is asked for."""
+        before = anydb.read_bytes()
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(anydb), "--rebuild"
+        )
+        assert rc == 0
+        assert payload["rebuild_attempted"] is False
+        assert any("--rebuild needs --apply" in n for n in payload["notes"])
+        assert anydb.read_bytes() == before
+
+    def test_a_dry_run_asks_nothing_of_lsof(self, anydb, monkeypatch, capsys):
+        """A dry run holds a read-only handle and neither checkpoints nor
+        rebuilds, so spawning lsof for it is pure cost."""
+        calls = []
+        monkeypatch.setattr(
+            opencode_gc, "db_holders", lambda db: calls.append(db) or []
+        )
+        rc, payload = _run_json_cli(monkeypatch, capsys, "--db", str(anydb))
+        assert rc == 0
+        assert calls == []
+        assert payload["holders_before"] is None
+
+
+class TestRebuildEndToEnd:
+    """The CLI path: prune, reclaim, checkpoint, then rebuild -- which is the
+    order that makes a store too big to rebuild before a prune small enough to
+    rebuild after one. macmini pre-prune needed ~64 GiB for a plain VACUUM
+    against 14 GiB free and was correctly refused; post-prune live is 6.2 GiB,
+    so VACUUM INTO needs ~6.5 GiB against 13 GiB. It fits.
+    """
+
+    def test_prune_then_rebuild_actually_shrinks_the_file(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Mutation: drop the `--rebuild` handling from main. The file then
+        stays at its pre-prune size, because incremental reclamation alone
+        cannot return a freelist this large in one pass.
+        """
+        path = tmp_path / "e2e.db"
+        conn = _make_live_db(path)
+        conn.execute("BEGIN")
+        for i in range(150):
+            _add_live_session(conn, f"s{i}", age_days=30, events=60, messages=8)
+        for i in range(5):
+            _add_live_session(conn, f"live{i}", age_days=0.5, events=10, messages=2)
+        conn.execute("COMMIT")
+        conn.close()
+        before = path.stat().st_size
+
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--rebuild",
+            "--batch-sleep-ms", "0", "--rebuild-min-free-gib", "0",
+        )
+
+        assert rc == 0, payload["errors"]
+        assert payload["sessions_deleted"] == 150
+        assert payload["rebuild_completed"] is True
+        assert payload["rebuild_skipped"] is None
+
+        after = path.stat().st_size
+        assert after < before, f"the file must shrink: {before} -> {after}"
+        assert payload["bytes_after"] < payload["bytes_before"]
+
+        # The survivors and their children are all still there and intact.
+        check = sqlite3.connect(str(path))
+        try:
+            assert check.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert check.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+            assert [r[0] for r in check.execute(
+                "SELECT id FROM session ORDER BY id"
+            )] == [f"live{i}" for i in range(5)]
+            assert check.execute("SELECT count(*) FROM todo").fetchone()[0] == 10
+            assert check.execute("SELECT count(*) FROM event").fetchone()[0] == 50
+        finally:
+            check.close()
+
+    def test_an_existing_run_without_rebuild_is_unchanged(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The whole change is additive: without --rebuild nothing rewrites."""
+        path = tmp_path / "norebuild.db"
+        conn = _make_live_db(path)
+        for i in range(20):
+            _add_live_session(conn, f"s{i}", age_days=30)
+        conn.close()
+        inode = path.stat().st_ino
+
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--batch-sleep-ms", "0"
+        )
+
+        assert rc == 0
+        assert payload["sessions_deleted"] == 20
+        assert payload["rebuild_attempted"] is False
+        assert payload["rebuild_completed"] is False
+        assert path.stat().st_ino == inode, "the file must not be replaced"
+
+    def test_a_rebuild_is_skipped_on_a_non_incremental_store(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A copy inherits the source's auto_vacuum, so rebuilding a NONE store
+        would produce a NONE store that still cannot reclaim in place."""
+        path = tmp_path / "none.db"
+        conn = sqlite3.connect(str(path), isolation_level=None)
+        conn.executescript(LIVE_SCHEMA)
+        assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+        _add_live_session(conn, "old", age_days=30)
+        conn.close()
+
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--rebuild",
+            "--batch-sleep-ms", "0",
+        )
+
+        assert rc == 0
+        assert payload["rebuild_completed"] is False
+        assert "auto_vacuum is NONE" in payload["rebuild_skipped"]
+        assert payload["errors"] == []
+
+
+class TestTodoOrphanProvenance:
+    """Which mechanism strands `todo` rows, and which does not.
+
+    A live host showed `todo` = 551 orphans while `event`, `event_sequence`,
+    `message`, `part` and `session_message` were all 0. The two candidate
+    causes behave differently, and the difference is testable:
+
+      * a delete run with `PRAGMA foreign_keys=ON` that touches only `session`
+        (and the event tables) cascades, and takes `todo` with it;
+      * a delete run with foreign keys OFF -- SQLite's default, and what
+        opencode's own session deletes use -- strands every cascade child.
+
+    `message.session_id` and `todo.session_id` carry the SAME
+    `ON DELETE CASCADE` constraint, so any mechanism that orphaned one would
+    have orphaned the other. The host's `message` orphan count was 0, which
+    places the `todo` orphans before the FK-enabled prune rather than in it.
+    """
+
+    def test_a_cascade_prune_does_not_orphan_todo_rows(self, tmp_path):
+        path = tmp_path / "cascade.db"
+        conn = _make_live_db(path, wal=False)
+        _add_live_session(conn, "old", age_days=30)
+        conn.close()
+
+        pruner = sqlite3.connect(str(path), isolation_level=None)
+        try:
+            pruner.execute("PRAGMA foreign_keys = ON")
+            assert pruner.execute("PRAGMA foreign_keys").fetchone()[0] == 1, \
+                "the fixture must really have cascades enabled"
+            assert pruner.execute("SELECT count(*) FROM todo").fetchone()[0] == 2
+
+            pruner.execute("BEGIN IMMEDIATE")
+            pruner.execute("DELETE FROM event WHERE aggregate_id='old'")
+            pruner.execute("DELETE FROM event_sequence WHERE aggregate_id='old'")
+            pruner.execute("DELETE FROM session WHERE id='old'")
+            pruner.execute("COMMIT")
+
+            for table in ("todo", "message", "session_message", "session_input",
+                          "session_share", "session_context_epoch"):
+                assert pruner.execute(
+                    f"SELECT count(*) FROM {table}"
+                ).fetchone()[0] == 0, f"the cascade must have taken {table}"
+        finally:
+            pruner.close()
+
+    def test_a_session_delete_with_foreign_keys_off_orphans_every_child(
+        self, tmp_path
+    ):
+        """SQLite's default, and what opencode's own session deletes run under.
+        This is the mechanism that produces the orphans, and the reason this
+        module deletes every table explicitly instead of trusting cascade."""
+        path = tmp_path / "nofk.db"
+        conn = _make_live_db(path, wal=False)
+        _add_live_session(conn, "old", age_days=30)
+        conn.close()
+
+        opencode_like = sqlite3.connect(str(path), isolation_level=None)
+        try:
+            assert opencode_like.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+            opencode_like.execute("DELETE FROM session WHERE id='old'")
+
+            assert opencode_like.execute(
+                "SELECT count(*) FROM todo"
+            ).fetchone()[0] == 2, "with cascades off the todo rows are stranded"
+            assert opencode_like.execute(
+                "SELECT count(*) FROM message"
+            ).fetchone()[0] == 2, (
+                "message carries the same ON DELETE CASCADE as todo, so any "
+                "mechanism that orphans one orphans the other"
+            )
+        finally:
+            opencode_like.close()
+
+    def test_this_tool_orphans_neither_whatever_the_pragma_says(self, tmp_path):
+        """The explicit deletes do not depend on the pragma being set either
+        way, which is the property that makes them correct under SQLite's
+        default."""
+        path = tmp_path / "explicit.db"
+        conn = _make_live_db(path, wal=False)
+        try:
+            _add_live_session(conn, "old", age_days=30)
+            assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+
+            opencode_gc.delete_sessions(
+                conn, ["old"], cutoff_ms=_cutoff(), batch=25, deadline=None,
+            )
+
+            assert _live_counts(conn) == {
+                t: 0 for t in ("session",) + LIVE_CHILD_TABLES
+            }
+        finally:
+            conn.close()
+
+
+class TestRebuildFailureIsReportedNotRaised:
+    """The rebuild runs after the deletes are already committed, so nothing it
+    does may escape as a traceback: an operator deciding what to restore needs
+    the counts far more than a stack trace.
+    """
+
+    def _store(self, path, sessions=30):
+        conn = _make_live_db(path)
+        for i in range(sessions):
+            _add_live_session(conn, f"s{i}", age_days=30)
+        conn.close()
+        return path
+
+    def test_an_interrupt_during_the_rebuild_still_reports_the_deletions(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Ctrl-C is how an operator stops a long rebuild, and by then the
+        prune has already committed.
+
+        Mutation: drop the `except (KeyboardInterrupt, OSError)` around
+        `_run_rebuild` in main. The interrupt then escapes and the committed
+        deletions are reported nowhere.
+        """
+        path = self._store(tmp_path / "interrupt.db")
+
+        def interrupting(db, stats, **kw):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+        monkeypatch.setattr(opencode_gc, "rebuild_database", interrupting)
+
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--rebuild",
+            "--batch-sleep-ms", "0",
+        )
+
+        assert rc == 1
+        assert payload["sessions_deleted"] == 30, \
+            "the committed deletions must still be reported"
+        assert any("KeyboardInterrupt" in e for e in payload["errors"])
+        assert len(_snapshot(path, tables=("session",))["session"]) == 0
+
+    def test_an_interrupt_inside_vacuum_into_removes_the_partial_copy(
+        self, tmp_path, monkeypatch
+    ):
+        """A BaseException is not a guard abort and must propagate, but the
+        partial copy still has to go: SQLite leaves it behind either way.
+
+        Mutation: delete the `except BaseException: _unlink_quietly(target);
+        raise` clause. The partial copy then survives the interrupt.
+        """
+        path = self._store(tmp_path / "ctrlc.db")
+        target = path.with_name(path.name + opencode_gc.REBUILD_SUFFIX)
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+
+        real_connect = opencode_gc.connect
+
+        class InterruptsTheVacuum(sqlite3.Connection):
+            def execute(self, sql, *a):
+                if sql.startswith("VACUUM INTO"):
+                    # Leave a partial copy behind exactly as SQLite does on an
+                    # aborted VACUUM INTO, then interrupt.
+                    target.write_bytes(b"partial")
+                    raise KeyboardInterrupt()
+                return super().execute(sql, *a)
+
+        def interrupting_connect(db, *, read_only, **kw):
+            if read_only:
+                return real_connect(db, read_only=read_only, **kw)
+            return sqlite3.connect(
+                str(Path(db).resolve()), isolation_level=None,
+                factory=InterruptsTheVacuum,
+            )
+
+        conn = real_connect(path, read_only=True)
+        try:
+            stats = opencode_gc.read_stats(conn)
+        finally:
+            conn.close()
+
+        monkeypatch.setattr(opencode_gc, "connect", interrupting_connect)
+        with pytest.raises(KeyboardInterrupt):
+            opencode_gc.rebuild_database(
+                path, stats, max_seconds=60.0, min_free_bytes=0
+            )
+
+        assert not target.exists(), \
+            "the partial copy must not survive an interrupt"

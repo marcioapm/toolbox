@@ -511,22 +511,29 @@ opencode's SQLite store never prunes finished sessions. Measured on one host:
 **76.6 GB across 3,164 sessions** (2.30M `event` rows), growing ~6 GB/day.
 
 ```bash
-opencode-gc                              # dry run, 5-day retention
-opencode-gc --apply                      # delete + release pages
+opencode-gc                              # dry run, 4-day retention
+opencode-gc --apply                      # delete + reclaim + checkpoint
 opencode-gc --retention-days 14 --apply
+opencode-gc --apply --rebuild            # also compact the file, if idle
 opencode-gc --apply --enable-incremental-vacuum   # first run on a new host
 opencode-gc --json                       # machine-readable
 ```
 
 ### Why a session delete is not enough
 
-The foreign keys are:
+Every foreign key that references `session(id)`, plus the two event tables that
+key on a session id with no foreign key at all:
 
 ```
-message.session_id -> session.id                    ON DELETE CASCADE
-part.message_id    -> message.id                    ON DELETE CASCADE
-event.aggregate_id -> event_sequence.aggregate_id   ON DELETE CASCADE
-event_sequence     -> (nothing)
+message.session_id               -> session.id   ON DELETE CASCADE
+todo.session_id                  -> session.id   ON DELETE CASCADE
+session_message.session_id       -> session.id   ON DELETE CASCADE
+session_input.session_id         -> session.id   ON DELETE CASCADE
+session_share.session_id         -> session.id   ON DELETE CASCADE
+session_context_epoch.session_id -> session.id   ON DELETE CASCADE
+part.message_id                  -> message.id   ON DELETE CASCADE
+event.aggregate_id -> event_sequence.aggregate_id ON DELETE CASCADE
+event_sequence                   -> (nothing)
 ```
 
 `event_sequence` has **no** foreign key to `session` — its `aggregate_id` merely
@@ -535,7 +542,27 @@ happens to equal a session id. So `opencode session delete` (or a plain
 `PRAGMA foreign_keys` is also off by default, so the cascades above do not fire
 unless enabled. This tool deletes each table explicitly, children first.
 
-### Why incremental vacuum
+That list being complete is what makes deleting with foreign keys off equivalent
+to deleting with the cascades on, so the tool checks it against the schema and
+**refuses to run** if the database has a session child it does not know about.
+A future opencode migration adding one would otherwise orphan its rows silently.
+
+### Checkpointing the WAL
+
+In WAL mode a page released by `incremental_vacuum` does not leave the file until
+a checkpoint folds the WAL back into it — and an uncheckpointed WAL is itself on
+the disk. One host had accumulated **15.28 GiB** of WAL that had never been
+checkpointed; a single `wal_checkpoint(TRUNCATE)` folded it in 2.5 seconds.
+
+Every `--apply` run therefore checkpoints, and the mode depends on who else has
+the database open. `TRUNCATE` and `RESTART` wait for readers and block writers
+while they hold the WAL; `PASSIVE` never blocks. opencode instances are writers,
+and a writer that exhausts its own `busy_timeout` behind this tool dies with
+`Error: Failed to execute statement`. So `TRUNCATE` runs only when `lsof` reports
+that **nothing** holds the database, and `PASSIVE` runs in every other case —
+including when holders cannot be determined at all.
+
+### Reclaiming space: incremental, and `--rebuild`
 
 A plain `VACUUM` copies the database to a temporary file and then overwrites the
 original under a journal, so SQLite documents it as needing up to **twice** the
@@ -543,7 +570,43 @@ file size in free space — impossible at 76 GB on a full disk. `PRAGMA
 auto_vacuum=2` (INCREMENTAL) lets `PRAGMA incremental_vacuum(N)` hand pages back
 in bounded chunks with no rewrite and no large temp file.
 
-`--enable-incremental-vacuum` switches a database to that mode. From
+Incremental reclamation is a trickle, not a reclaim path: it relocates pages one
+at a time with pointer-map updates, measured at **~10–20 MB/min** (2,141 pages in
+60.7s on one host, 1,891 in 62.1s on another). Draining a 55 GiB freelist at that
+rate would take 90–108 hours. It keeps a pruned database from growing; it will
+not shrink one that already has.
+
+`--rebuild` is what shrinks it. `VACUUM INTO` writes only the compacted copy, so
+it needs the **live** size plus ~5% rather than 2x the file — which is why a
+32 GiB file holding 6.2 GiB of live data can be rebuilt on 13 GiB of free disk
+where a plain `VACUUM` of the same file needs ~64 GiB and is rightly refused.
+
+It is opportunistic and heavily guarded, because the rebuild is safe but the
+**swap** is what loses data:
+
+- It runs only when nothing holds the database, and **refuses when that cannot be
+  determined** — a missing `lsof` reads as *unknown*, never as *idle*. launchd and
+  systemd start jobs with a bare environment and macOS keeps `lsof` in
+  `/usr/sbin`, so this is the expected failure mode, not an exotic one.
+- Holders are **re-checked immediately before the swap** and the copy discarded if
+  any appeared. A process that opens the database during the rebuild keeps
+  writing to the old inode, and `os.replace` would strand those writes. The
+  re-check shrinks that window from minutes to the microseconds around the
+  rename. A process that both starts *and* exits inside the rebuild window is
+  still unprotected — which is why this pass stays opportunistic and is never the
+  only reclaim path.
+- The copy is verified (`quick_check` ok, `auto_vacuum` still INCREMENTAL) before
+  it is trusted, and the `-wal`/`-shm` sidecars are deleted before the swap, or
+  the new file would be read against a stale WAL.
+- The call is bounded from *inside* SQLite by a wall-clock cap and a free-space
+  floor, via `set_progress_handler`. `--max-seconds` cannot bound `VACUUM INTO`,
+  which is one uninterruptible call: an unbounded one ran **23 minutes**, wrote a
+  **39.6 GB** temp copy and drove a disk from 88% to 93% before it was killed by
+  hand. The partial copy SQLite leaves behind is unlinked on every abort path.
+- A guard that refuses or aborts is a **skip, not an error**: the database is
+  untouched and a later run may succeed, so the exit status stays 0.
+
+`--enable-incremental-vacuum` switches a database to INCREMENTAL. From
 `auto_vacuum=FULL` this is a header change and costs nothing. From
 `auto_vacuum=NONE` it costs one full `VACUUM`, so it refuses unless the
 filesystem holding the database has 2x the database size (including its WAL)
@@ -568,6 +631,13 @@ large.
   so opencode can keep running and an interrupted run never leaves a session
   pointing at a deleted parent. Sessions in a `parent_id` cycle have no safe
   order and are retained.
+- Between batches the write lock is handed back deliberately: a PASSIVE
+  checkpoint folds what the batch wrote, then `--batch-sleep-ms` pauses before
+  the next transaction. Writers serialise, so this is what gives a queued
+  opencode instance a window to win the lock instead of timing out.
+- `PRAGMA journal_size_limit` is set on this tool's own connection so its
+  transactions cannot leave a huge WAL behind. It is per-connection and does not
+  affect opencode's own connections.
 - If `--enable-incremental-vacuum` is requested and the conversion fails, nothing
   is deleted.
 - Committed batches cannot be undone, so a deadline or a lock/IO failure part-way
@@ -575,7 +645,8 @@ large.
   how many eligible sessions were left — instead of a traceback.
 - `--max-seconds` stops *starting* new batches; it is not a bound on total
   runtime, since a batch or a `VACUUM` already in flight runs to completion.
-  `--vacuum-pages` bounds page reclamation. Both reject NaN and out-of-range
+  `--vacuum-pages` bounds page reclamation, and `--rebuild-max-seconds` is the
+  only thing that can bound a `VACUUM INTO`. All reject NaN and out-of-range
   values rather than silently disabling themselves.
 - Released pages and reclaimed bytes are reported separately: in WAL mode a
   long-lived reader can defer the checkpoint that actually shrinks the file, so
@@ -588,18 +659,22 @@ large.
 
 | Code | Meaning |
 |------|---------|
-| `0` | completed |
+| `0` | completed (a skipped `--rebuild` is still a completed run) |
 | `1` | an error occurred (nothing deleted, or a partial delete that is reported) |
-| `2` | bad arguments, or no database at `--db` |
+| `2` | bad arguments, no database at `--db`, or a schema this tool cannot safely prune |
 | `3` | no error, but a deadline left eligible sessions unprocessed; re-run to continue |
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--db` | `~/.local/share/opencode/opencode.db` | database path |
-| `--retention-days` | `5` | keep sessions updated within this window |
+| `--retention-days` | `4` | keep sessions updated within this window |
 | `--apply` | off | actually delete |
-| `--batch` | `200` | sessions per transaction (clamped to SQLite's variable limit) |
+| `--batch` | `25` | sessions per transaction (clamped to SQLite's variable limit) |
+| `--batch-sleep-ms` | `1000` | pause between batches, yielding the write lock (0 disables) |
 | `--max-seconds` | `600` | stop starting new batches after this long (0 = no limit) |
 | `--vacuum-pages` | all | cap pages released per run (>= 1) |
 | `--no-vacuum` | off | delete rows but do not release pages |
 | `--enable-incremental-vacuum` | off | switch `auto_vacuum` to INCREMENTAL |
+| `--rebuild` | off | compact with `VACUUM INTO` when nothing holds the database |
+| `--rebuild-max-seconds` | `900` | hard wall-clock cap on the rebuild |
+| `--rebuild-min-free-gib` | `25` | refuse/abort a rebuild that would leave less free |
