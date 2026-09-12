@@ -1,0 +1,1 @@
+{"id":"evt_01aca0fc9002tQRegPDzXSoOEZ","type":"permission.asked","properties":{"id":"per_01aca0fc9001RErYXMMOqtBPsk","sessionID":"ses_fe535fcedffeUlpdC3YcshQoLs","permission":"bash","patterns":["echo hi"],"metadata":{"command":"echo hi"},"always":["echo *"],"tool":{"messageID":"msg_01aca040e001oThKGoQ85XL9km","callID":"toolu_01CWmhmNfwtD7CMqctVqC3Zk"}}}

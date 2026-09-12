@@ -301,6 +301,7 @@ slackcli unreact C02DLS4PFH7 1710430020.123456 thumbsup
 | `unread` | — | Show channels with unread messages |
 | `react` | — | Add an emoji reaction |
 | `unreact` | — | Remove an emoji reaction |
+| `opencode-gc` | Prune old opencode sessions and release freed SQLite pages back to the filesystem | — |
 
 ### Token Scopes
 
@@ -503,3 +504,102 @@ llm-usage -p anthropic
 ## License
 
 MIT
+
+## opencode-gc
+
+opencode's SQLite store never prunes finished sessions. Measured on one host:
+**76.6 GB across 3,164 sessions** (2.30M `event` rows), growing ~6 GB/day.
+
+```bash
+opencode-gc                              # dry run, 5-day retention
+opencode-gc --apply                      # delete + release pages
+opencode-gc --retention-days 14 --apply
+opencode-gc --apply --enable-incremental-vacuum   # first run on a new host
+opencode-gc --json                       # machine-readable
+```
+
+### Why a session delete is not enough
+
+The foreign keys are:
+
+```
+message.session_id -> session.id                    ON DELETE CASCADE
+part.message_id    -> message.id                    ON DELETE CASCADE
+event.aggregate_id -> event_sequence.aggregate_id   ON DELETE CASCADE
+event_sequence     -> (nothing)
+```
+
+`event_sequence` has **no** foreign key to `session` — its `aggregate_id` merely
+happens to equal a session id. So `opencode session delete` (or a plain
+`DELETE FROM session`) strands every event row, which is the bulk of the file.
+`PRAGMA foreign_keys` is also off by default, so the cascades above do not fire
+unless enabled. This tool deletes each table explicitly, children first.
+
+### Why incremental vacuum
+
+A plain `VACUUM` copies the database to a temporary file and then overwrites the
+original under a journal, so SQLite documents it as needing up to **twice** the
+file size in free space — impossible at 76 GB on a full disk. `PRAGMA
+auto_vacuum=2` (INCREMENTAL) lets `PRAGMA incremental_vacuum(N)` hand pages back
+in bounded chunks with no rewrite and no large temp file.
+
+`--enable-incremental-vacuum` switches a database to that mode. From
+`auto_vacuum=FULL` this is a header change and costs nothing. From
+`auto_vacuum=NONE` it costs one full `VACUUM`, so it refuses unless the
+filesystem holding the database has 2x the database size (including its WAL)
+plus a reserve free, and unless SQLite's temp filesystem, when it is a different
+one, has room for a copy. Run it once per host, ideally before the file gets
+large.
+
+### Safety
+
+- Dry run by default; `--apply` is required to delete anything. Dry-run row
+  counts are a point-in-time estimate, reported with the cutoff they used.
+- A session is only expired when it **and every descendant** are older than the
+  retention window — `session.parent_id` has no foreign key, so deleting a
+  parent out from under a live child would leave a dangling reference.
+- Eligibility is decided **again inside each write transaction**. The database is
+  live, so a session opencode touched (or gave a live child) after the selection
+  pass is skipped rather than deleted.
+- A `NULL time_updated` is an unknown age, not an infinite one: such sessions are
+  kept and reported.
+- `--retention-days` below 1 is refused; this deletes irreplaceable history.
+- Deletes run in batches inside transactions, ordered deepest-descendant-first,
+  so opencode can keep running and an interrupted run never leaves a session
+  pointing at a deleted parent. Sessions in a `parent_id` cycle have no safe
+  order and are retained.
+- If `--enable-incremental-vacuum` is requested and the conversion fails, nothing
+  is deleted.
+- Committed batches cannot be undone, so a deadline or a lock/IO failure part-way
+  through still prints a full result — committed counts, `incomplete: true`, and
+  how many eligible sessions were left — instead of a traceback.
+- `--max-seconds` stops *starting* new batches; it is not a bound on total
+  runtime, since a batch or a `VACUUM` already in flight runs to completion.
+  `--vacuum-pages` bounds page reclamation. Both reject NaN and out-of-range
+  values rather than silently disabling themselves.
+- Released pages and reclaimed bytes are reported separately: in WAL mode a
+  long-lived reader can defer the checkpoint that actually shrinks the file, so
+  bytes are measured from the real database and `-wal` file sizes.
+- `--db` opens exactly the named file. A path containing `?`, `#` or `%` is not
+  reparsed as URI syntax, which would otherwise point the tool at a neighbouring
+  database.
+
+### Exit status
+
+| Code | Meaning |
+|------|---------|
+| `0` | completed |
+| `1` | an error occurred (nothing deleted, or a partial delete that is reported) |
+| `2` | bad arguments, or no database at `--db` |
+| `3` | no error, but a deadline left eligible sessions unprocessed; re-run to continue |
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--db` | `~/.local/share/opencode/opencode.db` | database path |
+| `--retention-days` | `5` | keep sessions updated within this window |
+| `--apply` | off | actually delete |
+| `--batch` | `200` | sessions per transaction (clamped to SQLite's variable limit) |
+| `--max-seconds` | `600` | stop starting new batches after this long (0 = no limit) |
+| `--vacuum-pages` | all | cap pages released per run (>= 1) |
+| `--no-vacuum` | off | delete rows but do not release pages |
+| `--enable-incremental-vacuum` | off | switch `auto_vacuum` to INCREMENTAL |

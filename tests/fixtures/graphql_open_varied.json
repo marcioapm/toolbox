@@ -1,0 +1,707 @@
+{
+  "data": {
+    "repository": {
+      "pr_4615": {
+        "state": "OPEN",
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "APPROVED",
+        "isDraft": false,
+        "title": "feat: experiment recompute (versioned recommended actions + activity history)",
+        "url": "https://github.com/absmartly/abs/pull/4615",
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "statusCheckRollup": {
+                  "state": "SUCCESS",
+                  "contexts": {
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "sync-to-external-repo"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "check-sql"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "code-check"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "Update preview controls"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "schema-sync-check"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "Scan"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "code-check"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "Handle preview control command"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "Create and deploy preview"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "Destroy preview"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "[code]smith"
+                      },
+                      {
+                        "__typename": "StatusContext",
+                        "state": "SUCCESS",
+                        "context": "CodeRabbit"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "pr_4547": {
+        "state": "OPEN",
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "REVIEW_REQUIRED",
+        "isDraft": false,
+        "title": "fix(inserter): serialize datasource init between boot poll and CDC to prevent silent teardown race",
+        "url": "https://github.com/absmartly/abs/pull/4547",
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "statusCheckRollup": {
+                  "state": "FAILURE",
+                  "contexts": {
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "FAILURE",
+                        "status": "COMPLETED",
+                        "name": "check-paths"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "FAILURE",
+                        "status": "COMPLETED",
+                        "name": "code-check"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "FAILURE",
+                        "status": "COMPLETED",
+                        "name": "Update preview controls"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "FAILURE",
+                        "status": "COMPLETED",
+                        "name": "Scan"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "sync-to-external-repo"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "chromatic-deployment"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "compute-affected"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "Handle preview control command"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "pipeline"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "Create and deploy preview"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "smoke"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "Destroy preview"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "backend-code-check"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "smoke-report"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "FAILURE",
+                        "status": "COMPLETED",
+                        "name": "gate"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "changeman"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "collector"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "contextman"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "debezium"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "discoveryman"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "engine"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "exporter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "inserter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "notifyman"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "previewer"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "retentionman"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "scheduler"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "usageman"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "webhooker"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "backend"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": ".github/dependabot.yml"
+                      },
+                      {
+                        "__typename": "StatusContext",
+                        "state": "SUCCESS",
+                        "context": "CodeRabbit"
+                      },
+                      {
+                        "__typename": "StatusContext",
+                        "state": "SUCCESS",
+                        "context": "Storybook Publish"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "pr_4620": {
+        "state": "OPEN",
+        "mergeable": "MERGEABLE",
+        "reviewDecision": "REVIEW_REQUIRED",
+        "isDraft": false,
+        "title": "feat(analytics): pre-experiment bias check backend (FT-2069)",
+        "url": "https://github.com/absmartly/abs/pull/4620",
+        "commits": {
+          "nodes": [
+            {
+              "commit": {
+                "statusCheckRollup": {
+                  "state": "SUCCESS",
+                  "contexts": {
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "sync-to-external-repo"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "code-check"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "check-sql"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "check-paths"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "code-check"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "Update preview controls"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "schema-sync-check"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "Scan"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "code-check"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "Handle preview control command"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "pipeline / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "Create and deploy preview"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "smoke / code-check / Frontend static checks (typecheck, lint, format, build)"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SKIPPED",
+                        "status": "COMPLETED",
+                        "name": "Destroy preview"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "smoke / code-check / Frontend unit tests (shard 1/4)"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "smoke / code-check / Frontend unit tests (shard 2/4)"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "smoke / code-check / Frontend unit tests (shard 3/4)"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "smoke / code-check / Frontend unit tests (shard 4/4)"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "smoke / build-images"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "smoke / e2e-tests (chromium)"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "smoke-report / generate-report"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "gate"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "changeman / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "changeman / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "collector / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "collector / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "contextman / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "contextman / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "debezium / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "debezium / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "discoveryman / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "discoveryman / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "engine / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "engine / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "exporter / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "exporter / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "inserter / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "inserter / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "notifyman / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "notifyman / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "previewer / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "previewer / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "retentionman / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "retentionman / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "scheduler / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "scheduler / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "usageman / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "usageman / build"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "webhooker / filter / filter"
+                      },
+                      {
+                        "__typename": "CheckRun",
+                        "conclusion": "SUCCESS",
+                        "status": "COMPLETED",
+                        "name": "webhooker / build"
+                      },
+                      {
+                        "__typename": "StatusContext",
+                        "state": "SUCCESS",
+                        "context": "CodeRabbit"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
