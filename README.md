@@ -514,10 +514,18 @@ opencode's SQLite store never prunes finished sessions. Measured on one host:
 opencode-gc                              # dry run, 4-day retention
 opencode-gc --apply                      # delete + reclaim + checkpoint
 opencode-gc --retention-days 14 --apply
-opencode-gc --apply --rebuild            # also compact the file, if idle
 opencode-gc --apply --enable-incremental-vacuum   # first run on a new host
 opencode-gc --json                       # machine-readable
+
+opencode-gc rebuild --dry-run            # what compacting would reclaim
+opencode-gc rebuild --yes-nothing-is-using-it     # MANUAL ONLY; see below
 ```
+
+There are two commands. `prune` is the default — a bare `opencode-gc` is
+`opencode-gc prune` — and it is safe to run while opencode is using the
+database. `rebuild` is not: it replaces the database file and must be run by
+hand, with opencode stopped. Nothing on a timer should ever invoke it, and no
+combination of prune flags can reach it.
 
 ### Why a session delete is not enough
 
@@ -562,7 +570,7 @@ and a writer that exhausts its own `busy_timeout` behind this tool dies with
 that **nothing** holds the database, and `PASSIVE` runs in every other case —
 including when holders cannot be determined at all.
 
-### Reclaiming space: incremental, and `--rebuild`
+### Reclaiming space: incremental, and the `rebuild` command
 
 A plain `VACUUM` copies the database to a temporary file and then overwrites the
 original under a journal, so SQLite documents it as needing up to **twice** the
@@ -576,83 +584,116 @@ at a time with pointer-map updates, measured at **~10–20 MB/min** (2,141 pages
 rate would take 90–108 hours. It keeps a pruned database from growing; it will
 not shrink one that already has.
 
-`--rebuild` is what shrinks it. `VACUUM INTO` writes only the compacted copy, so
+`rebuild` is what shrinks it. `VACUUM INTO` writes only the compacted copy, so
 it needs the **live** size plus ~5% rather than 2x the file — which is why a
 32 GiB file holding 6.2 GiB of live data can be rebuilt on 13 GiB of free disk
 where a plain `VACUUM` of the same file needs ~64 GiB and is rightly refused.
 
-It is heavily guarded, because the rebuild is safe but the **swap** is what
-loses data. The cutover does **not** rest on holder snapshots: `lsof` answers
-"who was attached at instant T", and that is not the question. A writer that
-opens after a check, commits after `VACUUM INTO` took its snapshot, and exits
-before the next check is invisible to *both* while its transaction is absent
-from the copy — so the swap installed a database missing a committed row.
-Reproduced. No number of extra checks closes it, because every one of them
-samples process liveness and liveness is not the property at issue.
+### `rebuild` requires that nothing else has the database open
 
-Three mechanisms replace the sampling, each answering a question a snapshot
-cannot:
+**This command replaces the database file. It requires that nothing else has
+that file open. Running it while opencode is live can lose committed
+sessions.** It refuses if it can see a holder, but that check is a convenience,
+not a guarantee — see below for exactly what it does and does not prove.
 
-- **`PRAGMA data_version` — did anyone commit?** It changes whenever *another*
-  connection commits, and is stable across our own writes and our own
-  `VACUUM INTO`. Read on a connection held open for the whole rebuild and again
-  under the lock below; any change discards the copy. Process liveness is
-  irrelevant to it.
-- **`BEGIN EXCLUSIVE`, held across the rename — can anyone commit *now*?** In
-  WAL mode it blocks other connections' writes while leaving readers alone, and
-  it survives `os.replace`: a writer queued against it stays queued until this
-  connection releases. That closes the window between the last look and the
-  rename, which is the window no check can cover. `VACUUM INTO` cannot run
-  inside a transaction, so the lock is taken *after* the rebuild, for the
-  cutover only.
-- **`lsof` on the backup name — is anyone still holding the *old* inode?** The
-  one snapshot that is not a race. The old database is hard-linked aside before
-  the rename, so afterwards the old inode is reachable through exactly one
-  pathname that nothing else on the host knows. The set of processes holding it
-  is therefore **closed** — it cannot grow, so observing it empty is a proof
-  rather than a sample. A straggler found there sends the rename back, restoring
-  the original at the live path with its writes intact.
+That is a precondition you provide, not something the tool establishes. It is
+why `rebuild` is a separate command rather than a flag on the prune, why it
+requires `--yes-nothing-is-using-it`, and why **nothing on a timer may run it**.
+No combination of `prune` flags can reach it; there is a test that pins this.
 
-`lsof` is still consulted first, but only as a cheap **pre-filter** so a busy
-host does not pay for a 20-minute rebuild the cutover will refuse. It no longer
-authorises anything. A missing `lsof` still reads as *unknown*, never *idle*:
-launchd and systemd start jobs with a bare environment and macOS keeps it in
-`/usr/sbin`. Any diagnostic on stderr, unexpected exit status or unparseable
-output is likewise *unknown* — a missing `-shm` is routine, and asking `lsof`
-about it earned a diagnostic that read as "nobody holds this".
+#### The procedure
 
-The rest of the protocol:
+```bash
+# 1. Stop opencode and close every running agent. Check nothing is left:
+lsof ~/.local/share/opencode/opencode.db
 
-- **Nothing is destroyed before the replacement is in place.** The source WAL is
-  folded first so the preserved old file is self-contained, the old database is
-  hard-linked aside, the new file is installed, the file and its directory are
-  synced, and only then is the old set removed. Every partial-failure path — a
-  failed `link`, `replace` or `fsync` — leaves a database that still opens at
-  the live pathname with all committed rows. The previous order unlinked the
-  `-wal` *before* `os.replace`, so a handled `OSError` from the rename destroyed
-  every WAL-only-committed transaction.
+# 2. See what it would reclaim. Touches nothing.
+opencode-gc rebuild --dry-run
+
+# 3. Do it.
+opencode-gc rebuild --yes-nothing-is-using-it
+
+# 4. Confirm.
+opencode-gc rebuild --dry-run     # file size should now be ~= live size
+```
+
+On macmini the expected shape is a **32.1 GiB file with 6.2 GiB live**, so it
+reclaims **~26 GiB** and takes roughly **a minute**. Prune first: the live size
+is what the copy has to write, so a store too big to rebuild before a prune is
+comfortably rebuildable after one.
+
+#### Why there is no online version of this
+
+Three designs were attempted for swapping the file while opencode was running.
+Each closed one window and opened another, and review found Criticals in all
+three: a queued writer's commit landing in the replacement's `-wal` after the
+exclusive lock was dropped; stragglers that opened the replacement after a first
+rename; a pre-existing hard link making "the old inode has exactly one pathname"
+false; and process death between the rename and the sidecar cleanup leaving two
+main files sharing one `db-wal` name. **Every one of them requires another
+process writing during the swap.** Rather than attempt a fourth, the
+precondition removes them: under guaranteed quiescence none is reachable.
+
+#### What the remaining guards honestly do
+
+They are **pre-flight checks that catch a mistaken operator** — "I thought I'd
+closed everything" — not a proof of exclusion. They are nearly free, so they
+stay; the honest claim is the precondition, not the check.
+
+- **`lsof` on the database and its sidecars.** If anything holds it, the rebuild
+  refuses and **names the pids** so you can go and close them. A missing `lsof`
+  reads as *unknown*, never *idle* — launchd and systemd start jobs with a bare
+  environment and macOS keeps it in `/usr/sbin` — and unknown is also a refusal.
+  Any diagnostic on stderr, unexpected exit status or unparseable output is
+  likewise unknown. This is a snapshot: a process can attach immediately after
+  it, and nothing here prevents that.
+- **`st_nlink != 1`.** A second hard link is a second public pathname to the same
+  inode. `lsof` was given one path and cannot enumerate who might arrive through
+  the other, and `os.replace` only moves the name it was given — the other name
+  would keep pointing at the un-rebuilt original, which then silently diverges.
+  Refused, with the link count in the message.
+- **`PRAGMA data_version`, read before and after the copy.** The only check here
+  that detects a *commit* rather than an *attachment*: it changes whenever
+  another connection commits, and is stable across our own work. A rebuild takes
+  about a minute, which is long enough for a forgotten agent to write, and a
+  writer that opens and exits inside that window is invisible to any number of
+  holder snapshots while its transaction is absent from the copy. If it moved,
+  the copy is discarded.
+- **The source WAL must fold completely** (`wal_checkpoint(TRUNCATE)`) before the
+  swap, or it refuses. This is load-bearing for the ordering below: the sidecars
+  are removed *before* the rename, which is only safe because they are known to
+  carry no committed frame by then.
+
+And the parts that are about crash-safety rather than concurrency, which hold
+regardless:
+
+- **The rename is the last mutating step.** Sidecars cleared (WAL already
+  folded), original hard-linked aside, then `os.replace` — which is atomic, so
+  the live pathname holds either the whole old database or the whole new one.
+  Every failure up to and including it leaves a complete, openable database with
+  every committed row. A failure *after* it is reported as an **error with a
+  non-zero exit** naming both files, because the replacement is installed and
+  only you can finish the job.
 - **The copy is verified before it is trusted**: `quick_check` ok, `auto_vacuum`
-  still INCREMENTAL, and the source's **journal mode** and **permissions**
-  established on it and read back from a fresh connection. `VACUUM INTO` writes
-  its output in the default `DELETE` mode and at the process umask whatever the
-  source used — measured, a `0600` WAL source produced a `0644` `DELETE` copy.
-  Either would be swapped in silently: one changes opencode's concurrency model,
-  the other publishes session history to every local user. Both now fail closed.
+  still INCREMENTAL, and the source's **journal mode**, **permissions** and
+  **ownership** established on it and read back from a fresh connection.
+  `VACUUM INTO` writes its output in the default `DELETE` mode and at the process
+  umask whatever the source used — measured, a `0600` WAL source produced a
+  `0644` `DELETE` copy. One changes opencode's concurrency model, the other
+  publishes session history to every local user. Both fail closed.
 - **One rebuild at a time**, via `flock` on a lock file beside the database. Two
   invocations share one `.rebuild-tmp` and would destroy each other's copy
-  mid-write; a manual run landing on a timed one is the ordinary way that
-  happens. The lock is advisory and per-open-file-description, so the kernel
+  mid-write. The lock is advisory and per-open-file-description, so the kernel
   drops it however abruptly the holder dies.
 - The call is bounded from *inside* SQLite by a wall-clock cap and a free-space
-  floor, via `set_progress_handler`. `--max-seconds` cannot bound `VACUUM INTO`,
-  which is one uninterruptible call: an unbounded one ran **23 minutes**, wrote a
-  **39.6 GB** temp copy and drove a disk from 88% to 93% before it was killed by
-  hand. The partial copy SQLite leaves behind is unlinked on every abort path.
-  Note the cap is enforced at the next progress callback: a statement blocked in
-  filesystem I/O runs no callbacks and can overshoot it.
+  floor, via `set_progress_handler`. Nothing at the Python level can bound
+  `VACUUM INTO`, which is one uninterruptible call: an unbounded one ran
+  **23 minutes**, wrote a **39.6 GB** temp copy and drove a disk from 88% to 93%
+  before it was killed by hand. The partial copy SQLite leaves behind is unlinked
+  on every abort path. The cap is enforced at the next progress callback, so a
+  statement blocked in filesystem I/O can overshoot it.
 - A guard that refuses or aborts is a **skip, not an error**: the database is
-  untouched and a later run may succeed, so the exit status stays 0. That
-  includes a refused cutover — a safe no-op beats a hopeful swap.
+  untouched and a later run may succeed, so the exit status stays 0.
 
 Files it may leave beside the database, and what to do about them:
 
@@ -686,12 +727,15 @@ large.
   lock is released between batches — so an opencode migration adding a session
   child can land after an unlocked check and be orphaned by every batch after it.
   A schema that changes mid-run rolls that batch back and stops, reporting what
-  was already committed. The check covers the **transitive** closure: `message`,
-  `part`, `event` and `event_sequence` are deleted explicitly too, so a table
-  hanging off any of them is orphaned exactly as surely as a direct child of
-  `session`. Identifiers are compared case-insensitively, since
-  `REFERENCES SeSsIoN(id)` is valid SQLite. `delete_sessions` enforces this
-  itself rather than trusting its caller to have done so.
+  was already committed. The check walks the **transitive** closure rather than
+  direct children — that does not change *which* schemas are refused (a table two
+  hops out always has an uncovered intermediate one hop out, which is refused
+  either way) but it names the whole chain, so you fix `CHILD_TABLES` in one pass
+  instead of learning the tables one run at a time. Identifiers are compared
+  case-insensitively, and that part *is* load-bearing: `REFERENCES SeSsIoN(id)`
+  is valid SQLite, and a case-sensitive check would accept the table and orphan
+  its rows silently. `delete_sessions` enforces all of this itself rather than
+  trusting its caller to have done so.
 - A `NULL time_updated` is an unknown age, not an infinite one: such sessions are
   kept and reported.
 - `--retention-days` below 1 is refused; this deletes irreplaceable history.
@@ -713,7 +757,7 @@ large.
   how many eligible sessions were left — instead of a traceback.
 - `--max-seconds` stops *starting* new batches; it is not a bound on total
   runtime, since a batch or a `VACUUM` already in flight runs to completion.
-  `--vacuum-pages` bounds page reclamation, and `--rebuild-max-seconds` is the
+  `--vacuum-pages` bounds page reclamation, and `rebuild --max-seconds` is the
   only thing that can bound a `VACUUM INTO`. All reject NaN and out-of-range
   values rather than silently disabling themselves.
 - Released pages and reclaimed bytes are reported separately: in WAL mode a
@@ -722,15 +766,29 @@ large.
 - `--db` opens exactly the named file. A path containing `?`, `#` or `%` is not
   reparsed as URI syntax, which would otherwise point the tool at a neighbouring
   database.
+- **The prune cannot rebuild.** There is no flag on this command that replaces
+  the database file, so nothing running unattended can.
 
 ### Exit status
 
+`prune`:
+
 | Code | Meaning |
 |------|---------|
-| `0` | completed (a skipped `--rebuild` is still a completed run) |
+| `0` | completed |
 | `1` | an error occurred (nothing deleted, or a partial delete that is reported) |
 | `2` | bad arguments, no database at `--db`, or a schema this tool cannot safely prune |
 | `3` | no error, but a deadline left eligible sessions unprocessed; re-run to continue |
+
+`rebuild`:
+
+| Code | Meaning |
+|------|---------|
+| `0` | rebuilt, previewed, or a guard refused (the database is untouched) |
+| `1` | the rebuild failed — including a failure *after* the replacement was installed, which names both files |
+| `2` | bad arguments, no database at `--db`, an unusable schema, or `--yes-nothing-is-using-it` was not given |
+
+### `opencode-gc prune` (the default command)
 
 | Flag | Default | Meaning |
 |------|---------|---------|
@@ -743,6 +801,15 @@ large.
 | `--vacuum-pages` | all | cap pages released per run (>= 1) |
 | `--no-vacuum` | off | delete rows but do not release pages |
 | `--enable-incremental-vacuum` | off | switch `auto_vacuum` to INCREMENTAL |
-| `--rebuild` | off | compact with `VACUUM INTO` when nothing holds the database |
-| `--rebuild-max-seconds` | `900` | abort the rebuild at the first progress callback after this long |
-| `--rebuild-min-free-gib` | `25` | refuse/abort a rebuild that would leave less free |
+| `--json` | off | machine-readable output |
+
+### `opencode-gc rebuild` (manual only)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--db` | `~/.local/share/opencode/opencode.db` | database path |
+| `--yes-nothing-is-using-it` | off | **required to change anything.** Confirms opencode is stopped and nothing else has the database open |
+| `--dry-run` | off | report size, live bytes and expected reclaim; touch nothing |
+| `--max-seconds` | `900` | abort at the first progress callback after this long |
+| `--min-free-gib` | `25` | refuse/abort a rebuild that would leave less free |
+| `--json` | off | machine-readable output |

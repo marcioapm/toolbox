@@ -152,6 +152,15 @@ def _run_json_cli(monkeypatch, capsys, *args):
     return opencode_gc.main(), json.loads(capsys.readouterr().out)
 
 
+def _run_rebuild_cli(monkeypatch, capsys, *args):
+    """The `rebuild` subcommand, which must always be named explicitly."""
+    monkeypatch.setattr(
+        opencode_gc.sys, "argv",
+        ["opencode-gc", opencode_gc.REBUILD_COMMAND, *args, "--json"],
+    )
+    return opencode_gc.main(), json.loads(capsys.readouterr().out)
+
+
 def _counting_clock():
     """Advances one second per read, so a deadline trips at an exact batch
     instead of at whatever the wall clock happens to do on a loaded machine."""
@@ -822,12 +831,20 @@ class TestTheSchemaGuardHoldsUnderTheWriteLock:
             assert not check.in_transaction
 
     def test_the_rolled_back_batch_deletes_nothing(self, tmp_path):
-        """The refusal happens before any DELETE in that transaction, so the
-        batch it interrupts leaves no partial work.
+        """A refused batch leaves no partial work: exactly the batches that
+        committed before the migration are gone, and nothing else.
 
-        Mutation: move the `verify_usable(conn)` call to after the DELETE loop.
-        The rows are deleted and then rolled back -- which this still catches
-        via the counts, but the window is real.
+        Mutation: delete the in-transaction `verify_usable(conn)` block. The
+        run continues to completion -- all 6 sessions deleted, `failure` None
+        -- instead of stopping at 3 with the migration reported.
+
+        No mutation of the check's POSITION is derivable here, and the earlier
+        claim that there was one is withdrawn: moving `verify_usable` to after
+        the DELETE loop was verified NOT to fail this test, because the
+        transaction rolls back either way and the observable end state is
+        identical. Only the width of the window differs, and this test cannot
+        see it. (Dropping `_rollback_quietly` is likewise invisible: sqlite3
+        rolls an open transaction back when the connection closes.)
         """
         path = tmp_path / "nopartial.db"
         ids = self._store(path, sessions=6)
@@ -4100,12 +4117,14 @@ class TestChildTablesCoverTheLiveSchema:
     def test_a_table_orphaned_through_any_deleted_parent_is_refused(
         self, tmp_path, name, ddl
     ):
-        """Checking only DIRECT children of `session` passed every schema here.
+        """Every one of these hangs off a table in the deletion plan -- not
+        just off `session` -- and each must be refused.
 
-        Mutation: restore the original body -- collect tables whose
-        `foreign_key_list` names exactly `"session"`, subtract CHILD_TABLES.
-        All four cases pass verification again, and the orphan test below
-        deletes the session while the dependent row survives.
+        The `shouty` case is the load-bearing one for casefolding. Mutation:
+        compare `PRAGMA foreign_key_list`'s parent spelling without
+        `.casefold()`. `REFERENCES SeSsIoN(id)` is then not recognised as a
+        reference to `session`, the table is accepted, and its rows are
+        orphaned by every prune with no refusal at all.
         """
         path = tmp_path / f"{name}.db"
         conn = _make_live_db(path)
@@ -4119,6 +4138,58 @@ class TestChildTablesCoverTheLiveSchema:
                 opencode_gc.verify_usable(probe)
         finally:
             probe.close()
+
+    def test_the_refusal_names_every_table_in_the_orphaned_chain(self, tmp_path):
+        """What the transitive closure actually buys.
+
+        It is NOT load-bearing for the decision: a table two hops out cannot
+        exist without an intermediate one hop out, and that intermediate is
+        itself uncovered, so a one-hop check refuses the same schemas. A
+        reviewer replaced the closure with a one-hop check and the whole suite
+        still passed.
+
+        What it buys is the MESSAGE. Here `bookmark` hangs off `session`,
+        `bookmark_tag` off `bookmark` and `tag_note` off `bookmark_tag`. A
+        one-hop check names only `bookmark`, so an operator adds it to
+        CHILD_TABLES, re-runs, and is told about the next one -- three rounds
+        to learn what the closure says at once.
+
+        Mutation: replace the closure's `while changed:` loop with a single
+        pass over the direct children of `deleted`. `bookmark_tag` and
+        `tag_note` vanish from the refusal and this fails.
+        """
+        path = tmp_path / "chain.db"
+        conn = _make_live_db(path)
+        conn.execute(
+            "CREATE TABLE bookmark (id text PRIMARY KEY, "
+            "session_id text NOT NULL REFERENCES session(id))"
+        )
+        conn.execute(
+            "CREATE TABLE bookmark_tag (id text PRIMARY KEY, "
+            "bookmark_id text NOT NULL REFERENCES bookmark(id))"
+        )
+        conn.execute(
+            "CREATE TABLE tag_note (id text PRIMARY KEY, "
+            "tag_id text NOT NULL REFERENCES bookmark_tag(id))"
+        )
+        conn.close()
+
+        probe = opencode_gc.connect(path, read_only=True)
+        try:
+            assert opencode_gc.orphaned_by_deletion(probe) == {
+                "bookmark", "bookmark_tag", "tag_note"
+            }, "the whole chain must be found, not just the first hop"
+            with pytest.raises(RuntimeError) as exc_info:
+                opencode_gc.verify_usable(probe)
+        finally:
+            probe.close()
+
+        message = str(exc_info.value)
+        for table in ("bookmark", "bookmark_tag", "tag_note"):
+            assert table in message, (
+                f"{table} is orphaned and must be named in the refusal, so the "
+                f"operator fixes CHILD_TABLES in one pass: {message}"
+            )
 
     def test_an_unknown_child_is_orphaned_without_the_refusal(self, tmp_path):
         """The consequence the refusal exists to prevent, demonstrated rather
@@ -4860,8 +4931,13 @@ GIB = 1024 ** 3
 
 class TestRebuildGuards:
     """`VACUUM INTO` is the only pass that shrinks an already-oversized file,
-    and the only destructive one. The rebuild is safe; the SWAP is what loses
-    data, so the guards around it are the whole safety argument.
+    and the only destructive one.
+
+    What makes the swap safe is the PRECONDITION -- the operator stopped
+    opencode -- not these guards. They are pre-flight checks that catch the
+    realistic mistake ("I thought I'd closed everything") cheaply, and each is
+    tested here for what it actually refuses, not for a guarantee it does not
+    provide.
     """
 
     def _store(self, path, *, sessions=40, wal=True):
@@ -4879,15 +4955,13 @@ class TestRebuildGuards:
             conn.close()
 
     def _rebuild(self, path, monkeypatch, *, holders, max_seconds=60.0,
-                 min_free=0, late=..., clock=time.monotonic):
-        """Run a rebuild with a scripted holder sequence: `holders` for the
-        pre-flight check, `late` for the pre-swap re-check."""
-        answers = [holders] if late is ... else [holders, late]
+                 min_free=0, clock=time.monotonic):
+        """Run a rebuild with a scripted answer from the holder lookup."""
         calls = []
 
         def fake(db):
             calls.append(db)
-            return answers[min(len(calls) - 1, len(answers) - 1)]
+            return holders
 
         monkeypatch.setattr(opencode_gc, "db_holders", fake)
         outcome = opencode_gc.rebuild_database(
@@ -4909,7 +4983,7 @@ class TestRebuildGuards:
         conn.close()
         before = path.stat().st_size
 
-        outcome, _ = self._rebuild(path, monkeypatch, holders=[], late=[])
+        outcome, _ = self._rebuild(path, monkeypatch, holders=[])
 
         assert outcome.failure is None, outcome.failure
         assert outcome.skipped is None, outcome.skipped
@@ -4925,8 +4999,11 @@ class TestRebuildGuards:
             check.close()
 
     def test_a_held_database_is_not_rebuilt(self, tmp_path, monkeypatch):
-        """Mutation: drop the `if holders:` branch from rebuild_database. The
-        swap then runs while another process is writing to the old inode.
+        """The foot-gun guard: an operator who believes they closed opencode
+        and did not is told which pids to go and close.
+
+        Mutation: drop the `if holders:` branch from rebuild_preflight. The
+        swap then replaces a file another process is still using.
         """
         path = self._store(tmp_path / "held.db")
         before = path.read_bytes()
@@ -4935,14 +5012,15 @@ class TestRebuildGuards:
 
         assert outcome.completed is False
         assert outcome.attempted is False
-        assert "2 process(es) hold the database" in outcome.skipped
+        assert "2 process(es) still hold the database" in outcome.skipped
+        assert "991,992" in outcome.skipped, "the pids must be named to be useful"
         assert outcome.failure is None
         assert path.read_bytes() == before, "the database must be untouched"
 
     def test_undeterminable_holders_refuse_the_rebuild(self, tmp_path, monkeypatch):
         """Mutation: `if holders is None:` -> `if False:`. `None` then falls
         through to `if holders:`, which is falsey, and a host whose lsof is
-        missing rebuilds and swaps blind.
+        missing rebuilds blind.
         """
         path = self._store(tmp_path / "blind.db")
         before = path.read_bytes()
@@ -4954,58 +5032,47 @@ class TestRebuildGuards:
         assert "cannot determine who holds the database" in outcome.skipped
         assert path.read_bytes() == before
 
-    def test_a_holder_appearing_during_the_rebuild_discards_the_copy(
-        self, tmp_path, monkeypatch
-    ):
-        """A process still holding the OLD inode at the swap must send the
-        rebuild back, with the original database restored at the live path.
+    def test_a_hard_linked_database_is_refused(self, tmp_path, monkeypatch):
+        """A second hard link is a second public pathname to the same inode.
 
-        The check that finds it is not a snapshot: it runs after the rename,
-        against the backup name, and the old inode is reachable through no
-        other pathname by then -- so the set of processes holding it cannot
-        grow, and observing it non-empty is decisive. See `_swap_in`.
+        Two things break. The holder check was given ONE path and cannot
+        enumerate who might come in through the other, so "nothing holds it" is
+        not established even momentarily -- a process can open the alias at any
+        time. And `os.replace` only moves the name it was given: the other name
+        keeps pointing at the un-rebuilt original, which from that moment
+        silently diverges from the live database.
 
-        Mutation: delete the `stragglers = db_holders(backup)` block. The swap
-        stands and the straggler's writes are stranded on an unlinked inode.
+        Mutation: drop the `link_count != 1` branch from rebuild_preflight. The
+        rebuild proceeds and `alias.db` is left holding a stale database that
+        nothing will ever update again.
         """
-        path = self._store(tmp_path / "late.db")
+        path = self._store(tmp_path / "linked.db")
+        alias = tmp_path / "alias.db"
+        os.link(path, alias)
+        assert path.stat().st_nlink == 2, "the fixture must really be linked"
         before = path.read_bytes()
 
-        outcome, calls = self._rebuild(
-            path, monkeypatch, holders=[], late=["8080"]
-        )
-
-        assert len(calls) == 2, "the old inode must be checked after the rename"
-        assert calls[1].name.endswith(opencode_gc.REBUILD_BACKUP_SUFFIX), (
-            "the decisive check must be against the backup name, not the live "
-            f"path, or it is another snapshot: {calls[1]}"
-        )
-        assert outcome.completed is False
-        assert outcome.attempted is True, "the rebuild itself must have run"
-        assert "1 process(es) attached during the rebuild" in outcome.skipped
-        assert "rolled back" in outcome.skipped
-        assert path.read_bytes() == before, "the original file must survive intact"
-        assert not path.with_name(path.name + opencode_gc.REBUILD_SUFFIX).exists(), \
-            "the discarded copy must not be left on disk"
-        assert not path.with_name(
-            path.name + opencode_gc.REBUILD_BACKUP_SUFFIX
-        ).exists(), "the backup link must not be left behind"
-
-    def test_holders_becoming_undeterminable_mid_rebuild_discards_the_copy(
-        self, tmp_path, monkeypatch
-    ):
-        path = self._store(tmp_path / "lateblind.db")
-        before = path.read_bytes()
-
-        outcome, _ = self._rebuild(path, monkeypatch, holders=[], late=None)
+        outcome, _ = self._rebuild(path, monkeypatch, holders=[])
 
         assert outcome.completed is False
-        assert "undeterminable" in outcome.skipped
-        assert path.read_bytes() == before
-        assert not path.with_name(path.name + opencode_gc.REBUILD_SUFFIX).exists()
-        assert not path.with_name(
-            path.name + opencode_gc.REBUILD_BACKUP_SUFFIX
-        ).exists()
+        assert outcome.attempted is False, "it must refuse before writing a copy"
+        assert outcome.failure is None, "a refusal is a skip, not a failure"
+        assert "2 hard links" in outcome.skipped
+        assert path.read_bytes() == before, "the database must be untouched"
+        assert alias.stat().st_ino == path.stat().st_ino, (
+            "the alias must still be the same inode: nothing was replaced"
+        )
+
+    def test_a_single_linked_database_is_not_refused(self, tmp_path, monkeypatch):
+        """The complement, so the refusal above is a boundary rather than a
+        blanket rejection: the ordinary one-link case must still rebuild.
+        """
+        path = self._store(tmp_path / "unlinked.db")
+        assert path.stat().st_nlink == 1
+
+        outcome, _ = self._rebuild(path, monkeypatch, holders=[])
+
+        assert outcome.completed is True, outcome.skipped or outcome.failure
 
     def test_the_swap_replaces_the_inode_and_clears_the_sidecars(
         self, tmp_path, monkeypatch
@@ -5040,7 +5107,7 @@ class TestRebuildGuards:
             assert shm.exists(), "the fixture must really leave a -shm"
             old_inode = path.stat().st_ino
 
-            outcome, _ = self._rebuild(path, monkeypatch, holders=[], late=[])
+            outcome, _ = self._rebuild(path, monkeypatch, holders=[])
 
             assert outcome.completed is True, outcome.skipped or outcome.failure
             assert path.stat().st_ino != old_inode, "the file must be replaced"
@@ -5063,7 +5130,7 @@ class TestRebuildGuards:
             ),
         )
 
-        outcome, _ = self._rebuild(path, monkeypatch, holders=[], late=[])
+        outcome, _ = self._rebuild(path, monkeypatch, holders=[])
 
         assert outcome.completed is False
         assert "failed quick_check" in outcome.failure
@@ -5125,29 +5192,23 @@ class TestRebuildGuards:
 
 
 
-class TestTheCutoverIsProvenNotSampled:
-    """The Critical this protocol exists to close.
+class TestTheRebuildRefusesWhenTheDatabaseWasNotQuiescent:
+    """The rebuild requires that nothing else has the database open, and the
+    operator is what guarantees that. These test what happens when they were
+    WRONG -- which is the realistic failure, not an adversarial one.
 
-    `lsof` answers "who was attached at instant T". It cannot answer "did
-    anyone COMMIT during the interval", and those are different questions. A
-    writer that opens after the pre-check, commits after `VACUUM INTO` took its
-    snapshot, and exits before the post-check is invisible to both, while its
-    transaction is absent from the copy -- so the swap installed a database
-    missing a committed row. Reproduced by a reviewer:
+    `lsof` answers "who was attached at instant T", which cannot answer "did
+    anyone commit during the rebuild": a writer that opens after the check,
+    commits, and exits before the swap is invisible to every attachment
+    snapshot while its transaction is absent from the copy. Reproduced by a
+    reviewer as `completed True rows_after_swap [('before',)]`.
 
-        completed True rows_after_swap [('before',)]
-
-    A third check does not close this, and no number of them can: every one is
-    a sample of process liveness, and liveness is not the property at issue.
-
-    Three mechanisms replace the sampling, each tested below against the exact
-    race it is responsible for:
-
-      * PRAGMA data_version  -- detects the commit itself
-      * BEGIN EXCLUSIVE      -- excludes writers across the rename
-      * lsof on the backup    -- names the holders of the old inode, which by
-                                then has exactly one pathname and so is a
-                                closed set rather than a sample
+    `PRAGMA data_version` is what catches that, and it is kept for exactly that
+    reason: a rebuild takes about a minute on the real store, which is long
+    enough for a forgotten agent to write. It is two pragma reads and needs no
+    lock. It does not make a concurrent rebuild safe -- nothing here does --
+    but it turns the most likely mistake into a refusal instead of silent data
+    loss.
     """
 
     def _store(self, path, *, sessions=12):
@@ -5176,23 +5237,27 @@ class TestTheCutoverIsProvenNotSampled:
     def test_a_commit_during_the_rebuild_is_detected_and_the_copy_discarded(
         self, tmp_path, monkeypatch
     ):
-        """THE CRITICAL, reproduced and then closed.
+        """A forgotten agent that wrote during the rebuild, caught.
 
         A real child process commits a row while the rebuild is between its
         `VACUUM INTO` and its swap, and exits before anything looks again --
-        the sequence both holder snapshots return `[]` for. The commit must
-        survive.
+        the sequence a holder snapshot returns `[]` for however many times it
+        is taken. The commit must survive.
 
-        Mutation: delete the `data_version` comparison from `_swap_in`. The
-        swap proceeds and `marker` is gone, which is exactly the reproduction
-        above.
+        This is the operator having been wrong about quiescence. It is not a
+        design for concurrent safety, and the refusal says so by name; the
+        point is that the mistake costs a refused rebuild rather than a
+        silently truncated database.
+
+        Mutation: delete the `current != version` comparison from
+        `_rebuild_locked`. The swap proceeds and `marker` is gone.
         """
         path = self._store(tmp_path / "racer.db")
         with _sqlite(path) as setup:
             setup.execute("CREATE TABLE marker (id text PRIMARY KEY)")
 
-        # Both holder lookups answer "idle", because in the real race both
-        # genuinely do: the writer has come and gone between them.
+        # The holder lookup answers "idle", because in the real sequence it
+        # genuinely does: the writer has come and gone inside the rebuild.
         monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
 
         real_prepare = opencode_gc._prepare_replacement
@@ -5257,179 +5322,109 @@ class TestTheCutoverIsProvenNotSampled:
         assert path.stat().st_size < before
         assert self._sessions(path) == 4
 
-    def test_a_writer_queued_across_the_rename_never_loses_its_commit(
+    def test_the_sidecars_are_cleared_before_the_rename_not_after(
         self, tmp_path, monkeypatch
     ):
-        """The window no check can cover: between the last look and the rename.
+        """The `-wal` describes the inode being RETIRED. If it outlives the
+        rename it is paired with the replacement, and SQLite replays it over
+        the new file -- a fixture where the source had advanced past the copy
+        read the source's rows back through the new database.
 
-        A real child process queues on the write lock while the swap runs. It
-        opened the OLD inode, so committing there after the rename would strand
-        the row on a file nothing can reach. Two mechanisms have to combine:
-        `BEGIN EXCLUSIVE` keeps it queued until the cutover has decided, and
-        the backup-name check then sees it holding the old inode and undoes the
-        rename -- so the writer wakes to find the original still at the live
-        path and its commit lands there.
+        Doing it before the rename is also what bounds a crash mid-swap: there
+        is no instant at which the new main file and the old `-wal` share the
+        `db-wal` name, because by the time the new file exists the sidecars are
+        already gone.
 
-        Mutation: remove the `BEGIN EXCLUSIVE` (and its ROLLBACK) and the
-        writer commits into the doomed inode mid-swap; remove the
-        backup-name straggler check and the rename stands over it. Either way
-        the final assertion finds `marker` empty.
+        Mutation: move the sidecar unlink to after `os.replace`. The recorded
+        order below inverts and this fails.
         """
-        path = self._store(tmp_path / "queued.db")
-        with _sqlite(path) as setup:
-            setup.execute("CREATE TABLE marker (id text PRIMARY KEY)")
+        path = self._store(tmp_path / "order.db")
+        wal = path.with_name(path.name + "-wal")
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
 
-        writer_state = {}
+        events = []
         real_replace = opencode_gc.os.replace
+        real_unlink = opencode_gc._unlink_quietly
 
-        def start_a_writer_then_rename(src, dst):
-            # Called from inside _swap_in, so BEGIN EXCLUSIVE is already held
-            # and data_version has already been compared. The writer therefore
-            # contends across the rename itself rather than before the rebuild.
-            # Only the first rename is hooked: the second is the rollback.
-            if "proc" in writer_state:
-                return real_replace(src, dst)
-            proc = subprocess.Popen(
-                [sys.executable, "-c", textwrap.dedent(f"""
-                    import sqlite3, time
-                    conn = sqlite3.connect({str(path)!r}, isolation_level=None,
-                                           timeout=60)
-                    conn.execute("SELECT count(*) FROM marker").fetchone()
-                    print("ready", flush=True)
-                    started = time.monotonic()
-                    conn.execute("INSERT INTO marker VALUES ('queued-writer')")
-                    conn.close()
-                    print(f"{{time.monotonic() - started:.3f}}", flush=True)
-                """)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            writer_state["proc"] = proc
-            assert proc.stdout.readline().strip() == "ready"
-            # Long enough for it to reach the INSERT and block on our lock.
-            time.sleep(0.6)
-            assert proc.poll() is None, (
-                "the writer must still be blocked; if it has already finished "
-                "it committed into the inode about to be replaced"
-            )
-            real_replace(src, dst)
+        def note_replace(src, dst):
+            events.append(("replace", Path(dst).name))
+            return real_replace(src, dst)
 
-        monkeypatch.setattr(opencode_gc.os, "replace", start_a_writer_then_rename)
+        def note_unlink(target):
+            if str(target).endswith(opencode_gc.SIDECAR_SUFFIXES):
+                events.append(("unlink-sidecar", Path(target).name))
+            return real_unlink(target)
+
+        # A real WAL to clear, held open so SQLite does not fold it for us.
+        attached = sqlite3.connect(str(path), isolation_level=None)
         try:
+            attached.execute("SELECT count(*) FROM session").fetchone()
+            with _sqlite(path) as writer:
+                writer.execute("DELETE FROM event WHERE aggregate_id='s0'")
+            assert wal.exists() and wal.stat().st_size > 0, \
+                "the fixture must really leave a WAL, or this proves nothing"
+
+            monkeypatch.setattr(opencode_gc.os, "replace", note_replace)
+            monkeypatch.setattr(opencode_gc, "_unlink_quietly", note_unlink)
             outcome = self._rebuild(path)
         finally:
             monkeypatch.undo()
-        proc = writer_state["proc"]
-        try:
-            waited = float(proc.stdout.readline().strip())
-        finally:
-            proc.wait(timeout=30)
-
-        assert proc.returncode == 0, proc.stderr.read()
-        assert waited >= 0.5, (
-            "the writer must have been genuinely blocked by the exclusive lock, "
-            f"not merely invoked; it waited {waited}s"
-        )
-        assert outcome.completed is False, (
-            "a writer holding the old inode must send the swap back"
-        )
-        assert "rolled back" in (outcome.skipped or "")
-        assert str(proc.pid) in outcome.skipped
-
-        with _sqlite(path) as check:
-            rows = check.execute("SELECT id FROM marker").fetchall()
-        assert rows == [("queued-writer",)], (
-            "a writer queued across the swap must not lose its commit to a "
-            f"replaced inode; got {rows}"
-        )
-        assert not path.with_name(
-            path.name + opencode_gc.REBUILD_BACKUP_SUFFIX
-        ).exists()
-
-    def test_a_straggler_on_the_old_inode_rolls_the_rename_back(
-        self, tmp_path, monkeypatch
-    ):
-        """A process that attached before the rename keeps the old inode alive
-        and would keep writing to a file nothing can reach.
-
-        It is detected against the BACKUP name, after the rename: by then the
-        old inode has exactly one pathname, and nothing else on the host knows
-        it, so the holder set is closed and cannot grow. That is what makes
-        this a proof rather than another sample -- and the rename is undone,
-        restoring the original at the live path with the straggler's writes.
-
-        Mutation: check `db_holders(db)` instead of `db_holders(backup)`. After
-        the rename that path is the NEW inode, the straggler is invisible on
-        it, and the swap stands.
-        """
-        path = self._store(tmp_path / "straggler.db")
-        original = path.read_bytes()
-        original_inode = path.stat().st_ino
-        state = {}
-
-        # The straggler attaches during the rebuild, after the pre-filter has
-        # already seen an idle database -- which is the whole scenario. A child
-        # started before it would simply be turned away by the pre-filter and
-        # the cutover would never be exercised.
-        real_prepare = opencode_gc._prepare_replacement
-
-        def attach_mid_rebuild(target, source_stat, journal_mode):
-            state["stack"] = contextlib.ExitStack()
-            state["child"] = state["stack"].enter_context(_holder_process(path))
-            return real_prepare(target, source_stat, journal_mode)
-
-        monkeypatch.setattr(opencode_gc, "_prepare_replacement", attach_mid_rebuild)
-        try:
-            # Real lsof, real child: no scripted holder sequence at all.
-            outcome = self._rebuild(path)
-            child = state["child"]
-
-            assert outcome.completed is False
-            assert outcome.skipped is not None
-            assert "rolled back" in outcome.skipped
-            assert str(child.pid) in outcome.skipped, (
-                f"the straggler must be named; got {outcome.skipped}"
-            )
-        finally:
-            monkeypatch.undo()
-            if "stack" in state:
-                state["stack"].close()
-
-        assert path.stat().st_ino == original_inode, (
-            "the rename must be undone, restoring the original inode"
-        )
-        assert path.read_bytes() == original
-        assert not path.with_name(
-            path.name + opencode_gc.REBUILD_BACKUP_SUFFIX
-        ).exists()
-        assert not path.with_name(path.name + opencode_gc.REBUILD_SUFFIX).exists()
-
-    def test_a_process_attaching_after_the_rename_is_not_a_straggler(
-        self, tmp_path, monkeypatch
-    ):
-        """The complement, and the reason the backup-name check is sound: a
-        process that opens the database after the rename gets the NEW inode,
-        so it never appears against the backup name and must not veto a swap
-        that is already correct for it.
-        """
-        path = self._store(tmp_path / "latecomer.db")
-        monkeypatch.setattr(opencode_gc, "db_holders", opencode_gc.db_holders)
-        opened = {}
-        real_replace = opencode_gc.os.replace
-
-        def attach_after_rename(src, dst):
-            real_replace(src, dst)
-            opened["child"] = contextlib.ExitStack()
-            opened["holder"] = opened["child"].enter_context(_holder_process(Path(dst)))
-
-        monkeypatch.setattr(opencode_gc.os, "replace", attach_after_rename)
-        try:
-            outcome = self._rebuild(path)
-        finally:
-            monkeypatch.undo()
-            if "child" in opened:
-                opened["child"].close()
+            attached.close()
 
         assert outcome.completed is True, outcome.skipped or outcome.failure
+        kinds = [kind for kind, _ in events]
+        assert "unlink-sidecar" in kinds, "the sidecars must be cleared at all"
+        assert "replace" in kinds
+        assert kinds.index("unlink-sidecar") < kinds.index("replace"), (
+            "every sidecar must be removed before the rename, or the new main "
+            f"file shares a -wal namespace with the old one: {events}"
+        )
+        assert not wal.exists(), "no WAL may survive the swap"
+
+    def test_a_wal_that_cannot_be_folded_stops_the_swap_before_any_unlink(
+        self, tmp_path, monkeypatch
+    ):
+        """Clearing the sidecars before the rename is only safe because the WAL
+        is empty by then: the caller folds it with a TRUNCATE checkpoint and
+        refuses if a single frame could not move.
+
+        Without that refusal the unlink would destroy committed frames. This
+        pins the dependency -- an unfoldable WAL must stop the swap while the
+        sidecars are still on disk.
+
+        Mutation: drop the `if folded.busy:` refusal from `_rebuild_locked`.
+        The 200 `unfoldable` rows below are then deleted with the -wal.
+        """
+        path = self._store(tmp_path / "unfoldable.db")
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+
+        pin = sqlite3.connect(str(path), isolation_level=None)
+        try:
+            pin.execute("BEGIN")
+            pin.execute("SELECT count(*) FROM session").fetchone()
+            with _sqlite(path) as writer:
+                for i in range(200):
+                    writer.execute(
+                        "INSERT INTO todo (session_id, content, position) "
+                        "VALUES ('s0','unfoldable',?)", (40_000 + i,)
+                    )
+            outcome = self._rebuild(path)
+
+            assert outcome.completed is False
+            assert "WAL could not be fully folded" in (outcome.skipped or "")
+        finally:
+            pin.close()
+
+        with _sqlite(path) as check:
+            assert check.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert check.execute(
+                "SELECT count(*) FROM todo WHERE content='unfoldable'"
+            ).fetchone()[0] == 200, (
+                "rows committed into the unfoldable tail must survive"
+            )
+        assert self._sessions(path) == 12
+
+
 
     def test_the_source_journal_mode_survives_the_rebuild(self, tmp_path, monkeypatch):
         """`VACUUM INTO` writes its output in the default DELETE mode whatever
@@ -5536,31 +5531,31 @@ class TestTheCutoverIsProvenNotSampled:
         assert stat.S_IMODE(path.stat().st_mode) == source_mode
 
     @pytest.mark.parametrize("failure_point", ["replace", "fsync", "backup"])
-    def test_every_partial_swap_failure_leaves_a_recoverable_database(
+    def test_every_failure_before_the_rename_leaves_a_recoverable_database(
         self, tmp_path, monkeypatch, failure_point
     ):
-        """The second Critical: the old sequence unlinked the -wal and -shm
-        BEFORE `os.replace`, so an OSError from the -shm unlink or from the
-        rename left the original main file at the live path with its WAL
-        already deleted -- every WAL-only-committed transaction lost, on a
-        HANDLED error path rather than a crash.
+        """Nothing is destroyed until the replacement is durably in place.
 
-        Nothing is destroyed here until the replacement is durably in place.
-        Whatever fails, the live pathname must still open and still hold every
-        committed row.
+        The rename is the last mutating step, so every failure up to and
+        including it leaves a complete database at the live pathname -- and
+        `os.replace` is atomic, so even the rename itself leaves either the
+        whole old file or the whole new one.
 
-        Mutation: restore the old ordering -- unlink the sidecars, then
-        replace. The `replace` case then finds a database missing its WAL.
+        The commit below exists only in the WAL when the swap begins, which is
+        the case that used to be lost: an earlier ordering unlinked the
+        sidecars while they still carried committed frames, so a HANDLED
+        OSError from the rename destroyed every WAL-only transaction. The
+        current order folds the WAL first and refuses if it cannot, so by the
+        time anything is unlinked those frames are in the main file.
+
+        Mutation: move the `checkpoint_wal(conn, "TRUNCATE")` fold to after
+        `_swap_in`. The sidecars are then cleared while they still carry
+        `committed-in-wal`, and the `replace` case loses it.
         """
         path = self._store(tmp_path / f"fail_{failure_point}.db")
         with _sqlite(path) as setup:
             setup.execute("CREATE TABLE marker (id text PRIMARY KEY)")
 
-        # A commit that exists only in the WAL when the swap begins. The
-        # protocol folds it into the main file BEFORE preserving anything, so
-        # the preserved old database is self-contained -- but the old code
-        # unlinked the WAL carrying it and only then attempted the rename.
-        #
         # `keeper` stays open across the whole rebuild: SQLite folds and deletes
         # the WAL when the LAST connection closes, so a fixture that closed
         # everything first would have no WAL left and would pass against an
@@ -5606,51 +5601,71 @@ class TestTheCutoverIsProvenNotSampled:
         finally:
             keeper.close()
 
-    def test_a_source_wal_that_cannot_be_folded_stops_the_swap(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("failure_point", ["dir-fsync", "backup-unlink"])
+    def test_a_failure_after_the_rename_is_an_error_naming_both_files(
+        self, tmp_path, monkeypatch, capsys, failure_point
     ):
-        """The preserved old file has to be self-contained. A reader pinning an
-        older snapshot means the WAL still carries committed frames, so
-        "preserving the old database" would preserve a main file whose tail is
-        in a sidecar about to be removed.
+        """Once `os.replace` has landed, the replacement IS the database, and
+        nothing after it may be reported as a skip.
 
-        Mutation: drop the `if folded.busy:` refusal. The swap proceeds against
-        a source whose WAL was never fully folded, and the rows written into the
-        unfoldable tail are not in the copy that replaces it.
+        A skip means "untouched, try again later" and exits 0. Here the swap
+        has happened: the directory entry may not be durable, or the preserved
+        original is still sitting at `.rebuild-old` where it will refuse every
+        later rebuild. Both need the operator, so both must be errors that exit
+        non-zero and NAME the two files involved.
+
+        Mutation: report either branch with `outcome.skipped` instead of
+        `outcome.failure` -- the shape the old rollback path had. The exit
+        status silently becomes 0 and the operator is never told.
         """
-        path = self._store(tmp_path / "unfolded.db")
+        path = self._store(tmp_path / f"after_{failure_point}.db")
         monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+        backup = path.with_name(path.name + opencode_gc.REBUILD_BACKUP_SUFFIX)
 
-        pin = sqlite3.connect(str(path), isolation_level=None)
-        try:
-            pin.execute("BEGIN")
-            pin.execute("SELECT count(*) FROM session").fetchone()
-            with _sqlite(path) as writer:
-                for i in range(200):
-                    writer.execute(
-                        "INSERT INTO todo (session_id, content, position) "
-                        "VALUES ('s0','unfoldable',?)", (40_000 + i,)
-                    )
-            outcome = self._rebuild(path)
+        real_fsync = opencode_gc._fsync_path
+        real_unlink = opencode_gc.Path.unlink
 
-            assert outcome.completed is False
-            assert "WAL could not be fully folded" in (outcome.skipped or "")
-        finally:
-            pin.close()
+        def fail_on_the_directory(target):
+            if Path(target).is_dir():
+                raise OSError(5, "injected I/O error")
+            return real_fsync(target)
 
-        # Not a byte comparison: a partial checkpoint legitimately moves some
-        # frames into the main file, so the bytes change while the DATA must
-        # not. Every row written into the unfoldable tail has to still be there.
+        def fail_on_the_backup(self, **kw):
+            # Only the backup removal: the rebuild legitimately unlinks the
+            # temporary copy earlier, and failing that never reaches the rename.
+            if self.name.endswith(opencode_gc.REBUILD_BACKUP_SUFFIX):
+                raise OSError(5, "injected I/O error")
+            return real_unlink(self, **kw)
+
+        if failure_point == "dir-fsync":
+            monkeypatch.setattr(opencode_gc, "_fsync_path", fail_on_the_directory)
+        else:
+            monkeypatch.setattr(opencode_gc.Path, "unlink", fail_on_the_backup)
+
+        rc, payload = _run_rebuild_cli(
+            monkeypatch, capsys, "--db", str(path),
+            opencode_gc.CONFIRM_FLAG, "--min-free-gib", "0",
+        )
+        monkeypatch.undo()
+
+        assert rc == 1, (
+            "a failure after the rename must exit non-zero: the swap happened "
+            "and only the operator can finish it"
+        )
+        assert payload["skipped"] is None, (
+            "this is not 'untouched, try again' -- the replacement is installed"
+        )
+        assert payload["errors"], "the operator must be told"
+        message = " ".join(payload["errors"])
+        assert str(path) in message, f"the live path must be named: {message}"
+        assert str(backup) in message, f"the preserved original must be named: {message}"
+
+        # The replacement really is installed, which is what makes the above
+        # the right reporting rather than pedantry.
         with _sqlite(path) as check:
             assert check.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-            assert check.execute(
-                "SELECT count(*) FROM todo WHERE content='unfoldable'"
-            ).fetchone()[0] == 200
-        assert self._sessions(path) == 12
-        assert not path.with_name(path.name + opencode_gc.REBUILD_SUFFIX).exists()
-        assert not path.with_name(
-            path.name + opencode_gc.REBUILD_BACKUP_SUFFIX
-        ).exists()
+            assert check.execute("SELECT count(*) FROM session").fetchone()[0] == 12
+
 
     def test_a_leftover_backup_stops_the_rebuild_rather_than_overwriting_it(
         self, tmp_path, monkeypatch
@@ -5676,9 +5691,9 @@ class TestTheCutoverIsProvenNotSampled:
 
 
 class TestOnlyOneRebuildRunsAtATime:
-    """Two `--rebuild` invocations share one `.rebuild-tmp` path and would each
-    destroy the other's copy mid-write. A manual run landing on top of a timed
-    one is the ordinary way that happens.
+    """Two rebuilds share one `.rebuild-tmp` path and would each destroy the
+    other's copy mid-write. Two terminals, or an impatient second invocation,
+    is the ordinary way that happens.
     """
 
     def _store(self, path):
@@ -5958,25 +5973,25 @@ class TestRebuildIsBounded:
         self, tmp_path, monkeypatch, capsys
     ):
         """A guard that fired did its job: the database is untouched and a
-        later run may succeed. Reporting it as an error would page someone
-        every five minutes for a working safety valve.
+        later run may succeed. Reporting it as an error would make a working
+        safety valve look like a fault.
 
-        Mutation: in main, `res.errors.append(...)` for `rb.skipped` instead of
-        `res.notes.append(...)`. The exit status then becomes 1.
+        Mutation: in `_rebuild_command`, route `outcome.skipped` into
+        `report.errors` instead of `report.skipped`. The exit status then
+        becomes 1.
         """
         path = self._big_store(tmp_path / "skipzero.db", sessions=40)
         monkeypatch.setattr(opencode_gc, "db_holders", lambda db: ["31337"])
 
-        rc, payload = _run_json_cli(
-            monkeypatch, capsys, "--db", str(path), "--apply", "--rebuild",
-            "--batch-sleep-ms", "0", "--retention-days", "9999",
+        rc, payload = _run_rebuild_cli(
+            monkeypatch, capsys, "--db", str(path),
+            opencode_gc.CONFIRM_FLAG, "--min-free-gib", "0",
         )
 
         assert rc == 0, "a skipped rebuild is not an error"
         assert payload["errors"] == []
-        assert payload["rebuild_completed"] is False
-        assert "hold the database" in payload["rebuild_skipped"]
-        assert any("--rebuild did not run" in n for n in payload["notes"])
+        assert payload["completed"] is False
+        assert "still hold the database" in payload["skipped"]
 
 
 class _Usage:
@@ -6277,19 +6292,122 @@ class TestNewFlagsAndDefaults:
         return path
 
     def test_help_lists_the_new_flags_and_keeps_the_old_ones(self, monkeypatch, capsys):
+        """The top-level help must make the two commands and their difference
+        visible, and `prune --help` must still offer every existing flag."""
         monkeypatch.setattr(opencode_gc.sys, "argv", ["opencode-gc", "--help"])
         with pytest.raises(SystemExit) as exit_info:
             opencode_gc.main()
         assert exit_info.value.code == 0
 
         out = capsys.readouterr().out
-        for flag in ("--rebuild", "--rebuild-max-seconds", "--rebuild-min-free-gib",
-                     "--batch-sleep-ms"):
-            assert flag in out, f"{flag} must be documented"
-        for flag in ("--retention-days", "--apply", "--batch", "--max-seconds",
-                     "--vacuum-pages", "--no-vacuum", "--enable-incremental-vacuum",
-                     "--json", "--db"):
-            assert flag in out, f"the existing flag {flag} must still be offered"
+        assert opencode_gc.PRUNE_COMMAND in out
+        assert opencode_gc.REBUILD_COMMAND in out
+        assert "MANUAL ONLY" in out, (
+            "the top-level help must say the rebuild is not automatic"
+        )
+        assert opencode_gc.CONFIRM_FLAG in out
+
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", opencode_gc.PRUNE_COMMAND, "--help"],
+        )
+        with pytest.raises(SystemExit):
+            opencode_gc.main()
+        prune_help = capsys.readouterr().out
+        for flag in ("--retention-days", "--apply", "--batch", "--batch-sleep-ms",
+                     "--max-seconds", "--vacuum-pages", "--no-vacuum",
+                     "--enable-incremental-vacuum", "--json", "--db"):
+            assert flag in prune_help, f"the existing flag {flag} must still be offered"
+
+    def test_the_rebuild_help_states_the_quiescence_requirement(
+        self, monkeypatch, capsys
+    ):
+        """Definition of done: `--help` must make it obvious that the rebuild
+        is manual and requires quiescence, without the operator having to read
+        the README to find out."""
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", opencode_gc.REBUILD_COMMAND, "--help"],
+        )
+        with pytest.raises(SystemExit) as exit_info:
+            opencode_gc.main()
+        assert exit_info.value.code == 0
+
+        out = capsys.readouterr().out
+        assert "REQUIRES A QUIESCENT DATABASE" in out
+        assert "Stop opencode" in out
+        assert opencode_gc.CONFIRM_FLAG in out
+        assert "--dry-run" in out
+        assert "timer" in out, "it must say not to automate it"
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--apply"],
+            ["--apply", "--rebuild"],
+            ["--rebuild"],
+            ["--apply", "--enable-incremental-vacuum"],
+            [opencode_gc.PRUNE_COMMAND, "--apply", "--rebuild"],
+            ["--apply", "--yes-nothing-is-using-it"],
+        ],
+    )
+    def test_no_prune_invocation_can_reach_the_rebuild(
+        self, anydb, monkeypatch, capsys, argv
+    ):
+        """The core of the scope cut: nothing unattended may rebuild.
+
+        A timer runs the prune. If any combination of prune flags could reach
+        `rebuild_database`, the file could be replaced while opencode was live
+        -- which is the precondition violation the whole design now rests on
+        avoiding. `--rebuild` no longer exists on this path and must be a parse
+        error rather than a silently ignored token.
+
+        Mutation: add a `--rebuild` flag back to the prune parser that calls
+        `rebuild_database`. The first case to pass parsing then trips the spy.
+        """
+        called = []
+        monkeypatch.setattr(
+            opencode_gc, "rebuild_database",
+            lambda *a, **kw: called.append(a) or opencode_gc.RebuildOutcome(),
+        )
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", *argv, "--db", str(anydb), "--batch-sleep-ms", "0"],
+        )
+        try:
+            opencode_gc.main()
+        except SystemExit as exc:
+            # argparse rejecting an unknown flag is the desired outcome for the
+            # cases that carry one; it is never exit 0 with a rebuild done.
+            assert exc.code == 2, f"{argv} exited {exc.code}"
+        capsys.readouterr()
+
+        assert called == [], (
+            f"`opencode-gc {' '.join(argv)}` reached the rebuild; no prune "
+            "invocation may, because the prune is what runs unattended"
+        )
+
+    def test_the_rebuild_subcommand_does_reach_it(
+        self, anydb, monkeypatch, capsys
+    ):
+        """The complement, so the test above is a property of the prune surface
+        and not of a spy that never fires."""
+        called = []
+        monkeypatch.setattr(
+            opencode_gc, "rebuild_database",
+            lambda *a, **kw: called.append(a) or opencode_gc.RebuildOutcome(
+                attempted=True, completed=True
+            ),
+        )
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+
+        rc, _ = _run_rebuild_cli(
+            monkeypatch, capsys, "--db", str(anydb), opencode_gc.CONFIRM_FLAG,
+        )
+
+        assert rc == 0
+        assert len(called) == 1, "the named subcommand must reach the rebuild"
 
     def test_retention_defaults_to_four_days(self, anydb, monkeypatch, capsys):
         """Márcio's call; the cutoff is what actually decides, so it is what is
@@ -6328,20 +6446,11 @@ class TestNewFlagsAndDefaults:
         "flag, value",
         [
             ("--batch-sleep-ms", "-1"),
-            ("--rebuild-max-seconds", "0"),      # unbounded is the incident
-            ("--rebuild-max-seconds", "-5"),
-            ("--rebuild-max-seconds", "nan"),
-            ("--rebuild-min-free-gib", "-1"),
-            ("--rebuild-min-free-gib", "nan"),
         ],
     )
     def test_invalid_new_bounds_are_refused_without_touching_the_db(
         self, anydb, monkeypatch, capsys, flag, value
     ):
-        """Mutation: drop the `--rebuild-max-seconds must be finite and > 0`
-        check. `0` is then accepted and the guard's deadline is `now`, or
-        worse, never trips.
-        """
         before = _snapshot(anydb, tables=("session",))
         monkeypatch.setattr(
             opencode_gc.sys, "argv",
@@ -6353,16 +6462,148 @@ class TestNewFlagsAndDefaults:
         assert flag in capsys.readouterr().err
         assert _snapshot(anydb, tables=("session",)) == before
 
-    def test_rebuild_needs_apply(self, anydb, monkeypatch, capsys):
-        """A dry run must never rewrite the file, whatever else is asked for."""
+    @pytest.mark.parametrize(
+        "flag, value",
+        [
+            ("--max-seconds", "0"),        # unbounded is the 2026-09-12 incident
+            ("--max-seconds", "-5"),
+            ("--max-seconds", "nan"),
+            ("--min-free-gib", "-1"),
+            ("--min-free-gib", "nan"),
+        ],
+    )
+    def test_invalid_rebuild_bounds_are_refused_without_touching_the_db(
+        self, anydb, monkeypatch, capsys, flag, value
+    ):
+        """Mutation: drop the `--max-seconds must be finite and > 0` check from
+        `_rebuild_command`. `0` is then accepted and the guard's deadline is
+        `now` -- or with NaN, never trips at all, which is the 23-minute
+        runaway.
+        """
         before = anydb.read_bytes()
-        rc, payload = _run_json_cli(
-            monkeypatch, capsys, "--db", str(anydb), "--rebuild"
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", opencode_gc.REBUILD_COMMAND, "--db", str(anydb),
+             opencode_gc.CONFIRM_FLAG, flag, value],
         )
-        assert rc == 0
-        assert payload["rebuild_attempted"] is False
-        assert any("--rebuild needs --apply" in n for n in payload["notes"])
+        with pytest.raises(SystemExit) as exit_info:
+            opencode_gc.main()
+        assert exit_info.value.code == 2
+        assert flag in capsys.readouterr().err
         assert anydb.read_bytes() == before
+
+    def test_the_rebuild_refuses_without_the_confirmation(
+        self, anydb, monkeypatch, capsys
+    ):
+        """No default-yes. An operator who has not stated the precondition gets
+        a refusal that names the flag and points at --dry-run.
+
+        Mutation: drop the `if not args.confirmed and not args.dry_run` branch.
+        A bare `opencode-gc rebuild` then rebuilds, which is exactly the stray
+        script this flag exists to stop.
+        """
+        before = anydb.read_bytes()
+        monkeypatch.setattr(
+            opencode_gc, "rebuild_database",
+            lambda *a, **kw: pytest.fail("an unconfirmed rebuild must not run"),
+        )
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", opencode_gc.REBUILD_COMMAND, "--db", str(anydb)],
+        )
+
+        rc = opencode_gc.main()
+
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert opencode_gc.CONFIRM_FLAG in err, "the refusal must name the flag"
+        assert "--dry-run" in err, "and offer the safe alternative"
+        assert "nothing else has it open" in err
+        assert anydb.read_bytes() == before
+
+    def test_the_confirmation_and_dry_run_are_mutually_exclusive(
+        self, anydb, monkeypatch, capsys
+    ):
+        """Asking for both is ambiguous about intent, and the ambiguity is
+        about whether the file gets replaced. Refuse rather than pick."""
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", opencode_gc.REBUILD_COMMAND, "--db", str(anydb),
+             opencode_gc.CONFIRM_FLAG, "--dry-run"],
+        )
+        with pytest.raises(SystemExit) as exit_info:
+            opencode_gc.main()
+        assert exit_info.value.code == 2
+        assert "mutually exclusive" in capsys.readouterr().err
+
+    def test_a_dry_run_rebuild_touches_nothing_and_reports_the_saving(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """`--dry-run` must preview the reclaim without writing. It reports the
+        current size, the live bytes and the expected saving, from the same
+        preflight the real run uses.
+
+        Mutation: let `--dry-run` fall through to `rebuild_database`. The
+        fixture's inode changes and this fails.
+        """
+        path = tmp_path / "preview.db"
+        conn = _make_live_db(path)
+        conn.execute("BEGIN")
+        for i in range(60):
+            _add_live_session(conn, f"s{i}", age_days=30, events=40, messages=6)
+        conn.execute("COMMIT")
+        conn.close()
+        # Free a large chunk, so live is genuinely smaller than the file.
+        gc_conn = opencode_gc.connect(path, read_only=False)
+        opencode_gc.delete_sessions(
+            gc_conn, [f"s{i}" for i in range(50)], cutoff_ms=_cutoff(), batch=25,
+            deadline=None,
+        )
+        gc_conn.close()
+        before = path.read_bytes()
+        inode = path.stat().st_ino
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
+
+        rc, payload = _run_rebuild_cli(
+            monkeypatch, capsys, "--db", str(path), "--dry-run",
+            "--min-free-gib", "0",
+        )
+
+        assert rc == 0
+        assert payload["dry_run"] is True
+        assert payload["completed"] is False
+        assert payload["attempted"] is False
+        assert payload["skipped"] is None, payload["skipped"]
+        assert payload["bytes_before"] > 0
+        assert 0 < payload["live_bytes"] < payload["bytes_before"], (
+            "the preview must show live bytes below the file size, or there is "
+            f"nothing to reclaim to report: {payload}"
+        )
+        assert payload["expected_reclaim"] == (
+            payload["bytes_before"] - payload["live_bytes"]
+        )
+        assert path.read_bytes() == before, "a dry run must not write"
+        assert path.stat().st_ino == inode, "and must not replace the file"
+
+    def test_a_dry_run_reports_the_refusal_the_real_run_would_hit(
+        self, anydb, monkeypatch, capsys
+    ):
+        """The preview is only useful if it shares the preflight: an operator
+        checking before they stop opencode should be told it is held.
+
+        Mutation: have `--dry-run` skip `rebuild_preflight`. The holder is then
+        not reported and the preview implies a rebuild would work.
+        """
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: ["4242"])
+
+        rc, payload = _run_rebuild_cli(
+            monkeypatch, capsys, "--db", str(anydb), "--dry-run",
+            "--min-free-gib", "0",
+        )
+
+        assert rc == 0, "a preview that finds a holder is not an error"
+        assert "still hold the database" in (payload["skipped"] or "")
+        assert "4242" in payload["skipped"]
 
     def test_a_dry_run_asks_nothing_of_lsof(self, anydb, monkeypatch, capsys):
         """A dry run holds a read-only handle and neither checkpoints nor
@@ -6378,17 +6619,18 @@ class TestNewFlagsAndDefaults:
 
 
 class TestRebuildEndToEnd:
-    """The CLI path: prune, reclaim, checkpoint, then rebuild -- which is the
-    order that makes a store too big to rebuild before a prune small enough to
-    rebuild after one. macmini pre-prune needed ~64 GiB for a plain VACUUM
-    against 14 GiB free and was correctly refused; post-prune live is 6.2 GiB,
-    so VACUUM INTO needs ~6.5 GiB against 13 GiB. It fits.
+    """The two commands in the order an operator runs them: prune while
+    opencode is live, then stop opencode and rebuild. That order is what makes
+    a store too big to rebuild small enough to rebuild -- macmini pre-prune
+    needed ~64 GiB for a plain VACUUM against 14 GiB free and was correctly
+    refused; post-prune live is 6.2 GiB, so VACUUM INTO needs ~6.5 GiB against
+    13 GiB. It fits.
     """
 
     def test_prune_then_rebuild_actually_shrinks_the_file(
         self, tmp_path, monkeypatch, capsys
     ):
-        """Mutation: drop the `--rebuild` handling from main. The file then
+        """Mutation: drop the `_swap_in` call from `_rebuild_locked`. The file
         stays at its pre-prune size, because incremental reclamation alone
         cannot return a freelist this large in one pass.
         """
@@ -6404,19 +6646,35 @@ class TestRebuildEndToEnd:
         before = path.stat().st_size
 
         monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
-        rc, payload = _run_json_cli(
-            monkeypatch, capsys, "--db", str(path), "--apply", "--rebuild",
-            "--batch-sleep-ms", "0", "--rebuild-min-free-gib", "0",
+        # `--no-vacuum` stands in for the macmini shape: a freelist far larger
+        # than incremental reclamation can drain in a run (~10-20 MB/min, so
+        # ~90-108 hours for 55 GiB). The pages are free but still in the file,
+        # which is the state the rebuild exists for.
+        rc, prune = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply",
+            "--batch-sleep-ms", "0", "--no-vacuum",
+        )
+        assert rc == 0, prune["errors"]
+        assert prune["sessions_deleted"] == 150
+        assert path.stat().st_size >= before * 0.9, (
+            "the prune alone must NOT have shrunk the file here, or the "
+            "rebuild below is reclaiming nothing"
+        )
+
+        # The operator stops opencode, then rebuilds.
+        rc, payload = _run_rebuild_cli(
+            monkeypatch, capsys, "--db", str(path), opencode_gc.CONFIRM_FLAG,
+            "--min-free-gib", "0",
         )
 
         assert rc == 0, payload["errors"]
-        assert payload["sessions_deleted"] == 150
-        assert payload["rebuild_completed"] is True
-        assert payload["rebuild_skipped"] is None
+        assert payload["completed"] is True
+        assert payload["skipped"] is None
 
         after = path.stat().st_size
         assert after < before, f"the file must shrink: {before} -> {after}"
         assert payload["bytes_after"] < payload["bytes_before"]
+        assert payload["bytes_reclaimed"] > 0
 
         # The survivors and their children are all still there and intact.
         check = sqlite3.connect(str(path))
@@ -6431,10 +6689,11 @@ class TestRebuildEndToEnd:
         finally:
             check.close()
 
-    def test_an_existing_run_without_rebuild_is_unchanged(
+    def test_a_prune_never_replaces_the_file(
         self, tmp_path, monkeypatch, capsys
     ):
-        """The whole change is additive: without --rebuild nothing rewrites."""
+        """The prune is the unattended path and must leave the inode alone: it
+        deletes rows and reclaims pages in place, and nothing more."""
         path = tmp_path / "norebuild.db"
         conn = _make_live_db(path)
         for i in range(20):
@@ -6449,11 +6708,9 @@ class TestRebuildEndToEnd:
 
         assert rc == 0
         assert payload["sessions_deleted"] == 20
-        assert payload["rebuild_attempted"] is False
-        assert payload["rebuild_completed"] is False
         assert path.stat().st_ino == inode, "the file must not be replaced"
 
-    def test_a_rebuild_is_skipped_on_a_non_incremental_store(
+    def test_a_rebuild_is_refused_on_a_non_incremental_store(
         self, tmp_path, monkeypatch, capsys
     ):
         """A copy inherits the source's auto_vacuum, so rebuilding a NONE store
@@ -6466,14 +6723,14 @@ class TestRebuildEndToEnd:
         conn.close()
 
         monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
-        rc, payload = _run_json_cli(
-            monkeypatch, capsys, "--db", str(path), "--apply", "--rebuild",
-            "--batch-sleep-ms", "0",
+        rc, payload = _run_rebuild_cli(
+            monkeypatch, capsys, "--db", str(path), opencode_gc.CONFIRM_FLAG,
+            "--min-free-gib", "0",
         )
 
         assert rc == 0
-        assert payload["rebuild_completed"] is False
-        assert "auto_vacuum is NONE" in payload["rebuild_skipped"]
+        assert payload["completed"] is False
+        assert "auto_vacuum is NONE" in payload["skipped"]
         assert payload["errors"] == []
 
 
@@ -6572,9 +6829,9 @@ class TestTodoOrphanProvenance:
 
 
 class TestRebuildFailureIsReportedNotRaised:
-    """The rebuild runs after the deletes are already committed, so nothing it
-    does may escape as a traceback: an operator deciding what to restore needs
-    the counts far more than a stack trace.
+    """The rebuild is a destructive file operation an operator watches, so
+    nothing it does may escape as a traceback: what went wrong, and whether the
+    replacement is installed, is what they need to decide what to do next.
     """
 
     def _store(self, path, sessions=30):
@@ -6584,15 +6841,14 @@ class TestRebuildFailureIsReportedNotRaised:
         conn.close()
         return path
 
-    def test_an_interrupt_during_the_rebuild_still_reports_the_deletions(
+    def test_an_interrupt_during_the_rebuild_is_reported_not_raised(
         self, tmp_path, monkeypatch, capsys
     ):
-        """Ctrl-C is how an operator stops a long rebuild, and by then the
-        prune has already committed.
+        """Ctrl-C is how an operator stops a long rebuild.
 
-        Mutation: drop the `except (KeyboardInterrupt, OSError)` around
-        `_run_rebuild` in main. The interrupt then escapes and the committed
-        deletions are reported nowhere.
+        Mutation: drop the `except (KeyboardInterrupt, OSError, ...)` around
+        `rebuild_database` in `_rebuild_command`. The interrupt escapes as a
+        traceback and the exit status becomes 130, which no report produces.
         """
         path = self._store(tmp_path / "interrupt.db")
 
@@ -6602,16 +6858,17 @@ class TestRebuildFailureIsReportedNotRaised:
         monkeypatch.setattr(opencode_gc, "db_holders", lambda db: [])
         monkeypatch.setattr(opencode_gc, "rebuild_database", interrupting)
 
-        rc, payload = _run_json_cli(
-            monkeypatch, capsys, "--db", str(path), "--apply", "--rebuild",
-            "--batch-sleep-ms", "0",
+        rc, payload = _run_rebuild_cli(
+            monkeypatch, capsys, "--db", str(path), opencode_gc.CONFIRM_FLAG,
+            "--min-free-gib", "0",
         )
 
         assert rc == 1
-        assert payload["sessions_deleted"] == 30, \
-            "the committed deletions must still be reported"
+        assert payload["completed"] is False
         assert any("KeyboardInterrupt" in e for e in payload["errors"])
-        assert len(_snapshot(path, tables=("session",))["session"]) == 0
+        # The database is untouched: the interrupt landed before any swap.
+        with _sqlite(path) as check:
+            assert check.execute("SELECT count(*) FROM session").fetchone()[0] == 30
 
     def test_an_interrupt_inside_vacuum_into_removes_the_partial_copy(
         self, tmp_path, monkeypatch

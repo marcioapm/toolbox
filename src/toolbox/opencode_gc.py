@@ -50,25 +50,35 @@ writers, and a writer that exhausts its own `busy_timeout` against us dies with
 anything else holds the database: PASSIVE whenever it might, TRUNCATE only when
 nothing does.
 
-RECLAIM IN PLACE, REBUILD ONLY WHEN IDLE
-----------------------------------------
+RECLAIM IN PLACE; REBUILD BY HAND, AGAINST A QUIESCENT DATABASE
+---------------------------------------------------------------
 `PRAGMA incremental_vacuum` relocates pages one at a time with pointer-map
 updates, and measures at ~10-20 MB/min (2,141 pages in 60.7s on vibes; 1,891
 pages in 62.1s on macmini). Draining a 55 GiB freelist at that rate takes
 ~90-108 hours: it is a trickle that keeps a pruned database from growing, not a
 way to shrink one that already has.
 
-`--rebuild` is. `VACUUM INTO` writes only the compacted copy, so it needs
-live-size plus a margin rather than the 2x a plain `VACUUM` needs -- the
-distinction that makes a 32 GiB file with 6.2 GiB live reclaimable on 13 GiB of
-free disk. It is also the dangerous pass. Its cutover does not rest on holder
-snapshots: `lsof` cannot tell you whether anyone COMMITTED during a rebuild,
-only who was attached at one instant, and a writer that opens and exits inside
-the window is invisible to any number of such checks while its transaction is
-absent from the copy. Instead `PRAGMA data_version` detects the commit,
-`BEGIN EXCLUSIVE` held across the rename excludes writers from the window no
-check can cover, and the old inode is hard-linked aside so the processes still
-holding it can be named exactly. See `_swap_in`.
+The `rebuild` subcommand is. `VACUUM INTO` writes only the compacted copy, so
+it needs live-size plus a margin rather than the 2x a plain `VACUUM` needs --
+the distinction that makes a 32 GiB file with 6.2 GiB live reclaimable on 13
+GiB of free disk.
+
+It is a separate subcommand, and not a flag on the prune, because replacing a
+database file safely WHILE ANOTHER PROCESS IS WRITING TO IT is a problem this
+tool does not solve. Three designs were attempted and each produced Criticals:
+a writer's commit landing in the replacement's `-wal` after the lock was
+dropped; stragglers that opened the replacement after the first rename; a
+pre-existing hard link making "the old inode has exactly one pathname" false;
+and process death between the rename and the cleanup leaving two main files
+sharing one `db-wal` namespace. Every one of them needs a concurrent writer.
+
+So the precondition replaces the proof: `rebuild` is run by hand, by an
+operator who has stopped opencode, and it requires an explicit
+`--yes-nothing-is-using-it`. Nothing on a timer can reach it -- `prune` has no
+flag that rebuilds. The checks that remain (holders, hard links, WAL foldable,
+`data_version`) are PRE-FLIGHT CHECKS THAT CATCH A MISTAKEN OPERATOR. They are
+not, and are not claimed to be, proof that nothing is attached. See
+`rebuild_database`.
 
 THE DATABASE IS LIVE WHILE THIS RUNS
 ------------------------------------
@@ -190,15 +200,13 @@ REBUILD_DISK_POLL_SECONDS = 2.0
 # slow the rebuild.
 REBUILD_PROGRESS_INSTRUCTIONS = 20_000
 REBUILD_SUFFIX = ".rebuild-tmp"
-# The old database is hard-linked here for the duration of the swap, so it
-# stays recoverable until the new one is durably in place -- and so the set of
-# processes still holding it can be named, which is what makes the cutover
-# provable rather than opportunistic. See `_swap_in`.
+# The old database is hard-linked here across the swap, so the live pathname is
+# never without a complete database for an instant and the original stays
+# recoverable until the replacement is durably in place. See `_swap_in`.
 REBUILD_BACKUP_SUFFIX = ".rebuild-old"
-# Two --rebuild runs share one REBUILD_SUFFIX path and would destroy each
-# other's copy mid-write. flock is advisory and process-scoped, which is
-# exactly the scope of the collision: a manual invocation landing on top of a
-# timed one.
+# Two rebuilds share one REBUILD_SUFFIX path and would destroy each other's
+# copy mid-write. flock is advisory and process-scoped, which is exactly the
+# scope of the collision: two terminals, or an impatient second invocation.
 REBUILD_LOCK_SUFFIX = ".rebuild-lock"
 
 # Per-connection, so opencode's own connections keep their own (unlimited)
@@ -304,13 +312,6 @@ class Result:
     # not be determined at all, which is not the same as nobody and never
     # treated as such.
     holders_before: list | None = None
-    holders_after: list | None = None
-    rebuild_attempted: bool = False
-    rebuild_completed: bool = False
-    rebuild_seconds: float = 0.0
-    # Why a rebuild did not happen. A guard refusing or aborting is a skip and
-    # exits 0: the database is untouched and the next run may well succeed.
-    rebuild_skipped: str | None = None
     # Real on-disk footprint (main database + WAL), not page arithmetic: a
     # released page is not a reclaimed byte until the file actually shrinks.
     bytes_before: int = 0
@@ -373,9 +374,11 @@ def db_holders(db: Path) -> list[str] | None:
     missing lsof reading as idle would swap the file out from under live
     writers.
 
-    An empty list is still only a snapshot: a process can attach a millisecond
-    later. It is a cheap pre-filter, never the authority for a swap -- see
-    `rebuild_database`, which proves exclusion instead of sampling it.
+    An empty list is only a snapshot: a process can attach a millisecond later,
+    and nothing here prevents that. It is a PRE-FLIGHT CHECK against an
+    operator who believes they closed everything and did not -- it never
+    establishes that the database is quiescent. The rebuild's correctness rests
+    on the operator's precondition; this catches the common mistake cheaply.
 
     Every per-path lookup must be understood or the whole answer is `None`.
     Measured on macmini (lsof 4.91): a path that does not exist exits 1 with
@@ -965,14 +968,14 @@ class RebuildOutcome:
     `skipped` and `failure` are deliberately different outcomes. A guard that
     refused or aborted left the database untouched and the next run may well
     succeed, so it is a skip and exits 0; only something that went wrong is a
-    failure.
+    failure. A failure raised after the replacement was installed is still a
+    failure, and names both files -- see `SwapOutcome`.
     """
 
     attempted: bool = False
     completed: bool = False
     seconds: float = 0.0
     holders_before: list | None = None
-    holders_after: list | None = None
     bytes_written: int = 0
     skipped: str | None = None
     failure: str | None = None
@@ -1103,164 +1106,119 @@ def _prepare_replacement(target: Path, source_stat: os.stat_result, journal_mode
     return None
 
 
-def _swap_in(db: Path, target: Path, conn: sqlite3.Connection, expected_version: int
-             ) -> str | None:
-    """Install `target` at `db`, or explain why it was not safe to.
+@dataclass
+class SwapOutcome:
+    """The result of installing the rebuilt copy.
 
-    Returns None on success, otherwise a reason -- and on every such reason the
-    live pathname still holds a database with every committed row, because the
-    old file is only ever unlinked once the new one is durably in place.
+    `refusal` and `failure` are different outcomes and the difference is where
+    the database ended up. A refusal happened BEFORE the rename: the original
+    is still at the live pathname, untouched, and a later run may well succeed,
+    so it exits 0. A failure means something went wrong, and when
+    `installed` is true it went wrong with the replacement ALREADY at the live
+    pathname -- which is the one state an operator has to be told about by
+    name, because only they can decide what to do with the preserved original.
+    """
 
-    THE ARGUMENT THIS PROTOCOL RESTS ON
-    -----------------------------------
-    `lsof` cannot authorise this. It answers "who was attached at instant T",
-    never "did anyone commit during the interval", so a writer that opens after
-    the check, commits after `VACUUM INTO` took its snapshot, and exits before
-    the next check is invisible to every snapshot while its transaction is
-    absent from the copy. Reproduced: the swap installed a copy missing a
-    committed row. A third check does not help; no number of them does.
+    installed: bool = False
+    refusal: str | None = None
+    failure: str | None = None
 
-    Three mechanisms replace it, and each answers a question a snapshot cannot:
 
-    1. `PRAGMA data_version` -- did anyone commit? It changes whenever ANOTHER
-       connection commits to the database, and is stable across our own writes
-       and our own `VACUUM INTO` (verified on fixtures, both directions,
-       same-process and cross-process). Read on this held connection before the
-       rebuild and again under the lock below, it detects the exact race the
-       holder snapshots miss, without caring who is alive.
-    2. `BEGIN EXCLUSIVE`, held across the rename -- can anyone commit now? In
-       WAL mode it blocks other connections' writes while leaving readers
-       alone, and it survives `os.replace`: a writer queued against it stays
-       queued until this connection releases, then commits to the NEW file
-       (measured: blocked 2.06s, committed after release, saw the rebuilt
-       contents). That closes the window between the last check and the rename,
-       which is the window no check can cover.
-    3. `lsof` on the backup name -- is anyone still holding the OLD inode? This
-       is the one snapshot that is not a race. After the rename the old inode
-       is reachable through exactly one pathname, the backup link this function
-       just made, and nothing else on the host knows that name. The set of
-       processes holding it is therefore CLOSED: it cannot grow, so observing
-       it empty is a proof rather than a sample. Verified: a straggler that
-       attached before the rename shows up there and nowhere else, and a
-       process attaching after the rename gets the new inode and never appears.
+def _swap_in(db: Path, target: Path) -> SwapOutcome:
+    """Install `target` at `db`, assuming nothing else has the database open.
 
-    A straggler found by (3) is not data loss -- it is detected before the old
-    file is discarded, and the rename is rolled back, restoring the original
-    inode at the live pathname with the straggler's writes intact.
+    Pure filesystem work: the caller has already folded the WAL, checked
+    `data_version` and CLOSED its connection, so by the time this runs the
+    database at `db` is a self-contained file that no connection in this
+    process is holding.
 
-    `VACUUM INTO` cannot run inside a transaction ("cannot VACUUM from within a
-    transaction"), so the lock is necessarily taken after the rebuild, for the
-    cutover only. That is sufficient: (1) covers the rebuild interval and (2)
-    covers the cutover, so between them every instant from snapshot to rename
-    is accounted for by something other than a guess.
+    WHAT MAKES THIS SAFE IS THE PRECONDITION, NOT THIS FUNCTION
+    -----------------------------------------------------------
+    This is a file replacement, and it is correct exactly when nothing else has
+    the database open. It does not defend against a concurrent writer and does
+    not try to: three earlier designs did, and each one closed a window while
+    opening another (a commit landing in the replacement's `-wal` after the
+    lock was released; stragglers that opened the replacement after a first
+    rename; a pre-existing hard link falsifying "the old inode has exactly one
+    pathname"; a crash between the rename and the sidecar cleanup leaving two
+    main files sharing one `db-wal` name). The operator guarantees quiescence
+    instead, and the guards in `rebuild_database` merely catch the case where
+    they were mistaken.
+
+    The ordering is what is left of that, and it is chosen so that the rename
+    is the LAST mutating step:
+
+    1. The sidecars are removed first, while the WAL is known to be empty --
+       the caller folded it with a TRUNCATE checkpoint and refused if any frame
+       could not be moved, and then closed the connection, which folds again.
+       A `-wal` that carries no committed frame is not data, and removing it
+       before the rename is what stops a crash mid-swap from leaving the NEW
+       main file paired with the OLD file's `-wal`. SQLite would replay that
+       WAL over the replacement.
+    2. The original is hard-linked aside, so it survives the rename and stays
+       recoverable until the replacement is durable.
+    3. `os.replace` is atomic: the live pathname holds either the whole old
+       database or the whole new one, never neither.
+
+    Every failure up to and including step 3 therefore leaves a complete,
+    openable database at `db` with every committed row. A failure AFTER it
+    leaves the new database installed and the old one at the backup name, and
+    says so with both paths in the message.
     """
     backup = db.with_name(db.name + REBUILD_BACKUP_SUFFIX)
     if backup.exists():
-        return (
+        return SwapOutcome(refusal=(
             f"{backup} already exists; a previous rebuild may have been "
             "interrupted mid-swap. Check it against the live database and "
             "remove it by hand before rebuilding again"
-        )
-
-    # Fold the WAL first: the preserved old file has to be self-contained, or
-    # "preserving" it keeps a main file whose committed tail is in a sidecar.
-    # Through checkpoint_wal, so the connection's busy_timeout is suspended for
-    # it: a blocking checkpoint that cannot get the WAL otherwise waits the
-    # full 30s (measured 31.85s) with every opencode writer queued behind it,
-    # and the answer after waiting is the same refusal.
-    try:
-        folded = checkpoint_wal(conn, "TRUNCATE")
-    except sqlite3.Error as exc:
-        return f"the source WAL could not be checkpointed before the swap: {exc}"
-    if folded.busy:
-        return (
-            "the source WAL could not be fully folded before the swap "
-            f"({folded.pages_checkpointed} of {folded.wal_pages} page(s) "
-            "moved); another connection is still using part of it"
-        )
+        ))
 
     try:
-        conn.execute("BEGIN EXCLUSIVE")
-    except sqlite3.Error as exc:
-        return (
-            "the database could not be locked for the swap, so a writer could "
-            f"commit into the window the rename cannot cover: {exc}"
-        )
+        _fsync_path(target)
+    except OSError as exc:
+        return SwapOutcome(failure=f"the rebuilt copy could not be flushed to disk: {exc}")
 
-    replaced = False
-    try:
-        current = int(conn.execute("PRAGMA data_version").fetchone()[0])
-        if current != expected_version:
-            return (
-                "another connection committed while the rebuild ran "
-                f"(data_version {expected_version} -> {current}); the copy "
-                "predates that write and swapping it in would discard it"
-            )
-
-        try:
-            _fsync_path(target)
-        except OSError as exc:
-            return f"the rebuilt copy could not be flushed to disk: {exc}"
-
-        # One hard link, so the old inode stays reachable under a name of our
-        # own no matter what the rename does. The live pathname is never
-        # without a database for an instant: os.replace is atomic, and until it
-        # runs the original is still there.
-        try:
-            os.link(db, backup)
-        except OSError as exc:
-            return f"the old database could not be preserved before the swap: {exc}"
-
-        try:
-            os.replace(target, db)
-            replaced = True
-        except OSError as exc:
-            _unlink_quietly(backup)
-            return f"the rebuilt copy could not be swapped in: {exc}"
-
-        # The old inode now has exactly one name, and it is ours. Anyone
-        # holding it attached before the rename and would keep writing to a
-        # file nothing can reach.
-        stragglers = db_holders(backup)
-        if stragglers is None or stragglers:
-            try:
-                os.replace(backup, db)
-            except OSError as exc:
-                return (
-                    "a process is still holding the old database and it could "
-                    f"not be put back: {exc}. The rebuilt copy is now at {db} "
-                    f"and the original is at {backup}; restore it by hand"
-                )
-            replaced = False
-            if stragglers is None:
-                return (
-                    "rebuild rolled back: whether anything still holds the old "
-                    "database became undeterminable at the swap"
-                )
-            return (
-                f"rebuild rolled back: {len(stragglers)} process(es) attached "
-                f"during the rebuild [{','.join(stragglers[:8])}] and still "
-                "hold the old file; their writes would have been stranded"
-            )
-
-        try:
-            _fsync_path(db.parent)
-        except OSError as exc:
-            return f"the swap could not be made durable: {exc}"
-    finally:
-        try:
-            conn.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
-        if not replaced:
-            _unlink_quietly(backup)
-
-    # Only now, with the new file durably at the live pathname and proven to be
-    # the only one anything can reach, is the old set safe to remove.
-    _unlink_quietly(backup)
+    # Before the rename, and only because the WAL is empty by now: a sidecar
+    # surviving the swap describes the inode being retired, and SQLite replays
+    # it over the replacement.
     for suffix in SIDECAR_SUFFIXES:
         _unlink_quietly(db.with_name(db.name + suffix))
-    return None
+
+    try:
+        os.link(db, backup)
+    except OSError as exc:
+        return SwapOutcome(
+            failure=f"the old database could not be preserved before the swap: {exc}"
+        )
+
+    try:
+        os.replace(target, db)
+    except OSError as exc:
+        _unlink_quietly(backup)
+        return SwapOutcome(failure=f"the rebuilt copy could not be swapped in: {exc}")
+
+    # Past here the replacement IS the database. Nothing below can be reported
+    # as a skip: the swap has happened and only its durability is in question.
+    try:
+        _fsync_path(db.parent)
+    except OSError as exc:
+        return SwapOutcome(installed=True, failure=(
+            f"the rebuilt database is installed at {db} but the directory "
+            f"entry could not be made durable: {exc}. The previous database is "
+            f"preserved at {backup}; if the host loses power before the "
+            f"filesystem flushes, the rename may not survive. Verify {db} and "
+            f"remove {backup} by hand"
+        ))
+
+    try:
+        backup.unlink()
+    except OSError as exc:
+        return SwapOutcome(installed=True, failure=(
+            f"the rebuilt database is installed at {db}, but the preserved "
+            f"original at {backup} could not be removed: {exc}. Remove it by "
+            "hand; until it is gone every later rebuild refuses"
+        ))
+    return SwapOutcome(installed=True)
 
 
 class _RebuildLock:
@@ -1308,39 +1266,49 @@ def rebuild_database(
     min_free_bytes: int,
     clock=time.monotonic,
 ) -> RebuildOutcome:
-    """Compact the database with `VACUUM INTO` and swap the copy in, if idle.
+    """Compact the database with `VACUUM INTO` and install the copy.
 
-    This is the only pass that actually shrinks a file that has already grown:
-    `incremental_vacuum` returns ~10-20 MB/min, so a 55 GiB freelist would take
-    days. It is also the only destructive one, and the order of its guards is
-    the whole safety argument:
+    THE PRECONDITION
+    ----------------
+    Nothing else may have the database open. This is the operator's
+    responsibility -- they stopped opencode before running it -- and it is the
+    reason the function is reachable only from an explicit `rebuild`
+    subcommand behind an explicit confirmation flag, never from a prune and
+    never from a timer.
 
-    1. Take the single-instance lock. Two `--rebuild` invocations share one
-       `.rebuild-tmp` path and would each destroy the other's copy mid-write;
-       a manual run colliding with a timed one is the ordinary way that
-       happens.
-    2. Ask `lsof` whether anything holds the database. This is a PRE-FILTER
-       and nothing more -- it is here so a busy host does not pay for a
-       20-minute rebuild that the cutover will refuse, not because it
-       authorises anything. `None` (undeterminable) is still a refusal.
-    3. Refuse unless the copy fits AND still leaves the floor free. The copy is
-       a full second copy of the live data, appearing on a disk that on
-       2026-09-12 was already at 88%.
-    4. Record `PRAGMA data_version` on a connection held open for the whole
-       rebuild, so a commit by anyone else during it can be detected rather
-       than guessed at.
-    5. Bound the call itself from inside SQLite, by wall clock and by free
-       space, and unlink the partial copy on every abort path -- SQLite leaves
-       it behind (verified: the output file exists after `interrupted`), so
-       without this a 39 GB orphan accumulates per abort.
-    6. Verify the copy before trusting it: `quick_check` ok, auto_vacuum still
-       INCREMENTAL, and the source's journal mode, permissions and ownership
-       established on it and read back.
-    7. Swap under proof rather than under a snapshot -- see `_swap_in`.
+    The guards below are pre-flight checks against a mistaken operator, not a
+    proof of exclusion. Each is nearly free and catches the realistic error
+    ("I thought I had closed everything"); none of them makes the swap safe
+    against a writer that is genuinely running. In order:
 
-    The connection opened in step 4 is held until the swap is done: it is what
-    `data_version` is read on and what `BEGIN EXCLUSIVE` is taken on, and both
-    are meaningless on a connection opened afterwards.
+    1. The single-instance `flock`. Two rebuilds share one `.rebuild-tmp` path
+       and would each destroy the other's copy mid-write.
+    2. `lsof`: if anything holds the database, refuse and NAME the pids, so the
+       operator can go and close them. Undeterminable (`None`) is also a
+       refusal -- a missing lsof must not read as idle.
+    3. `st_nlink != 1`: a second hard link is a second public pathname to this
+       inode, so "nothing is using it" cannot be established by looking at the
+       one name we were given, and the rename leaves the other name pointing at
+       the stale original. Refuse.
+    4. Free space: the copy must fit AND still leave the floor free.
+    5. `PRAGMA data_version` before and after the `VACUUM INTO`. This is the
+       one check that detects a COMMIT rather than an attachment: it changes
+       whenever another connection commits, and is stable across our own work.
+       A rebuild takes about a minute on the real store, which is long enough
+       for a forgotten agent to write, and an attachment check cannot see a
+       writer that came and went inside it.
+    6. The call itself is bounded from INSIDE SQLite, by wall clock and by free
+       space, and the partial copy is unlinked on every abort path. This is
+       unrelated to concurrency: it is the 23-minute, 39.6 GB runaway of
+       2026-09-12, which no Python-level deadline could reach.
+    7. The copy is verified before it is trusted: `quick_check` ok, auto_vacuum
+       still INCREMENTAL, and the source's journal mode, permissions and
+       ownership established on it and read back from a fresh connection.
+    8. The source WAL is folded and this connection is CLOSED before the swap,
+       so the file being replaced is self-contained and we are not ourselves a
+       holder of it.
+
+    Everything up to the rename fails closed, leaving the original in place.
     """
     outcome = RebuildOutcome()
 
@@ -1365,6 +1333,61 @@ def rebuild_database(
         lock.release()
 
 
+def rebuild_preflight(
+    db: Path, stats: DbStats, *, min_free_bytes: int
+) -> str | None:
+    """Reasons not to start a rebuild, or None. Touches nothing.
+
+    Shared by the real run and by `--dry-run`, so a preview reports the same
+    refusals the run would hit rather than a second implementation of them.
+    """
+    holders = db_holders(db)
+    if holders is None:
+        return (
+            "cannot determine who holds the database (lsof is missing from "
+            "PATH, or too slow to answer); refusing rather than assuming it is "
+            "idle"
+        )
+    if holders:
+        return (
+            f"{len(holders)} process(es) still hold the database "
+            f"[{','.join(holders[:8])}]. Stop opencode and any running agents, "
+            "then try again"
+        )
+
+    try:
+        link_count = db.stat().st_nlink
+    except OSError as exc:
+        return f"the database could not be inspected: {exc}"
+    if link_count != 1:
+        # Another name for this inode is another way in, and one this tool was
+        # never told about: `lsof` on the path it was given cannot enumerate
+        # who may come through the other. The rename also only moves OUR name
+        # -- the other one keeps pointing at the un-rebuilt original, which
+        # then silently diverges from the live database.
+        return (
+            f"{db} has {link_count} hard links, so it is reachable under "
+            "another name this tool cannot see. A process can open it through "
+            "that name at any time, and the rebuild only replaces this one: "
+            "the other name would keep the old database. Remove the extra "
+            "link, or rebuild the file it points at"
+        )
+
+    needed = int(live_bytes(stats) * REBUILD_COPY_HEADROOM)
+    try:
+        free = shutil.disk_usage(db.parent).free
+    except OSError as exc:
+        return f"free space on {db.parent} could not be measured: {exc}"
+    # `free - needed >= floor`, not `free >= needed`: a rebuild that fits
+    # exactly still drives the filesystem to the edge while it runs.
+    if free - needed < min_free_bytes:
+        return (
+            f"a rebuild needs ~{needed:,} bytes and must leave {min_free_bytes:,} "
+            f"free; only {free:,} available on {db.parent}"
+        )
+    return None
+
+
 def _rebuild_locked(
     db: Path,
     stats: DbStats,
@@ -1374,34 +1397,10 @@ def _rebuild_locked(
     clock,
     outcome: RebuildOutcome,
 ) -> RebuildOutcome:
-    holders = db_holders(db)
-    outcome.holders_before = holders
-    if holders is None:
-        outcome.skipped = (
-            "cannot determine who holds the database (lsof missing or timed "
-            "out); not starting a rebuild that would be refused at the swap"
-        )
-        return outcome
-    if holders:
-        outcome.skipped = (
-            f"{len(holders)} process(es) hold the database "
-            f"[{','.join(holders[:8])}]; a rebuild only runs when nothing does"
-        )
-        return outcome
-
-    needed = int(live_bytes(stats) * REBUILD_COPY_HEADROOM)
-    try:
-        free = shutil.disk_usage(db.parent).free
-    except OSError as exc:
-        outcome.skipped = f"free space on {db.parent} could not be measured: {exc}"
-        return outcome
-    # `free - needed >= floor`, not `free >= needed`: a rebuild that fits
-    # exactly still drives the filesystem to the edge while it runs.
-    if free - needed < min_free_bytes:
-        outcome.skipped = (
-            f"a rebuild needs ~{needed:,} bytes and must leave {min_free_bytes:,} "
-            f"free; only {free:,} available on {db.parent}"
-        )
+    outcome.holders_before = db_holders(db)
+    refusal = rebuild_preflight(db, stats, min_free_bytes=min_free_bytes)
+    if refusal:
+        outcome.skipped = refusal
         return outcome
 
     try:
@@ -1430,6 +1429,7 @@ def _rebuild_locked(
     # try/finally covers the whole lifetime of both: an interrupt during
     # verification or the swap would otherwise leave tens of gigabytes behind.
     installed = False
+    closed = False
     try:
         try:
             journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0])
@@ -1475,26 +1475,73 @@ def _rebuild_locked(
             outcome.failure = f"the rebuilt copy could not be measured: {exc}"
             return outcome
 
+        # The quiescence check that is not an attachment check. A rebuild takes
+        # about a minute on the real store; an opencode that started, committed
+        # and exited inside it leaves no trace in any holder snapshot, and its
+        # rows are not in the copy about to be installed.
         try:
-            refusal = _swap_in(db, target, conn, version)
-        except (sqlite3.Error, OSError) as exc:
+            current = int(conn.execute("PRAGMA data_version").fetchone()[0])
+        except sqlite3.Error as exc:
+            outcome.failure = f"the source database could not be re-read: {exc}"
+            return outcome
+        if current != version:
+            outcome.skipped = (
+                "another connection committed while the rebuild ran "
+                f"(data_version {version} -> {current}); the copy predates that "
+                "write and installing it would discard it. Something is still "
+                "using the database"
+            )
+            return outcome
+
+        # Fold the WAL so the file about to be replaced is self-contained, and
+        # so the sidecars the swap removes carry no committed frame.
+        try:
+            folded = checkpoint_wal(conn, "TRUNCATE")
+        except sqlite3.Error as exc:
+            outcome.failure = (
+                f"the source WAL could not be checkpointed before the swap: {exc}"
+            )
+            return outcome
+        if folded.busy:
+            outcome.skipped = (
+                "the source WAL could not be fully folded before the swap "
+                f"({folded.pages_checkpointed} of {folded.wal_pages} page(s) "
+                "moved); another connection is still using part of it"
+            )
+            return outcome
+
+        # Closed before the swap: our own open handle would otherwise be a
+        # holder of the inode being retired, and closing in WAL mode writes.
+        try:
+            conn.close()
+            closed = True
+        except sqlite3.Error as exc:
+            outcome.failure = f"the source database could not be closed: {exc}"
+            return outcome
+
+        try:
+            swap = _swap_in(db, target)
+        except OSError as exc:
             outcome.failure = f"the swap failed: {type(exc).__name__}: {exc}"
             return outcome
-        if refusal:
-            # Every refusal leaves the original database at the live pathname.
-            outcome.skipped = refusal
+        installed = swap.installed
+        if swap.refusal:
+            # Nothing was renamed: the original is still at the live pathname.
+            outcome.skipped = swap.refusal
             return outcome
-        installed = True
-        outcome.holders_after = []
+        if swap.failure:
+            outcome.failure = swap.failure
+            return outcome
         outcome.completed = True
         return outcome
     finally:
         if not installed:
             _unlink_quietly(target)
-        try:
-            conn.close()
-        except sqlite3.Error:
-            pass
+        if not closed:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
 
 
 def _verify_rebuilt(target: Path, journal_mode: str = "") -> str | None:
@@ -1639,18 +1686,19 @@ def orphaned_by_deletion(conn: sqlite3.Connection) -> set[str]:
     is exactly what `todo`, `session_message`, `session_input` and
     `session_share` were before they were added to the list.
 
-    Reachability is transitive, not one hop. `session` is not the only parent
-    that disappears: `message`, `part`, `event` and `event_sequence` are each
-    deleted explicitly, with foreign keys off, so nothing cascades. A table
-    referencing `message` is orphaned exactly as surely as one referencing
-    `session`, and checking only direct children passed such a schema. The
-    closure is therefore rooted at every table in the deletion plan and walked
-    until it stops growing.
+    The closure is rooted at every table in the deletion plan and walked until
+    it stops growing, rather than checking one hop. That is for the MESSAGE,
+    not for the decision: a table two hops out cannot exist without an
+    intermediate table one hop out, and that intermediate is itself uncovered,
+    so a one-hop check refuses the same schemas. What the closure adds is the
+    whole chain in the refusal, so an operator is told every table they have to
+    add to `CHILD_TABLES` instead of discovering them one run at a time.
 
-    SQLite identifiers are case-insensitive but `PRAGMA foreign_key_list`
-    echoes the spelling used in the declaration, so `REFERENCES SeSsIoN(id)`
-    is a valid reference that a `== "session"` test does not recognise.
-    Everything here is compared casefolded.
+    The casefolding IS load-bearing. SQLite identifiers are case-insensitive
+    but `PRAGMA foreign_key_list` echoes the spelling used in the declaration,
+    so `REFERENCES SeSsIoN(id)` is a real reference that a `== "session"` test
+    does not recognise -- and the table hanging off it would be orphaned with
+    no refusal at all. Everything here is compared casefolded.
     """
     # child table -> the parent tables it references.
     parents: dict[str, set[str]] = {}
@@ -1737,58 +1785,147 @@ def verify_usable(conn: sqlite3.Connection) -> None:
             )
 
 
-def main() -> int:
+# The prune is what runs unattended, so it is what a bare invocation means and
+# what every existing timer keeps invoking. `rebuild` has to be spelled out.
+PRUNE_COMMAND = "prune"
+REBUILD_COMMAND = "rebuild"
+CONFIRM_FLAG = "--yes-nothing-is-using-it"
+
+REBUILD_EPILOG = """\
+REQUIRES A QUIESCENT DATABASE. Stop opencode and close every running agent
+first. This replaces the database file: run it while opencode is live and
+committed sessions can be lost. It refuses if it can see a holder, but that
+check is a convenience for the common mistake, not a guarantee -- the
+guarantee is yours.
+
+  opencode-gc rebuild --dry-run                    # what it would reclaim
+  opencode-gc rebuild --yes-nothing-is-using-it    # do it
+
+There is deliberately no way to reach this from `prune`, and nothing on a
+timer should ever invoke it.
+"""
+
+
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
+        prog="opencode-gc",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "commands:\n"
+            f"  {PRUNE_COMMAND} (default)   delete expired sessions and reclaim "
+            "pages. Safe to run\n"
+            "                    while opencode is using the database, and the "
+            "only\n                    thing a timer should ever invoke.\n"
+            f"  {REBUILD_COMMAND}           compact the file with VACUUM INTO. "
+            "MANUAL ONLY: requires\n"
+            "                    that nothing else has the database open, and "
+            f"an\n                    explicit {CONFIRM_FLAG}. Never\n"
+            "                    run this from a timer.\n"
+        ),
     )
-    ap.add_argument("--db", type=Path, default=DEFAULT_DB,
-                    help=f"opencode database (default {DEFAULT_DB})")
-    ap.add_argument("--retention-days", type=float, default=4.0,
-                    help="keep sessions updated within this many days (default 4)")
-    ap.add_argument("--apply", action="store_true",
-                    help="actually delete; without this the run is a dry run")
-    ap.add_argument("--batch", type=int, default=DEFAULT_BATCH,
-                    help=f"sessions per transaction (default {DEFAULT_BATCH}; clamped "
-                         "to SQLite's bound-variable limit)")
-    ap.add_argument("--batch-sleep-ms", type=int, default=DEFAULT_BATCH_SLEEP_MS,
-                    help="pause between batches, handing the write lock back to "
-                         f"opencode (default {DEFAULT_BATCH_SLEEP_MS}; 0 disables)")
-    ap.add_argument("--max-seconds", type=float, default=600.0,
-                    help="stop starting new batches after this long (default 600); "
-                         "0 means no limit. Not a bound on total runtime: a batch "
-                         "or a VACUUM already in flight runs to completion")
-    ap.add_argument("--vacuum-pages", type=int, default=None,
-                    help="cap pages released per run, >= 1 "
-                         "(default: the whole freelist)")
-    ap.add_argument("--no-vacuum", action="store_true",
-                    help="delete rows but do not release pages")
-    ap.add_argument("--enable-incremental-vacuum", action="store_true",
-                    help="switch auto_vacuum to INCREMENTAL. From FULL this is a "
-                         "header change; from NONE it needs one full VACUUM and "
-                         f"~{VACUUM_COPY_FACTOR}x the database size free")
-    ap.add_argument("--rebuild", action="store_true",
-                    help="also compact the file with VACUUM INTO, but only when "
-                         "nothing holds the database. Unlike incremental "
-                         "reclamation this actually shrinks an already-oversized "
-                         "file, and unlike a plain VACUUM it needs the live size "
-                         f"(~{REBUILD_COPY_HEADROOM}x) rather than "
-                         f"{VACUUM_COPY_FACTOR}x the file")
-    ap.add_argument("--rebuild-max-seconds", type=float,
-                    default=DEFAULT_REBUILD_MAX_SECONDS,
-                    help="abort the rebuild at the first SQLite progress callback "
-                         f"after this long (default {DEFAULT_REBUILD_MAX_SECONDS:g}); "
-                         "--max-seconds cannot bound VACUUM INTO at all, but a "
-                         "statement blocked in filesystem I/O runs no callbacks and "
-                         "can overshoot this")
-    ap.add_argument("--rebuild-min-free-gib", type=float,
-                    default=DEFAULT_REBUILD_MIN_FREE_GIB,
-                    help="refuse to start a rebuild that would not leave this much "
-                         "free, and abort one that drops below it "
-                         f"(default {DEFAULT_REBUILD_MIN_FREE_GIB:g})")
-    ap.add_argument("--json", action="store_true")
-    args = ap.parse_args()
+    sub = ap.add_subparsers(dest="command")
 
+    prune = sub.add_parser(
+        PRUNE_COMMAND,
+        help="delete expired sessions and reclaim pages (the default)",
+        description="Delete expired sessions and reclaim freed pages. Safe to "
+                    "run while opencode is using the database.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    prune.add_argument("--db", type=Path, default=DEFAULT_DB,
+                       help=f"opencode database (default {DEFAULT_DB})")
+    prune.add_argument("--retention-days", type=float, default=4.0,
+                       help="keep sessions updated within this many days (default 4)")
+    prune.add_argument("--apply", action="store_true",
+                       help="actually delete; without this the run is a dry run")
+    prune.add_argument("--batch", type=int, default=DEFAULT_BATCH,
+                       help=f"sessions per transaction (default {DEFAULT_BATCH}; "
+                            "clamped to SQLite's bound-variable limit)")
+    prune.add_argument("--batch-sleep-ms", type=int, default=DEFAULT_BATCH_SLEEP_MS,
+                       help="pause between batches, handing the write lock back to "
+                            f"opencode (default {DEFAULT_BATCH_SLEEP_MS}; 0 disables)")
+    prune.add_argument("--max-seconds", type=float, default=600.0,
+                       help="stop starting new batches after this long (default "
+                            "600); 0 means no limit. Not a bound on total runtime: "
+                            "a batch or a VACUUM already in flight runs to completion")
+    prune.add_argument("--vacuum-pages", type=int, default=None,
+                       help="cap pages released per run, >= 1 "
+                            "(default: the whole freelist)")
+    prune.add_argument("--no-vacuum", action="store_true",
+                       help="delete rows but do not release pages")
+    prune.add_argument("--enable-incremental-vacuum", action="store_true",
+                       help="switch auto_vacuum to INCREMENTAL. From FULL this is a "
+                            "header change; from NONE it needs one full VACUUM and "
+                            f"~{VACUUM_COPY_FACTOR}x the database size free")
+    prune.add_argument("--json", action="store_true")
+
+    rebuild = sub.add_parser(
+        REBUILD_COMMAND,
+        help="compact the file with VACUUM INTO. MANUAL ONLY: requires that "
+             "nothing else has the database open",
+        description="Compact the database with VACUUM INTO and install the "
+                    "compacted copy.",
+        epilog=REBUILD_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    rebuild.add_argument("--db", type=Path, default=DEFAULT_DB,
+                         help=f"opencode database (default {DEFAULT_DB})")
+    rebuild.add_argument(
+        CONFIRM_FLAG, dest="confirmed", action="store_true",
+        help="confirm that opencode is stopped and nothing else has this "
+             "database open. Required to change anything; there is no --apply "
+             "and no default-yes",
+    )
+    rebuild.add_argument(
+        "--dry-run", action="store_true",
+        help="report what a rebuild would reclaim -- current size, live bytes, "
+             "expected saving -- and touch nothing",
+    )
+    rebuild.add_argument("--max-seconds", type=float,
+                         default=DEFAULT_REBUILD_MAX_SECONDS,
+                         help="abort the rebuild at the first SQLite progress "
+                              "callback after this long (default "
+                              f"{DEFAULT_REBUILD_MAX_SECONDS:g}); a statement "
+                              "blocked in filesystem I/O runs no callbacks and "
+                              "can overshoot this")
+    rebuild.add_argument("--min-free-gib", type=float,
+                         default=DEFAULT_REBUILD_MIN_FREE_GIB,
+                         help="refuse to start a rebuild that would not leave "
+                              "this much free, and abort one that drops below it "
+                              f"(default {DEFAULT_REBUILD_MIN_FREE_GIB:g})")
+    rebuild.add_argument("--json", action="store_true")
+    return ap
+
+
+def _argv_with_default_command(argv: list[str]) -> list[str]:
+    """Insert the implicit `prune` so a bare `opencode-gc --apply` still prunes.
+
+    The default runs in the direction that is safe: an operator who omits the
+    command gets the prune, never the rebuild. `rebuild` is only ever reached
+    by naming it.
+    """
+    for i, token in enumerate(argv):
+        if token in (PRUNE_COMMAND, REBUILD_COMMAND):
+            # A subcommand anywhere before the first option is the command; a
+            # bare word after one is an argument to it and not ours to move.
+            if all(a.startswith("-") for a in argv[:i]):
+                return argv
+            break
+        if token in ("-h", "--help"):
+            return argv
+    return [PRUNE_COMMAND, *argv]
+
+
+def main() -> int:
+    ap = _build_parser()
+    args = ap.parse_args(_argv_with_default_command(sys.argv[1:]))
+    if args.command == REBUILD_COMMAND:
+        return _rebuild_command(ap, args)
+    return _prune_command(ap, args)
+
+
+def _prune_command(ap: argparse.ArgumentParser, args) -> int:
     if not math.isfinite(args.retention_days) or args.retention_days < MIN_RETENTION_DAYS:
         ap.error(f"--retention-days must be finite and >= {MIN_RETENTION_DAYS}")
     if args.batch < 1:
@@ -1799,12 +1936,6 @@ def main() -> int:
     # disable the deadline instead of limiting it.
     if not math.isfinite(args.max_seconds) or args.max_seconds < 0:
         ap.error("--max-seconds must be finite and >= 0 (0 means no limit)")
-    if not math.isfinite(args.rebuild_max_seconds) or args.rebuild_max_seconds <= 0:
-        # No "0 means unlimited" here: an unbounded VACUUM INTO is the exact
-        # failure this cap exists to prevent.
-        ap.error("--rebuild-max-seconds must be finite and > 0")
-    if not math.isfinite(args.rebuild_min_free_gib) or args.rebuild_min_free_gib < 0:
-        ap.error("--rebuild-min-free-gib must be finite and >= 0")
     if args.vacuum_pages is not None and args.vacuum_pages < 1:
         ap.error("--vacuum-pages must be >= 1; omit it to release the whole freelist")
     if not args.db.is_file():
@@ -1990,42 +2121,11 @@ def main() -> int:
             res.errors.append(f"closing the database failed: "
                               f"{type(exc).__name__}: {exc}")
 
-    if args.rebuild and args.apply:
-        # After our own connection is closed, so we are not a holder of the
-        # file we are about to replace, and after the deletes, so the copy is
-        # made from the pruned data rather than the data being pruned.
-        try:
-            rb = _run_rebuild(db_path, args)
-        except (KeyboardInterrupt, OSError, sqlite3.Error, ValueError) as exc:
-            res.incomplete = True
-            res.errors.append(f"the rebuild stopped: {type(exc).__name__}: {exc}")
-        else:
-            res.rebuild_attempted = rb.attempted
-            res.rebuild_completed = rb.completed
-            res.rebuild_seconds = rb.seconds
-            res.rebuild_skipped = rb.skipped
-            # The rebuild's own preflight snapshot, not the checkpoint-time one
-            # taken earlier against a different instant: reporting the latter
-            # alongside a `rebuild_skipped` describing the former is two
-            # different observations under one name.
-            if rb.holders_before is not None or rb.attempted:
-                res.holders_before = rb.holders_before
-            res.holders_after = rb.holders_after
-            if rb.skipped:
-                # The database is untouched and a later run may succeed, so
-                # this is reported and exits 0. It is not an error and not
-                # incomplete work: nothing eligible was destroyed or half-done.
-                res.notes.append(f"--rebuild did not run: {rb.skipped}")
-            if rb.failure:
-                res.errors.append(f"--rebuild failed: {rb.failure}")
-            if rb.completed:
-                res.notes.append(
-                    f"rebuilt the database in {rb.seconds:g}s "
-                    f"({rb.bytes_written:,} bytes written)"
-                )
-    elif args.rebuild:
-        res.notes.append("--rebuild needs --apply; a dry run rewrites nothing")
-
+    # No rebuild here, by design. A prune is the unattended path -- it is what
+    # a timer invokes and what runs while opencode is live -- and the rebuild
+    # replaces the database file, which is only correct when nothing else has
+    # it open. It is a separate subcommand behind an explicit confirmation so
+    # that no combination of flags on this path can reach it.
     try:
         res.bytes_after = on_disk_bytes(db_path)
         res.wal_bytes_after = wal_bytes(db_path)
@@ -2042,29 +2142,176 @@ def main() -> int:
     return _report(args, res)
 
 
-def _run_rebuild(db_path: Path, args) -> RebuildOutcome:
-    """Re-read the post-deletion stats and attempt the rebuild.
+@dataclass
+class RebuildReport:
+    """What one `rebuild` invocation did, or would have done."""
 
-    The stats have to be re-read here: the live size that decides whether the
-    copy fits is the size after the deletes, which is the entire reason a store
-    too big to rebuild before a prune is small enough to rebuild after one.
+    db: str
+    dry_run: bool
+    confirmed: bool = False
+    bytes_before: int = 0
+    bytes_after: int = 0
+    live_bytes: int = 0
+    expected_reclaim: int = 0
+    auto_vacuum: str = ""
+    holders: list | None = None
+    attempted: bool = False
+    completed: bool = False
+    seconds: float = 0.0
+    bytes_written: int = 0
+    skipped: str | None = None
+    errors: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+
+    @property
+    def bytes_reclaimed(self) -> int:
+        return max(0, self.bytes_before - self.bytes_after)
+
+
+def _rebuild_command(ap: argparse.ArgumentParser, args) -> int:
+    """The manual rebuild. Nothing automated reaches this.
+
+    Exit status: 0 for a completed rebuild, a preview, or a guard that refused
+    (the database is untouched and a later run may succeed); 1 for a failure;
+    2 for an unusable input or a missing confirmation.
     """
-    probe = connect(db_path, read_only=True)
+    if not math.isfinite(args.max_seconds) or args.max_seconds <= 0:
+        # No "0 means unlimited" here: an unbounded VACUUM INTO is the exact
+        # failure this cap exists to prevent.
+        ap.error("--max-seconds must be finite and > 0")
+    if not math.isfinite(args.min_free_gib) or args.min_free_gib < 0:
+        ap.error("--min-free-gib must be finite and >= 0")
+    if args.confirmed and args.dry_run:
+        ap.error(f"--dry-run and {CONFIRM_FLAG} are mutually exclusive")
+    if not args.confirmed and not args.dry_run:
+        # Never a default-yes. An operator who has not said the words gets a
+        # refusal naming them, and a --dry-run that costs nothing.
+        print(
+            "opencode-gc rebuild: this replaces the database file and requires "
+            "that nothing else has it open.\n"
+            "Stop opencode and close every running agent, then re-run with "
+            f"{CONFIRM_FLAG}.\n"
+            "To see what it would reclaim without touching anything: "
+            "opencode-gc rebuild --dry-run",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.db.is_file():
+        print(f"opencode-gc: no database at {args.db}", file=sys.stderr)
+        return 2
+    db_path = args.db.resolve()
+
+    report = RebuildReport(
+        db=str(args.db), dry_run=args.dry_run, confirmed=args.confirmed
+    )
     try:
+        probe = connect(db_path, read_only=True)
+    except (sqlite3.Error, RuntimeError, ValueError) as exc:
+        print(f"opencode-gc: cannot open {args.db}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        verify_usable(probe)
         stats = read_stats(probe)
-    finally:
+    except (RuntimeError, sqlite3.Error) as exc:
         probe.close()
+        print(f"opencode-gc: cannot use {args.db}: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        try:
+            probe.close()
+        except sqlite3.Error:
+            pass
+
+    report.bytes_before = report.bytes_after = on_disk_bytes(db_path)
+    report.live_bytes = live_bytes(stats)
+    report.auto_vacuum = stats.auto_vacuum_name
+    # What the file would lose: everything on the freelist. The copy is the
+    # live pages plus the WAL it folds, so the saving is measured from the
+    # real on-disk footprint rather than from page arithmetic alone.
+    report.expected_reclaim = max(0, report.bytes_before - report.live_bytes)
+    min_free_bytes = int(args.min_free_gib * 1024 ** 3)
+
     if stats.auto_vacuum != 2:
-        return RebuildOutcome(skipped=(
+        report.skipped = (
             f"auto_vacuum is {stats.auto_vacuum_name}; a rebuilt copy would "
             "inherit that and could not reclaim in place. Run "
-            "--enable-incremental-vacuum first"
+            "`opencode-gc prune --apply --enable-incremental-vacuum` first"
+        )
+        return _report_rebuild(args, report)
+
+    if args.dry_run:
+        # The same preflight the real run uses, so a preview reports the
+        # refusals the run would hit rather than a second implementation.
+        report.holders = db_holders(db_path)
+        refusal = rebuild_preflight(db_path, stats, min_free_bytes=min_free_bytes)
+        if refusal:
+            report.skipped = refusal
+        else:
+            report.notes.append(
+                "preflight passed: a rebuild would run now. Nothing has been "
+                "touched."
+            )
+        return _report_rebuild(args, report)
+
+    try:
+        outcome = rebuild_database(
+            db_path, stats,
+            max_seconds=args.max_seconds, min_free_bytes=min_free_bytes,
+        )
+    except (KeyboardInterrupt, OSError, sqlite3.Error, ValueError) as exc:
+        report.errors.append(f"the rebuild stopped: {type(exc).__name__}: {exc}")
+        report.bytes_after = on_disk_bytes(db_path)
+        return _report_rebuild(args, report)
+
+    report.holders = outcome.holders_before
+    report.attempted = outcome.attempted
+    report.completed = outcome.completed
+    report.seconds = outcome.seconds
+    report.bytes_written = outcome.bytes_written
+    report.skipped = outcome.skipped
+    if outcome.failure:
+        report.errors.append(outcome.failure)
+    report.bytes_after = on_disk_bytes(db_path)
+    return _report_rebuild(args, report)
+
+
+def _human_bytes(n: int) -> str:
+    """GiB once it is worth reading in GiB, MiB below that.
+
+    A 32 GiB store reports in GiB; a small database -- or a test fixture --
+    would otherwise print `0.00GiB` for every field and tell an operator
+    checking the expected reclaim nothing at all.
+    """
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.2f}GiB"
+    return f"{n / 1024 ** 2:.1f}MiB"
+
+
+def _report_rebuild(args, report: RebuildReport) -> int:
+    if args.json:
+        print(json.dumps(
+            asdict(report) | {"bytes_reclaimed": report.bytes_reclaimed}, indent=2
         ))
-    return rebuild_database(
-        db_path, stats,
-        max_seconds=args.rebuild_max_seconds,
-        min_free_bytes=int(args.rebuild_min_free_gib * 1024 ** 3),
-    )
+        return 1 if report.errors else 0
+
+    mode = "DRY RUN" if report.dry_run else "REBUILD"
+    print(f"[opencode-gc] {mode}: {report.db}")
+    print(f"    file {_human_bytes(report.bytes_before)}, live "
+          f"{_human_bytes(report.live_bytes)}, auto_vacuum={report.auto_vacuum}")
+    if report.dry_run:
+        print(f"    a rebuild would reclaim about "
+              f"{_human_bytes(report.expected_reclaim)}")
+    if report.completed:
+        print(f"    rebuilt in {report.seconds:g}s; "
+              f"{report.bytes_written:,} bytes written, "
+              f"{_human_bytes(report.bytes_reclaimed)} reclaimed")
+    if report.skipped:
+        print(f"    did not rebuild: {report.skipped}")
+    for note in report.notes:
+        print(f"    {note}")
+    for err in report.errors:
+        print(f"    ERROR: {err}", file=sys.stderr)
+    return 1 if report.errors else 0
 
 
 def _report(args, res: Result) -> int:
@@ -2114,8 +2361,6 @@ def _report(args, res: Result) -> int:
         print(f"    checkpointed {res.wal_pages_checkpointed:,} WAL page(s) "
               f"({res.wal_checkpoint_mode}); wal {res.wal_bytes_before:,} -> "
               f"{res.wal_bytes_after:,} bytes")
-    if res.rebuild_completed:
-        print(f"    rebuilt the file in {res.rebuild_seconds:g}s")
     for note in res.notes:
         print(f"    {note}")
     for err in res.errors:
