@@ -581,30 +581,86 @@ it needs the **live** size plus ~5% rather than 2x the file — which is why a
 32 GiB file holding 6.2 GiB of live data can be rebuilt on 13 GiB of free disk
 where a plain `VACUUM` of the same file needs ~64 GiB and is rightly refused.
 
-It is opportunistic and heavily guarded, because the rebuild is safe but the
-**swap** is what loses data:
+It is heavily guarded, because the rebuild is safe but the **swap** is what
+loses data. The cutover does **not** rest on holder snapshots: `lsof` answers
+"who was attached at instant T", and that is not the question. A writer that
+opens after a check, commits after `VACUUM INTO` took its snapshot, and exits
+before the next check is invisible to *both* while its transaction is absent
+from the copy — so the swap installed a database missing a committed row.
+Reproduced. No number of extra checks closes it, because every one of them
+samples process liveness and liveness is not the property at issue.
 
-- It runs only when nothing holds the database, and **refuses when that cannot be
-  determined** — a missing `lsof` reads as *unknown*, never as *idle*. launchd and
-  systemd start jobs with a bare environment and macOS keeps `lsof` in
-  `/usr/sbin`, so this is the expected failure mode, not an exotic one.
-- Holders are **re-checked immediately before the swap** and the copy discarded if
-  any appeared. A process that opens the database during the rebuild keeps
-  writing to the old inode, and `os.replace` would strand those writes. The
-  re-check shrinks that window from minutes to the microseconds around the
-  rename. A process that both starts *and* exits inside the rebuild window is
-  still unprotected — which is why this pass stays opportunistic and is never the
-  only reclaim path.
-- The copy is verified (`quick_check` ok, `auto_vacuum` still INCREMENTAL) before
-  it is trusted, and the `-wal`/`-shm` sidecars are deleted before the swap, or
-  the new file would be read against a stale WAL.
+Three mechanisms replace the sampling, each answering a question a snapshot
+cannot:
+
+- **`PRAGMA data_version` — did anyone commit?** It changes whenever *another*
+  connection commits, and is stable across our own writes and our own
+  `VACUUM INTO`. Read on a connection held open for the whole rebuild and again
+  under the lock below; any change discards the copy. Process liveness is
+  irrelevant to it.
+- **`BEGIN EXCLUSIVE`, held across the rename — can anyone commit *now*?** In
+  WAL mode it blocks other connections' writes while leaving readers alone, and
+  it survives `os.replace`: a writer queued against it stays queued until this
+  connection releases. That closes the window between the last look and the
+  rename, which is the window no check can cover. `VACUUM INTO` cannot run
+  inside a transaction, so the lock is taken *after* the rebuild, for the
+  cutover only.
+- **`lsof` on the backup name — is anyone still holding the *old* inode?** The
+  one snapshot that is not a race. The old database is hard-linked aside before
+  the rename, so afterwards the old inode is reachable through exactly one
+  pathname that nothing else on the host knows. The set of processes holding it
+  is therefore **closed** — it cannot grow, so observing it empty is a proof
+  rather than a sample. A straggler found there sends the rename back, restoring
+  the original at the live path with its writes intact.
+
+`lsof` is still consulted first, but only as a cheap **pre-filter** so a busy
+host does not pay for a 20-minute rebuild the cutover will refuse. It no longer
+authorises anything. A missing `lsof` still reads as *unknown*, never *idle*:
+launchd and systemd start jobs with a bare environment and macOS keeps it in
+`/usr/sbin`. Any diagnostic on stderr, unexpected exit status or unparseable
+output is likewise *unknown* — a missing `-shm` is routine, and asking `lsof`
+about it earned a diagnostic that read as "nobody holds this".
+
+The rest of the protocol:
+
+- **Nothing is destroyed before the replacement is in place.** The source WAL is
+  folded first so the preserved old file is self-contained, the old database is
+  hard-linked aside, the new file is installed, the file and its directory are
+  synced, and only then is the old set removed. Every partial-failure path — a
+  failed `link`, `replace` or `fsync` — leaves a database that still opens at
+  the live pathname with all committed rows. The previous order unlinked the
+  `-wal` *before* `os.replace`, so a handled `OSError` from the rename destroyed
+  every WAL-only-committed transaction.
+- **The copy is verified before it is trusted**: `quick_check` ok, `auto_vacuum`
+  still INCREMENTAL, and the source's **journal mode** and **permissions**
+  established on it and read back from a fresh connection. `VACUUM INTO` writes
+  its output in the default `DELETE` mode and at the process umask whatever the
+  source used — measured, a `0600` WAL source produced a `0644` `DELETE` copy.
+  Either would be swapped in silently: one changes opencode's concurrency model,
+  the other publishes session history to every local user. Both now fail closed.
+- **One rebuild at a time**, via `flock` on a lock file beside the database. Two
+  invocations share one `.rebuild-tmp` and would destroy each other's copy
+  mid-write; a manual run landing on a timed one is the ordinary way that
+  happens. The lock is advisory and per-open-file-description, so the kernel
+  drops it however abruptly the holder dies.
 - The call is bounded from *inside* SQLite by a wall-clock cap and a free-space
   floor, via `set_progress_handler`. `--max-seconds` cannot bound `VACUUM INTO`,
   which is one uninterruptible call: an unbounded one ran **23 minutes**, wrote a
   **39.6 GB** temp copy and drove a disk from 88% to 93% before it was killed by
   hand. The partial copy SQLite leaves behind is unlinked on every abort path.
+  Note the cap is enforced at the next progress callback: a statement blocked in
+  filesystem I/O runs no callbacks and can overshoot it.
 - A guard that refuses or aborts is a **skip, not an error**: the database is
-  untouched and a later run may succeed, so the exit status stays 0.
+  untouched and a later run may succeed, so the exit status stays 0. That
+  includes a refused cutover — a safe no-op beats a hopeful swap.
+
+Files it may leave beside the database, and what to do about them:
+
+| File | Meaning |
+| --- | --- |
+| `opencode.db.rebuild-lock` | empty; always present after one rebuild. Ignore. |
+| `opencode.db.rebuild-tmp` | a partial copy from an interrupted rebuild. Safe to delete. |
+| `opencode.db.rebuild-old` | **the previous database.** A rebuild was interrupted mid-swap. Compare it against the live file and remove it by hand; until then every rebuild refuses. |
 
 `--enable-incremental-vacuum` switches a database to INCREMENTAL. From
 `auto_vacuum=FULL` this is a header change and costs nothing. From
@@ -624,6 +680,18 @@ large.
 - Eligibility is decided **again inside each write transaction**. The database is
   live, so a session opencode touched (or gave a live child) after the selection
   pass is skipped rather than deleted.
+- The **schema guard is re-checked inside each batch's transaction**, not once
+  before the run. Deleting with `PRAGMA foreign_keys` off is only equivalent to
+  deleting with the cascades on while the table list is complete, and the write
+  lock is released between batches — so an opencode migration adding a session
+  child can land after an unlocked check and be orphaned by every batch after it.
+  A schema that changes mid-run rolls that batch back and stops, reporting what
+  was already committed. The check covers the **transitive** closure: `message`,
+  `part`, `event` and `event_sequence` are deleted explicitly too, so a table
+  hanging off any of them is orphaned exactly as surely as a direct child of
+  `session`. Identifiers are compared case-insensitively, since
+  `REFERENCES SeSsIoN(id)` is valid SQLite. `delete_sessions` enforces this
+  itself rather than trusting its caller to have done so.
 - A `NULL time_updated` is an unknown age, not an infinite one: such sessions are
   kept and reported.
 - `--retention-days` below 1 is refused; this deletes irreplaceable history.
@@ -676,5 +744,5 @@ large.
 | `--no-vacuum` | off | delete rows but do not release pages |
 | `--enable-incremental-vacuum` | off | switch `auto_vacuum` to INCREMENTAL |
 | `--rebuild` | off | compact with `VACUUM INTO` when nothing holds the database |
-| `--rebuild-max-seconds` | `900` | hard wall-clock cap on the rebuild |
+| `--rebuild-max-seconds` | `900` | abort the rebuild at the first progress callback after this long |
 | `--rebuild-min-free-gib` | `25` | refuse/abort a rebuild that would leave less free |

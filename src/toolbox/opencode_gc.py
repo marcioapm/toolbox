@@ -61,10 +61,14 @@ way to shrink one that already has.
 `--rebuild` is. `VACUUM INTO` writes only the compacted copy, so it needs
 live-size plus a margin rather than the 2x a plain `VACUUM` needs -- the
 distinction that makes a 32 GiB file with 6.2 GiB live reclaimable on 13 GiB of
-free disk. It is also the dangerous pass, and is gated accordingly: it runs
-only when nothing holds the database, re-checks that immediately before the
-swap, verifies the copy, and is bounded by a wall-clock cap and a free-space
-floor enforced from inside SQLite. See `rebuild_database`.
+free disk. It is also the dangerous pass. Its cutover does not rest on holder
+snapshots: `lsof` cannot tell you whether anyone COMMITTED during a rebuild,
+only who was attached at one instant, and a writer that opens and exits inside
+the window is invisible to any number of such checks while its transaction is
+absent from the copy. Instead `PRAGMA data_version` detects the commit,
+`BEGIN EXCLUSIVE` held across the rename excludes writers from the window no
+check can cover, and the old inode is hard-linked aside so the processes still
+holding it can be named exactly. See `_swap_in`.
 
 THE DATABASE IS LIVE WHILE THIS RUNS
 ------------------------------------
@@ -107,12 +111,14 @@ stopped early, 1 for one that errored.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import heapq
 import json
 import math
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -184,6 +190,16 @@ REBUILD_DISK_POLL_SECONDS = 2.0
 # slow the rebuild.
 REBUILD_PROGRESS_INSTRUCTIONS = 20_000
 REBUILD_SUFFIX = ".rebuild-tmp"
+# The old database is hard-linked here for the duration of the swap, so it
+# stays recoverable until the new one is durably in place -- and so the set of
+# processes still holding it can be named, which is what makes the cutover
+# provable rather than opportunistic. See `_swap_in`.
+REBUILD_BACKUP_SUFFIX = ".rebuild-old"
+# Two --rebuild runs share one REBUILD_SUFFIX path and would destroy each
+# other's copy mid-write. flock is advisory and process-scoped, which is
+# exactly the scope of the collision: a manual invocation landing on top of a
+# timed one.
+REBUILD_LOCK_SUFFIX = ".rebuild-lock"
 
 # Per-connection, so opencode's own connections keep their own (unlimited)
 # setting; this only stops OUR transactions from leaving a huge WAL behind.
@@ -358,21 +374,60 @@ def db_holders(db: Path) -> list[str] | None:
     writers.
 
     An empty list is still only a snapshot: a process can attach a millisecond
-    later, which is why the rebuild re-checks immediately before its swap.
+    later. It is a cheap pre-filter, never the authority for a swap -- see
+    `rebuild_database`, which proves exclusion instead of sampling it.
+
+    Every per-path lookup must be understood or the whole answer is `None`.
+    Measured on macmini (lsof 4.91): a path that does not exist exits 1 with
+    `lsof: status error on <path>: No such file or directory` on stderr and
+    nothing on stdout. Reading stdout alone scores that as "no holders", and a
+    missing `-shm` is routine, so one absent sidecar silently downgraded the
+    whole database to "idle" -- the fail-open this fails closed on. Note the
+    `--` separator is accepted by that lsof; the defect was never the argv.
+
+    A missing sidecar is skipped, being an ordinary state of a healthy
+    database. A missing MAIN file is not: the caller asked about a database
+    that is not there, and "nobody holds it" is not a safe thing to tell a
+    caller about to destroy something.
     """
     me = str(os.getpid())
     pids: set[str] = set()
-    for path in (str(db), *(str(db) + s for s in SIDECAR_SUFFIXES)):
+    try:
+        if not db.exists():
+            return None
+    except OSError:
+        return None
+    for path in (db, *(db.with_name(db.name + s) for s in SIDECAR_SUFFIXES)):
+        try:
+            if path != db and not path.exists():
+                continue
+        except OSError:
+            return None
         try:
             proc = subprocess.run(
-                ["lsof", "-t", "--", path],
+                ["lsof", "-t", "--", str(path)],
                 capture_output=True, text=True, timeout=HOLDER_LOOKUP_TIMEOUT_S,
+                check=False,   # a nonzero status is data here, not an error
             )
         except (OSError, subprocess.SubprocessError):
             # FileNotFoundError (no lsof), TimeoutExpired, and anything else
             # that stops it answering all mean the same thing: unknown.
             return None
-        pids.update(p for p in proc.stdout.split() if p.strip() and p.strip() != me)
+        if proc.stderr.strip():
+            # lsof reports permission problems and unreadable paths here while
+            # still exiting 1 with empty stdout, which is indistinguishable
+            # from "no matches" unless stderr is read.
+            return None
+        if proc.returncode not in (0, 1):
+            return None
+        found = proc.stdout.split()
+        if proc.returncode == 1 and found:
+            # Exit 1 means "no matching files"; PIDs alongside it mean the
+            # output is not what this parser assumes it is.
+            return None
+        if not all(p.isdigit() for p in found):
+            return None
+        pids.update(p for p in found if p != me)
     return sorted(pids)
 
 
@@ -382,6 +437,7 @@ class CheckpointOutcome:
 
     mode: str
     pages_checkpointed: int = 0
+    wal_pages: int = 0
     busy: bool = False
 
 
@@ -406,17 +462,27 @@ def checkpoint_wal(conn: sqlite3.Connection, mode: str) -> CheckpointOutcome:
     `PRAGMA wal_checkpoint` returns (busy, wal_pages, moved_pages). A database
     not in WAL mode answers (0, -1, -1) and is reported as zero pages moved,
     which is the truth: there is no WAL to fold.
+
+    `busy` alone understates incompleteness. A PASSIVE checkpoint blocked by a
+    reader's snapshot returns a ZERO busy flag while folding only part of the
+    WAL -- measured on a fixture: `(0, 204, 104)`, half the frames left, and
+    reported as a clean sweep. `moved < wal_pages` is the other way a
+    checkpoint is incomplete, and an operator watching a WAL that never shrinks
+    needs to be told about both.
     """
     previous = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
     conn.execute("PRAGMA busy_timeout=0")
     try:
-        busy, _wal_pages, moved = conn.execute(
+        busy, wal_pages, moved = conn.execute(
             f"PRAGMA wal_checkpoint({mode})"
         ).fetchone()
     finally:
         conn.execute(f"PRAGMA busy_timeout={previous}")
     return CheckpointOutcome(
-        mode=mode, pages_checkpointed=max(0, moved), busy=bool(busy)
+        mode=mode,
+        pages_checkpointed=max(0, moved),
+        wal_pages=max(0, wal_pages),
+        busy=bool(busy) or (wal_pages > 0 and 0 <= moved < wal_pages),
     )
 
 
@@ -618,7 +684,16 @@ def delete_sessions(
     reported as a failure rather than retried: against a live database the
     retry is an endless loop taking and releasing the write lock, which
     starves opencode and never terminates to report anything at all.
+
+    The schema guard is this function's own precondition, enforced here rather
+    than trusted to the caller, and re-enforced inside every batch's
+    transaction. `verify_usable` before the loop describes the schema at one
+    unlocked instant; the lock is deliberately released between batches, so an
+    opencode migration adding a session child can land after it and be orphaned
+    by the batches that follow. Revalidating under the write lock is what makes
+    the refusal true of the schema each transaction actually deletes from.
     """
+    verify_usable(conn)
     tables = [(t, c) for t, c in CHILD_TABLES if _table_exists(conn, t)]
     outcome = DeleteOutcome(rows={t: 0 for t, _ in tables} | {"session": 0})
     order_index = {sid: i for i, sid in enumerate(session_ids)}
@@ -639,6 +714,24 @@ def delete_sessions(
             # to fail, with SQLITE_BUSY, when opencode holds the write lock.
             conn.execute("BEGIN IMMEDIATE")
             began = True
+            # Under the lock, and before this batch deletes anything: the
+            # schema a migration may have changed since the last COMMIT is the
+            # schema this transaction is about to delete from.
+            try:
+                verify_usable(conn)
+            except RuntimeError as exc:
+                _rollback_quietly(conn)
+                began = False
+                outcome.failure = (
+                    f"the schema changed mid-run and this batch was rolled "
+                    f"back: {exc}"
+                )
+                break
+            # Re-read under the lock too: a known child table created by a
+            # migration mid-run is one the pre-loop list does not have, and
+            # every later batch would leave its rows behind.
+            tables = [(t, c) for t, c in CHILD_TABLES if _table_exists(conn, t)]
+            committed = {t: 0 for t, _ in tables} | {"session": 0}
             eligible = expired_session_ids(conn, cutoff_ms, restrict_to=pending).deletable
             doomed = eligible[:batch]
             # Anything left over is ineligible in the graph under this lock:
@@ -661,7 +754,9 @@ def delete_sessions(
             # overstates what is left rather than understating what was
             # destroyed.
             began = False
-            outcome.rows.update({t: outcome.rows[t] + n for t, n in committed.items()})
+            outcome.rows.update({
+                t: outcome.rows.get(t, 0) + n for t, n in committed.items()
+            })
             outcome.skipped.extend(sorted(ineligible, key=order_index.__getitem__))
             remaining_before = len(pending)
             pending = pending - set(doomed) - ineligible
@@ -932,6 +1027,279 @@ def _rebuild_guard(
     return guard
 
 
+def _fsync_path(path: Path) -> None:
+    """Force `path` to durable storage, directories included.
+
+    On darwin `fsync(2)` only hands the write to the drive, which may hold it
+    in a volatile cache; `F_FULLFSYNC` is the documented barrier that does not.
+    It is not available on every filesystem (SMB, some network mounts answer
+    ENOTTY/ENOTSUP), so a refusal falls back to fsync rather than failing the
+    swap -- the alternative is refusing to rebuild on an ordinary share.
+    """
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        full_fsync = getattr(fcntl, "F_FULLFSYNC", None)
+        if full_fsync is not None:
+            try:
+                fcntl.fcntl(fd, full_fsync)
+                return
+            except OSError:
+                pass
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _prepare_replacement(target: Path, source_stat: os.stat_result, journal_mode: str
+                         ) -> str | None:
+    """Give the rebuilt copy the source's mode, owner and journal mode.
+
+    Returns a reason not to swap it in, or None.
+
+    `VACUUM INTO` writes a brand-new file: it takes the process umask, not the
+    source's permissions, and it comes out in the default DELETE journal mode
+    whatever the source used. Measured on macmini: a 0600 WAL source produced a
+    0644 DELETE copy. Swapping that in publishes session history to every local
+    user and silently changes opencode's concurrency model -- in rollback-journal
+    mode a long reader blocks writers instead of coexisting with them.
+
+    Both are established here and then read back from a fresh connection,
+    because the value that matters is the one that persisted in the file rather
+    than the one the setting statement returned. Failure to establish either is
+    a refusal, not a warning: the swap is destructive and there is no way to
+    put the old file back once opencode has written to the new one.
+    """
+    try:
+        os.chmod(target, stat.S_IMODE(source_stat.st_mode))
+    except OSError as exc:
+        return f"the rebuilt copy could not be given the source's permissions: {exc}"
+    if (source_stat.st_uid, source_stat.st_gid) != (os.geteuid(), os.getegid()):
+        try:
+            os.chown(target, source_stat.st_uid, source_stat.st_gid)
+        except OSError as exc:
+            return (
+                f"the rebuilt copy could not be given the source's ownership "
+                f"(uid {source_stat.st_uid}, gid {source_stat.st_gid}): {exc}"
+            )
+
+    if journal_mode.casefold() == "wal":
+        # Set WAL and close: the mode is persistent in the file header, and a
+        # clean close leaves no sidecar behind for the swap to worry about.
+        conn = sqlite3.connect(str(target), isolation_level=None)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        finally:
+            conn.close()
+
+    problem = _verify_rebuilt(target, journal_mode)
+    if problem:
+        return problem
+    mode = stat.S_IMODE(target.stat().st_mode)
+    if mode != stat.S_IMODE(source_stat.st_mode):
+        return (
+            f"the rebuilt copy is mode {mode:04o}, not the source's "
+            f"{stat.S_IMODE(source_stat.st_mode):04o}"
+        )
+    return None
+
+
+def _swap_in(db: Path, target: Path, conn: sqlite3.Connection, expected_version: int
+             ) -> str | None:
+    """Install `target` at `db`, or explain why it was not safe to.
+
+    Returns None on success, otherwise a reason -- and on every such reason the
+    live pathname still holds a database with every committed row, because the
+    old file is only ever unlinked once the new one is durably in place.
+
+    THE ARGUMENT THIS PROTOCOL RESTS ON
+    -----------------------------------
+    `lsof` cannot authorise this. It answers "who was attached at instant T",
+    never "did anyone commit during the interval", so a writer that opens after
+    the check, commits after `VACUUM INTO` took its snapshot, and exits before
+    the next check is invisible to every snapshot while its transaction is
+    absent from the copy. Reproduced: the swap installed a copy missing a
+    committed row. A third check does not help; no number of them does.
+
+    Three mechanisms replace it, and each answers a question a snapshot cannot:
+
+    1. `PRAGMA data_version` -- did anyone commit? It changes whenever ANOTHER
+       connection commits to the database, and is stable across our own writes
+       and our own `VACUUM INTO` (verified on fixtures, both directions,
+       same-process and cross-process). Read on this held connection before the
+       rebuild and again under the lock below, it detects the exact race the
+       holder snapshots miss, without caring who is alive.
+    2. `BEGIN EXCLUSIVE`, held across the rename -- can anyone commit now? In
+       WAL mode it blocks other connections' writes while leaving readers
+       alone, and it survives `os.replace`: a writer queued against it stays
+       queued until this connection releases, then commits to the NEW file
+       (measured: blocked 2.06s, committed after release, saw the rebuilt
+       contents). That closes the window between the last check and the rename,
+       which is the window no check can cover.
+    3. `lsof` on the backup name -- is anyone still holding the OLD inode? This
+       is the one snapshot that is not a race. After the rename the old inode
+       is reachable through exactly one pathname, the backup link this function
+       just made, and nothing else on the host knows that name. The set of
+       processes holding it is therefore CLOSED: it cannot grow, so observing
+       it empty is a proof rather than a sample. Verified: a straggler that
+       attached before the rename shows up there and nowhere else, and a
+       process attaching after the rename gets the new inode and never appears.
+
+    A straggler found by (3) is not data loss -- it is detected before the old
+    file is discarded, and the rename is rolled back, restoring the original
+    inode at the live pathname with the straggler's writes intact.
+
+    `VACUUM INTO` cannot run inside a transaction ("cannot VACUUM from within a
+    transaction"), so the lock is necessarily taken after the rebuild, for the
+    cutover only. That is sufficient: (1) covers the rebuild interval and (2)
+    covers the cutover, so between them every instant from snapshot to rename
+    is accounted for by something other than a guess.
+    """
+    backup = db.with_name(db.name + REBUILD_BACKUP_SUFFIX)
+    if backup.exists():
+        return (
+            f"{backup} already exists; a previous rebuild may have been "
+            "interrupted mid-swap. Check it against the live database and "
+            "remove it by hand before rebuilding again"
+        )
+
+    # Fold the WAL first: the preserved old file has to be self-contained, or
+    # "preserving" it keeps a main file whose committed tail is in a sidecar.
+    # Through checkpoint_wal, so the connection's busy_timeout is suspended for
+    # it: a blocking checkpoint that cannot get the WAL otherwise waits the
+    # full 30s (measured 31.85s) with every opencode writer queued behind it,
+    # and the answer after waiting is the same refusal.
+    try:
+        folded = checkpoint_wal(conn, "TRUNCATE")
+    except sqlite3.Error as exc:
+        return f"the source WAL could not be checkpointed before the swap: {exc}"
+    if folded.busy:
+        return (
+            "the source WAL could not be fully folded before the swap "
+            f"({folded.pages_checkpointed} of {folded.wal_pages} page(s) "
+            "moved); another connection is still using part of it"
+        )
+
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+    except sqlite3.Error as exc:
+        return (
+            "the database could not be locked for the swap, so a writer could "
+            f"commit into the window the rename cannot cover: {exc}"
+        )
+
+    replaced = False
+    try:
+        current = int(conn.execute("PRAGMA data_version").fetchone()[0])
+        if current != expected_version:
+            return (
+                "another connection committed while the rebuild ran "
+                f"(data_version {expected_version} -> {current}); the copy "
+                "predates that write and swapping it in would discard it"
+            )
+
+        try:
+            _fsync_path(target)
+        except OSError as exc:
+            return f"the rebuilt copy could not be flushed to disk: {exc}"
+
+        # One hard link, so the old inode stays reachable under a name of our
+        # own no matter what the rename does. The live pathname is never
+        # without a database for an instant: os.replace is atomic, and until it
+        # runs the original is still there.
+        try:
+            os.link(db, backup)
+        except OSError as exc:
+            return f"the old database could not be preserved before the swap: {exc}"
+
+        try:
+            os.replace(target, db)
+            replaced = True
+        except OSError as exc:
+            _unlink_quietly(backup)
+            return f"the rebuilt copy could not be swapped in: {exc}"
+
+        # The old inode now has exactly one name, and it is ours. Anyone
+        # holding it attached before the rename and would keep writing to a
+        # file nothing can reach.
+        stragglers = db_holders(backup)
+        if stragglers is None or stragglers:
+            try:
+                os.replace(backup, db)
+            except OSError as exc:
+                return (
+                    "a process is still holding the old database and it could "
+                    f"not be put back: {exc}. The rebuilt copy is now at {db} "
+                    f"and the original is at {backup}; restore it by hand"
+                )
+            replaced = False
+            if stragglers is None:
+                return (
+                    "rebuild rolled back: whether anything still holds the old "
+                    "database became undeterminable at the swap"
+                )
+            return (
+                f"rebuild rolled back: {len(stragglers)} process(es) attached "
+                f"during the rebuild [{','.join(stragglers[:8])}] and still "
+                "hold the old file; their writes would have been stranded"
+            )
+
+        try:
+            _fsync_path(db.parent)
+        except OSError as exc:
+            return f"the swap could not be made durable: {exc}"
+    finally:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        if not replaced:
+            _unlink_quietly(backup)
+
+    # Only now, with the new file durably at the live pathname and proven to be
+    # the only one anything can reach, is the old set safe to remove.
+    _unlink_quietly(backup)
+    for suffix in SIDECAR_SUFFIXES:
+        _unlink_quietly(db.with_name(db.name + suffix))
+    return None
+
+
+class _RebuildLock:
+    """Single-instance guard around one database's rebuild.
+
+    `flock(LOCK_EX|LOCK_NB)` on a lock file beside the database. Advisory and
+    per-open-file-description, so the kernel releases it if the process dies
+    however abruptly -- a stale lock file cannot wedge the next run, which is
+    the failure mode a PID file would have.
+
+    The lock file is deliberately never unlinked: removing it races another
+    process that has already opened it and is about to flock the now-orphaned
+    inode, which would let both proceed. It is an empty file.
+    """
+
+    def __init__(self, db: Path) -> None:
+        self._path = db.with_name(db.name + REBUILD_LOCK_SUFFIX)
+        self._fd: int | None = None
+
+    def acquire(self) -> bool:
+        fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._fd = fd
+        return True
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            os.close(self._fd)   # closing drops the flock
+        except OSError:
+            pass
+        self._fd = None
+
+
 def rebuild_database(
     db: Path,
     stats: DbStats,
@@ -947,37 +1315,71 @@ def rebuild_database(
     days. It is also the only destructive one, and the order of its guards is
     the whole safety argument:
 
-    1. Refuse if anything holds the database, and refuse if that cannot be
-       determined -- `db_holders` returns None, never an optimistic empty list.
-    2. Refuse unless the copy fits AND still leaves the floor free. The copy is
+    1. Take the single-instance lock. Two `--rebuild` invocations share one
+       `.rebuild-tmp` path and would each destroy the other's copy mid-write;
+       a manual run colliding with a timed one is the ordinary way that
+       happens.
+    2. Ask `lsof` whether anything holds the database. This is a PRE-FILTER
+       and nothing more -- it is here so a busy host does not pay for a
+       20-minute rebuild that the cutover will refuse, not because it
+       authorises anything. `None` (undeterminable) is still a refusal.
+    3. Refuse unless the copy fits AND still leaves the floor free. The copy is
        a full second copy of the live data, appearing on a disk that on
        2026-09-12 was already at 88%.
-    3. Bound the call itself from inside SQLite, by wall clock and by free
+    4. Record `PRAGMA data_version` on a connection held open for the whole
+       rebuild, so a commit by anyone else during it can be detected rather
+       than guessed at.
+    5. Bound the call itself from inside SQLite, by wall clock and by free
        space, and unlink the partial copy on every abort path -- SQLite leaves
        it behind (verified: the output file exists after `interrupted`), so
        without this a 39 GB orphan accumulates per abort.
-    4. Verify the copy before trusting it: `quick_check` ok, and auto_vacuum
-       still INCREMENTAL, or the swap would silently cost the store its ability
-       to reclaim anything in place.
-    5. Re-check holders immediately before the swap and discard the copy if any
-       appeared. The rebuild is safe; the swap is what loses data. A process
-       that opens the database during the rebuild keeps writing to the OLD
-       inode, and `os.replace` strands those writes on an unlinked inode. The
-       re-check shrinks that window from the minutes a rebuild takes to the
-       microseconds around the rename. A process that both starts AND exits
-       inside the rebuild window is still unprotected -- which is why this pass
-       stays opportunistic and must never be the only reclaim path.
-    6. Delete the -wal/-shm sidecars before the swap, or the new file is opened
-       against a stale WAL describing the old one.
+    6. Verify the copy before trusting it: `quick_check` ok, auto_vacuum still
+       INCREMENTAL, and the source's journal mode, permissions and ownership
+       established on it and read back.
+    7. Swap under proof rather than under a snapshot -- see `_swap_in`.
+
+    The connection opened in step 4 is held until the swap is done: it is what
+    `data_version` is read on and what `BEGIN EXCLUSIVE` is taken on, and both
+    are meaningless on a connection opened afterwards.
     """
     outcome = RebuildOutcome()
 
+    lock = _RebuildLock(db)
+    try:
+        if not lock.acquire():
+            outcome.skipped = (
+                "another opencode-gc rebuild is running against this database; "
+                "they share one temporary copy and must not overlap"
+            )
+            return outcome
+    except OSError as exc:
+        outcome.skipped = f"the rebuild lock could not be taken: {exc}"
+        return outcome
+
+    try:
+        return _rebuild_locked(
+            db, stats, max_seconds=max_seconds, min_free_bytes=min_free_bytes,
+            clock=clock, outcome=outcome,
+        )
+    finally:
+        lock.release()
+
+
+def _rebuild_locked(
+    db: Path,
+    stats: DbStats,
+    *,
+    max_seconds: float,
+    min_free_bytes: int,
+    clock,
+    outcome: RebuildOutcome,
+) -> RebuildOutcome:
     holders = db_holders(db)
     outcome.holders_before = holders
     if holders is None:
         outcome.skipped = (
             "cannot determine who holds the database (lsof missing or timed "
-            "out); refusing to swap the file blind"
+            "out); not starting a rebuild that would be refused at the swap"
         )
         return outcome
     if holders:
@@ -1002,6 +1404,12 @@ def rebuild_database(
         )
         return outcome
 
+    try:
+        source_stat = db.stat()
+    except OSError as exc:
+        outcome.failure = f"the database could not be inspected: {exc}"
+        return outcome
+
     target = db.with_name(db.name + REBUILD_SUFFIX)
     state: dict = {}
     outcome.attempted = True
@@ -1018,87 +1426,88 @@ def rebuild_database(
         outcome.failure = f"{type(exc).__name__}: {exc}"
         return outcome
 
+    # Everything from here owns `target` and the open connection. One
+    # try/finally covers the whole lifetime of both: an interrupt during
+    # verification or the swap would otherwise leave tens of gigabytes behind.
+    installed = False
     try:
-        guard = _rebuild_guard(
-            db, clock() + max_seconds, min_free_bytes, state, clock=clock
-        )
-        conn.set_progress_handler(guard, REBUILD_PROGRESS_INSTRUCTIONS)
-        started = clock()
         try:
-            conn.execute("VACUUM INTO ?", (str(target),))
-        finally:
-            conn.set_progress_handler(None, 0)
-            outcome.seconds = round(clock() - started, 3)
-    except (sqlite3.Error, OSError) as exc:
-        _unlink_quietly(target)
-        if state.get("reason"):
-            # A guard abort arrives here as sqlite3.OperationalError
-            # ("interrupted") because CPython discards whatever a progress
-            # handler raises. The recorded reason is what distinguishes a
-            # deliberate skip from a real failure.
-            outcome.skipped = f"rebuild aborted: {state['reason']}"
-        else:
-            outcome.failure = f"{type(exc).__name__}: {exc}"
+            journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0])
+            version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+        except sqlite3.Error as exc:
+            outcome.failure = f"the source database could not be read: {exc}"
+            return outcome
+
+        try:
+            guard = _rebuild_guard(
+                db, clock() + max_seconds, min_free_bytes, state, clock=clock
+            )
+            conn.set_progress_handler(guard, REBUILD_PROGRESS_INSTRUCTIONS)
+            started = clock()
+            try:
+                conn.execute("VACUUM INTO ?", (str(target),))
+            finally:
+                conn.set_progress_handler(None, 0)
+                outcome.seconds = round(clock() - started, 3)
+        except (sqlite3.Error, OSError) as exc:
+            if state.get("reason"):
+                # A guard abort arrives here as sqlite3.OperationalError
+                # ("interrupted") because CPython discards whatever a progress
+                # handler raises. The recorded reason is what distinguishes a
+                # deliberate skip from a real failure.
+                outcome.skipped = f"rebuild aborted: {state['reason']}"
+            else:
+                outcome.failure = f"{type(exc).__name__}: {exc}"
+            return outcome
+
+        try:
+            problem = _prepare_replacement(target, source_stat, journal_mode)
+        except (sqlite3.Error, OSError) as exc:
+            outcome.failure = f"the rebuilt copy could not be checked: {exc}"
+            return outcome
+        if problem:
+            outcome.failure = problem
+            return outcome
+
+        try:
+            outcome.bytes_written = target.stat().st_size
+        except OSError as exc:
+            outcome.failure = f"the rebuilt copy could not be measured: {exc}"
+            return outcome
+
+        try:
+            refusal = _swap_in(db, target, conn, version)
+        except (sqlite3.Error, OSError) as exc:
+            outcome.failure = f"the swap failed: {type(exc).__name__}: {exc}"
+            return outcome
+        if refusal:
+            # Every refusal leaves the original database at the live pathname.
+            outcome.skipped = refusal
+            return outcome
+        installed = True
+        outcome.holders_after = []
+        outcome.completed = True
         return outcome
-    except BaseException:
-        _unlink_quietly(target)
-        raise
     finally:
+        if not installed:
+            _unlink_quietly(target)
         try:
             conn.close()
         except sqlite3.Error:
             pass
 
-    try:
-        problem = _verify_rebuilt(target)
-    except (sqlite3.Error, OSError) as exc:
-        _unlink_quietly(target)
-        outcome.failure = f"the rebuilt copy could not be checked: {exc}"
-        return outcome
-    if problem:
-        _unlink_quietly(target)
-        outcome.failure = problem
-        return outcome
 
-    late = db_holders(db)
-    outcome.holders_after = late
-    if late is None:
-        _unlink_quietly(target)
-        outcome.skipped = (
-            "rebuild discarded: holders became undeterminable while it ran, so "
-            "the swap cannot be shown to be safe"
-        )
-        return outcome
-    if late:
-        _unlink_quietly(target)
-        outcome.skipped = (
-            f"rebuild discarded: {len(late)} process(es) attached while it ran "
-            f"[{','.join(late[:8])}]; swapping would strand their writes on the "
-            "old inode"
-        )
-        return outcome
+def _verify_rebuilt(target: Path, journal_mode: str = "") -> str | None:
+    """Reasons not to trust the rebuilt copy, or None if it is sound.
 
-    try:
-        outcome.bytes_written = target.stat().st_size
-        # The sidecars describe the file being replaced. Left in place, the
-        # new one is opened against a WAL for the old one.
-        for suffix in SIDECAR_SUFFIXES:
-            db.with_name(db.name + suffix).unlink(missing_ok=True)
-        os.replace(target, db)
-    except OSError as exc:
-        _unlink_quietly(target)
-        outcome.failure = f"the rebuilt copy could not be swapped in: {exc}"
-        return outcome
-    outcome.completed = True
-    return outcome
-
-
-def _verify_rebuilt(target: Path) -> str | None:
-    """Reasons not to trust the rebuilt copy, or None if it is sound."""
+    Opened fresh so every answer is what persisted in the file rather than what
+    a setting statement returned on the connection that made it.
+    """
     check = sqlite3.connect(str(target), isolation_level=None)
     try:
         integrity = check.execute("PRAGMA quick_check").fetchone()[0]
         auto_vacuum = int(check.execute("PRAGMA auto_vacuum").fetchone()[0])
+        actual_journal = str(check.execute("PRAGMA journal_mode").fetchone()[0])
     finally:
         check.close()
     if integrity != "ok":
@@ -1109,6 +1518,11 @@ def _verify_rebuilt(target: Path) -> str | None:
         return (
             "the rebuilt copy came out auto_vacuum="
             f"{AUTO_VACUUM_NAMES.get(auto_vacuum, auto_vacuum)}, not INCREMENTAL"
+        )
+    if journal_mode and actual_journal.casefold() != journal_mode.casefold():
+        return (
+            f"the rebuilt copy came out journal_mode={actual_journal}, not the "
+            f"source's {journal_mode}"
         )
     return None
 
@@ -1210,8 +1624,13 @@ def enable_incremental_vacuum(conn: sqlite3.Connection, db: Path, stats: DbStats
     return [f"auto_vacuum {stats.auto_vacuum_name} -> INCREMENTAL (full VACUUM run)"]
 
 
-def session_child_tables(conn: sqlite3.Connection) -> set[str]:
-    """Every table whose foreign key references `session`, from the schema.
+def deleted_tables() -> set[str]:
+    """Every table this module deletes rows from, normalised for comparison."""
+    return {"session"} | {t.casefold() for t, _ in CHILD_TABLES}
+
+
+def orphaned_by_deletion(conn: sqlite3.Connection) -> set[str]:
+    """Tables whose rows this module's deletions would strand, from the schema.
 
     Asked of the database rather than assumed, because `CHILD_TABLES` being
     complete is what makes deleting with `PRAGMA foreign_keys` off equivalent
@@ -1219,15 +1638,47 @@ def session_child_tables(conn: sqlite3.Connection) -> set[str]:
     otherwise be orphaned by every session this tool deletes, silently, which
     is exactly what `todo`, `session_message`, `session_input` and
     `session_share` were before they were added to the list.
+
+    Reachability is transitive, not one hop. `session` is not the only parent
+    that disappears: `message`, `part`, `event` and `event_sequence` are each
+    deleted explicitly, with foreign keys off, so nothing cascades. A table
+    referencing `message` is orphaned exactly as surely as one referencing
+    `session`, and checking only direct children passed such a schema. The
+    closure is therefore rooted at every table in the deletion plan and walked
+    until it stops growing.
+
+    SQLite identifiers are case-insensitive but `PRAGMA foreign_key_list`
+    echoes the spelling used in the declaration, so `REFERENCES SeSsIoN(id)`
+    is a valid reference that a `== "session"` test does not recognise.
+    Everything here is compared casefolded.
     """
-    children: set[str] = set()
+    # child table -> the parent tables it references.
+    parents: dict[str, set[str]] = {}
     for (name,) in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
     ).fetchall():
-        for row in conn.execute(f'PRAGMA foreign_key_list("{name}")').fetchall():
-            if row[2] == "session":
-                children.add(name)
-    return children
+        refs = {
+            str(row[2]).casefold()
+            for row in conn.execute(f'PRAGMA foreign_key_list("{name}")').fetchall()
+        }
+        if refs:
+            parents[name.casefold()] = refs
+
+    deleted = deleted_tables()
+    # A table is orphaned if it references anything deleted, and once orphaned
+    # it is itself a vanishing parent for whatever references it.
+    vanishing = set(deleted)
+    orphaned: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for child, refs in parents.items():
+            if child in vanishing or not (refs & vanishing):
+                continue
+            orphaned.add(child)
+            vanishing.add(child)
+            changed = True
+    return orphaned - deleted
 
 
 def verify_usable(conn: sqlite3.Connection) -> None:
@@ -1239,12 +1690,11 @@ def verify_usable(conn: sqlite3.Connection) -> None:
     while nothing has been written.
 
     The reverse direction matters just as much and is checked here too: a
-    session child in the schema that `CHILD_TABLES` does not cover would have
-    its rows orphaned by every deletion, and nothing else would ever say so.
-    Refusing is the only safe answer, since the alternative is destroying
-    referential integrity quietly.
+    table the schema hangs off anything this tool deletes, and that
+    `CHILD_TABLES` does not cover, would have its rows orphaned by every
+    deletion, and nothing else would ever say so. Refusing is the only safe
+    answer, since the alternative is destroying referential integrity quietly.
     """
-    known = {t for t, _ in CHILD_TABLES}
     required = ["session"] + [t for t, _ in CHILD_TABLES if t in REQUIRED_CHILD_TABLES]
     try:
         present = {
@@ -1262,15 +1712,15 @@ def verify_usable(conn: sqlite3.Connection) -> None:
         )
 
     try:
-        uncovered = sorted(session_child_tables(conn) - known)
+        uncovered = sorted(orphaned_by_deletion(conn))
     except sqlite3.DatabaseError as exc:
         raise RuntimeError(f"cannot read the schema: {exc}") from exc
     if uncovered:
         raise RuntimeError(
-            f"table(s) {', '.join(uncovered)} reference session(id) but are not "
-            "in CHILD_TABLES, so deleting a session would orphan their rows. "
-            "Add them to CHILD_TABLES, children first, before pruning this "
-            "database"
+            f"table(s) {', '.join(uncovered)} reference a table this tool "
+            "deletes from but are not in CHILD_TABLES, so deleting a session "
+            "would orphan their rows. Add them to CHILD_TABLES, children "
+            "first, before pruning this database"
         )
 
     # A table can exist without the columns this tool keys on.
@@ -1326,10 +1776,11 @@ def main() -> int:
                          f"{VACUUM_COPY_FACTOR}x the file")
     ap.add_argument("--rebuild-max-seconds", type=float,
                     default=DEFAULT_REBUILD_MAX_SECONDS,
-                    help="hard wall-clock cap on the rebuild, enforced from inside "
-                         f"SQLite (default {DEFAULT_REBUILD_MAX_SECONDS:g}); "
-                         "--max-seconds cannot bound VACUUM INTO, which is one "
-                         "uninterruptible call")
+                    help="abort the rebuild at the first SQLite progress callback "
+                         f"after this long (default {DEFAULT_REBUILD_MAX_SECONDS:g}); "
+                         "--max-seconds cannot bound VACUUM INTO at all, but a "
+                         "statement blocked in filesystem I/O runs no callbacks and "
+                         "can overshoot this")
     ap.add_argument("--rebuild-min-free-gib", type=float,
                     default=DEFAULT_REBUILD_MIN_FREE_GIB,
                     help="refuse to start a rebuild that would not leave this much "
@@ -1544,8 +1995,8 @@ def main() -> int:
         # file we are about to replace, and after the deletes, so the copy is
         # made from the pruned data rather than the data being pruned.
         try:
-            rb = _run_rebuild(db_path, args, res)
-        except (KeyboardInterrupt, OSError) as exc:
+            rb = _run_rebuild(db_path, args)
+        except (KeyboardInterrupt, OSError, sqlite3.Error, ValueError) as exc:
             res.incomplete = True
             res.errors.append(f"the rebuild stopped: {type(exc).__name__}: {exc}")
         else:
@@ -1553,6 +2004,12 @@ def main() -> int:
             res.rebuild_completed = rb.completed
             res.rebuild_seconds = rb.seconds
             res.rebuild_skipped = rb.skipped
+            # The rebuild's own preflight snapshot, not the checkpoint-time one
+            # taken earlier against a different instant: reporting the latter
+            # alongside a `rebuild_skipped` describing the former is two
+            # different observations under one name.
+            if rb.holders_before is not None or rb.attempted:
+                res.holders_before = rb.holders_before
             res.holders_after = rb.holders_after
             if rb.skipped:
                 # The database is untouched and a later run may succeed, so
@@ -1585,7 +2042,7 @@ def main() -> int:
     return _report(args, res)
 
 
-def _run_rebuild(db_path: Path, args, res: Result) -> RebuildOutcome:
+def _run_rebuild(db_path: Path, args) -> RebuildOutcome:
     """Re-read the post-deletion stats and attempt the rebuild.
 
     The stats have to be re-read here: the live size that decides whether the
@@ -1608,13 +2065,6 @@ def _run_rebuild(db_path: Path, args, res: Result) -> RebuildOutcome:
         max_seconds=args.rebuild_max_seconds,
         min_free_bytes=int(args.rebuild_min_free_gib * 1024 ** 3),
     )
-    if res.pages_released and res.bytes_reclaimed == 0:
-        res.notes.append(
-            f"{res.pages_released:,} pages were released but the file has not "
-            "shrunk yet; a WAL checkpoint is pending, typically because another "
-            "reader is still holding the database open."
-        )
-    return _report(args, res)
 
 
 def _report(args, res: Result) -> int:
