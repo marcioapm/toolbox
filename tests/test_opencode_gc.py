@@ -7231,3 +7231,90 @@ class TestRebuildFailureIsReportedNotRaised:
 
         assert not target.exists(), \
             "the partial copy must not survive an interrupt"
+
+
+class TestVerifierHandlesEverySqliteDialect:
+    """`PRAGMA quick_check` reports corruption in two different ways depending
+    on the SQLite build, and the verifier has to refuse under both.
+
+    Measured 2026-09-12: sqlite 3.46.1 (GitHub Actions on 3.11 and 3.12, and
+    two of our four hosts) RAISES `DatabaseError: database disk image is
+    malformed`, while 3.53.1 (macmini) returns the diagnosis as a row. The
+    suite passed locally and failed in CI on exactly this.
+    """
+
+    def test_a_quick_check_that_raises_is_a_refusal_not_an_exception(
+        self, tmp_path, monkeypatch
+    ):
+        """Mutation: drop the `except sqlite3.DatabaseError` clause from
+        _verify_rebuilt. The error then propagates out of the guard whose whole
+        job is to refuse an unsound copy, and this test errors instead of
+        passing.
+        """
+        target = tmp_path / "rebuilt.db"
+        conn = _make_live_db(target, wal=False)
+        _add_live_session(conn, "s", age_days=1)
+        conn.close()
+
+        # Sound to begin with, or the refusal below proves nothing.
+        assert opencode_gc._verify_rebuilt(target) is None
+
+        real_connect = sqlite3.connect
+
+        class _RaisingConnection:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *args):
+                if "quick_check" in sql:
+                    raise sqlite3.DatabaseError("database disk image is malformed")
+                return self._inner.execute(sql, *args)
+
+            def close(self):
+                self._inner.close()
+
+        def _connect(path, *args, **kwargs):
+            return _RaisingConnection(real_connect(path, *args, **kwargs))
+
+        monkeypatch.setattr(opencode_gc.sqlite3, "connect", _connect)
+
+        problem = opencode_gc._verify_rebuilt(target)
+        assert problem is not None, (
+            "a quick_check that raises must produce a refusal, not propagate"
+        )
+        assert "quick_check" in problem, problem
+        assert "malformed" in problem, problem
+
+    def test_the_raising_connection_is_still_closed(self, tmp_path, monkeypatch):
+        """The refusal must not leak the handle it opened -- a leaked reader
+        would then show up as a foreign holder and block the next rebuild.
+        """
+        target = tmp_path / "rebuilt.db"
+        conn = _make_live_db(target, wal=False)
+        _add_live_session(conn, "s", age_days=1)
+        conn.close()
+
+        real_connect = sqlite3.connect
+        closed = []
+
+        class _RaisingConnection:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *args):
+                if "quick_check" in sql:
+                    raise sqlite3.DatabaseError("database disk image is malformed")
+                return self._inner.execute(sql, *args)
+
+            def close(self):
+                closed.append(True)
+                self._inner.close()
+
+        monkeypatch.setattr(
+            opencode_gc.sqlite3,
+            "connect",
+            lambda path, *a, **k: _RaisingConnection(real_connect(path, *a, **k)),
+        )
+
+        opencode_gc._verify_rebuilt(target)
+        assert closed, "the verifier must close its connection on the raise path"

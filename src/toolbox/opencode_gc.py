@@ -1605,6 +1605,15 @@ def _verify_rebuilt(target: Path, journal_mode: str = "") -> str | None:
         integrity = check.execute("PRAGMA quick_check").fetchone()[0]
         auto_vacuum = int(check.execute("PRAGMA auto_vacuum").fetchone()[0])
         actual_journal = str(check.execute("PRAGMA journal_mode").fetchone()[0])
+    except sqlite3.DatabaseError as exc:
+        # Older SQLite RAISES on a corrupt file where newer SQLite returns the
+        # diagnosis as a row: measured 3.46.1 (CI, and two of our four hosts)
+        # raising "database disk image is malformed" from PRAGMA quick_check
+        # where 3.53.1 answers with a string. Both mean the same thing -- do
+        # not trust this copy -- so both must produce a refusal. A verifier
+        # that throws instead of refusing is the one failure this function
+        # exists to prevent.
+        return f"the rebuilt copy failed quick_check: {exc}"
     finally:
         check.close()
     if integrity != "ok":
