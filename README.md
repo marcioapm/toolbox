@@ -513,6 +513,7 @@ opencode's SQLite store never prunes finished sessions. Measured on one host:
 ```bash
 opencode-gc                              # dry run, 4-day retention
 opencode-gc --apply                      # delete + reclaim + checkpoint
+opencode-gc --apply --require-idle       # mutate only while lsof reports idle
 opencode-gc --retention-days 14 --apply
 opencode-gc --apply --enable-incremental-vacuum   # first run on a new host
 opencode-gc --json                       # machine-readable
@@ -720,12 +721,18 @@ Files it may leave beside the database, and what to do about them:
 filesystem holding the database has 2x the database size (including its WAL)
 plus a reserve free, and unless SQLite's temp filesystem, when it is a different
 one, has room for a copy. Run it once per host, ideally before the file gets
-large.
+large. `--apply --require-idle` cannot be combined with this option: a full
+`VACUUM` cannot yield part-way, so perform a one-off conversion in a maintenance
+window instead.
 
 ### Safety
 
 - Dry run by default; `--apply` is required to delete anything. Dry-run row
   counts are a point-in-time estimate, reported with the cutoff they used.
+- `--require-idle` is fail-closed: an `lsof` result of `[]` proceeds, a non-empty
+  holder list skips or yields, and an undeterminable result (`None`) does the
+  same. The gate is sampled before mutation and between units of committed work;
+  it observes rather than excludes concurrent processes.
 - A session is only expired when it **and every descendant** are older than the
   retention window — `session.parent_id` has no foreign key, so deleting a
   parent out from under a live child would leave a dangling reference.
@@ -789,7 +796,11 @@ large.
 | `0` | completed |
 | `1` | an error occurred (nothing deleted, or a partial delete that is reported) |
 | `2` | bad arguments, no database at `--db`, or a schema this tool cannot safely prune |
-| `3` | no error, but a deadline left eligible sessions unprocessed; re-run to continue |
+| `3` | stopped early without error; committed work is durable and eligible work remains |
+| `4` | `--require-idle` refused at preflight; no mutation occurred |
+
+JSON reports the gate through `require_idle`, `idle_gate_observed`, and
+`idle_gate_outcome`.
 
 `rebuild`:
 
@@ -806,6 +817,7 @@ large.
 | `--db` | `~/.local/share/opencode/opencode.db` | database path |
 | `--retention-days` | `4` | keep sessions updated within this window |
 | `--apply` | off | actually delete |
+| `--require-idle` | off | fail closed unless `lsof` reports no holders before and during mutation |
 | `--batch` | `25` | sessions per transaction (clamped to SQLite's variable limit) |
 | `--batch-sleep-ms` | `1000` | pause between batches, yielding the write lock (0 disables) |
 | `--max-seconds` | `600` | stop starting new batches after this long (0 = no limit) |

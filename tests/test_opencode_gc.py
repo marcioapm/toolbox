@@ -1286,6 +1286,26 @@ class TestIncrementalVacuum:
         assert vac.released == 0
         assert vac.deadline_reached is False
 
+    def test_a_false_predicate_stops_between_steps(self, db, monkeypatch):
+        _, conn = db
+        for i in range(120):
+            _add_session(conn, f"s{i}", age_days=30, events=40, messages=10)
+        _delete(conn, [f"s{i}" for i in range(120)])
+        free_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        assert free_before > 1
+        monkeypatch.setattr(opencode_gc, "INCREMENTAL_VACUUM_STEP_PAGES", 1)
+        answers = iter([True, False])
+
+        vac = opencode_gc.run_incremental_vacuum(
+            conn, pages=None, deadline=None, should_continue=lambda: next(answers),
+        )
+
+        free_after = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        assert vac.released == 1
+        assert free_after == free_before - vac.released
+        assert vac.remaining == free_after
+        assert vac.yielded is True
+
     def test_enable_is_a_noop_when_already_incremental(self, db):
         path, conn = db
         stats = opencode_gc.read_stats(conn)
@@ -4406,6 +4426,167 @@ class TestCheckpointModeSelection:
         assert any("could not be determined" in n for n in payload["notes"])
 
 
+class TestRequireIdle:
+    def _store(self, path, sessions=6):
+        conn = _make_live_db(path)
+        for i in range(sessions):
+            _add_live_session(conn, f"s{i}", age_days=30)
+        conn.close()
+        return path
+
+    @pytest.mark.parametrize(
+        "holders, observed",
+        [(["4242", "4343"], "busy"), (None, "undeterminable")],
+    )
+    def test_non_idle_preflight_skips_without_mutation(
+        self, tmp_path, monkeypatch, capsys, holders, observed
+    ):
+        path = self._store(tmp_path / f"{observed}.db")
+        before = _snapshot(path, tables=("session", "event"))
+        calls = []
+        monkeypatch.setattr(
+            opencode_gc, "db_holders", lambda db: calls.append(db) or holders
+        )
+
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--require-idle",
+        )
+
+        assert rc == 4
+        assert calls == [path.resolve()], "preflight must decide and report one snapshot"
+        assert payload["require_idle"] is True
+        assert payload["holders_before"] == holders
+        assert payload["idle_gate_observed"] == observed
+        assert payload["idle_gate_outcome"] == "preflight-skip"
+        assert payload["sessions_deleted"] == 0
+        assert payload["incomplete"] is False
+        assert payload["errors"] == []
+        assert _snapshot(path, tables=("session", "event")) == before
+
+    def test_idle_preflight_runs_to_completion_and_truncates(self, tmp_path, monkeypatch, capsys):
+        path = self._store(tmp_path / "idle-gate.db")
+        calls = []
+        monkeypatch.setattr(
+            opencode_gc, "db_holders", lambda db: calls.append(db) or []
+        )
+
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--require-idle",
+            "--batch-sleep-ms", "0",
+        )
+
+        assert rc == 0
+        assert calls == [path.resolve()] * 2
+        assert payload["sessions_deleted"] == 6
+        assert payload["idle_gate_observed"] == "idle"
+        assert payload["idle_gate_outcome"] == "ran-to-completion"
+        assert payload["wal_checkpoint_mode"] == "TRUNCATE"
+
+    @pytest.mark.parametrize(
+        "later_holders, observed",
+        [(["5150"], "busy"), (None, "undeterminable")],
+    )
+    def test_mid_pass_non_idle_yields_with_committed_rows_and_exit_three(
+        self, tmp_path, monkeypatch, capsys, later_holders, observed
+    ):
+        path = self._store(tmp_path / "mid-pass.db")
+        answers = iter([[], later_holders])
+        calls = []
+        monkeypatch.setattr(
+            opencode_gc, "db_holders", lambda db: calls.append(db) or next(answers)
+        )
+        monkeypatch.setattr(opencode_gc.time, "monotonic", lambda: 0.0)
+
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--require-idle",
+            "--batch", "2", "--batch-sleep-ms", "0", "--max-seconds", "0",
+            "--no-vacuum",
+        )
+
+        assert rc == 3
+        assert len(calls) == 2
+        assert payload["holders_before"] == []
+        assert payload["idle_gate_observed"] == observed
+        assert payload["idle_gate_outcome"] == "mid-pass-yield"
+        assert payload["sessions_deleted"] == 2
+        assert payload["sessions_remaining"] == 4
+        assert payload["incomplete"] is True
+        assert payload["wal_checkpoint_mode"] == ""
+        assert payload["errors"] == []
+        with _sqlite(path) as check:
+            assert check.execute("SELECT count(*) FROM session").fetchone()[0] == 4
+
+    @pytest.mark.parametrize(
+        "later_holders, observed",
+        [(["5252"], "busy"), (None, "undeterminable")],
+    )
+    def test_vacuum_rechecks_between_steps(
+        self, tmp_path, monkeypatch, capsys, later_holders, observed
+    ):
+        path = self._store(tmp_path / "vacuum-yield.db", sessions=80)
+        monkeypatch.setattr(opencode_gc, "INCREMENTAL_VACUUM_STEP_PAGES", 1)
+        answers = iter([[], [], later_holders])
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: next(answers))
+        ticks = iter([0.0, 6.0])
+        monkeypatch.setattr(opencode_gc.time, "monotonic", lambda: next(ticks))
+
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--require-idle",
+            "--batch", "100", "--batch-sleep-ms", "0", "--max-seconds", "0",
+        )
+
+        assert rc == 3
+        assert payload["sessions_deleted"] == 80
+        assert payload["pages_released"] == 1
+        assert payload["pages_reclaimable_remaining"] > 0
+        assert payload["idle_gate_observed"] == observed
+        assert payload["idle_gate_outcome"] == "mid-pass-yield"
+        assert payload["wal_checkpoint_mode"] == ""
+
+    def test_holder_appearing_at_final_sample_prevents_checkpoint(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        path = self._store(tmp_path / "final-holder.db")
+        answers = iter([[], ["5353"]])
+        calls = []
+        monkeypatch.setattr(
+            opencode_gc, "db_holders", lambda db: calls.append(db) or next(answers)
+        )
+
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply", "--require-idle",
+            "--batch", "100", "--batch-sleep-ms", "0", "--no-vacuum",
+        )
+
+        assert rc == 3
+        assert calls == [path.resolve()] * 2
+        assert payload["sessions_deleted"] == 6
+        assert payload["idle_gate_observed"] == "busy"
+        assert payload["idle_gate_outcome"] == "mid-pass-yield"
+        assert payload["wal_checkpoint_mode"] == ""
+        assert payload["incomplete"] is True
+        with _sqlite(path) as check:
+            assert check.execute("SELECT count(*) FROM session").fetchone()[0] == 0
+
+    def test_omitting_require_idle_preserves_busy_store_behavior(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        path = self._store(tmp_path / "ungated.db")
+        monkeypatch.setattr(opencode_gc, "db_holders", lambda db: ["6160"])
+
+        rc, payload = _run_json_cli(
+            monkeypatch, capsys, "--db", str(path), "--apply",
+            "--batch-sleep-ms", "0",
+        )
+
+        assert rc == 0
+        assert payload["require_idle"] is False
+        assert payload["idle_gate_observed"] == "not-requested"
+        assert payload["idle_gate_outcome"] == "not-requested"
+        assert payload["sessions_deleted"] == 6
+        assert payload["wal_checkpoint_mode"] == "PASSIVE"
+
+
 class TestCheckpointActuallyFoldsTheWal:
     """opencode-gc never checkpointed. In WAL mode a page released by
     incremental_vacuum does not leave the file until a checkpoint runs, and an
@@ -6451,6 +6632,26 @@ class TestDeletionYieldsTheWriteLock:
             f"only PASSIVE may run between batches, saw {sorted(set(modes))}"
         )
 
+    def test_a_false_predicate_stops_before_the_next_batch(self, tmp_path):
+        path = tmp_path / "idle-yield.db"
+        ids = self._store(path, sessions=6)
+        conn = opencode_gc.connect(path, read_only=False)
+        checks = []
+        try:
+            outcome = opencode_gc.delete_sessions(
+                conn, ids, cutoff_ms=_cutoff(), batch=2, deadline=None,
+                sleep_ms=0, should_continue=lambda: checks.append(conn.in_transaction) or False,
+            )
+
+            assert outcome.rows["session"] == 2
+            assert outcome.remaining == 4
+            assert outcome.yielded is True
+            assert outcome.incomplete is True
+            assert checks == [False], "the check must run outside the transaction"
+            assert conn.execute("SELECT count(*) FROM session").fetchone()[0] == 4
+        finally:
+            conn.close()
+
     def test_a_writer_in_another_process_wins_the_lock_during_the_pause(
         self, tmp_path
     ):
@@ -6627,7 +6828,7 @@ class TestNewFlagsAndDefaults:
         prune_help = capsys.readouterr().out
         for flag in ("--retention-days", "--apply", "--batch", "--batch-sleep-ms",
                      "--max-seconds", "--vacuum-pages", "--no-vacuum",
-                     "--enable-incremental-vacuum", "--json", "--db"):
+                     "--enable-incremental-vacuum", "--require-idle", "--json", "--db"):
             assert flag in prune_help, f"the existing flag {flag} must still be offered"
 
     def test_the_rebuild_help_states_the_quiescence_requirement(
@@ -6752,6 +6953,25 @@ class TestNewFlagsAndDefaults:
 
         assert seen["batch"] == opencode_gc.DEFAULT_BATCH == 25
         assert seen["sleep_ms"] == opencode_gc.DEFAULT_BATCH_SLEEP_MS == 1000
+
+    def test_require_idle_refuses_incremental_vacuum_conversion_under_apply(
+        self, anydb, monkeypatch, capsys
+    ):
+        before = _snapshot(anydb, tables=("session",))
+        monkeypatch.setattr(
+            opencode_gc.sys, "argv",
+            ["opencode-gc", "--db", str(anydb), "--apply", "--require-idle",
+             "--enable-incremental-vacuum"],
+        )
+
+        with pytest.raises(SystemExit) as exit_info:
+            opencode_gc.main()
+
+        assert exit_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "--require-idle" in err
+        assert "--enable-incremental-vacuum" in err
+        assert _snapshot(anydb, tables=("session",)) == before
 
     @pytest.mark.parametrize(
         "flag, value",

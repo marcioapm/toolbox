@@ -92,6 +92,14 @@ graph under its own write lock and recomputes eligibility, the
 descendant-first order and the batch boundary from it; the selection pass
 bounds which sessions may be considered, not which are deleted or when.
 
+For hosts where the prune must get entirely out of a booting server's way,
+`--require-idle` adds a fail-closed gate. It starts only when `lsof` determines
+that nobody else holds the store, then samples again between delete batches and
+incremental-vacuum steps. A busy or undeterminable preflight exits 4 without
+mutation; a later such answer keeps committed work, yields before the next
+mutation, and exits 3. Holder checks are snapshots, not exclusion: the five
+second sampling interval bounds subprocess overhead, not attachment races.
+
 WHY INCREMENTAL VACUUM AND NOT VACUUM
 -------------------------------------
 A plain `VACUUM` copies the database to a temporary file and then overwrites
@@ -115,8 +123,8 @@ committed counts, `incomplete: true`, and the number of eligible sessions left
 destroyed. Ctrl-C is the expected way to stop a multi-hour prune, so the
 guarded region covers every statement of a batch and everything after the last
 one: an interrupt landing between two guarded blocks would exit 130, a status
-no report ever produces. Exit status is 0 for a complete run, 3 for one
-stopped early, 1 for one that errored.
+no report ever produces. Exit status is 0 for a complete run, 3 for one stopped
+early, 4 for a require-idle preflight skip, and 1 for one that errored.
 """
 from __future__ import annotations
 
@@ -132,6 +140,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -232,6 +241,11 @@ HOLDER_LOOKUP_TIMEOUT_S = 30.0
 # against our transaction dies with "Failed to execute statement".
 DEFAULT_BATCH = 25
 DEFAULT_BATCH_SLEEP_MS = 1000
+# One lsof process per batch would add substantial overhead to a long prune.
+# Five seconds still notices a newly started opencode promptly without turning
+# a 25-session batch loop into a subprocess loop.
+IDLE_RECHECK_SECONDS = 5.0
+INCREMENTAL_VACUUM_STEP_PAGES = 2000
 
 
 @dataclass
@@ -273,6 +287,7 @@ class DeleteOutcome:
     # Candidates never attempted, because the run stopped first.
     remaining: int = 0
     deadline_reached: bool = False
+    yielded: bool = False
     # PASSIVE checkpoints run between batches, and the WAL pages they folded.
     checkpoints: int = 0
     pages_checkpointed: int = 0
@@ -282,7 +297,7 @@ class DeleteOutcome:
 
     @property
     def incomplete(self) -> bool:
-        return self.failure is not None or self.deadline_reached
+        return self.failure is not None or self.deadline_reached or self.yielded
 
 
 @dataclass
@@ -319,6 +334,9 @@ class Result:
     # not be determined at all, which is not the same as nobody and never
     # treated as such.
     holders_before: list | None = None
+    require_idle: bool = False
+    idle_gate_observed: str = "not-requested"
+    idle_gate_outcome: str = "not-requested"
     # Real on-disk footprint (main database + WAL), not page arithmetic: a
     # released page is not a reclaimed byte until the file actually shrinks.
     bytes_before: int = 0
@@ -457,14 +475,16 @@ def checkpoint_wal(conn: sqlite3.Connection, mode: str) -> CheckpointOutcome:
     PASSIVE does what it can and yields. TRUNCATE and RESTART instead wait for
     readers and block writers while they hold the WAL -- and they wait for the
     connection's whole `busy_timeout`, which this tool sets to 30 seconds.
+    opencode's own connections use 5 seconds, so a checkpoint that queues one
+    for longer than that kills the server's write even if this call later wins.
     Measured: with one reader holding an older snapshot, `wal_checkpoint`
     (TRUNCATE) returned busy after 31.85s; the same call with `busy_timeout=0`
     returned the identical busy result in 0.0s.
 
     That matters because `checkpoint_mode_for` can only ever act on a snapshot
     of who holds the database. A process attaching between that snapshot and
-    this call would otherwise turn a checkpoint chosen as safe into a 30-second
-    stall for every opencode writer queued behind it. So the timeout is
+    this call would otherwise turn a checkpoint chosen as safe into a stall
+    that outlasts opencode's 5-second timeout. So the timeout is
     suspended for the duration and restored afterwards: a blocking mode that
     cannot get the WAL gives up immediately and reports `busy` instead, and the
     frames fold on a later run.
@@ -641,6 +661,7 @@ def delete_sessions(
     clock=time.monotonic,
     sleep_ms: int = 0,
     sleep=time.sleep,
+    should_continue: Callable[[], bool] | None = None,
 ) -> DeleteOutcome:
     """Delete sessions and all their rows, children first, in batches.
 
@@ -669,6 +690,9 @@ def delete_sessions(
     selection can never be deleted and always shields its parents.
 
     `clock` is the monotonic source the deadline is compared against.
+    `should_continue`, when provided, is checked only between committed
+    batches, while no transaction is open. False leaves the remaining
+    candidates untouched and returns a clean partial outcome.
 
     A batch that fails is rolled back, but every batch committed before it is
     already durable and irreversible. The failure is therefore recorded on the
@@ -795,6 +819,9 @@ def delete_sessions(
                 outcome.checkpoints += 1
                 if sleep_ms:
                     sleep(sleep_ms / 1000.0)
+                if should_continue is not None and not should_continue():
+                    outcome.yielded = True
+                    break
         except (sqlite3.Error, KeyboardInterrupt, MemoryError, OSError) as exc:
             if began:
                 _rollback_quietly(conn)
@@ -883,6 +910,7 @@ class VacuumOutcome:
     released: int = 0
     target: int = 0
     deadline_reached: bool = False
+    yielded: bool = False
     # incremental_vacuum returned without moving a page. The rest of the
     # freelist is still in the file and this mechanism cannot shift it, so
     # re-running continues nothing -- unlike a deadline or a page budget.
@@ -895,7 +923,7 @@ class VacuumOutcome:
 
 def run_incremental_vacuum(
     conn: sqlite3.Connection, *, pages: int | None, deadline: float | None,
-    clock=time.monotonic,
+    clock=time.monotonic, should_continue: Callable[[], bool] | None = None,
 ) -> VacuumOutcome:
     """Release freed pages back to the filesystem.
 
@@ -913,20 +941,24 @@ def run_incremental_vacuum(
     deadline, the page budget or a stall: exiting 0 with a still-oversized
     file tells an operator the reclamation finished when it did not. Other
     failures propagate: no row is at stake here, and the caller already routes
-    them into the report alongside the deletion counts that are.
+    them into the report alongside the deletion counts that are. A false
+    `should_continue` answer stops before the next step starts.
     """
     before = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
     if before == 0:
         return VacuumOutcome()
-    step = 2000
     budget = before if pages is None else min(pages, before)
     outcome = VacuumOutcome(target=before)
     while outcome.released < budget:
+        if should_continue is not None and not should_continue():
+            outcome.yielded = True
+            break
         if deadline is not None and clock() > deadline:
             outcome.deadline_reached = True
             break
         conn.execute(
-            f"PRAGMA incremental_vacuum({min(step, budget - outcome.released)})"
+            "PRAGMA incremental_vacuum("
+            f"{min(INCREMENTAL_VACUUM_STEP_PAGES, budget - outcome.released)})"
         )
         now = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
         released = max(0, before - now)
@@ -1898,6 +1930,12 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="keep sessions updated within this many days (default 4)")
     prune.add_argument("--apply", action="store_true",
                        help="actually delete; without this the run is a dry run")
+    prune.add_argument(
+        "--require-idle", action="store_true",
+        help="mutate only while lsof determines that nobody else holds the "
+             "database; busy or undeterminable skips before writing, and a "
+             "later busy/undeterminable check yields between batches",
+    )
     prune.add_argument("--batch", type=int, default=DEFAULT_BATCH,
                        help=f"sessions per transaction (default {DEFAULT_BATCH}; "
                             "clamped to SQLite's bound-variable limit)")
@@ -1997,6 +2035,12 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
         ap.error("--max-seconds must be finite and >= 0 (0 means no limit)")
     if args.vacuum_pages is not None and args.vacuum_pages < 1:
         ap.error("--vacuum-pages must be >= 1; omit it to release the whole freelist")
+    if args.apply and args.require_idle and args.enable_incremental_vacuum:
+        ap.error(
+            "--require-idle cannot be combined with "
+            "--enable-incremental-vacuum under --apply; conversion from "
+            "auto_vacuum=NONE requires a full VACUUM that cannot yield"
+        )
     if not args.db.is_file():
         print(f"opencode-gc: no database at {args.db}", file=sys.stderr)
         return 2
@@ -2008,7 +2052,10 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
 
     deadline = time.monotonic() + args.max_seconds if args.max_seconds > 0 else None
     res = Result(db=str(args.db), dry_run=not args.apply,
-                 retention_days=args.retention_days)
+                 retention_days=args.retention_days, require_idle=args.require_idle)
+    if args.require_idle and not args.apply:
+        res.idle_gate_observed = "not-checked"
+        res.idle_gate_outcome = "dry-run"
 
     try:
         conn = connect(db_path, read_only=not args.apply)
@@ -2049,6 +2096,58 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
                 "from PATH, or too slow); treating it as busy"
             )
 
+        should_continue = None
+        if args.apply and args.require_idle:
+            if holders is None:
+                res.idle_gate_observed = "undeterminable"
+                res.idle_gate_outcome = "preflight-skip"
+                res.notes.append(
+                    "--require-idle could not determine who holds the database; "
+                    "skipping without mutation"
+                )
+            elif holders:
+                res.idle_gate_observed = "busy"
+                res.idle_gate_outcome = "preflight-skip"
+                res.notes.append(
+                    f"--require-idle found {len(holders)} holder(s) "
+                    f"[{','.join(holders[:8])}]; skipping without mutation"
+                )
+            else:
+                res.idle_gate_observed = "idle"
+                next_check = None
+
+                def idle_store(*, force: bool = False) -> bool:
+                    nonlocal next_check
+                    now = time.monotonic()
+                    if not force and next_check is not None and now < next_check:
+                        return True
+                    next_check = now + IDLE_RECHECK_SECONDS
+                    current_holders = db_holders(db_path)
+                    if current_holders == []:
+                        res.idle_gate_observed = "idle"
+                        return True
+                    res.idle_gate_observed = (
+                        "undeterminable" if current_holders is None else "busy"
+                    )
+                    if current_holders is None:
+                        res.notes.append(
+                            "--require-idle could no longer determine who holds "
+                            "the database; yielding before the next mutation"
+                        )
+                    else:
+                        res.notes.append(
+                            f"--require-idle found {len(current_holders)} holder(s) "
+                            f"[{','.join(current_holders[:8])}]; yielding before "
+                            "the next mutation"
+                        )
+                    return False
+
+                should_continue = idle_store
+
+        if res.idle_gate_outcome == "preflight-skip":
+            res.bytes_after = on_disk_bytes(db_path)
+            return _report(args, res)
+
         if args.enable_incremental_vacuum:
             if not args.apply:
                 res.notes.append(
@@ -2080,6 +2179,7 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
                     conn, selection.deletable,
                     cutoff_ms=cutoff_ms, batch=batch, deadline=deadline,
                     sleep_ms=args.batch_sleep_ms,
+                    should_continue=should_continue,
                 )
                 res.rows_deleted = outcome.rows
                 res.sessions_deleted = outcome.rows.get("session", 0)
@@ -2098,6 +2198,13 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
                         f"--max-seconds reached; {outcome.remaining} eligible "
                         "session(s) were not attempted. Re-run to continue."
                     )
+                if outcome.yielded:
+                    res.idle_gate_outcome = "mid-pass-yield"
+                    res.notes.append(
+                        f"--require-idle yielded between delete batches; "
+                        f"{outcome.remaining} eligible session(s) were not "
+                        "attempted. Re-run when the store is idle."
+                    )
             else:
                 res.rows_deleted = count_rows_for(conn, selection.deletable, batch)
 
@@ -2107,16 +2214,20 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
         try:
             # Reclaiming is still worth doing after a partial delete: the pages
             # freed by the batches that did commit are already on the freelist.
-            if args.apply and not args.no_vacuum:
+            if (args.apply and not args.no_vacuum
+                    and res.idle_gate_outcome != "mid-pass-yield"):
                 current = read_stats(conn)
                 if current.auto_vacuum == 2:
                     vac = run_incremental_vacuum(
-                        conn, pages=args.vacuum_pages, deadline=deadline
+                        conn, pages=args.vacuum_pages, deadline=deadline,
+                        should_continue=should_continue,
                     )
                     res.pages_released = vac.released
                     res.pages_reclaimable_remaining = vac.remaining
                     res.vacuum_deadline_reached = vac.deadline_reached
                     res.vacuum_stalled = vac.stalled
+                    if vac.yielded:
+                        res.idle_gate_outcome = "mid-pass-yield"
                     if vac.remaining:
                         # Whatever stopped the pass, pages that were eligible
                         # are still in the file, so it is larger than a run
@@ -2127,6 +2238,12 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
                                 f"--max-seconds reached during page reclamation; "
                                 f"{vac.remaining:,} of {vac.target:,} page(s) were not "
                                 "released. Re-run to continue."
+                            )
+                        elif vac.yielded:
+                            res.notes.append(
+                                f"--require-idle yielded between page reclamation "
+                                f"steps; {vac.remaining:,} of {vac.target:,} "
+                                "page(s) remain. Re-run when the store is idle."
                             )
                         elif vac.stalled:
                             res.notes.append(
@@ -2148,13 +2265,20 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
                         "--enable-incremental-vacuum to reclaim future deletes."
                     )
 
-            if args.apply:
+            if (args.apply and res.idle_gate_outcome != "mid-pass-yield"
+                    and should_continue is not None):
+                idle_before_checkpoint = idle_store(force=True)
+                if not idle_before_checkpoint:
+                    res.idle_gate_outcome = "mid-pass-yield"
+                    res.incomplete = True
+            if args.apply and res.idle_gate_outcome != "mid-pass-yield":
                 # Without this the released pages stay in the file and the WAL
                 # keeps whatever the deletes wrote into it -- 15.28 GiB of it
                 # on vibes, never checkpointed. TRUNCATE only when the database
                 # is known to be idle: it waits for readers and blocks writers
                 # while it holds the WAL, and opencode instances are writers.
-                ckpt = checkpoint_wal(conn, checkpoint_mode_for(holders))
+                checkpoint_holders = [] if args.require_idle else holders
+                ckpt = checkpoint_wal(conn, checkpoint_mode_for(checkpoint_holders))
                 res.wal_checkpoint_mode = ckpt.mode
                 res.wal_pages_checkpointed += ckpt.pages_checkpointed
                 res.wal_checkpoint_busy = ckpt.busy
@@ -2198,6 +2322,9 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
             "shrunk yet; a WAL checkpoint is pending, typically because another "
             "reader is still holding the database open."
         )
+    if (args.apply and args.require_idle
+            and res.idle_gate_outcome != "mid-pass-yield"):
+        res.idle_gate_outcome = "ran-to-completion"
     return _report(args, res)
 
 
@@ -2379,8 +2506,9 @@ def _report(args, res: Result) -> int:
     """Print the result and map it to an exit status.
 
     0 = complete, 1 = an error occurred, 3 = no error but eligible work was
-    left undone (a deadline). Automation must be able to tell "finished" from
-    "stopped part-way with rows already destroyed".
+    left undone, 4 = --require-idle skipped before mutation. Automation must
+    be able to tell "finished" from "stopped part-way with rows already
+    destroyed" and from "did not start because the store was not idle".
     """
     if args.json:
         print(json.dumps(asdict(res) | {"bytes_reclaimed": res.bytes_reclaimed}, indent=2))
@@ -2432,6 +2560,8 @@ def _report(args, res: Result) -> int:
 def _status(res: Result) -> int:
     if res.errors:
         return 1
+    if res.idle_gate_outcome == "preflight-skip":
+        return 4
     return 3 if res.incomplete else 0
 
 
