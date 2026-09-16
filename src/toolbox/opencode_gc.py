@@ -2322,9 +2322,8 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
             "shrunk yet; a WAL checkpoint is pending, typically because another "
             "reader is still holding the database open."
         )
-    if args.apply and args.require_idle and res.idle_gate_outcome not in (
-        "preflight-skip", "mid-pass-yield"
-    ):
+    if (args.apply and args.require_idle
+            and res.idle_gate_outcome != "mid-pass-yield"):
         res.idle_gate_outcome = "ran-to-completion"
     return _report(args, res)
 
