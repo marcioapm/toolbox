@@ -475,14 +475,16 @@ def checkpoint_wal(conn: sqlite3.Connection, mode: str) -> CheckpointOutcome:
     PASSIVE does what it can and yields. TRUNCATE and RESTART instead wait for
     readers and block writers while they hold the WAL -- and they wait for the
     connection's whole `busy_timeout`, which this tool sets to 30 seconds.
+    opencode's own connections use 5 seconds, so a checkpoint that queues one
+    for longer than that kills the server's write even if this call later wins.
     Measured: with one reader holding an older snapshot, `wal_checkpoint`
     (TRUNCATE) returned busy after 31.85s; the same call with `busy_timeout=0`
     returned the identical busy result in 0.0s.
 
     That matters because `checkpoint_mode_for` can only ever act on a snapshot
     of who holds the database. A process attaching between that snapshot and
-    this call would otherwise turn a checkpoint chosen as safe into a 30-second
-    stall for every opencode writer queued behind it. So the timeout is
+    this call would otherwise turn a checkpoint chosen as safe into a stall
+    that outlasts opencode's 5-second timeout. So the timeout is
     suspended for the duration and restored afterwards: a blocking mode that
     cannot get the WAL gives up immediately and reports `busy` instead, and the
     frames fold on a later run.
@@ -2033,6 +2035,12 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
         ap.error("--max-seconds must be finite and >= 0 (0 means no limit)")
     if args.vacuum_pages is not None and args.vacuum_pages < 1:
         ap.error("--vacuum-pages must be >= 1; omit it to release the whole freelist")
+    if args.apply and args.require_idle and args.enable_incremental_vacuum:
+        ap.error(
+            "--require-idle cannot be combined with "
+            "--enable-incremental-vacuum under --apply; conversion from "
+            "auto_vacuum=NONE requires a full VACUUM that cannot yield"
+        )
     if not args.db.is_file():
         print(f"opencode-gc: no database at {args.db}", file=sys.stderr)
         return 2
@@ -2106,12 +2114,12 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
                 )
             else:
                 res.idle_gate_observed = "idle"
-                next_check = time.monotonic() + IDLE_RECHECK_SECONDS
+                next_check = None
 
-                def idle_store() -> bool:
+                def idle_store(*, force: bool = False) -> bool:
                     nonlocal next_check
                     now = time.monotonic()
-                    if now < next_check:
+                    if not force and next_check is not None and now < next_check:
                         return True
                     next_check = now + IDLE_RECHECK_SECONDS
                     current_holders = db_holders(db_path)
@@ -2121,7 +2129,6 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
                     res.idle_gate_observed = (
                         "undeterminable" if current_holders is None else "busy"
                     )
-                    res.idle_gate_outcome = "mid-pass-yield"
                     if current_holders is None:
                         res.notes.append(
                             "--require-idle could no longer determine who holds "
@@ -2192,6 +2199,7 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
                         "session(s) were not attempted. Re-run to continue."
                     )
                 if outcome.yielded:
+                    res.idle_gate_outcome = "mid-pass-yield"
                     res.notes.append(
                         f"--require-idle yielded between delete batches; "
                         f"{outcome.remaining} eligible session(s) were not "
@@ -2258,15 +2266,19 @@ def _prune_command(ap: argparse.ArgumentParser, args) -> int:
                     )
 
             if (args.apply and res.idle_gate_outcome != "mid-pass-yield"
-                    and should_continue is not None and not should_continue()):
-                res.incomplete = True
+                    and should_continue is not None):
+                idle_before_checkpoint = idle_store(force=True)
+                if not idle_before_checkpoint:
+                    res.idle_gate_outcome = "mid-pass-yield"
+                    res.incomplete = True
             if args.apply and res.idle_gate_outcome != "mid-pass-yield":
                 # Without this the released pages stay in the file and the WAL
                 # keeps whatever the deletes wrote into it -- 15.28 GiB of it
                 # on vibes, never checkpointed. TRUNCATE only when the database
                 # is known to be idle: it waits for readers and blocks writers
                 # while it holds the WAL, and opencode instances are writers.
-                ckpt = checkpoint_wal(conn, checkpoint_mode_for(holders))
+                checkpoint_holders = [] if args.require_idle else holders
+                ckpt = checkpoint_wal(conn, checkpoint_mode_for(checkpoint_holders))
                 res.wal_checkpoint_mode = ckpt.mode
                 res.wal_pages_checkpointed += ckpt.pages_checkpointed
                 res.wal_checkpoint_busy = ckpt.busy
